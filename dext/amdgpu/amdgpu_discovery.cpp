@@ -231,4 +231,117 @@ discovery_parse(const uint8_t *binary, uint64_t binarySize,
     return kIOReturnSuccess;
 }
 
+//
+// discover_ips_on_die — bootstraps the IP base table the way amdgpu
+// does it on Linux. See amdgpu_discovery.h for the algorithm summary.
+//
+kern_return_t
+discover_ips_on_die(DeviceContext &dev, DiscoveryParseResult *outResult)
+{
+    if (outResult) memset(outResult, 0, sizeof(*outResult));
+
+    // Step 1: VRAM size in MB from the legacy absolute mmRCC_CONFIG_MEMSIZE.
+    // amdgpu does this on every ASIC including RDNA4; the absolute
+    // alias resolves to the right physical register regardless of
+    // NBIO version.
+    uint32_t vram_mb = RREG32_abs(dev, BootstrapRegs::RCC_CONFIG_MEMSIZE);
+    if (vram_mb == 0 || vram_mb == 0xFFFFFFFFu) {
+        char m[96];
+        snprintf(m, sizeof(m),
+                 "RCC_CONFIG_MEMSIZE returned %#x — GPU not responding",
+                 vram_mb);
+        if (outResult) snprintf(outResult->err, sizeof(outResult->err), "%s", m);
+        DISC_LOG("%{public}s", m);
+        return kIOReturnNotReady;
+    }
+    uint64_t vram_bytes = static_cast<uint64_t>(vram_mb) << 20;
+    DISC_LOG("on-die: VRAM size = %u MB (%llu bytes) from RCC_CONFIG_MEMSIZE",
+             vram_mb, vram_bytes);
+
+    // Step 2: sysmem-TMR override path.
+    uint32_t scratch2 = RREG32_abs(dev, BootstrapRegs::DRIVER_SCRATCH_2);
+    if (scratch2 != 0 && scratch2 != 0xFFFFFFFFu) {
+        uint32_t scratch0 = RREG32_abs(dev, BootstrapRegs::DRIVER_SCRATCH_0);
+        uint32_t scratch1 = RREG32_abs(dev, BootstrapRegs::DRIVER_SCRATCH_1);
+        uint64_t sysmem_tmr = (static_cast<uint64_t>(scratch1) << 32)
+                            | scratch0;
+        DISC_LOG("on-die: PSP placed TMR in sysmem at %#llx (size=%u) — "
+                 "this path requires mapping host-physical sysmem from "
+                 "the dext, which AS PCIDriverKit doesn't expose. Use "
+                 "LoadDiscoveryBin from userspace as the escape hatch.",
+                 sysmem_tmr, scratch2);
+        if (outResult) snprintf(outResult->err, sizeof(outResult->err),
+                                "PSP placed TMR in sysmem at %#llx — "
+                                "use LoadDiscoveryBin", sysmem_tmr);
+        return kIOReturnUnsupported;
+    }
+
+    // Step 3: VRAM-resident TMR. Lives at vram_end - 1 MB.
+    uint64_t tmr_offset = vram_bytes - kDiscoveryTMROffset;
+
+    // The dext can only read VRAM through BAR2's visible window.
+    // If the TMR sits outside that window, on-die discovery is
+    // not possible without PSP cooperation (which would land in
+    // the DRIVER_SCRATCH path above).
+    if (dev.bar2VisibleVRAMSize == 0) {
+        DISC_LOG("on-die: BAR2 visible size unknown — cannot read TMR");
+        if (outResult) snprintf(outResult->err, sizeof(outResult->err),
+                                "BAR2 visible VRAM size = 0");
+        return kIOReturnNotReady;
+    }
+
+    // BAR2 maps the *top* of VRAM or the *bottom* depending on PSP
+    // firmware policy. The simplest assumption: BAR2 base corresponds
+    // to vram_start (offset 0 in VRAM) and the visible region is
+    // [0, bar2VisibleVRAMSize). On most discrete AMD GPUs the
+    // TMR is placed at the very top of VRAM — outside the visible
+    // window for small-BAR setups.
+    //
+    // Per scottjg's research (docs/AS_DART_LIMITS.md), our AS setup
+    // is small-BAR (256 MB / 1 GB visible). On those configs PSP
+    // either (a) places the TMR in visible VRAM by skipping the top
+    // 32 GB and using offset (visible_size - 1 MB), or (b) writes
+    // the location into DRIVER_SCRATCH (step 2 above).
+    //
+    // Try the top-of-VISIBLE-VRAM interpretation first since the
+    // top-of-FULL-VRAM offset is out of BAR2 range:
+    uint64_t bar2_off = tmr_offset;
+    if (bar2_off >= dev.bar2VisibleVRAMSize) {
+        uint64_t visible_top_offset = dev.bar2VisibleVRAMSize
+                                    - kDiscoveryTMROffset;
+        DISC_LOG("on-die: top-of-VRAM offset %#llx outside BAR2 visible "
+                 "(%llu MB); retrying at top-of-visible %#llx",
+                 tmr_offset, dev.bar2VisibleVRAMSize >> 20,
+                 visible_top_offset);
+        bar2_off = visible_top_offset;
+    }
+
+    // Step 4: read the binary out of BAR2 + bar2_off via 32-bit MMIO.
+    // 10 KB = 2560 dwords; we allocate 16 KB to round to the AS
+    // page size + the upstream DISCOVERY_TMR_SIZE.
+    uint8_t  binary[kDiscoveryTMRSize];
+    uint32_t *out_dw = reinterpret_cast<uint32_t *>(binary);
+    const uint32_t dword_count = kDiscoveryTMRSize / 4;
+    for (uint32_t i = 0; i < dword_count; i++) {
+        out_dw[i] = RBAR2_32(dev, bar2_off + i * 4ULL);
+    }
+
+    // Sanity-check the binary signature before handing to the parser.
+    auto *hdr = reinterpret_cast<const DiscoveryBinaryHeader *>(binary);
+    if (hdr->signature != kDiscoverySignature) {
+        DISC_LOG("on-die: bad signature %#010x at BAR2+%#llx — "
+                 "TMR not where expected (visible-VRAM %llu MB; "
+                 "consider LoadDiscoveryBin)",
+                 hdr->signature, bar2_off, dev.bar2VisibleVRAMSize >> 20);
+        if (outResult) snprintf(outResult->err, sizeof(outResult->err),
+                                "bad signature %#010x at BAR2+%#llx",
+                                hdr->signature, bar2_off);
+        return kIOReturnInvalid;
+    }
+
+    DISC_LOG("on-die: read %u bytes from BAR2+%#llx, signature ok",
+             kDiscoveryTMRSize, bar2_off);
+    return discovery_parse(binary, kDiscoveryTMRSize, dev, outResult);
+}
+
 } // namespace amdgpu

@@ -30,6 +30,7 @@
 #include "amdgpu_ih.h"
 #include "amdgpu_rlc.h"
 #include "amdgpu_cp.h"
+#include "amdgpu_discovery.h"
 
 namespace amdgpu {
 

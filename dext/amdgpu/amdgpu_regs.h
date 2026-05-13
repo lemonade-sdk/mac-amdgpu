@@ -99,6 +99,31 @@ WREG32(const DeviceContext &ctx, uint32_t reg, uint32_t value)
     ctx.pci->MemoryWrite32(ctx.bar0MemIndex,
                            static_cast<uint64_t>(reg) * 4ULL, value);
 }
+
+// Absolute BAR0 read — bypasses SOC15 indirection. Used by the
+// bootstrap path (IP discovery) to read mmRCC_CONFIG_MEMSIZE +
+// mmDRIVER_SCRATCH_{0,1,2} before any IP bases are resolved.
+static inline uint32_t
+RREG32_abs(const DeviceContext &ctx, uint32_t reg_dword_offset)
+{
+    uint32_t value = 0xFFFFFFFFu;
+    ctx.pci->MemoryRead32(ctx.bar0MemIndex,
+                          static_cast<uint64_t>(reg_dword_offset) * 4ULL,
+                          &value);
+    return value;
+}
+
+// 32-bit read from BAR2 at the given **byte** offset. BAR2 maps the
+// visible VRAM aperture; offsets larger than ctx.bar2VisibleVRAMSize
+// are not valid (the IP discovery TMR must live in the visible
+// window or the on-die path bails — see amdgpu_discovery::discover_ips_on_die).
+static inline uint32_t
+RBAR2_32(const DeviceContext &ctx, uint64_t byte_offset)
+{
+    uint32_t value = 0;
+    ctx.pci->MemoryRead32(ctx.bar2MemIndex, byte_offset, &value);
+    return value;
+}
 #endif
 
 //============================================================

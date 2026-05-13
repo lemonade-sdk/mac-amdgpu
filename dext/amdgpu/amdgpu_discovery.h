@@ -147,4 +147,25 @@ kern_return_t discovery_parse(const uint8_t *binary, uint64_t binarySize,
                               DeviceContext &dev,
                               DiscoveryParseResult *outResult);
 
+//
+// discover_ips_on_die — perform IP discovery exactly the way Linux's
+// amdgpu_discovery_init does it:
+//
+//   1. RREG32(mmRCC_CONFIG_MEMSIZE) absolute — VRAM size in MB.
+//   2. RREG32(mmDRIVER_SCRATCH_2) absolute — if non-zero, PSP has
+//      placed the discovery binary in sysmem at (SCRATCH_0|<<32 |
+//      SCRATCH_1) with size SCRATCH_2. That path requires mapping
+//      a host-physical sysmem range from the dext, which AS
+//      PCIDriverKit doesn't expose; we error out and ask the
+//      caller to use LoadDiscoveryBin as the escape hatch.
+//   3. Else compute (vram_size_mb << 20) - kDiscoveryTMROffset and
+//      read the binary from BAR2 at that VRAM offset.
+//   4. discovery_parse() the binary, populating dev.ip.
+//
+// Returns kIOReturnSuccess on success. On the "TMR in sysmem"
+// branch returns kIOReturnUnsupported with a clear log line.
+//
+kern_return_t discover_ips_on_die(DeviceContext &dev,
+                                  DiscoveryParseResult *outResult);
+
 } // namespace amdgpu

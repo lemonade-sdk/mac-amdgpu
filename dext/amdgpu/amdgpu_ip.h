@@ -167,6 +167,42 @@ namespace PSPBootloaderCmd {
 constexpr uint32_t kPSPBootloaderReadyBit = 0x80000000u;
 constexpr uint32_t kPSPFwPriBufSize       = 1024u * 1024u;  // PSP_1_MEG
 
+// ============================================================
+// Bootstrap registers — absolute BAR0 dword offsets that don't
+// require any IP base to be resolved.
+//
+// These are the chicken-and-egg solver: amdgpu_discovery.c reads
+// them via plain RREG32(mm...) (no SOC15 wrapper) to bootstrap the
+// IP base table. On RDNA4 / gfx1201 the same legacy absolute
+// aliases still resolve to the right physical registers.
+//
+// Sources:
+//   drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c:140-148
+//
+// mmRCC_CONFIG_MEMSIZE  : VRAM size in MB.
+// mmDRIVER_SCRATCH_0    : TMR offset LO (PSP-written; sysmem-TMR override)
+// mmDRIVER_SCRATCH_1    : TMR offset HI
+// mmDRIVER_SCRATCH_2    : TMR size in bytes (0 if no sysmem override)
+//
+// Discovery binary location (per amdgpu_discovery_get_tmr_info):
+//   if DRIVER_SCRATCH_2 != 0:
+//       offset = (DRIVER_SCRATCH_1 << 32) | DRIVER_SCRATCH_0
+//       size   = DRIVER_SCRATCH_2
+//   else:
+//       offset = (vram_size_mb << 20) - DISCOVERY_TMR_OFFSET
+//       size   = DISCOVERY_TMR_SIZE
+// ============================================================
+namespace BootstrapRegs {
+    constexpr uint32_t RCC_CONFIG_MEMSIZE = 0x0DE3;
+    constexpr uint32_t DRIVER_SCRATCH_0   = 0x0094;
+    constexpr uint32_t DRIVER_SCRATCH_1   = 0x0095;
+    constexpr uint32_t DRIVER_SCRATCH_2   = 0x0096;
+}
+
+constexpr uint64_t kDiscoveryTMROffset = 0x100000;   // 1 MB
+constexpr uint32_t kDiscoveryTMRSize   = 0x10000;    // 64 KB allocation
+                                                     // (binary itself is ~10 KB)
+
 // **** Apple Silicon page size is 16 KB, not 4 KB. ****
 //
 // All DMA-mappable buffers handed to the GPU through DART must be

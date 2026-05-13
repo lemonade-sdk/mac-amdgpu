@@ -89,8 +89,29 @@ run_stage(BringupContext &ctx, BringupStage s)
     switch (s) {
     case BringupStage::None:
         return kIOReturnSuccess;
-    case BringupStage::IPDiscovery:
-        return bringup_ip_discovery(ctx);
+    case BringupStage::IPDiscovery: {
+        // Do on-die discovery the way amdgpu does — read VRAM size
+        // from mmRCC_CONFIG_MEMSIZE absolute, then memcpy the binary
+        // out of BAR2 and parse. Falls back to letting the caller
+        // try LoadDiscoveryBin if on-die isn't possible (e.g. PSP
+        // placed the TMR in sysmem via DRIVER_SCRATCH).
+        DiscoveryParseResult res{};
+        kern_return_t r = discover_ips_on_die(ctx.device, &res);
+        if (r == kIOReturnSuccess) {
+            return bringup_ip_discovery(ctx);  // pin version constants
+        }
+        // On-die failed; if userspace has already provided a binary
+        // via LoadDiscoveryBin, those bases stay set and we treat
+        // IPDiscovery as a success. Otherwise propagate the error
+        // so the caller knows to provide one.
+        if (ctx.device.ip.isResolved(IPBlock::MP0) &&
+            ctx.device.ip.isResolved(IPBlock::GC)) {
+            INIT_LOG("on-die discovery failed (%#x) but IP bases already "
+                     "set from a prior LoadDiscoveryBin — accepting", r);
+            return bringup_ip_discovery(ctx);
+        }
+        return r;
+    }
     case BringupStage::PSPInit:
         return psp_init(ctx.device, ctx.psp);
     case BringupStage::PSPLoadSOS:
