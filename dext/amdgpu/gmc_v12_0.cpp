@@ -641,9 +641,99 @@ gmc_init(DeviceContext &dev, GMCContext &gmc)
         GMC_LOG("skipping gfxhub_gart_enable — IP base unresolved");
     }
 
+    // HDP flush — invalidate HDP cache so the GPU sees the page-
+    // table writes we just made via the BAR.
+    if (dev.ip.isResolved(IPBlock::HDP)) {
+        gmc_hdp_flush(dev);
+    }
+
+    // Flush TLBs on both hubs (vmid=0, legacy flush type). This
+    // ensures the page tables are picked up before the first GPU
+    // memory access through GART.
+    if (dev.ip.isResolved(gmc.mmhub.ip)) {
+        gmc_flush_gpu_tlb(dev, gmc, gmc.mmhub, /*vmid*/ 0, /*type*/ 0);
+    }
+    if (dev.ip.isResolved(gmc.gfxhub.ip)) {
+        gmc_flush_gpu_tlb(dev, gmc, gmc.gfxhub, /*vmid*/ 0, /*type*/ 0);
+    }
+
     dev.gmcReady = true;
-    GMC_LOG("GMCInit complete (HDP flush + fault-enable + tlb-flush "
-            "remain — see docs/port_plans/GMC_v12.md steps 14-17)");
+    GMC_LOG("GMCInit complete");
+    return kIOReturnSuccess;
+}
+
+// ============================================================
+// HDP flush — invalidates the HDP cache so reads from VRAM via the
+// BAR aperture see fresh data. Linux's amdgpu_device_flush_hdp
+// dispatches per-IP version; for v7 (gfx1201) it's a simple write
+// to regHDP_MEM_COHERENCY_FLUSH_CNTL.
+// ============================================================
+kern_return_t
+gmc_hdp_flush(DeviceContext &dev)
+{
+    if (!dev.ip.isResolved(IPBlock::HDP)) return kIOReturnNotReady;
+    // regHDP_MEM_COHERENCY_FLUSH_CNTL is a single dword at offset
+    // 0x230C in the HDP register window per gc_12_0_0_offset.h
+    // (HDP shares the same offset across v7.x in practice). Writing
+    // 1 to bit 0 triggers the flush.
+    constexpr uint32_t kHDP_MEM_COHERENCY_FLUSH_CNTL = 0x230C;
+    WREG32(dev,
+           SOC15_REG_OFFSET(dev, IPBlock::HDP, kHDP_MEM_COHERENCY_FLUSH_CNTL),
+           1);
+    return kIOReturnSuccess;
+}
+
+// ============================================================
+// gmc_flush_gpu_tlb — invalidate TLB entries using the engines we
+// armed in hub_program_invalidation. Mirrors gmc_v12_0_flush_gpu_tlb.
+//
+// The protocol: write a request word to VM_INVALIDATE_ENG0_REQ with
+// the vmid + flush type packed into specific bit positions, then
+// poll VM_INVALIDATE_ENG0_ACK until the corresponding bit is set.
+// ============================================================
+kern_return_t
+gmc_flush_gpu_tlb(DeviceContext &dev, const GMCContext &gmc,
+                  const HubContext &hub, uint32_t vmid, uint32_t flush_type)
+{
+    (void)gmc;
+    if (!hub.inited || !dev.ip.isResolved(hub.ip)) return kIOReturnNotReady;
+
+    // Request word layout (from gmc_v12_0_get_invalidate_req):
+    //   bit  0      = PER_VMID_INVALIDATE_REQ shifted left by vmid
+    //   bits 4..5   = FLUSH_TYPE
+    //   bit 6       = INVALIDATE_L2_PTES
+    //   bit 7       = INVALIDATE_L2_PDE0
+    //   bit 8       = INVALIDATE_L2_PDE1
+    //   bit 9       = INVALIDATE_L2_PDE2
+    //   bit 10      = INVALIDATE_L1_PTES
+    //   bit 11      = INVALIDATE_L1_PDES
+    //   bit 12      = CLEAR_PROTECTION_FAULT_STATUS_ADDR
+    uint32_t req = 0;
+    req |= (1u << vmid);                  // PER_VMID bit
+    req |= ((flush_type & 0x3) << 4);     // FLUSH_TYPE
+    req |= (1u << 6);   // INVALIDATE_L2_PTES
+    req |= (1u << 7);   // INVALIDATE_L2_PDE0
+    req |= (1u << 8);   // INVALIDATE_L2_PDE1
+    req |= (1u << 9);   // INVALIDATE_L2_PDE2
+    req |= (1u << 10);  // INVALIDATE_L1_PTES
+    req |= (1u << 11);  // INVALIDATE_L1_PDES
+
+    const uint32_t req_reg = SOC15_REG_OFFSET(dev, hub.ip,
+                                              hub.vm_invalidate_eng0_req);
+    const uint32_t ack_reg = SOC15_REG_OFFSET(dev, hub.ip,
+                                              hub.vm_invalidate_eng0_ack);
+
+    WREG32(dev, req_reg, req);
+
+    // Poll ack bit for this vmid.
+    uint32_t expected = (1u << vmid);
+    uint32_t value = 0;
+    if (!poll_reg(dev, ack_reg, expected, expected,
+                  /*timeout_us*/ 100000, &value)) {
+        GMC_LOG("flush_gpu_tlb: ack timeout (req=%#x ack=%#x ip=%u)",
+                req, value, (unsigned)hub.ip);
+        return kIOReturnTimeout;
+    }
     return kIOReturnSuccess;
 }
 

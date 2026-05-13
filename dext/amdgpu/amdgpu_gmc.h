@@ -168,6 +168,19 @@ void gmc_release_resources(GMCContext &gmc);
 kern_return_t gmc_mmhub_gart_enable(DeviceContext &dev, GMCContext &gmc);
 kern_return_t gmc_gfxhub_gart_enable(DeviceContext &dev, GMCContext &gmc);
 
+// HDP flush — port of amdgpu_device_flush_hdp. Writes the HDP
+// memory-read-cache invalidate register. Used after writing PTEs
+// or after gart_enable so the GPU sees fresh state.
+kern_return_t gmc_hdp_flush(DeviceContext &dev);
+
+// flush_gpu_tlb — uses the invalidation engines hub_program_invalidation
+// armed. Writes a request to VM_INVALIDATE_ENG0_REQ, polls ACK.
+// vmid: 0..15 (0 = system, 1..14 = user, 15 = all)
+// flush_type: 0 = legacy, 1 = light-weight, 2 = heavyweight
+kern_return_t gmc_flush_gpu_tlb(DeviceContext &dev, const GMCContext &gmc,
+                                const HubContext &hub,
+                                uint32_t vmid, uint32_t flush_type);
+
 // Top-level GMCInit stage entry — runs the chain.
 kern_return_t gmc_init(DeviceContext &dev, GMCContext &gmc);
 
