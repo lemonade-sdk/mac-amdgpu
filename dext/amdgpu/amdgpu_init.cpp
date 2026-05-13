@@ -103,6 +103,7 @@ run_stage(BringupContext &ctx, BringupStage s)
     case BringupStage::IHInit:
         return ih_init_full(ctx.device, ctx.ih);
     case BringupStage::RLCInit:
+        return rlc_init_full(ctx.device, ctx.gmc, ctx.rlc);
     case BringupStage::CPInit:
     case BringupStage::MESInit:
     case BringupStage::GFXInit:
