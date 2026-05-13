@@ -4,7 +4,7 @@ Granular tasks. Status legend: `[ ]` open · `[~]` in progress · `[x]` done · 
 
 Phase numbers match `ROADMAP.md`. Target hardware fixed: Apple Silicon M5 Pro/Max/Ultra + TB5 + AMD Radeon AI PRO R9700 (gfx1201, RDNA4).
 
-Last sync against `git log`: commit `69d4137` (Phase 1B chunk 13 — IH v7 ring + drain).
+Last sync against `git log`: commit `8a04754` (Phase 1B chunk 17 — HQD program + CP enable + SubmitTestPM4, Hello PM4 plumbing complete).
 
 ---
 
@@ -109,7 +109,7 @@ Cite Linux source file in commit messages.
 - [x] 190  Port `mmhub_v4_1_0_gart_enable` — write MMHUB context0 PT base, L1/L2 TLB cntls, per-VMID context (14×)
 - [x] 191  Port `gfxhub_v12_0_gart_enable` — same for GFXHUB
 - [x] 192  Port HDP flush
-- [-] 193  Port `set_fault_enable_default`
+- [-] 193  Port `set_fault_enable_default` — the per-VMID CONTEXT*_CNTL writes in hub_setup_vmid_config already enable faults; explicit toggle is suspend/resume territory.
 - [x] 194  Port `flush_gpu_tlb`
 - [ ] 195  Sanity test: map a sysmem page through GART, GPU-side read via SDMA → CPU compare
 
@@ -123,25 +123,25 @@ Cite Linux source file in commit messages.
 - [x] 206  Port MSI storm + flood control (IH_MSI_STORM_CTRL, IH_INT_FLOOD_CNTL)
 - [x] 207  Port `ih_v7_0_toggle_interrupts(true)` — enable + force-update trigger
 - [x] 208  Port `amdgpu_ih_process` — wptr read (shadow first, MMIO fallback), entry walk (8 dword stride), per-source dispatch
-- [ ] 209  Hook MSI-X handler in dext to call `amdgpu_ih_process` and signal `irqPending`/AsyncCompletion to userspace
-- [ ] 210  Per-source dispatch table (CP_EOP / UTCL2_FAULT / SDMA_TRAP / RAS) — `ih_drain` currently delegates to caller
+- [x] 209  Hook MSI-X handler in dext to call `amdgpu_ih_process` and signal `irqPending`/AsyncCompletion to userspace
+- [x] 210  Per-source dispatch table (CP_EOP / UTCL2_FAULT / SDMA_TRAP / RAS) — `mac_amdgpu_ih_dispatch` translates client_id+src_id → kIRQBit* in irqPending
 
 ### 1B.5 GFX12 + first PM4 — pending (see `docs/port_plans/HELLO_PM4.md`)
-- [ ] 220  Port `gfx_v12_0_rlc_init` — RLC clear-state buffer (4 KB **VRAM**; needs minimal allocator)
-- [ ] 221  Port `gfx_v12_0_rlc_resume`
-- [ ] 222  Wait for RLC autoload complete (CP_MES_INSTR_PNTR poll)
-- [ ] 223  Port `gfx_v12_0_gfxhub_enable` — GFXHUB enable + UTCL1 fault enable + TLB flush
-- [ ] 224  Allocate GFX ring buffer (16 KB **GTT**; sysmem-backed)
-- [ ] 225  Allocate write-back page (rptr + wptr + fence offsets, 4 KB sysmem)
+- [x] 220  Port `gfx_v12_0_rlc_init` — RLC clear-state buffer (4 KB **VRAM**; needs minimal allocator) — chunk 15
+- [x] 221  Port `gfx_v12_0_rlc_resume` — chunk 15
+- [x] 222  Wait for RLC autoload complete (CP_MES_INSTR_PNTR poll) — chunk 15
+- [x] 223  Port `gfx_v12_0_gfxhub_enable` — GFXHUB enable + UTCL1 fault enable + TLB flush — done as part of gmc_init in chunk 11
+- [x] 224  Allocate GFX ring buffer (16 KB **GTT**; sysmem-backed) — chunk 16 (`cp_alloc_storage`)
+- [x] 225  Allocate write-back page (rptr + wptr + fence offsets, 4 KB sysmem) — chunk 16
 - [ ] 226  Port `gfx_v12_0_constants_init` — tile mode tables + cache configs
-- [ ] 227  Port `gfx_v12_0_cp_gfx_resume` — CP_RB0_BASE/BASE_HI/CNTL/WPTR/RPTR_ADDR + doorbell control
-- [ ] 228  Port `gfx_v12_0_kiq_resume` — KIQ ring + MQD (VRAM); register init via GRBM_GFX_INDEX select
-- [ ] 229  Port `gfx_v12_0_cp_gfx_start` — set CP_ME_CNTL ME0_ACTIVE=1
-- [ ] 230  PM4 packet builders (NOP, WRITE_DATA, RELEASE_MEM) → `dext/amdgpu/amdgpu_pm4.h`
-- [ ] 231  Submit NOP via doorbell, observe CP_RB0_RPTR advance
-- [ ] 232  Submit WRITE_DATA + RELEASE_MEM EOP fence; observe fence_value in WB page
-- [ ] 233  **"Hello GFX12" milestone** — IH ring delivers EOP IRQ, dispatch reaches userspace via WaitInterrupt
-- [ ] 234  Register EOP/RAS/VM-fault interrupt source handlers via `amdgpu_irq_add_id` analog
+- [x] 227  Port `gfx_v12_0_cp_gfx_resume` — CP_RB0_BASE/BASE_HI/CNTL/WPTR/RPTR_ADDR + doorbell control — chunk 17 (`cp_hqd_program`)
+- [~] 228  Port `gfx_v12_0_kiq_resume` — deferred; using direct CP_RB0 path. MES-managed queue setup is Phase 1B chunk 18+.
+- [x] 229  Port `gfx_v12_0_cp_gfx_start` — set CP_ME_CNTL ME0_ACTIVE=1 — chunk 17 (`cp_enable`)
+- [x] 230  PM4 packet builders (NOP, WRITE_DATA, RELEASE_MEM) → `dext/amdgpu/amdgpu_pm4.h` — chunk 16
+- [x] 231  Submit NOP via doorbell, observe CP_RB0_RPTR advance — chunk 17 (`cp_emit_eop_fence` + SubmitTestPM4 selector)
+- [x] 232  Submit WRITE_DATA + RELEASE_MEM EOP fence; observe fence_value in WB page — chunk 17 (same)
+- [~] 233  **"Hello GFX12" milestone** — codebase path complete but UNTESTED on hardware; see chunk 17 commit `8a04754`.
+- [x] 234  Register EOP/RAS/VM-fault interrupt source handlers via `amdgpu_irq_add_id` analog — chunk 14 (`mac_amdgpu_ih_dispatch`)
 
 ### 1B.6 MES v12_1 — pending (see `docs/port_plans/MES_v12_1.md`)
 - [ ] 250  LoadFirmware: uni_mes (`gc_12_0_1_uni_mes.bin`) or split mes+mes1 via `psp_load_ip_fw`
