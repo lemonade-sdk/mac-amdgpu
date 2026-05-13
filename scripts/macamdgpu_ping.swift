@@ -50,7 +50,8 @@ private let kStageIPDiscovery:    UInt64 = 1
 private let kStagePSPInit:        UInt64 = 2
 private let kStagePSPLoadSOS:     UInt64 = 3
 private let kStagePSPRingCreate:  UInt64 = 4
-private let kStageSMUInit:        UInt64 = 5
+private let kStageTMRSetup:       UInt64 = 5
+private let kStageSMUInit:        UInt64 = 6
 
 // Firmware types (match MacAMDGPU.cpp).
 private let kFwKDB:               UInt64 = 1
@@ -61,6 +62,16 @@ private let kFwIntfDrv:           UInt64 = 5
 private let kFwDbgDrv:            UInt64 = 6
 private let kFwRASDrv:            UInt64 = 7
 private let kFwIPKeyMgrDrv:       UInt64 = 8
+// Post-SOS IP firmware (0x100 + psp_gfx_fw_type)
+private let kFwIP_PMFW:           UInt64 = 0x100 + 18
+private let kFwIP_RLC_G:          UInt64 = 0x100 + 8
+private let kFwIP_CP_ME:          UInt64 = 0x100 + 1
+private let kFwIP_CP_PFP:         UInt64 = 0x100 + 2
+private let kFwIP_CP_MEC:         UInt64 = 0x100 + 4
+private let kFwIP_SDMA0:          UInt64 = 0x100 + 9
+private let kFwIP_IMU_I:          UInt64 = 0x100 + 68
+private let kFwIP_IMU_D:          UInt64 = 0x100 + 69
+private let kFwIP_RS64_MES:       UInt64 = 0x100 + 76
 
 // IP block ids (match amdgpu_ip.h IPBlock enum).
 private let kBlockGC:    UInt64 = 0

@@ -58,6 +58,7 @@ enum {
 // Firmware type tags used by LoadFirmware. Pre-SOS components route
 // through psp_bootloader_load_component; SOS is special (psp_load_sos).
 enum {
+    // Pre-SOS bootloader components (load via psp_bootloader_load_component).
     kMacAMDGPUFwTypeSOS         = 0,
     kMacAMDGPUFwTypeKDB         = 1,
     kMacAMDGPUFwTypeSPL         = 2,
@@ -68,6 +69,22 @@ enum {
     kMacAMDGPUFwTypeRASDrv      = 7,
     kMacAMDGPUFwTypeIPKeyMgrDrv = 8,
     kMacAMDGPUFwTypeTA          = 9,
+    // Post-SOS IP firmware (load via psp_load_ip_fw through the ring).
+    // Encoded as 0x100 + psp_gfx_fw_type so userspace doesn't collide
+    // with the pre-SOS namespace.
+    kMacAMDGPUFwTypeIP_SMU         = 0x100 + 18,
+    kMacAMDGPUFwTypeIP_SDMA0       = 0x100 + 9,
+    kMacAMDGPUFwTypeIP_SDMA1       = 0x100 + 10,
+    kMacAMDGPUFwTypeIP_RLC_G       = 0x100 + 8,
+    kMacAMDGPUFwTypeIP_CP_ME       = 0x100 + 1,
+    kMacAMDGPUFwTypeIP_CP_PFP      = 0x100 + 2,
+    kMacAMDGPUFwTypeIP_CP_MEC      = 0x100 + 4,
+    kMacAMDGPUFwTypeIP_IMU_I       = 0x100 + 68,
+    kMacAMDGPUFwTypeIP_IMU_D       = 0x100 + 69,
+    kMacAMDGPUFwTypeIP_RS64_MES         = 0x100 + 76,
+    kMacAMDGPUFwTypeIP_RS64_MES_STACK   = 0x100 + 77,
+    kMacAMDGPUFwTypeIP_RS64_KIQ         = 0x100 + 78,
+    kMacAMDGPUFwTypeIP_RS64_KIQ_STACK   = 0x100 + 79,
 };
 
 enum {
@@ -875,6 +892,20 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             return amdgpu::psp_bootloader_load_component(
                 dev, psp, bin, fwSize, amdgpu::PSPBootloaderCmd::LoadIPKeyMgrDrv);
         default:
+            // Post-SOS IP firmware path: fwType encoded as 0x100 + psp_gfx_fw_type.
+            if (fwType >= 0x100 && fwType < 0x200) {
+                uint32_t gfxFwType = static_cast<uint32_t>(fwType - 0x100);
+                // The PSP LOAD_IP_FW path reads the firmware bytes directly
+                // from a DART-mapped buffer at a stable bus address. We use
+                // the client's DMABuffer for this; the bus address is the
+                // first segment's bus addr (we've already enforced
+                // single-segment mappings).
+                if (ivars->dmaSegmentsCount < 1) return kIOReturnNotReady;
+                uint64_t fwBusAddr = ivars->dmaSegments[0].address;
+                return amdgpu::psp_load_ip_fw(dev, psp, fwBusAddr,
+                                              static_cast<uint32_t>(fwSize),
+                                              gfxFwType);
+            }
             MACAMDGPU_LOG("LoadFirmware: fw type %llu not yet implemented",
                           fwType);
             return kIOReturnUnsupported;
