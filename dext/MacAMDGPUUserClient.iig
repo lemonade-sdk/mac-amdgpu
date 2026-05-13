@@ -4,17 +4,21 @@
 //  Phase 1A surface (this commit):
 //      Ping              — round-trip plumbing test
 //      GetIdentity       — bus/dev/fn + VID/DID/class code
-//      GetBARInfo        — per-BAR memoryIndex/size/type for IOConnectMapMemory64
-//      CopyClientMemoryForType — exposes BAR0..5 to userspace as mappable memory
+//      GetBARInfo        — per-BAR memoryIndex/size/type
+//      SetupInterrupts   — allocate MSI-X vectors + IRQ shared page
+//      WaitInterrupt     — async block until any enabled vector fires
+//      SetIRQMask        — write irqEnabled bitmap (4×u64 = 256 bits)
+//      AllocateDMABuffer — single contiguous DMA buffer per client
+//      FreeDMABuffer
+//      ResetDevice       — FLR → hot-reset fallback
+//      CopyClientMemoryForType — BAR0..5, DMABuffer, IRQState
 //
-//  Reserved for follow-up commits:
-//      Claim / Terminate                  — PCI Open/Close + bus master enable
-//      MMIORead / MMIOWrite               — slow path; userspace prefers BAR mmap
-//      ConfigRead / ConfigWrite           — config space slow path
-//      AllocateDMABuffer / FreeDMABuffer  — dext-allocated DMA
-//      SetupInterrupts / WaitInterrupt    — MSI-X delivery
-//      ResetDevice                        — FLR / hot-reset
-//      submit_cs / wait_fence / alloc_bo  — amdgpu UAPI (later phases)
+//  Reserved for follow-up commits / Phase 1B:
+//      Claim / Terminate                   — explicit PCI Open/Close
+//      MMIORead / MMIOWrite                — slow path; ICD prefers BAR mmap
+//      ConfigRead / ConfigWrite            — config space slow path
+//      submit_cs / wait_fence / alloc_bo   — amdgpu UAPI
+//      DART iova region management         — for GART page tables
 //
 
 #ifndef MacAMDGPUUserClient_h
@@ -22,6 +26,7 @@
 
 #include <Availability.h>
 #include <DriverKit/IOUserClient.iig>
+#include <DriverKit/IOInterruptDispatchSource.iig>
 
 class MacAMDGPUUserClient: public IOUserClient
 {
@@ -40,6 +45,18 @@ public:
     CopyClientMemoryForType(uint64_t type,
                             uint64_t *options,
                             IOMemoryDescriptor **memory) override;
+
+    virtual void
+    AsyncCompletion(OSAction *action,
+                    IOReturn status,
+                    const IOUserClientAsyncArgumentsArray asyncData,
+                    uint32_t asyncDataCount) override;
+
+    virtual void
+    InterruptOccurred(OSAction *action,
+                      uint64_t count,
+                      uint64_t time)
+        TYPE(IOInterruptDispatchSource::InterruptOccurred);
 };
 
 #endif /* MacAMDGPUUserClient_h */
