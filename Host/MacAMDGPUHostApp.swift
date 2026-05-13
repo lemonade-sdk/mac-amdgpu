@@ -74,7 +74,7 @@ final class DriverController: NSObject, ObservableObject,
     // Must match the dext's CFBundleIdentifier from dext/Info.plist
     // after xcodegen has resolved $(PRODUCT_BUNDLE_IDENTIFIER).
     private let dextBundleIdentifier =
-        "com.example.MacAMDGPUHost.MacAMDGPU"
+        "com.geramyloveless.MacAMDGPUHost.MacAMDGPU"
 
     @Published var log: String = ""
     @Published var status: String = "idle"

@@ -62,18 +62,9 @@ EOF
 if [[ $do_gen -eq 1 ]]; then
   ensure_xcodegen
 
-  if [[ -z "${XCODE_TEAM_ID:-}" ]]; then
-    cat <<EOF
-warning: XCODE_TEAM_ID is unset. The generated project will compile
-locally but won't be signable. Export it before building if you want
-to register the bundle ID with Apple:
-
-  export XCODE_TEAM_ID=ABCDE12345
-
-Your team ID is the 10-char prefix shown in:
-  security find-identity -v -p codesigning
-EOF
-  fi
+  # project.yml defaults to YBQ9BU6Q6F (Geramy's team) if env unset.
+  # Override on the command line for builds against a different team.
+  echo "==> using DEVELOPMENT_TEAM=${XCODE_TEAM_ID:-YBQ9BU6Q6F}"
 
   echo "==> generating $PROJECT_FILE from project.yml"
   xcodegen generate --spec project.yml --project "$PROJECT_ROOT" --quiet

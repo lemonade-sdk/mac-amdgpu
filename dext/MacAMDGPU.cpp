@@ -30,6 +30,7 @@
 #include "MacAMDGPUUserClient.h"
 
 #include "amdgpu/amdgpu_init.h"
+#include "amdgpu/amdgpu_discovery.h"
 
 #define MACAMDGPU_LOG(fmt, ...) \
     os_log(OS_LOG_DEFAULT, "mac.amdgpu: " fmt, ##__VA_ARGS__)
@@ -51,6 +52,7 @@ enum {
     kMacAMDGPUMethodLoadFirmware      = 10,
     kMacAMDGPUMethodSetIPBase         = 11,
     kMacAMDGPUMethodGetIPBase         = 12,
+    kMacAMDGPUMethodLoadDiscoveryBin  = 13,
 };
 
 // Firmware type tags used by LoadFirmware. Pre-SOS components route
@@ -913,6 +915,44 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         arguments->scalarOutput[1] =
             driver->ivars->bringup.device.ip.isResolved(block) ? 1 : 0;
         return kIOReturnSuccess;
+    }
+
+    case kMacAMDGPUMethodLoadDiscoveryBin: {
+        // scalarInput[0] = size in bytes of the discovery binary
+        // currently sitting at the start of this client's DMABuffer.
+        // scalarOutput[0] = 1 if parse ok, 0 otherwise
+        // scalarOutput[1] = number of IPs recognised (GC/MP0/MP1/...)
+        if (arguments->scalarInput == nullptr ||
+            arguments->scalarInputCount < 1 ||
+            arguments->scalarOutput == nullptr ||
+            arguments->scalarOutputCount < 2) {
+            return kIOReturnBadArgument;
+        }
+        if (ivars == nullptr || ivars->dmaBuffer == nullptr) {
+            return kIOReturnNotReady;
+        }
+        uint64_t size = arguments->scalarInput[0];
+        if (size == 0 || size > ivars->dmaBufferSize) {
+            return kIOReturnBadArgument;
+        }
+        IOAddressSegment seg = {};
+        if (ivars->dmaBuffer->GetAddressRange(&seg) != kIOReturnSuccess) {
+            return kIOReturnInternalError;
+        }
+        amdgpu::DiscoveryParseResult res{};
+        kern_return_t r = amdgpu::discovery_parse(
+            reinterpret_cast<const uint8_t *>(seg.address),
+            size, driver->ivars->bringup.device, &res);
+        arguments->scalarOutput[0] = res.ok ? 1 : 0;
+        arguments->scalarOutput[1] = res.num_ips_total;
+        if (res.ok) {
+            MACAMDGPU_LOG("discovery loaded: gc v%u.%u.%u, %u dies, %u ips",
+                          res.ip_version_major, res.ip_version_minor,
+                          res.ip_version_rev, res.num_dies, res.num_ips_total);
+        } else {
+            MACAMDGPU_LOG("discovery parse failed: %{public}s", res.err);
+        }
+        return r;
     }
 
     default:

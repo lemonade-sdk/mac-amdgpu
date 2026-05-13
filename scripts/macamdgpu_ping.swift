@@ -34,6 +34,7 @@ private let kInitDevice:        UInt32 = 9
 private let kLoadFirmware:      UInt32 = 10
 private let kSetIPBase:         UInt32 = 11
 private let kGetIPBase:         UInt32 = 12
+private let kLoadDiscoveryBin:  UInt32 = 13
 
 private let kMemBAR0:           UInt32 = 0
 private let kMemBAR2:           UInt32 = 2
@@ -307,6 +308,35 @@ func loadFirmware(_ conn: io_connect_t, type: UInt64, path: String) {
     }
 }
 
+func loadDiscovery(_ conn: io_connect_t, path: String) {
+    let url = URL(fileURLWithPath: path)
+    guard let data = try? Data(contentsOf: url) else {
+        warn("could not read discovery binary at \(path)")
+        return
+    }
+    let size = UInt64(data.count)
+    print("discovery:  loading \(path) (\(size) bytes)")
+
+    _ = mustScalar(conn, kAllocateDMABuffer,
+                   input: [size, 16384], outputCount: 2,
+                   name: "AllocateDMABuffer(discovery)")
+    let (p, _) = mapMemory(conn, kMemDMABuffer, "DMABuffer")
+    data.withUnsafeBytes { raw in
+        _ = memcpy(p, raw.baseAddress, Int(size))
+    }
+    let (kr, out) = callScalar(conn, kLoadDiscoveryBin,
+                               input: [size], outputCount: 2)
+    _ = IOConnectUnmapMemory64(conn, kMemDMABuffer, mach_task_self_,
+                               mach_vm_address_t(UInt(bitPattern: p)))
+    _ = callScalar(conn, kFreeDMABuffer)
+    if kr == KERN_SUCCESS, out.first == 1 {
+        print("discovery:  parsed ok (\(out[1]) ips total)")
+    } else {
+        warn("LoadDiscoveryBin kr=\(String(format: "%#x", kr)) "
+             + "ok=\(out.first ?? 0)")
+    }
+}
+
 func resetDevice(_ conn: io_connect_t) {
     warn("ResetDevice — issuing FLR")
     _ = callScalar(conn, kResetDevice)
@@ -322,6 +352,10 @@ var sosPath: String? = nil
 if let i = args.firstIndex(of: "--load-sos"), i + 1 < args.count {
     sosPath = args[i + 1]
 }
+var discoveryPath: String? = nil
+if let i = args.firstIndex(of: "--load-discovery"), i + 1 < args.count {
+    discoveryPath = args[i + 1]
+}
 
 print("opening MacAMDGPU service…")
 let conn = openService()
@@ -335,8 +369,13 @@ mapBAR0(conn)      // triggers lazy PCI Open + populates BringupContext
 _ = testDMA(conn)
 testIRQ(conn)
 
-if wantInit || sosPath != nil {
+if let p = discoveryPath {
+    loadDiscovery(conn, path: p)
     showIPBases(conn)
+}
+
+if wantInit || sosPath != nil {
+    if discoveryPath == nil { showIPBases(conn) }
     initDevice(conn, stage: kStageIPDiscovery)
     initDevice(conn, stage: kStagePSPInit)
 

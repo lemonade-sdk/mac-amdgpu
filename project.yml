@@ -22,7 +22,7 @@
 name: MacAMDGPU
 
 options:
-  bundleIdPrefix: com.example
+  bundleIdPrefix: com.geramyloveless
   deploymentTarget:
     macOS: "14.0"
   groupSortPosition: top
@@ -34,7 +34,9 @@ settings:
     SWIFT_VERSION: "5.10"
     CLANG_CXX_LANGUAGE_STANDARD: "gnu++20"
     CLANG_CXX_LIBRARY: "libc++"
-    DEVELOPMENT_TEAM: ${XCODE_TEAM_ID}
+    # Apple Developer team — defaults to Geramy's team, override via env:
+    #   XCODE_TEAM_ID=ABCDE12345 scripts/build.sh
+    DEVELOPMENT_TEAM: ${XCODE_TEAM_ID:-YBQ9BU6Q6F}
     CODE_SIGN_STYLE: Automatic
     ENABLE_USER_SCRIPT_SANDBOXING: NO
     DEAD_CODE_STRIPPING: YES
@@ -71,7 +73,7 @@ targets:
       - sdk: PCIDriverKit.framework
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.example.MacAMDGPUHost.MacAMDGPU
+        PRODUCT_BUNDLE_IDENTIFIER: com.geramyloveless.MacAMDGPUHost.MacAMDGPU
         PRODUCT_NAME: MacAMDGPU
         SDKROOT: driverkit
         DRIVERKIT_DEPLOYMENT_TARGET: "23.0"
@@ -101,7 +103,7 @@ targets:
           - "*.swift"
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.example.MacAMDGPUHost
+        PRODUCT_BUNDLE_IDENTIFIER: com.geramyloveless.MacAMDGPUHost
         PRODUCT_NAME: MacAMDGPUHost
         INFOPLIST_FILE: Host/Info.plist
         CODE_SIGN_ENTITLEMENTS: Host/Host.entitlements
@@ -109,9 +111,8 @@ targets:
         MACOSX_DEPLOYMENT_TARGET: "14.0"
         SYSTEM_EXTENSION_TARGETS: MacAMDGPU
     dependencies:
+      # xcodegen handles the destination based on the embedded target's
+      # type (driver-extension → Contents/Library/SystemExtensions).
       - target: MacAMDGPU
         embed: true
         codeSign: true
-        copy:
-          destination: plugins
-          subpath: Contents/Library/SystemExtensions
