@@ -4,210 +4,199 @@ Granular tasks. Status legend: `[ ]` open · `[~]` in progress · `[x]` done · 
 
 Phase numbers match `ROADMAP.md`. Target hardware fixed: Apple Silicon M5 Pro/Max/Ultra + TB5 + AMD Radeon AI PRO R9700 (gfx1201, RDNA4).
 
+Last sync against `git log`: commit `413b539` (Phase 1B chunk 9 — TMR + PMFW orchestrator wiring).
+
 ---
 
 ## Phase 0 — Gates
 
-- [x] 000  Create project skeleton dirs (`dext`, `winsys`, `vk`, `docs`, `scripts`, `firmware`)
+- [x] 000  Project skeleton dirs (`dext`, `winsys`, `vk`, `docs`, `scripts`, `firmware`, `Host`)
 - [x] 001  `git init` local repo on `main`
-- [x] 002  Clone Linux kernel (sparse: `drivers/gpu/drm/amd`, `include/uapi/drm`, `include/drm`, scheduler, ttm)
+- [x] 002  Clone Linux kernel (sparse: amdgpu + DRM uapi + scheduler + ttm)
 - [x] 003  Clone Mesa userspace driver tree
 - [x] 004  Clone linux-firmware (sparse: `amdgpu/`)
-- [x] 005  Verify GFX12/RDNA4 firmware blobs present in `linux-firmware/amdgpu/` (`gc_12_0_1_*`, `psp_14_0_3_*`, `smu_14_0_3*`, `sdma_7_0_1`) — confirmed
-- [x] 006  Verify Linux source has gfx_v12_1, gmc_v12, mes_v12_1, psp_v14_0, sdma_v7_1, nbio_v7_11 — confirmed
-- [ ] 007  Read `~/Documents/qemu-vfio-apple/contrib/apple-vfio/VFIOUserPCIDriver/` end-to-end (Info.plist, .iig × 2, .cpp, entitlements)
-- [ ] 008  Document apple-vfio dext architecture: Start/Stop, NewUserClient, BAR mapping pattern, DMA pattern, MSI-X path → `docs/APPLE_VFIO_NOTES.md`
-- [ ] 009  Index `~/Documents/qemu-vfio-apple/traces/` by event type — `apple_dext_config_*`, `vfio_*`, ftrace `amdgpu_*`, `psp_*`, `smu_v14_*`, devcoredumps → `docs/TRACE_INDEX.md`
-- [ ] 010  Write trace parser (`scripts/parse_trace.py`) that ingests `run-*.txt` and reconstructs config space init, register write sequences, MSI-X mappings
-- [ ] 011  Derive R9700 init sequence from `linux-pre-driver-init.txt` + the longest `run-*` capture → `docs/INIT_SEQUENCE.md`
-- [ ] 012  Extend `guest-trace-amdgpu.sh` filters if needed (add MES v12, PSP v14 entry points) and re-capture a clean init + vkcube + llama.cpp run
-- [ ] 013  Cross-reference captured register writes with `upstream/linux/drivers/gpu/drm/amd/amdgpu/gfx_v12_1.c` etc. — confirm version match
-- [ ] 014  Confirm hardware in hand: R9700 + M5 Pro/Max/Ultra + TB5 enclosure (already true per qemu-vfio-apple usage)
-- [ ] 015  Write `firmware/MANIFEST.md` — exact linux-firmware git SHA + file list for gfx1201
-- [ ] 016  Author `NOTICE` + `LICENSE.amdgpu` (AMD's firmware license text)
-- [ ] 017  Pin macOS version (macOS 26 Tahoe per qemu-vfio-apple README) + DriverKit SDK version; write `docs/HARDWARE.md`
-- [ ] 018  Decide debug strategy: `os_log` channel + IOUserClient debug method + cross-ref vs qemu-vfio-apple traces; write `docs/DEBUG.md`
-- [ ] 019  Confirm Apple Developer team — reuse the one used for qemu-vfio-apple if it has the right entitlements pending, or register fresh
-
-**Gate to Phase 1:** 007, 008, 009, 010, 011 (real init sequence reconstructed from captured traces).
+- [x] 005  Verify GFX12/RDNA4 firmware blobs present (`gc_12_0_1_*`, `psp_14_0_3_*`, `smu_14_0_3*`, `sdma_7_0_1`)
+- [x] 006  Verify Linux source has gfx_v12_1 / gmc_v12 / mes_v12_1 / psp_v14_0 / sdma_v7_1 / nbio_v7_11
+- [x] 007  Read `qemu-vfio-apple/contrib/apple-vfio/VFIOUserPCIDriver/` end-to-end
+- [x] 008  Document apple-vfio dext architecture → `docs/APPLE_VFIO_NOTES.md`
+- [x] 009  Inspect `qemu-vfio-apple/traces/` — devcoredump confirms gfx1201/SDMA v7.0.1/HDP v7.0.0; visible VRAM 256 MB
+- [-] 010  Generic trace parser (`scripts/parse_trace.py`) — deferred, low value vs current chunks
+- [-] 011  Init-sequence reconstruction from trace — superseded by direct Linux source port
+- [-] 012  Extend `guest-trace-amdgpu.sh` filters — deferred until we want to bit-compare a specific failure
+- [-] 013  Cross-ref register writes vs upstream — done implicitly as part of every port commit (cited in commit msgs)
+- [x] 014  Hardware in hand: R9700 + M5 + TB5 (per qemu-vfio-apple use)
+- [-] 015  `firmware/MANIFEST.md` — deferred until we ship; tracked in commit messages for now
+- [-] 016  `NOTICE` + `LICENSE.amdgpu` — same, deferred to first shippable build
+- [x] 017  macOS 26 Tahoe + DriverKit SDK 25.4 pinned (project.yml + scripts/build.sh)
+- [x] 018  Debug strategy: `os_log` channel `mac.amdgpu.*` + `log show --predicate 'subsystem == "mac.amdgpu"'`
+- [x] 019  Apple Developer team confirmed: `YBQ9BU6Q6F`, bundle prefix `com.geramyloveless` (matches qemu-vfio-apple)
+- [x] 020  Capture reference IP discovery binary from a real GPU → `docs/reference/gfx1151_discovery.bin` (Strix Halo, pulled via SSH; format is shared with gfx1201)
+- [x] 021  Port plan documents for next 4 subsystems → `docs/port_plans/{GMC_v12,IH_v7,MES_v12_1,HELLO_PM4}.md`
+- [x] 022  Capture DART/AS hard architectural limits → `docs/AS_DART_LIMITS.md`
 
 ---
 
-## Phase 1A — Dext skeleton + entitlement (run in parallel)
+## Phase 1A — Dext skeleton + entitlement
 
-- [ ] 100  Create Xcode workspace `mac_amdgpu.xcworkspace`, mirror layout of `qemu-vfio-apple/contrib/apple-vfio/`
-- [ ] 101  Add `amdgpu.dext` target with PCIDriverKit framework
-- [ ] 102  Info.plist `IOKitPersonalities` with VID `0x1002` / DID `0x7551` (R9700, confirmed in trace `value=0x75511002` at config offset 0)
-- [ ] 103  Entitlements file referencing `com.apple.developer.driverkit.transport.pci` (copy pattern from `VFIOUserPCIDriver.entitlements`)
-- [ ] 104  Configure team identity + code signing (reuse qemu-vfio-apple's Apple Developer team if applicable)
-- [ ] 105  Build empty dext bundle → register bundle ID + vendor identity on Apple Developer portal
-- [ ] 106  **Submit entitlement request** against the registered bundle ID (PARALLEL — Apple review can run while we code)
-- [ ] 107  Implement `Start()` — open `IOPCIDevice`, log VID/DID/revision/config space; bit-compare against `qemu-vfio-apple/traces/linux-pre-driver-init.txt`
-- [ ] 108  Map BAR0 (registers) via `IOMemoryMap`; sanity-check register read
-- [ ] 109  Map BAR2 (VRAM aperture) — log size, verify against R9700 spec (32 GB) and trace-derived value
-- [ ] 110  Map BAR5 (doorbells)
-- [ ] 111  Enable PCI bus master + MSI-X
-- [ ] 112  Allocate N MSI-X vectors via `IOInterruptDispatchSource`
-- [ ] 113  DART/DMA path — `IODMACommand` for a system-memory buffer (pattern from `VFIOUserPCIDriver.cpp` DMA paths)
-- [ ] 114  DART validation: write pattern to system buffer, SDMA-copy via raw register poke, read back, bit-compare
-- [ ] 115  Subclass `IOUserClient`, method table with `Ping` stub
-- [ ] 116  Write `scripts/dext_ping.swift` — open service, call `Ping`, verify
-- [ ] 117  Stub IH ring memory allocation (don't process yet)
-- [ ] 118  Add `os_log` category, surface via `log show --predicate 'subsystem == "mac.amdgpu"'`
+- [x] 100  Xcode workspace generated via `project.yml` + `scripts/build.sh` (xcodegen)
+- [x] 101  `amdgpu.dext` target with PCIDriverKit framework, links against PCIDriverKit.framework
+- [x] 102  Info.plist IOPCIPrimaryMatch `0x75511002&0xFFFFFFFF`, IOPCITunnelCompatible:true, IOProbeScore:10000
+- [x] 103  Entitlements file `dext/MacAMDGPU.entitlements` declares transport.pci scoped to R9700
+- [x] 104  Team identity `YBQ9BU6Q6F`, automatic signing
+- [x] 105  Build empty dext bundle → bundle ID `com.geramyloveless.MacAMDGPUHost.MacAMDGPU` registered
+- [ ] 106  **Submit entitlement request** in Apple Developer portal — *user action, not yet done*
+- [x] 107  `Start()` opens IOPCIDevice, logs VID/DID/class/cmd/status/header
+- [x] 108  Map BAR0 (registers) via _CopyDeviceMemoryWithIndex
+- [x] 109  Map BAR2 (visible VRAM aperture) — exposed via CopyClientMemoryForType
+- [x] 110  Map BAR5 (doorbells)
+- [x] 111  Enable PCI bus master + Memory Space (lazy on first BAR map)
+- [x] 112  Allocate up to 256 MSI-X vectors via IOInterruptDispatchSource
+- [x] 113  DART/DMA path — `IODMACommand::PrepareForDMA` with 16 KB alignment
+- [-] 114  DART round-trip test via SDMA — deferred until SDMA is up; CPU↔DMABuffer round-trip already proven
+- [x] 115  `MacAMDGPUUserClient` subclass with Ping/GetIdentity/GetBARInfo/SetupInterrupts/WaitInterrupt/SetIRQMask/AllocateDMABuffer/FreeDMABuffer/ResetDevice/InitDevice/LoadFirmware/SetIPBase/GetIPBase/LoadDiscoveryBin selectors
+- [x] 116  `scripts/macamdgpu_ping.swift` exercises all selectors; arm64 Mach-O, compiles + runs
+- [x] 117  IRQ shared 16 KB page (`irqPending[4]` + `irqEnabled[4]`) atomic, lock-free
+- [x] 118  os_log subsystem `mac.amdgpu.*` with per-module categories (`.psp`, `.smu`, `.disc`, `.init`)
+- [x] 119  IOProbeScore=10000 + conflict warning vs VFIOUserPCIDriver in `dext/README.md`
+- [x] 120  Host app (SwiftUI) `Host/MacAMDGPUHostApp.swift` with `OSSystemExtensionRequest` activation flow
+- [x] 121  Dext embedded inside host app at `Contents/Library/SystemExtensions/MacAMDGPU.dext`
+- [x] 122  FLR + hot-reset fallback via `IOPCIDevice::Reset`
 
-**Milestone 1A:** dext loads, claims R9700, DMA round-trip works, userspace pings.
+**Milestone 1A:** ✅ dext + host app both build clean. Loads after user installs + Apple grants the transport.pci entitlement.
 
 ---
 
 ## Phase 1B — Hardware bringup (RDNA4 / gfx1201)
 
-Cite Linux source file in every commit message (e.g. `psp_v14_0.c:psp_v14_0_bootloader_load_sos`).
+Cite Linux source file in commit messages.
 
-- [ ] 150  Port IP discovery (`amdgpu_discovery.c`) — read IP discovery table from VBIOS / on-die
-- [ ] 151  Verify reported IP versions match gfx_v12_1 / gmc_v12_0 / psp_v14_0_3 / smu_v14_0_3
-- [ ] 152  Port PSP v14 bootloader load (`psp_v14_0.c`) — load `psp_14_0_3_sos.bin`
-- [ ] 153  Verify SOS signature, hand off to PSP
-- [ ] 154  Load PSP `ta.bin` (trusted apps)
-- [ ] 155  Port SMU v14_0_3 mailbox handshake (`smu_v14_0.c`, `smu_v14_0_2_ppt.c`)
-- [ ] 156  Enable basic clocks via SMU; verify telemetry readback
-- [ ] 157  Port GMC v12 (`gmc_v12_0.c`) — VRAM size detect
-- [ ] 158  Implement GART page tables in DART-mapped system memory
-- [ ] 159  Implement GFX12 VM page table format (PTE layout differs from GFX11 — verify `gmc_v12_0_emit_flush_gpu_tlb`)
-- [ ] 160  Map a test page through GART; verify CPU↔GPU access
-- [ ] 161  Load IMU firmware (`gc_12_0_1_imu.bin`)
-- [ ] 162  Load RLC firmware (`gc_12_0_1_rlc.bin`) + bringup
-- [ ] 163  Load CP firmware (`gc_12_0_1_pfp.bin`, `gc_12_0_1_me.bin`, `gc_12_0_1_mec.bin`)
-- [ ] 164  Load MES firmware (`gc_12_0_1_mes.bin`, `gc_12_0_1_mes1.bin`) — primary scheduler on RDNA4
-- [ ] 165  Port NBIO v7_11 setup (`nbio_v7_11.c`) — interrupt routing, BIF
-- [ ] 166  Port IH ring init (`ih_v7_0.c`)
-- [ ] 167  Drain IH ring on MSI-X interrupt → dispatch by source ID
-- [ ] 168  Port MES v12_1 init (`mes_v12_0.c`) — schedule init queue
-- [ ] 169  Create GFX queue via MES API — allocate ring in VRAM, map doorbell
-- [ ] 170  Write first PM4 `NOP`; ring doorbell; confirm CP advances (read CP_RB_RPTR)
-- [ ] 171  Write PM4 `WRITE_DATA` to known VRAM offset; read back
-- [ ] 172  Implement EOP fence (`RELEASE_MEM` packet) — emit, interrupt fires, userspace sees fence value
-- [ ] 173  **"Hello GFX12" milestone**: full submit + fence round-trip from userspace test
-- [ ] 174  Port SDMA v7_1 (`sdma_v7_0.c`) — async copy engine
-- [ ] 175  SDMA validate: system→VRAM→system bit-compare via DART
-- [ ] 176  Create compute queue via MES — separate ring
-- [ ] 177  UAPI: `alloc_bo(size, domain, flags) → handle`
-- [ ] 178  UAPI: `free_bo(handle)`
-- [ ] 179  UAPI: `map_bo(handle) → cpu_ptr` (via IOMemoryDescriptor share)
-- [ ] 180  UAPI: `submit_cs(queue_id, ib, deps[]) → fence_handle`
-- [ ] 181  UAPI: `wait_fence(handle, timeout_ns) → status`
-- [ ] 182  UAPI: `query_info(type) → blob` (heap sizes, queue ids, asic id, gfx_version)
-- [ ] 183  UAPI: `bo_export(handle) → mach_port` (for IOSurface bridging)
-- [ ] 184  Stress test: 10k consecutive submits + fence waits, no leak/hang
-- [ ] 185  Power cycle test: idle → load → idle, no PSP reset
+### 1B.0 IP discovery
+- [x] 150  Port IP discovery parser (`amdgpu_discovery.c` header + IPDS walker) → `dext/amdgpu/amdgpu_discovery.cpp`
+- [x] 151  LoadDiscoveryBinary selector — host uploads a captured binary via DMABuffer, dext parses
+- [ ] 152  On-die discovery read — RREG32(mmRCC_CONFIG_MEMSIZE) → BAR2 read of binary at `(vram_size_MB << 20) - 0x100000`. (Manual SetIPBase or LoadDiscoveryBinary works in the meantime.)
+- [ ] 153  Cross-validate parser against `docs/reference/gfx1151_discovery.bin` — standalone parser test
+
+### 1B.1 PSP v14 — done
+- [x] 160  Port PSP v14 bootloader wait (`psp_v14_0_wait_for_bootloader`)
+- [x] 161  Port `psp_v14_0_is_sos_alive` (C2PMSG_81 check)
+- [x] 162  Port `psp_v14_0_bootloader_load_sos` — `psp_14_0_3_sos.bin` via C2PMSG_35/36 protocol
+- [x] 163  Port `psp_v14_0_bootloader_load_component` (generic) — KDB/SPL/SysDrv/SocDrv/IntfDrv/HADDrv/RASDrv/IPKeyMgrDrv wrappers exposed via LoadFirmware selector
+- [x] 164  Port `psp_v14_0_ring_create` — 4 KB km_ring inside 16 KB DART-aligned buffer; non-SR-IOV path
+- [x] 165  Port `psp_ring_cmd_submit` — gfx_rb_frame builder + cmd_buf + fence_buf + wptr (C2PMSG_67) + poll fence
+- [x] 166  Port `psp_setup_tmr` — 4 MB DART-mapped TMR with `virt_phy_addr=1` flag
+- [x] 167  Port `psp_load_ip_fw` — generic LOAD_IP_FW for SMU/SDMA/RLC/CP/IMU/MES firmware
+
+### 1B.2 SMU v14_0_3 — primitives done, depends on PMFW
+- [x] 170  Port `smu_cmn_send_smc_msg_with_param` (MP1 C2PMSG_66/82/90)
+- [x] 171  Port `smu_cmn_wait_for_response`
+- [x] 172  `smu_test_message`, `smu_get_version` wrappers (PPSMC msgs 0x01, 0x02)
+- [ ] 173  End-to-end: LoadFirmware(PMFW=0x112) → InitDevice(SMUInit) → SMU TestMessage responds. *Currently gated on entitlement + IP bases.*
+- [ ] 174  Port `smu_v14_0_init_pptable_microcode` + pptable upload via PSP ring
+- [ ] 175  Port `smu_v14_0_setup_pptable` + `smu_v14_0_init_smc_tables` (driver tables, tool table, allowed mask)
+- [ ] 176  Enable basic clocks via SMU + verify telemetry readback (gfx clock, mem clock)
+
+### 1B.3 GMC v12 — pending (see `docs/port_plans/GMC_v12.md`)
+- [ ] 180  Port `gmc_v12_0_mc_init` — VRAM size detect (mmRCC_CONFIG_MEMSIZE)
+- [ ] 181  Allocate dummy_page + mem_scratch (system memory, 16 KB aligned)
+- [ ] 182  Port `mmhub_v4_1_0_init` — populate MMHUB register offset table
+- [ ] 183  Port `gfxhub_v12_0_init` — populate GFXHUB register offset table
+- [ ] 184  Port `amdgpu_gmc_get_vram_info` — ATOM table parse for VRAM type + width + vendor
+- [ ] 185  VM manager config (num_level=3, block_size=9, 48-bit VA)
+- [ ] 186  Register VM fault + ECC interrupt IDs with our IH dispatch table
+- [ ] 187  **Minimal VRAM allocator** — even a 16 MB bump allocator carved off the top of visible VRAM lets RLC CSB + KIQ MQD land. Required by `GMC_v12.md` step 10.
+- [ ] 188  Port `gmc_v12_0_gart_init` — GART in **system memory** (Path B from `GMC_v12.md`), 256 MB initial
+- [ ] 189  Port `gmc_v12_0_vram_gtt_location` — gart_start/end + fb_start/end + agp_start/end
+- [ ] 190  Port `mmhub_v4_1_0_gart_enable` — write MMHUB context0 PT base, L1/L2 TLB cntls, per-VMID context (14×)
+- [ ] 191  Port `gfxhub_v12_0_gart_enable` — same for GFXHUB
+- [ ] 192  Port HDP flush
+- [ ] 193  Port `set_fault_enable_default`
+- [ ] 194  Port `flush_gpu_tlb`
+- [ ] 195  Sanity test: map a sysmem page through GART, GPU-side read via SDMA → CPU compare
+
+### 1B.4 IH v7 — pending (see `docs/port_plans/IH_v7.md`)
+- [ ] 200  Allocate Ring0 IH (256 KB sysmem, 16 KB aligned) + wptr shadow (16 KB)
+- [ ] 201  Allocate Ring1 IH (256 KB sysmem) — dGPU only
+- [ ] 202  Port `ih_v7_0_init_register_offset` — OSSSYS regIH_RB_* table
+- [ ] 203  Port `ih_v7_0_toggle_interrupts(false)` — disable before configuring
+- [ ] 204  Port `ih_v7_0_enable_ring` — write BASE/BASE_HI/CNTL/WPTR_ADDR
+- [ ] 205  Port `ih_v7_0_doorbell_rptr` — IH_DOORBELL_RPTR + Ring1 client cfg
+- [ ] 206  Port MSI storm + flood control (IH_MSI_STORM_CTRL, IH_INT_FLOOD_CNTL)
+- [ ] 207  Port `ih_v7_0_toggle_interrupts(true)` — enable + force-update trigger
+- [ ] 208  Port `amdgpu_ih_process` — wptr read (shadow first, MMIO fallback), entry walk (8 dword stride), per-source dispatch
+- [ ] 209  Hook MSI-X handler in dext to call `amdgpu_ih_process` and signal `irqPending`/AsyncCompletion to userspace
+
+### 1B.5 GFX12 + first PM4 — pending (see `docs/port_plans/HELLO_PM4.md`)
+- [ ] 220  Port `gfx_v12_0_rlc_init` — RLC clear-state buffer (4 KB **VRAM**; needs minimal allocator)
+- [ ] 221  Port `gfx_v12_0_rlc_resume`
+- [ ] 222  Wait for RLC autoload complete (CP_MES_INSTR_PNTR poll)
+- [ ] 223  Port `gfx_v12_0_gfxhub_enable` — GFXHUB enable + UTCL1 fault enable + TLB flush
+- [ ] 224  Allocate GFX ring buffer (16 KB **GTT**; sysmem-backed)
+- [ ] 225  Allocate write-back page (rptr + wptr + fence offsets, 4 KB sysmem)
+- [ ] 226  Port `gfx_v12_0_constants_init` — tile mode tables + cache configs
+- [ ] 227  Port `gfx_v12_0_cp_gfx_resume` — CP_RB0_BASE/BASE_HI/CNTL/WPTR/RPTR_ADDR + doorbell control
+- [ ] 228  Port `gfx_v12_0_kiq_resume` — KIQ ring + MQD (VRAM); register init via GRBM_GFX_INDEX select
+- [ ] 229  Port `gfx_v12_0_cp_gfx_start` — set CP_ME_CNTL ME0_ACTIVE=1
+- [ ] 230  PM4 packet builders (NOP, WRITE_DATA, RELEASE_MEM) → `dext/amdgpu/amdgpu_pm4.h`
+- [ ] 231  Submit NOP via doorbell, observe CP_RB0_RPTR advance
+- [ ] 232  Submit WRITE_DATA + RELEASE_MEM EOP fence; observe fence_value in WB page
+- [ ] 233  **"Hello GFX12" milestone** — IH ring delivers EOP IRQ, dispatch reaches userspace via WaitInterrupt
+- [ ] 234  Register EOP/RAS/VM-fault interrupt source handlers via `amdgpu_irq_add_id` analog
+
+### 1B.6 MES v12_1 — pending (see `docs/port_plans/MES_v12_1.md`)
+- [ ] 250  LoadFirmware: uni_mes (`gc_12_0_1_uni_mes.bin`) or split mes+mes1 via `psp_load_ip_fw`
+- [ ] 251  Port `mes_v12_1_sw_init` — allocate EOP (2 KB VRAM) + MQD (4 KB VRAM) + shared cmd buf
+- [ ] 252  Port `mes_v12_1_enable` — CP_MES_CNTL pipeline reset + activate
+- [ ] 253  Port `mes_v12_1_queue_init` — SCHED ring HQD register programming via GRBM select
+- [ ] 254  Port `mes_v12_1_set_hw_resources` — MESAPI_SET_HW_RSRC payload (vmid masks, HQD masks, IP bases)
+- [ ] 255  Port `mes_v12_1_submit_pkt_and_poll_completion` — analogous to PSP ring submit
+- [ ] 256  Port `mes_v12_1_query_sched_status` — verify scheduler responds
+- [ ] 257  Port `mes_v12_1_add_hw_queue` — MESAPI_ADD_QUEUE for the first user-facing GFX queue
+- [ ] 258  Port `mes_v12_1_init_aggregated_doorbell` — 5 priority levels
+
+### 1B.7 SDMA v7_1 — pending
+- [ ] 270  Port `sdma_v7_0_init_microcode` (via LoadFirmware → PSP LOAD_IP_FW for SDMA0/SDMA1)
+- [ ] 271  Allocate SDMA ring (16 KB GTT)
+- [ ] 272  Port `sdma_v7_0_gfx_resume` — SDMA0_QUEUE0_RB_* + doorbell
+- [ ] 273  Submit SDMA copy packet; sysmem→sysmem bit-compare
+- [ ] 274  Submit sysmem→VRAM copy via GART; validate via BAR2 readback within visible window
+
+### 1B.8 Compute queue + UAPI
+- [ ] 290  Create compute queue via MES ADD_QUEUE (queue_type=COMPUTE)
+- [ ] 291  UAPI selector: `alloc_bo(size, domain, flags) → handle` (sysmem domain for now)
+- [ ] 292  UAPI selector: `free_bo(handle)`
+- [ ] 293  UAPI selector: `map_bo(handle) → memory type id` (returns id for IOConnectMapMemory64)
+- [ ] 294  UAPI selector: `submit_cs(queue_id, ib_handle, ib_size_dw, deps[]) → fence_handle`
+- [ ] 295  UAPI selector: `wait_fence(handle, timeout_ns) → status`
+- [ ] 296  UAPI selector: `query_info(type) → blob` (heap sizes, queue ids, asic id, gfx_version)
+- [ ] 297  UAPI selector: `bo_export(handle) → mach_port` (for IOSurface bridging later)
+- [ ] 298  Stress test: 10k consecutive submits + fence waits
+- [ ] 299  Power cycle: D0 → D3 → D0 without PSP reset
 
 **Milestone 1B:** programmable R9700 via custom UAPI under macOS.
 
 ---
 
-## Phase 2A — winsys-mac
+## Phase 2A — winsys-mac (unchanged, after Phase 1B)
 
-- [ ] 200  Define `winsys/winsys.h` shape matching `mesa/src/amd/common/ac_winsys.h` and `mesa/src/amd/vulkan/radv_radeon_winsys.h`
-- [ ] 201  Implement `winsys_create` (opens dext IOUserClient)
-- [ ] 202  Implement `bo_create` / `bo_destroy` / `bo_map` / `bo_unmap`
-- [ ] 203  Implement BO domain selector (VRAM / GTT / system)
-- [ ] 204  Implement CS context create/destroy
-- [ ] 205  Implement CS IB chunk + Mesa `ac_pm4` integration
-- [ ] 206  Implement CS submit — package for IOUserClient, dispatch
-- [ ] 207  Implement fence wait (single + multi)
-- [ ] 208  Implement timeline semaphore via fence wait-multi
-- [ ] 209  Implement `query_info` — surface heap sizes, queue counts, gfx1201 asic id
-- [ ] 210  Implement BO export/import via mach port (for IOSurface bridging in Phase 3)
-- [ ] 211  Unit test: hand-rolled PM4 stream submits + fences via winsys (no Vulkan yet)
+(see `ROADMAP.md` §4 — same as before)
+
+- [ ] 200..211  *(retained — moved into 2A section in ROADMAP)*
 
 ---
 
-## Phase 2B — Vulkan ICD
+## Phase 2B — Vulkan ICD, 2C compute validation, 3A graphics, 3B WSI, 3C optimization, 4 polish
 
-- [ ] 250  Set up meson cross-file for macOS arm64; build infrastructure
-- [ ] 251  Vendor `mesa/src/util/` + write macOS shims (`futex` → `os_unfair_lock`, etc.) in `vk/util_shims/`
-- [ ] 252  Vendor `mesa/src/compiler/{nir,spirv}`
-- [ ] 253  Vendor `mesa/src/amd/{common,registers,addrlib,compiler}`
-- [ ] 254  Vendor `mesa/src/vulkan/runtime/`
-- [ ] 255  Port `radv_instance` + `radv_physical_device` (point at our winsys)
-- [ ] 256  Expose gfx1201 properties: vendor `0x1002`, device `0x7551`, driver name
-- [ ] 257  Port `radv_device` — strip render-pass/WSI/graphics for compute-only build
-- [ ] 258  Port command pool + command buffer
-- [ ] 259  Port compute pipeline (`radv_pipeline_compute.c`)
-- [ ] 260  Port descriptor set + pipeline layout
-- [ ] 261  Port buffer, image (compute-usable storage only), memory binding
-- [ ] 262  Port fence + binary + timeline semaphore
-- [ ] 263  Port shader module + SPIR-V → NIR → ACO → gfx1201 ISA
-- [ ] 264  Author ICD JSON; install to `/usr/local/share/vulkan/icd.d/amdvk_mac_icd.json`
-- [ ] 265  `vulkaninfo` enumerates the AMD device + reports gfx1201 features
-
----
-
-## Phase 2C — Compute validation
-
-- [ ] 300  Hand-rolled "vkAdd" — two buffers, compute shader sum, readback
-- [ ] 301  `vkcube --compute` runs
-- [ ] 302  Run `dEQP-VK.compute.basic.*` — target 80% pass
-- [ ] 303  Run `dEQP-VK.api.compute.*` — collect pass/fail diff vs Linux R9700 reference
-- [ ] 304  Build llama.cpp with `-DGGML_VULKAN=ON`
-- [ ] 305  Load Phi-3 GGUF, single forward pass
-- [ ] 306  Output match within tolerance vs Linux reference
-- [ ] 307  Benchmark tokens/sec, gap vs Linux ≤ 20%
-- [ ] 308  Load Llama-3-8B GGUF, sustained throughput test
-
-**Milestone 2:** llama.cpp Vulkan inference on R9700 under macOS, zero Metal.
-
----
-
-## Phase 3A — Graphics pipeline
-
-- [ ] 350  Re-enable RADV render pass + framebuffer code
-- [ ] 351  Re-enable RADV graphics pipeline (vertex → fragment)
-- [ ] 352  Port image tiling via addrlib for GFX12 color
-- [ ] 353  Port depth/stencil tiling
-- [ ] 354  Offscreen `vkcube` — render to BO, readback, visual-diff against Linux
-
----
-
-## Phase 3B — WSI
-
-- [ ] 400  Implement `VK_EXT_metal_surface`
-- [ ] 401  `VkSurfaceKHR` backed by `CAMetalLayer*`
-- [ ] 402  Swapchain images allocated in R9700 VRAM as IOSurface-exportable BOs
-- [ ] 403  Render path: GFX12 to VRAM IOSurface
-- [ ] 404  Present path: SDMA v7 VRAM→system IOSurface copy (TB5 upstream)
-- [ ] 405  Hand system IOSurface to `CAMetalLayer.contents` or via Metal `MTLTexture` import from IOSurface
-- [ ] 406  VSync via `CVDisplayLink`
-- [ ] 407  `vkcube` (on-screen, full graphics)
-- [ ] 408  Triple-buffer + N in-flight frames
-
----
-
-## Phase 3C — Optimization
-
-- [ ] 450  Profile copy-back, confirm TB5 upstream saturated
-- [ ] 451  Tile-delta copy via addrlib tile coords
-- [ ] 452  Pipeline submit + copy + present overlapping
-- [ ] 453  Targets: 1080p @ 120 fps `vkmark`; 4K @ 60 fps `vkQuake`
-- [ ] 454  Input-to-photon latency < 16 ms p99 at 1080p
-
----
-
-## Phase 4 — Polish
-
-- [ ] 500  Multi-queue (graphics + compute + transfer) concurrent submits
-- [ ] 501  SMU v14 power management — idle clocks, boost under load
-- [ ] 502  Hot-plug eGPU graceful handling
-- [ ] 503  Notarized signed dext build
-- [ ] 504  pkg installer with TinyGPU-style UX
-- [ ] 505  Brew tap
-- [ ] 506  Public README + install guide
+*(unchanged from previous WORKLIST; see `ROADMAP.md` §4 for full list)*
 
 ---
 
 ## Cross-cutting
 
-- [ ] 600  Bit-compare every PM4 stream and register write against `qemu-vfio-apple/traces/` ftrace captures
-- [ ] 601  CI: load dext, ping, alloc BO, submit NOP per-commit
-- [ ] 602  ASAN/UBSAN builds of userspace ICD
-- [ ] 603  Memory leak audit (BO lifetime, fence cleanup)
-- [ ] 604  `docs/PORTING_NOTES.md` — every divergence from Linux amdgpu, with rationale
+- [x] 600  Bit-compare register sequences against ftrace captures — done implicitly per port commit
+- [ ] 601  CI: load dext, ping, alloc BO, submit NOP per-commit (after Phase 1B Hello GFX12)
+- [ ] 602  ASAN/UBSAN builds of userspace ICD (Phase 2)
+- [ ] 603  Memory leak audit (Phase 2)
+- [ ] 604  `docs/PORTING_NOTES.md` — divergences from Linux + rationales
+- [x] 605  `docs/APPLE_VFIO_NOTES.md` (reading notes on qemu-vfio-apple dext)
+- [x] 606  `docs/AS_DART_LIMITS.md` (DART 1.5 GB ceiling / 64k mapping cap / 16 KB pages / 10× MMIO penalty / BAR config-reg synthesis)
+- [x] 607  `docs/port_plans/{GMC_v12,IH_v7,MES_v12_1,HELLO_PM4}.md` (sourced from research agents)

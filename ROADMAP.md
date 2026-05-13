@@ -131,25 +131,38 @@ Build the Xcode bundle first so the entitlement request has a target. Apple's re
 
 Port from `upstream/linux/drivers/gpu/drm/amd/amdgpu/` against the gfx1201/v12_1/v7/v14 versioned files. Cite Linux source files in commit messages. Cross-check every register write against the ftrace captures in `qemu-vfio-apple/traces/` (those are the exact RREG32/WREG32 sequences amdgpu emits when bringing up our R9700 on our actual hardware).
 
-- 1B.1 IP discovery — RDNA4 uses on-die IP discovery table (`amdgpu_discovery.c`).
-- 1B.2 PSP v14 bringup (`psp_v14_0.c`): load `psp_14_0_3_sos.bin`, verify SOS signature, hand off.
-- 1B.3 SMU v14_0_3 (`smu_v14_0.c` + `smu_v14_0_2_ppt.c`): handshake via SMU mailbox; enable PCIe link training and basic clocks.
-- 1B.4 GMC v12 (`gmc_v12_0.c`): detect VRAM size (32 GB), program GART aperture, VM page table format (GFX12 PTE layout — different from GFX11).
-- 1B.5 Load GFX12 firmware: `gc_12_0_1_pfp.bin`, `gc_12_0_1_me.bin`, `gc_12_0_1_mec.bin`, `gc_12_0_1_rlc.bin`, `gc_12_0_1_imu.bin`, `gc_12_0_1_mes.bin`, `gc_12_0_1_mes1.bin`, `gc_12_0_1_toc.bin`.
-- 1B.6 IMU init (image management unit — new on GFX12 path).
-- 1B.7 RLC init + microcode bringup.
-- 1B.8 MES v12_1 init (`mes_v12_0.c`): MES is the queue scheduler on RDNA4 — most submissions go through MES, not direct KIQ.
-- 1B.9 NBIO v7_11 setup (`nbio_v7_11.c`) — interrupt routing, BIF programming.
-- 1B.10 IH ring init (`ih_v7_0.c`) + MSI-X dispatch wiring.
-- 1B.11 Create GFX queue via MES — doorbell mapping, ring buffer in VRAM.
-- 1B.12 First PM4: `NOP` → `WRITE_DATA` → `RELEASE_MEM` fence → IH → userspace. **"Hello GFX12" milestone.**
-- 1B.13 SDMA v7_1 (`sdma_v7_0.c`) — async copy engine; validate VRAM↔system bit-compare.
-- 1B.14 Compute queue (via MES) — separate ring for compute submits.
-- 1B.15 UAPI: `alloc_bo`, `free_bo`, `map_bo`, `submit_cs(queue, ib, deps)`, `wait_fence`, `info`.
-- 1B.16 Stress: 10k consecutive submits + fence, no leak/hang/PSP reset.
-- 1B.17 Power cycle test: idle → load → idle without crash.
+The bringup orchestrator (`dext/amdgpu/amdgpu_init.{h,cpp}`) drives a 14-stage ladder via the `InitDevice(target_stage)` selector. As of commit `413b539`, stages 0–4 + the LoadFirmware mechanism are in main; stages 5–14 are stubs returning `NotReady`/`Unsupported` until each subsystem lands.
 
-**Milestone 1B:** programmable AMD R9700 under macOS via custom UAPI. (Or: TinyGPU bridged if Phase 0.1 chose reuse — Phase 1B is then much smaller.)
+| # | Stage              | Source                            | Status |
+|---|---|---|---|
+| 0 | None               | —                                 | ✅ |
+| 1 | IPDiscovery        | parser ported; userspace uploads binary via `LoadDiscoveryBin` | ✅ (parser); on-die read pending |
+| 2 | PSPInit            | `psp_init` fw_pri buffer alloc    | ✅ |
+| 3 | PSPLoadSOS         | `psp_v14_0_bootloader_load_sos`   | ✅ |
+| 4 | PSPRingCreate      | `psp_v14_0_ring_create`           | ✅ |
+| 5 | TMRSetup           | `psp_setup_tmr` (4 MB DART-mapped TMR) | ✅ |
+| 6 | SMUInit            | `smu_send_msg_with_param` + TestMessage | mailbox ✅; PMFW load via LoadFirmware(0x112) pending |
+| 7 | GMCInit            | `gmc_v12_0_*` + `mmhub_v4_1_0_*` + `gfxhub_v12_0_*` | port plan written, no code yet |
+| 8 | IMUInit            | `gfx_v12_0_imu_*` (via PSP LOAD_IP_FW) | pending |
+| 9 | RLCInit            | `gfx_v12_0_rlc_init` + `_resume`  | pending |
+|10 | CPInit             | `gfx_v12_0_cp_gfx_resume`         | pending |
+|11 | MESInit            | `mes_v12_1_*` (port plan written) | pending |
+|12 | IHInit             | `ih_v7_0_*` (port plan written)   | pending |
+|13 | GFXInit            | First-PM4 path (port plan written) | pending |
+|14 | SDMAInit           | `sdma_v7_0_*` / `sdma_v7_1_*`     | pending |
+
+**Pre-SOS bootloader components** (KDB/SPL/SysDrv/SocDrv/IntfDrv/HADDrv/RASDrv/IPKeyMgrDrv) all load via `psp_bootloader_load_component` exposed through `LoadFirmware(type=1..8, size)`. Post-SOS IP firmware (PMFW, RLC, CP, IMU, MES, SDMA) loads via `psp_load_ip_fw` exposed through `LoadFirmware(type=0x100+psp_gfx_fw_type, size)`.
+
+The bringup contract:
+1. Userspace calls `LoadDiscoveryBinary` (or `SetIPBase` per block) so the IP base table is resolved.
+2. `InitDevice(target=PSPLoadSOS)` after host has called `LoadFirmware(SOS, size)`.
+3. `InitDevice(target=PSPRingCreate)` once SOS is alive.
+4. `InitDevice(target=TMRSetup)` after the ring is up.
+5. `LoadFirmware(PMFW=0x112, size)` → SMU comes online.
+6. `InitDevice(target=SMUInit)` — TestMessage now answers; SMU version logged.
+7. Subsequent stages (GMC/IMU/RLC/CP/MES/IH/GFX/SDMA) — each gates on the prior being done; each consumes one or more firmwares.
+
+**Milestone 1B:** programmable AMD R9700 under macOS via custom UAPI.
 
 ### Phase 2A — winsys-mac
 
