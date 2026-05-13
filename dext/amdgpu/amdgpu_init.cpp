@@ -68,6 +68,7 @@ stage_name(BringupStage s)
     case BringupStage::PSPInit:       return "PSPInit";
     case BringupStage::PSPLoadSOS:    return "PSPLoadSOS";
     case BringupStage::PSPRingCreate: return "PSPRingCreate";
+    case BringupStage::TMRSetup:      return "TMRSetup";
     case BringupStage::SMUInit:       return "SMUInit";
     case BringupStage::GMCInit:       return "GMCInit";
     case BringupStage::IMUInit:       return "IMUInit";
@@ -96,15 +97,28 @@ run_stage(BringupContext &ctx, BringupStage s)
         return psp_load_sos(ctx.device, ctx.psp);
     case BringupStage::PSPRingCreate:
         return psp_ring_create(ctx.device, ctx.psp);
-    // Stubs — return kIOReturnUnsupported until ported.
-    case BringupStage::SMUInit:
+    case BringupStage::TMRSetup:
+        return psp_setup_tmr(ctx.device, ctx.psp);
+    case BringupStage::SMUInit: {
+        uint32_t echo = 0;
+        kern_return_t r = smu_test_message(ctx.device, &echo);
+        if (r == kIOReturnSuccess) {
+            uint32_t ver = 0;
+            (void)smu_get_version(ctx.device, &ver);
+            ctx.device.smuOnline = true;
+        }
+        return r;
+    }
     case BringupStage::GMCInit:
-    case BringupStage::IMUInit:
+        return gmc_init(ctx.device, ctx.gmc);
     case BringupStage::IHInit:
         return ih_init_full(ctx.device, ctx.ih);
     case BringupStage::RLCInit:
         return rlc_init_full(ctx.device, ctx.gmc, ctx.rlc);
     case BringupStage::CPInit:
+        return cp_init_full(ctx.device, ctx.gmc, ctx.cp);
+    // Still-stubs — return Unsupported until ported.
+    case BringupStage::IMUInit:
     case BringupStage::MESInit:
     case BringupStage::GFXInit:
     case BringupStage::SDMAInit:

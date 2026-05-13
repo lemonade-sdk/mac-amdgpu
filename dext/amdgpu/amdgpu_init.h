@@ -29,6 +29,7 @@
 #include "amdgpu_gmc.h"
 #include "amdgpu_ih.h"
 #include "amdgpu_rlc.h"
+#include "amdgpu_cp.h"
 
 namespace amdgpu {
 
@@ -60,6 +61,7 @@ struct BringupContext {
     GMCContext    gmc;
     IHContext     ih;
     RLCContext    rlc;
+    CPContext     cp;
 
     BringupStage  reached;   // highest stage that completed
 };
