@@ -31,6 +31,7 @@
 
 #include "amdgpu/amdgpu_init.h"
 #include "amdgpu/amdgpu_discovery.h"
+#include "amdgpu/amdgpu_ih.h"
 
 #define MACAMDGPU_LOG(fmt, ...) \
     os_log(OS_LOG_DEFAULT, "mac.amdgpu: " fmt, ##__VA_ARGS__)
@@ -102,6 +103,26 @@ enum {
 #define MACAMDGPU_IRQ_PENDING_WORDS  4   // 4 × 64 = 256 vectors
 #define MACAMDGPU_MAX_DMA_SEGMENTS   32
 #define MACAMDGPU_DMA_BUFFER_MAX     (1536ULL * 1024ULL * 1024ULL)
+
+// Bits 0..127 of irqPending track raw MSI-X vector firings (one bit
+// per vector, capped at 128 — anything beyond would land in word 2+,
+// reserved for IH-routed events below).
+//
+// Bits 128..255 are IH-routed events. When the dext drains the IH
+// ring, each decoded entry's (client_id, src_id) maps to one of these
+// bits. Userspace can WaitInterrupt() and then read irqPending to
+// learn what kind of event arrived.
+//
+// Stable across the userspace ABI — don't renumber.
+enum {
+    kIRQBitGFXEOPFence   = 128,   // CP_EOP — fence value lands in entry's src_data
+    kIRQBitGFXRASError   = 129,   // CP_ECC_ERROR
+    kIRQBitVMFault       = 130,   // ATHUB UTCL2_FAULT
+    kIRQBitSDMA0Trap     = 131,
+    kIRQBitSDMA1Trap     = 132,
+    kIRQBitIHOverflow    = 133,   // IH ring overflowed since last drain
+    kIRQBitIHOther       = 134,   // catch-all for unrecognised entries
+};
 
 //============================================================
 // Driver instance state.
@@ -1113,11 +1134,73 @@ IMPL(MacAMDGPUUserClient, CopyClientMemoryForType)
 }
 
 //============================================================
+// IH dispatch glue.
+//
+// When MSI-X fires we drain the IH ring (if the IH subsystem is
+// active) and translate each entry's (client_id, src_id) to one
+// of the kIRQBit* event bits, raising it in the calling client's
+// irqPending bitmap. This lets a userspace caller block on
+// WaitInterrupt and then read irqPending to find out *what* event
+// fired, not just *that one* fired.
+//
+// Routes only to the primary client (driver->openerUserClient).
+// Phase 1B keeps a single client per device — multi-client fan-out
+// is a Phase 2+ concern.
+//============================================================
+struct IHDispatchCtx {
+    MacAMDGPUUserClient_IVars *ivars;   // primary client's IVars
+};
+
+static void
+mac_amdgpu_set_irq_bit(MacAMDGPUUserClient_IVars *iv, uint32_t bit_index)
+{
+    if (iv == nullptr || iv->irqPending == nullptr) return;
+    if (bit_index >= MACAMDGPU_MAX_IRQ_VECTORS) return;
+    uint32_t word = bit_index / 64;
+    uint64_t bit  = 1ULL << (bit_index % 64);
+    if (!(__atomic_load_n(&iv->irqEnabled[word], __ATOMIC_ACQUIRE) & bit)) {
+        return;
+    }
+    __atomic_fetch_or(&iv->irqPending[word], bit, __ATOMIC_RELEASE);
+}
+
+static void
+mac_amdgpu_ih_dispatch(const amdgpu::IHEntry &entry, void *user)
+{
+    auto *ctx = static_cast<IHDispatchCtx *>(user);
+    if (ctx == nullptr || ctx->ivars == nullptr) return;
+
+    uint32_t bit = kIRQBitIHOther;
+    if (entry.client_id == amdgpu::IHSourceID::CLIENT_GFX) {
+        if (entry.src_id == amdgpu::IHSourceID::SRC_CP_EOP) {
+            bit = kIRQBitGFXEOPFence;
+        } else if (entry.src_id == amdgpu::IHSourceID::SRC_CP_ECC_ERROR) {
+            bit = kIRQBitGFXRASError;
+        }
+    } else if (entry.client_id == amdgpu::IHSourceID::CLIENT_ATHUB &&
+               entry.src_id == amdgpu::IHSourceID::SRC_UTCL2_FAULT) {
+        bit = kIRQBitVMFault;
+    } else if (entry.client_id == amdgpu::IHSourceID::CLIENT_SDMA0 &&
+               entry.src_id == amdgpu::IHSourceID::SRC_SDMA_TRAP) {
+        bit = kIRQBitSDMA0Trap;
+    } else if (entry.client_id == amdgpu::IHSourceID::CLIENT_SDMA1 &&
+               entry.src_id == amdgpu::IHSourceID::SRC_SDMA_TRAP) {
+        bit = kIRQBitSDMA1Trap;
+    }
+    mac_amdgpu_set_irq_bit(ctx->ivars, bit);
+}
+
+//============================================================
 // InterruptOccurred — MSI-X fires, runs on irqQueue. Set pending
 // bit; if there's a pending WaitInterrupt OSAction, wake it.
 //
 // Lock-free path: client maps the IRQ shared page and polls
 // irqPending; or calls WaitInterrupt for an async wait.
+//
+// Phase 1B addition: after raising the raw-vector bit, also drain
+// the IH ring (if it's online). Each ring entry maps to one of the
+// kIRQBit* event bits, also raised in irqPending. This is what
+// surfaces EOP fences from a PM4 submit to userspace.
 //============================================================
 void
 IMPL(MacAMDGPUUserClient, InterruptOccurred)
@@ -1140,6 +1223,28 @@ IMPL(MacAMDGPUUserClient, InterruptOccurred)
     }
 
     __atomic_fetch_or(&ivars->irqPending[word], bit, __ATOMIC_RELEASE);
+
+    // Drain IH ring if active. The ring is per-device (lives on the
+    // driver) so we route only to the primary opener client.
+    MacAMDGPU *driver = OSDynamicCast(MacAMDGPU, GetProvider());
+    if (driver != nullptr && driver->ivars != nullptr) {
+        auto &bringup = driver->ivars->bringup;
+        if (bringup.ih.enabled && bringup.ih.inited) {
+            // Only the opener client receives IH events for now.
+            auto *opener = OSDynamicCast(MacAMDGPUUserClient,
+                                         driver->ivars->openerUserClient);
+            if (opener != nullptr && opener->ivars != nullptr) {
+                IHDispatchCtx dctx{ opener->ivars };
+                uint32_t n = amdgpu::ih_drain(bringup.device, bringup.ih,
+                                              &mac_amdgpu_ih_dispatch,
+                                              &dctx);
+                if (bringup.ih.overflows_seen > 0) {
+                    mac_amdgpu_set_irq_bit(opener->ivars, kIRQBitIHOverflow);
+                }
+                (void)n;
+            }
+        }
+    }
 
     // Wake any outstanding WaitInterrupt caller.
     OSAction *notify = __atomic_exchange_n(&ivars->pendingInterruptNotify,

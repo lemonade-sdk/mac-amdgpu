@@ -4,7 +4,7 @@ Granular tasks. Status legend: `[ ]` open · `[~]` in progress · `[x]` done · 
 
 Phase numbers match `ROADMAP.md`. Target hardware fixed: Apple Silicon M5 Pro/Max/Ultra + TB5 + AMD Radeon AI PRO R9700 (gfx1201, RDNA4).
 
-Last sync against `git log`: commit `413b539` (Phase 1B chunk 9 — TMR + PMFW orchestrator wiring).
+Last sync against `git log`: commit `69d4137` (Phase 1B chunk 13 — IH v7 ring + drain).
 
 ---
 
@@ -96,34 +96,35 @@ Cite Linux source file in commit messages.
 - [ ] 176  Enable basic clocks via SMU + verify telemetry readback (gfx clock, mem clock)
 
 ### 1B.3 GMC v12 — pending (see `docs/port_plans/GMC_v12.md`)
-- [ ] 180  Port `gmc_v12_0_mc_init` — VRAM size detect (mmRCC_CONFIG_MEMSIZE)
-- [ ] 181  Allocate dummy_page + mem_scratch (system memory, 16 KB aligned)
-- [ ] 182  Port `mmhub_v4_1_0_init` — populate MMHUB register offset table
-- [ ] 183  Port `gfxhub_v12_0_init` — populate GFXHUB register offset table
+- [x] 180  Port `gmc_v12_0_mc_init` — VRAM size detect (mmRCC_CONFIG_MEMSIZE)
+- [x] 181  Allocate dummy_page + mem_scratch (system memory, 16 KB aligned)
+- [x] 182  Port `mmhub_v4_1_0_init` — populate MMHUB register offset table
+- [x] 183  Port `gfxhub_v12_0_init` — populate GFXHUB register offset table
 - [ ] 184  Port `amdgpu_gmc_get_vram_info` — ATOM table parse for VRAM type + width + vendor
-- [ ] 185  VM manager config (num_level=3, block_size=9, 48-bit VA)
+- [x] 185  VM manager config (num_level=3, block_size=9, 48-bit VA)
 - [ ] 186  Register VM fault + ECC interrupt IDs with our IH dispatch table
-- [ ] 187  **Minimal VRAM allocator** — even a 16 MB bump allocator carved off the top of visible VRAM lets RLC CSB + KIQ MQD land. Required by `GMC_v12.md` step 10.
-- [ ] 188  Port `gmc_v12_0_gart_init` — GART in **system memory** (Path B from `GMC_v12.md`), 256 MB initial
-- [ ] 189  Port `gmc_v12_0_vram_gtt_location` — gart_start/end + fb_start/end + agp_start/end
-- [ ] 190  Port `mmhub_v4_1_0_gart_enable` — write MMHUB context0 PT base, L1/L2 TLB cntls, per-VMID context (14×)
-- [ ] 191  Port `gfxhub_v12_0_gart_enable` — same for GFXHUB
-- [ ] 192  Port HDP flush
-- [ ] 193  Port `set_fault_enable_default`
-- [ ] 194  Port `flush_gpu_tlb`
+- [x] 187  **Minimal VRAM allocator** — even a 16 MB bump allocator carved off the top of visible VRAM lets RLC CSB + KIQ MQD land. Required by `GMC_v12.md` step 10.
+- [x] 188  Port `gmc_v12_0_gart_init` — GART in **system memory** (Path B from `GMC_v12.md`), 256 MB initial
+- [x] 189  Port `gmc_v12_0_vram_gtt_location` — gart_start/end + fb_start/end + agp_start/end
+- [x] 190  Port `mmhub_v4_1_0_gart_enable` — write MMHUB context0 PT base, L1/L2 TLB cntls, per-VMID context (14×)
+- [x] 191  Port `gfxhub_v12_0_gart_enable` — same for GFXHUB
+- [x] 192  Port HDP flush
+- [-] 193  Port `set_fault_enable_default`
+- [x] 194  Port `flush_gpu_tlb`
 - [ ] 195  Sanity test: map a sysmem page through GART, GPU-side read via SDMA → CPU compare
 
 ### 1B.4 IH v7 — pending (see `docs/port_plans/IH_v7.md`)
-- [ ] 200  Allocate Ring0 IH (256 KB sysmem, 16 KB aligned) + wptr shadow (16 KB)
-- [ ] 201  Allocate Ring1 IH (256 KB sysmem) — dGPU only
-- [ ] 202  Port `ih_v7_0_init_register_offset` — OSSSYS regIH_RB_* table
-- [ ] 203  Port `ih_v7_0_toggle_interrupts(false)` — disable before configuring
-- [ ] 204  Port `ih_v7_0_enable_ring` — write BASE/BASE_HI/CNTL/WPTR_ADDR
-- [ ] 205  Port `ih_v7_0_doorbell_rptr` — IH_DOORBELL_RPTR + Ring1 client cfg
-- [ ] 206  Port MSI storm + flood control (IH_MSI_STORM_CTRL, IH_INT_FLOOD_CNTL)
-- [ ] 207  Port `ih_v7_0_toggle_interrupts(true)` — enable + force-update trigger
-- [ ] 208  Port `amdgpu_ih_process` — wptr read (shadow first, MMIO fallback), entry walk (8 dword stride), per-source dispatch
+- [x] 200  Allocate Ring0 IH (256 KB sysmem, 16 KB aligned) + wptr shadow (16 KB)
+- [x] 201  Allocate Ring1 IH (256 KB sysmem) — dGPU only
+- [x] 202  Port `ih_v7_0_init_register_offset` — OSSSYS regIH_RB_* table
+- [x] 203  Port `ih_v7_0_toggle_interrupts(false)` — disable before configuring
+- [x] 204  Port `ih_v7_0_enable_ring` — write BASE/BASE_HI/CNTL/WPTR_ADDR
+- [x] 205  Port `ih_v7_0_doorbell_rptr` — IH_DOORBELL_RPTR + Ring1 client cfg
+- [x] 206  Port MSI storm + flood control (IH_MSI_STORM_CTRL, IH_INT_FLOOD_CNTL)
+- [x] 207  Port `ih_v7_0_toggle_interrupts(true)` — enable + force-update trigger
+- [x] 208  Port `amdgpu_ih_process` — wptr read (shadow first, MMIO fallback), entry walk (8 dword stride), per-source dispatch
 - [ ] 209  Hook MSI-X handler in dext to call `amdgpu_ih_process` and signal `irqPending`/AsyncCompletion to userspace
+- [ ] 210  Per-source dispatch table (CP_EOP / UTCL2_FAULT / SDMA_TRAP / RAS) — `ih_drain` currently delegates to caller
 
 ### 1B.5 GFX12 + first PM4 — pending (see `docs/port_plans/HELLO_PM4.md`)
 - [ ] 220  Port `gfx_v12_0_rlc_init` — RLC clear-state buffer (4 KB **VRAM**; needs minimal allocator)
