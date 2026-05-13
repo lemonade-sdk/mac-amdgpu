@@ -29,6 +29,8 @@
 #include "MacAMDGPU.h"
 #include "MacAMDGPUUserClient.h"
 
+#include "amdgpu/amdgpu_init.h"
+
 #define MACAMDGPU_LOG(fmt, ...) \
     os_log(OS_LOG_DEFAULT, "mac.amdgpu: " fmt, ##__VA_ARGS__)
 
@@ -45,6 +47,19 @@ enum {
     kMacAMDGPUMethodAllocateDMABuffer = 6,
     kMacAMDGPUMethodFreeDMABuffer     = 7,
     kMacAMDGPUMethodResetDevice       = 8,
+    kMacAMDGPUMethodInitDevice        = 9,
+    kMacAMDGPUMethodLoadFirmware      = 10,
+    kMacAMDGPUMethodSetIPBase         = 11,
+    kMacAMDGPUMethodGetIPBase         = 12,
+};
+
+// Firmware type tags used by LoadFirmware.
+enum {
+    kMacAMDGPUFwTypeSOS   = 0,  // psp_14_0_3_sos.bin → PSPLoadSOS
+    kMacAMDGPUFwTypeTA    = 1,  // psp_14_0_3_ta.bin
+    kMacAMDGPUFwTypeKDB   = 2,
+    kMacAMDGPUFwTypeSysDrv= 3,
+    kMacAMDGPUFwTypeSocDrv= 4,
 };
 
 enum {
@@ -69,6 +84,11 @@ enum {
 struct MacAMDGPU_IVars {
     bool       pciOpen;
     IOService *openerUserClient;  // tracked so Open/Close entities match
+
+    // Phase 1B: per-device bringup state shared across user clients.
+    // Populated lazily when PCI is opened. Stages run on demand via
+    // InitDevice selector.
+    MacAMDGPU::BringupContext bringup;
 };
 
 //
@@ -762,6 +782,109 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
     case kMacAMDGPUMethodResetDevice:
         return mac_amdgpu_reset_device(this);
 
+    case kMacAMDGPUMethodInitDevice: {
+        // scalarInput[0] = target BringupStage; scalarOutput[0] = reached.
+        if (arguments->scalarInput == nullptr ||
+            arguments->scalarInputCount < 1 ||
+            arguments->scalarOutput == nullptr ||
+            arguments->scalarOutputCount < 1) {
+            return kIOReturnBadArgument;
+        }
+        if (!driver->ivars->pciOpen) {
+            // Bringup needs the device context populated, which happens
+            // on first BAR map. Force the client to map BAR0 first.
+            return kIOReturnNotOpen;
+        }
+        auto stage = (MacAMDGPU::BringupStage)arguments->scalarInput[0];
+        kern_return_t ret = MacAMDGPU::bringup_to(driver->ivars->bringup,
+                                                  stage);
+        arguments->scalarOutput[0] =
+            (uint64_t)driver->ivars->bringup.reached;
+        return ret;
+    }
+
+    case kMacAMDGPUMethodLoadFirmware: {
+        // scalarInput[0] = fw type; [1] = size in bytes; the firmware
+        // bytes are sourced from this client's DMABuffer (must be
+        // allocated and contain the payload before this call).
+        if (arguments->scalarInput == nullptr ||
+            arguments->scalarInputCount < 2) {
+            return kIOReturnBadArgument;
+        }
+        uint64_t fwType = arguments->scalarInput[0];
+        uint64_t fwSize = arguments->scalarInput[1];
+
+        if (ivars == nullptr || ivars->dmaBuffer == nullptr) {
+            MACAMDGPU_LOG("LoadFirmware: no DMABuffer on this client");
+            return kIOReturnNotReady;
+        }
+        if (fwSize == 0 || fwSize > ivars->dmaBufferSize) {
+            return kIOReturnBadArgument;
+        }
+        IOAddressSegment seg = {};
+        if (ivars->dmaBuffer->GetAddressRange(&seg) != kIOReturnSuccess) {
+            return kIOReturnInternalError;
+        }
+
+        switch (fwType) {
+        case kMacAMDGPUFwTypeSOS: {
+            auto &psp = driver->ivars->bringup.psp;
+            // psp_load_sos memcpys this into fw_pri before returning.
+            // The CPU-side pointer is stable for the duration of the
+            // synchronous call.
+            psp.sosFirmware     = reinterpret_cast<const uint8_t *>(
+                                      seg.address);
+            psp.sosFirmwareSize = fwSize;
+            kern_return_t ret = MacAMDGPU::psp_load_sos(
+                driver->ivars->bringup.device, psp);
+            // Clear our hold on the client-side pointer immediately.
+            psp.sosFirmware = nullptr;
+            psp.sosFirmwareSize = 0;
+            return ret;
+        }
+        default:
+            MACAMDGPU_LOG("LoadFirmware: fw type %llu not yet implemented",
+                          fwType);
+            return kIOReturnUnsupported;
+        }
+    }
+
+    case kMacAMDGPUMethodSetIPBase: {
+        // One-time bootstrap from userspace until we have on-die
+        // discovery wired up. scalarInput[0]=block id, [1]=base offset.
+        if (arguments->scalarInput == nullptr ||
+            arguments->scalarInputCount < 2) {
+            return kIOReturnBadArgument;
+        }
+        uint64_t blockId = arguments->scalarInput[0];
+        uint64_t base    = arguments->scalarInput[1];
+        if (blockId >= (uint64_t)MacAMDGPU::IPBlock::Count) {
+            return kIOReturnBadArgument;
+        }
+        driver->ivars->bringup.device.ip.set(
+            (MacAMDGPU::IPBlock)blockId, (uint32_t)base);
+        MACAMDGPU_LOG("IP base block=%llu set to %#llx", blockId, base);
+        return kIOReturnSuccess;
+    }
+
+    case kMacAMDGPUMethodGetIPBase: {
+        if (arguments->scalarInput == nullptr ||
+            arguments->scalarInputCount < 1 ||
+            arguments->scalarOutput == nullptr ||
+            arguments->scalarOutputCount < 2) {
+            return kIOReturnBadArgument;
+        }
+        uint64_t blockId = arguments->scalarInput[0];
+        if (blockId >= (uint64_t)MacAMDGPU::IPBlock::Count) {
+            return kIOReturnBadArgument;
+        }
+        auto block = (MacAMDGPU::IPBlock)blockId;
+        arguments->scalarOutput[0] = driver->ivars->bringup.device.ip.get(block);
+        arguments->scalarOutput[1] =
+            driver->ivars->bringup.device.ip.isResolved(block) ? 1 : 0;
+        return kIOReturnSuccess;
+    }
+
     default:
         return kIOReturnUnsupported;
     }
@@ -833,6 +956,30 @@ IMPL(MacAMDGPUUserClient, CopyClientMemoryForType)
             pci->ConfigurationRead16(0x04, &cmd);
         }
         MACAMDGPU_LOG("PCI opened, command=%#x", (unsigned)cmd);
+
+        // Populate per-device bringup context for Phase 1B.
+        auto &bdev = driver->ivars->bringup.device;
+        bdev.pci = pci;
+        bdev.psoCAlive = false;
+        bdev.smuOnline = false;
+        bdev.gmcReady  = false;
+        for (uint8_t bar = 0; bar < 6; bar++) {
+            uint8_t  mi = 0;
+            uint64_t sz = 0;
+            uint8_t  ty = 0;
+            if (pci->GetBARInfo(bar, &mi, &sz, &ty) != kIOReturnSuccess) {
+                continue;
+            }
+            switch (bar) {
+            case 0: bdev.bar0MemIndex = mi; bdev.bar0Size = sz; break;
+            case 2: bdev.bar2MemIndex = mi; bdev.bar2VisibleVRAMSize = sz;
+                    break;
+            case 5: bdev.bar5MemIndex = mi; break;
+            default: break;
+            }
+        }
+        MACAMDGPU_LOG("bringup ctx: BAR0=%llu B BAR2(visible VRAM)=%llu B",
+                      bdev.bar0Size, bdev.bar2VisibleVRAMSize);
     }
 
     uint8_t barIndex = (uint8_t)type;
