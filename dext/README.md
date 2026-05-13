@@ -63,6 +63,26 @@ A minimal host app is on the worklist (Phase 1A.105) — not yet written.
 
 ### 5. Loading + verifying
 
+> **Conflict warning — qemu-vfio-apple's VFIOUserPCIDriver.**
+> If the qemu-vfio-apple dext is already installed and active, it
+> matches **every PCI device** via `IOPCIPrimaryMatch=0xFFFFFFFF&0x00000000`,
+> which means it can claim the R9700 first. Symptoms: our dext
+> appears as `[activated waiting]` in `systemextensionsctl list`
+> but `ioreg -lw0 -c IOPCIDevice` shows the R9700 attached to
+> `VFIOUserPCIDriver` instead of `MacAMDGPU`. Resolutions, in
+> order of preference:
+>
+> 1. **Don't have both running.** Stop qemu-vfio-apple's host app
+>    before loading ours, or uninstall the VFIO dext temporarily:
+>    `systemextensionsctl uninstall <team-id> com.example.VFIOUserHostApp.VFIOUserPCIDriver`.
+> 2. **Rely on probe score.** Our Info.plist sets `IOProbeScore=10000`,
+>    above the default. A more-specific `IOPCIPrimaryMatch`
+>    (exact VID/DID, mask all-ones) also wins ties, so this should
+>    be self-resolving in practice — but verify with `ioreg`.
+> 3. **Narrow apple-vfio.** Edit its Info.plist to exclude
+>    `0x75511002&0xFFFFFFFF` (or any AMD VID) so it never sees the
+>    R9700.
+
 ```bash
 # Move app into place
 sudo cp -R ~/Library/Developer/Xcode/DerivedData/MacAMDGPUHost-*/Build/Products/Debug/MacAMDGPUHost.app /Applications/
@@ -75,9 +95,14 @@ open /Applications/MacAMDGPUHost.app
 
 # In System Settings → Privacy & Security → "Allow" the blocked extension.
 
-# Verify
+# Verify the dext is staged
 systemextensionsctl list
 # Expect a line for com.yourteam.MacAMDGPUHost.MacAMDGPU [activated enabled]
+
+# Verify the R9700 actually bound to OUR dext, not VFIOUserPCIDriver
+ioreg -lw0 -c IOPCIDevice | grep -A2 "vendor-id.*1002.*device-id.*7551"
+# Look for "IOUserClientClass" pointing to MacAMDGPUUserClient (good)
+# vs. VFIOUserPCIDriverUserClient (qemu-vfio-apple won the match).
 
 # Plug in the eGPU with the R9700 if not already; verify match
 log stream --predicate 'eventMessage CONTAINS "mac.amdgpu"' &

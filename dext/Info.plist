@@ -44,6 +44,16 @@
 			-->
 			<key>IOPCIPrimaryMatch</key>
 			<string>0x75511002&amp;0xFFFFFFFF</string>
+			<!--
+			    IOProbeScore — sentinel above default (0). Wins against
+			    the qemu-vfio-apple VFIOUserPCIDriver dext which matches
+			    every PCI device (0xFFFFFFFF&0x00000000) when both dexts
+			    are installed. If both are loaded and try to claim the
+			    R9700 simultaneously the more-specific match should win
+			    on its own — this is belt-and-braces.
+			-->
+			<key>IOProbeScore</key>
+			<integer>10000</integer>
 			<key>MacAMDGPUUserClientProperties</key>
 			<dict>
 				<key>IOClass</key>
