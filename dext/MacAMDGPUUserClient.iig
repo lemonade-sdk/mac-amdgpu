@@ -1,0 +1,45 @@
+//
+//  MacAMDGPUUserClient.iig — Per-process IPC endpoint.
+//
+//  Phase 1A surface (this commit):
+//      Ping              — round-trip plumbing test
+//      GetIdentity       — bus/dev/fn + VID/DID/class code
+//      GetBARInfo        — per-BAR memoryIndex/size/type for IOConnectMapMemory64
+//      CopyClientMemoryForType — exposes BAR0..5 to userspace as mappable memory
+//
+//  Reserved for follow-up commits:
+//      Claim / Terminate                  — PCI Open/Close + bus master enable
+//      MMIORead / MMIOWrite               — slow path; userspace prefers BAR mmap
+//      ConfigRead / ConfigWrite           — config space slow path
+//      AllocateDMABuffer / FreeDMABuffer  — dext-allocated DMA
+//      SetupInterrupts / WaitInterrupt    — MSI-X delivery
+//      ResetDevice                        — FLR / hot-reset
+//      submit_cs / wait_fence / alloc_bo  — amdgpu UAPI (later phases)
+//
+
+#ifndef MacAMDGPUUserClient_h
+#define MacAMDGPUUserClient_h
+
+#include <Availability.h>
+#include <DriverKit/IOUserClient.iig>
+
+class MacAMDGPUUserClient: public IOUserClient
+{
+public:
+    virtual kern_return_t Start(IOService *provider) override;
+    virtual kern_return_t Stop(IOService *provider) override;
+
+    virtual kern_return_t
+    ExternalMethod(uint64_t selector,
+                   IOUserClientMethodArguments *arguments,
+                   const IOUserClientMethodDispatch *dispatch,
+                   OSObject *target,
+                   void *reference) override;
+
+    virtual kern_return_t
+    CopyClientMemoryForType(uint64_t type,
+                            uint64_t *options,
+                            IOMemoryDescriptor **memory) override;
+};
+
+#endif /* MacAMDGPUUserClient_h */

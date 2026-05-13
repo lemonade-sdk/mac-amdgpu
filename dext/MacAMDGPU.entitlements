@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	    The narrower the entitlement scope, the easier the Apple review.
+	    Match scope is exact R9700 (VID 0x1002, DID 0x7551) here.
+	    Widening to all AMD VID later requires a new entitlement grant.
+	-->
+	<key>com.apple.developer.driverkit.transport.pci</key>
+	<array>
+		<dict>
+			<key>IOPCIPrimaryMatch</key>
+			<string>0x75511002&amp;0xFFFFFFFF</string>
+		</dict>
+	</array>
+	<!--
+	    Allow any signed userspace process to open a UserClient against
+	    the dext. We may tighten this later to a specific bundle ID.
+	-->
+	<key>com.apple.developer.driverkit.allow-any-userclient-access</key>
+	<true/>
+	<!--
+	    Required for any DriverKit extension that runs as a user-space
+	    kext replacement.
+	-->
+	<key>com.apple.developer.driverkit</key>
+	<true/>
+</dict>
+</plist>

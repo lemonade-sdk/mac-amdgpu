@@ -1,0 +1,27 @@
+//
+//  MacAMDGPU.iig — Driver class interface.
+//
+//  This is the IOService subclass that matches the PCI device and
+//  spawns one MacAMDGPUUserClient per open. Lifecycle only — no
+//  amdgpu logic lives here. Hardware bringup happens in the
+//  UserClient on first claim (later phases), then progressively
+//  moves up to per-driver state as the driver grows.
+//
+
+#ifndef MacAMDGPU_h
+#define MacAMDGPU_h
+
+#include <Availability.h>
+#include <DriverKit/IOService.iig>
+#include <PCIDriverKit/IOPCIDevice.iig>
+
+class MacAMDGPU: public IOService
+{
+public:
+    virtual kern_return_t Start(IOService *provider) override;
+    virtual kern_return_t Stop(IOService *provider) override;
+    virtual kern_return_t NewUserClient(uint32_t type,
+                                        IOUserClient **userClient) override;
+};
+
+#endif /* MacAMDGPU_h */

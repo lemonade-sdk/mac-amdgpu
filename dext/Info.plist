@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>DEXT</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.0.1</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>OSBundleUsageDescription</key>
+	<string>Native AMD GPU driver for Radeon AI PRO R9700 (RDNA4, gfx1201) over Thunderbolt 5.</string>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>MacAMDGPU</key>
+		<dict>
+			<key>IOClass</key>
+			<string>IOUserService</string>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+			<key>IOUserClass</key>
+			<string>MacAMDGPU</string>
+			<key>IOUserServerName</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>IOPCITunnelCompatible</key>
+			<true/>
+			<!--
+			    Match: VID=0x1002 (AMD), DID=0x7551 (Radeon AI PRO R9700, gfx1201).
+			    Format is "value&mask" — both 32-bit, value is (DID<<16)|VID.
+			    Mask 0xFFFFFFFF requires both halves to match exactly.
+			    To widen to "any RDNA4 from AMD", change mask to 0x0000FFFF
+			    so only VID is required, then add a sibling personality per
+			    target ASIC.
+			-->
+			<key>IOPCIPrimaryMatch</key>
+			<string>0x75511002&amp;0xFFFFFFFF</string>
+			<key>MacAMDGPUUserClientProperties</key>
+			<dict>
+				<key>IOClass</key>
+				<string>IOUserUserClient</string>
+				<key>IOUserClass</key>
+				<string>MacAMDGPUUserClient</string>
+			</dict>
+		</dict>
+	</dict>
+</dict>
+</plist>
