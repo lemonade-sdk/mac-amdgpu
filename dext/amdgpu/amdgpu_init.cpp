@@ -100,10 +100,11 @@ run_stage(BringupContext &ctx, BringupStage s)
     case BringupStage::SMUInit:
     case BringupStage::GMCInit:
     case BringupStage::IMUInit:
+    case BringupStage::IHInit:
+        return ih_init_full(ctx.device, ctx.ih);
     case BringupStage::RLCInit:
     case BringupStage::CPInit:
     case BringupStage::MESInit:
-    case BringupStage::IHInit:
     case BringupStage::GFXInit:
     case BringupStage::SDMAInit:
         INIT_LOG("stage %{public}s: NOT YET IMPLEMENTED", stage_name(s));

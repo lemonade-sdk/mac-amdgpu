@@ -27,6 +27,7 @@
 #include "amdgpu_psp.h"
 #include "amdgpu_smu.h"
 #include "amdgpu_gmc.h"
+#include "amdgpu_ih.h"
 
 namespace amdgpu {
 
@@ -56,6 +57,7 @@ struct BringupContext {
     DeviceContext device;
     PSPContext    psp;
     GMCContext    gmc;
+    IHContext     ih;
 
     BringupStage  reached;   // highest stage that completed
 };
