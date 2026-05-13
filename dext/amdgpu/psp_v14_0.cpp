@@ -123,10 +123,59 @@ static_assert(sizeof(PSPGfxRBFrame) == 64, "PSPGfxRBFrame must be 64 B");
 constexpr uint32_t kPSPGfxCmdRespSize = 1024;  // upstream psp_gfx_cmd_resp
 constexpr uint32_t kPSPFenceBufSize   = 16384; // AS page-aligned (only 4 B used)
 constexpr uint32_t kPSPCmdBufSize     = 16384; // AS page-aligned (only 1 KB used)
+constexpr uint32_t kPSPTMRDefaultSize = 4 * 1024 * 1024;  // 4 MB
+
+// Layout of upstream union psp_gfx_commands embedded inside
+// psp_gfx_cmd_resp at offset 28 (after buf_size/version/cmd_id +
+// the 4 RBI-only response fields). Only the variants we use are
+// modeled here; PSP doesn't care about the union slack.
+struct PSPGfxCmdSetupTmr {
+    uint32_t buf_phy_addr_lo;
+    uint32_t buf_phy_addr_hi;
+    uint32_t buf_size;
+    uint32_t tmr_flags;         // bit0=sriov, bit1=virt_phy_addr (we set this)
+    uint32_t system_phy_addr_lo;
+    uint32_t system_phy_addr_hi;
+};
+
+struct PSPGfxCmdLoadIpFw {
+    uint32_t fw_phy_addr_lo;
+    uint32_t fw_phy_addr_hi;
+    uint32_t fw_size;
+    uint32_t fw_type;           // enum psp_gfx_fw_type (host-endian u32)
+};
+
+// Layout of the cmd_resp buffer's leading fields. Matches upstream
+// `struct psp_gfx_cmd_resp` for the bits we actually write.
+struct PSPGfxCmdRespHeader {
+    uint32_t buf_size;
+    uint32_t buf_version;       // PSP_GFX_CMD_BUF_VERSION = 1
+    uint32_t cmd_id;
+    uint32_t resp_buf_addr_lo;  // 0 for GPCOM ring
+    uint32_t resp_buf_addr_hi;  // 0
+    uint32_t resp_offset;       // 0
+    uint32_t resp_buf_size;     // 0
+    // cmd union starts at offset 28
+};
+constexpr uint32_t kPSPGfxCmdBufVersion = 1;
 
 void
 psp_release(PSPContext &psp)
 {
+    if (psp.tmrDMACommand != nullptr) {
+        psp.tmrDMACommand->CompleteDMA(kIODMACommandCompleteDMANoOptions);
+        psp.tmrDMACommand->release();
+        psp.tmrDMACommand = nullptr;
+    }
+    if (psp.tmrBuffer != nullptr) {
+        psp.tmrBuffer->release();
+        psp.tmrBuffer = nullptr;
+    }
+    psp.tmrCPUAddr = nullptr;
+    psp.tmrBusAddr = 0;
+    psp.tmrSize    = 0;
+    psp.tmrSetUp   = false;
+
     if (psp.fenceDMACommand != nullptr) {
         psp.fenceDMACommand->CompleteDMA(kIODMACommandCompleteDMANoOptions);
         psp.fenceDMACommand->release();
@@ -593,6 +642,137 @@ psp_ring_cmd_submit(DeviceContext &dev, PSPContext &psp,
         return kIOReturnError;
     }
     PSP_LOG("ring_cmd_submit: ok (fence=%u)", fence_index);
+    return kIOReturnSuccess;
+}
+
+//
+// psp_setup_tmr — allocates a DART-backed system-memory buffer for
+// the TMR and submits GFX_CMD_ID_SETUP_TMR via the PSP ring.
+// Idempotent. Linux normally puts the TMR in VRAM; we use system
+// memory + the `virt_phy_addr` flag until we have a VRAM allocator.
+//
+kern_return_t
+psp_setup_tmr(DeviceContext &dev, PSPContext &psp)
+{
+    if (psp.tmrSetUp) return kIOReturnSuccess;
+    if (!psp.ringCreated || psp.cmdCPUAddr == nullptr) {
+        return kIOReturnNotReady;
+    }
+
+    // Allocate TMR backing buffer (system memory, DART-mapped).
+    IOBufferMemoryDescriptor *buf = nullptr;
+    kern_return_t ret = IOBufferMemoryDescriptor::Create(
+        kIOMemoryDirectionOutIn, kPSPTMRDefaultSize, kASPageSize, &buf);
+    if (ret != kIOReturnSuccess || buf == nullptr) {
+        PSP_LOG("tmr buffer alloc failed: %#x", ret);
+        return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
+    }
+    buf->SetLength(kPSPTMRDefaultSize);
+
+    IODMACommandSpecification spec = {};
+    spec.options        = kIODMACommandSpecificationNoOptions;
+    spec.maxAddressBits = 64;
+    IODMACommand *dma = nullptr;
+    ret = IODMACommand::Create(dev.pci, kIODMACommandCreateNoOptions,
+                               &spec, &dma);
+    if (ret != kIOReturnSuccess || dma == nullptr) {
+        buf->release();
+        return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
+    }
+    uint64_t flags = 0;
+    uint32_t segCount = 1;
+    IOAddressSegment seg = {};
+    ret = dma->PrepareForDMA(kIODMACommandPrepareForDMANoOptions, buf, 0,
+                             kPSPTMRDefaultSize, &flags, &segCount, &seg);
+    if (ret != kIOReturnSuccess || segCount != 1) {
+        dma->release();
+        buf->release();
+        return ret != kIOReturnSuccess ? ret : kIOReturnNotAligned;
+    }
+    IOAddressSegment cpu = {};
+    buf->GetAddressRange(&cpu);
+    psp.tmrBuffer     = buf;
+    psp.tmrDMACommand = dma;
+    psp.tmrBusAddr    = seg.address;
+    psp.tmrCPUAddr    = reinterpret_cast<void *>(cpu.address);
+    psp.tmrSize       = kPSPTMRDefaultSize;
+
+    // Build SETUP_TMR command in a scratch cmd_resp-sized buffer.
+    uint8_t cmd_buf[kPSPGfxCmdRespSize];
+    memset(cmd_buf, 0, sizeof(cmd_buf));
+    auto *hdr = reinterpret_cast<PSPGfxCmdRespHeader *>(cmd_buf);
+    hdr->buf_size    = sizeof(cmd_buf);
+    hdr->buf_version = kPSPGfxCmdBufVersion;
+    hdr->cmd_id      = PSPGfxCmd::SETUP_TMR;
+
+    auto *tmr = reinterpret_cast<PSPGfxCmdSetupTmr *>(cmd_buf + 28);
+    tmr->buf_phy_addr_lo    = static_cast<uint32_t>(psp.tmrBusAddr & 0xFFFFFFFFu);
+    tmr->buf_phy_addr_hi    = static_cast<uint32_t>(psp.tmrBusAddr >> 32);
+    tmr->buf_size           = static_cast<uint32_t>(psp.tmrSize);
+    tmr->tmr_flags          = 0x2;  // virt_phy_addr=1 — DART buffer is its own phys
+    tmr->system_phy_addr_lo = tmr->buf_phy_addr_lo;
+    tmr->system_phy_addr_hi = tmr->buf_phy_addr_hi;
+
+    uint32_t resp = 0;
+    ret = psp_ring_cmd_submit(dev, psp, cmd_buf, kPSPGfxCmdRespSize, &resp);
+    if (ret != kIOReturnSuccess) {
+        PSP_LOG("SETUP_TMR submit failed: %#x (resp=%#x)", ret, resp);
+        return ret;
+    }
+    psp.tmrSetUp = true;
+    PSP_LOG("SETUP_TMR ok — TMR at bus=%#llx size=%llu",
+            psp.tmrBusAddr, psp.tmrSize);
+    return kIOReturnSuccess;
+}
+
+//
+// psp_load_ip_fw — submit a GFX_CMD_ID_LOAD_IP_FW with the firmware
+// already staged in a DART-mapped buffer. PSP reads the bytes,
+// validates the signature, copies them into the TMR + then to the
+// target IP, and asserts the IP's reset. Returns kIOReturnSuccess
+// only if PSP's response status is 0.
+//
+kern_return_t
+psp_load_ip_fw(DeviceContext &dev, PSPContext &psp,
+               uint64_t fwBusAddr, uint32_t fwSize, uint32_t fwType)
+{
+    if (!psp.tmrSetUp) {
+        PSP_LOG("load_ip_fw(type=%u): TMR not set up — call psp_setup_tmr first",
+                fwType);
+        return kIOReturnNotReady;
+    }
+    if (fwBusAddr == 0 || fwSize == 0) {
+        return kIOReturnBadArgument;
+    }
+    // 4 KB alignment is the PSP protocol requirement (independent of
+    // AS 16 KB DART pages — we satisfy both because all our DART-mapped
+    // buffers come in at 16 KB-aligned bus addresses).
+    if (fwBusAddr & 0xFFF) {
+        return kIOReturnNotAligned;
+    }
+
+    uint8_t cmd_buf[kPSPGfxCmdRespSize];
+    memset(cmd_buf, 0, sizeof(cmd_buf));
+    auto *hdr = reinterpret_cast<PSPGfxCmdRespHeader *>(cmd_buf);
+    hdr->buf_size    = sizeof(cmd_buf);
+    hdr->buf_version = kPSPGfxCmdBufVersion;
+    hdr->cmd_id      = PSPGfxCmd::LOAD_IP_FW;
+
+    auto *load = reinterpret_cast<PSPGfxCmdLoadIpFw *>(cmd_buf + 28);
+    load->fw_phy_addr_lo = static_cast<uint32_t>(fwBusAddr & 0xFFFFFFFFu);
+    load->fw_phy_addr_hi = static_cast<uint32_t>(fwBusAddr >> 32);
+    load->fw_size        = fwSize;
+    load->fw_type        = fwType;
+
+    uint32_t resp = 0;
+    kern_return_t ret = psp_ring_cmd_submit(dev, psp, cmd_buf,
+                                            kPSPGfxCmdRespSize, &resp);
+    if (ret != kIOReturnSuccess) {
+        PSP_LOG("LOAD_IP_FW(type=%u, size=%u, bus=%#llx) failed: %#x resp=%#x",
+                fwType, fwSize, fwBusAddr, ret, resp);
+        return ret;
+    }
+    PSP_LOG("LOAD_IP_FW(type=%u, size=%u) ok", fwType, fwSize);
     return kIOReturnSuccess;
 }
 

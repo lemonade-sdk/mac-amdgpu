@@ -77,6 +77,20 @@ struct PSPContext {
     uint64_t  fenceBusAddr;
     void     *fenceCPUAddr;
     uint32_t  fenceCounter;
+
+    // TMR (Trusted Memory Region) — PSP-owned region used as the
+    // staging area for IP firmware loads. Linux puts this in VRAM,
+    // but PSP also accepts a system-memory region for early bringup
+    // (signaled via cmd_setup_tmr.tmr_flags.virt_phy_addr = 1). We
+    // do the latter until we have a VRAM allocator.
+#ifdef __APPLE__
+    IOBufferMemoryDescriptor *tmrBuffer;
+    IODMACommand             *tmrDMACommand;
+#endif
+    uint64_t  tmrBusAddr;
+    void     *tmrCPUAddr;
+    uint64_t  tmrSize;
+    bool      tmrSetUp;
 };
 
 //
@@ -160,5 +174,60 @@ kern_return_t psp_ring_create(DeviceContext &dev, PSPContext &psp);
 kern_return_t psp_ring_cmd_submit(DeviceContext &dev, PSPContext &psp,
                                   const void *cmd, uint32_t cmdSize,
                                   uint32_t *outRespStatus);
+
+//
+// psp_setup_tmr — port of psp_setup_tmr/_v2 from upstream
+// drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c. Allocates a TMR buffer
+// in DART-mapped system memory (idempotent) and submits a
+// GFX_CMD_ID_SETUP_TMR via the PSP ring. Required before any
+// LOAD_IP_FW submission.
+//
+// Default TMR size is 4 MB which is enough for SMU + RLC + CP + MES
+// + SDMA + IH staging; AMD's bootloader on some ASICs negotiates a
+// smaller size via LOAD_TOC, but for the initial port we statically
+// size it.
+//
+kern_return_t psp_setup_tmr(DeviceContext &dev, PSPContext &psp);
+
+//
+// psp_load_ip_fw — port of psp_load_ip_fw. Submits a
+// GFX_CMD_ID_LOAD_IP_FW for a single firmware image. The caller
+// stages the firmware bytes into `fwSysAddr` (CPU pointer to a
+// DART-mapped buffer; the caller passes the corresponding GPU bus
+// address as `fwBusAddr`). PSP copies the firmware into the TMR
+// then into the target IP's memory and asserts the IP's reset.
+//
+// fwType: one of the PSP_GFX_FW_TYPE_* values (e.g. SMU=18).
+//
+// The DMA buffer for the firmware bytes only needs to live for the
+// duration of this call; PSP reads and copies before returning.
+//
+kern_return_t psp_load_ip_fw(DeviceContext &dev, PSPContext &psp,
+                             uint64_t fwBusAddr, uint32_t fwSize,
+                             uint32_t fwType);
+
+// Subset of psp_gfx_fw_type — full enum in upstream
+// drivers/gpu/drm/amd/amdgpu/psp_gfx_if.h (208).
+namespace PSPGfxFwType {
+    constexpr uint32_t SMU       = 18;   // PMFW
+    constexpr uint32_t SDMA0     = 9;
+    constexpr uint32_t SDMA1     = 10;
+    constexpr uint32_t RLC_G     = 8;
+    constexpr uint32_t CP_ME     = 1;
+    constexpr uint32_t CP_PFP    = 2;
+    constexpr uint32_t CP_MEC    = 4;
+    constexpr uint32_t IMU_I     = 68;
+    constexpr uint32_t IMU_D     = 69;
+    constexpr uint32_t RS64_MES        = 76;
+    constexpr uint32_t RS64_MES_STACK  = 77;
+    constexpr uint32_t RS64_KIQ        = 78;
+    constexpr uint32_t RS64_KIQ_STACK  = 79;
+}
+
+// GFX command IDs (subset). Full list in upstream psp_gfx_if.h.
+namespace PSPGfxCmd {
+    constexpr uint32_t SETUP_TMR   = 5;
+    constexpr uint32_t LOAD_IP_FW  = 6;
+}
 
 } // namespace amdgpu
