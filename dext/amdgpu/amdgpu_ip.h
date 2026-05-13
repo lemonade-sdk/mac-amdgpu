@@ -135,6 +135,17 @@ namespace PSPBootloaderCmd {
 constexpr uint32_t kPSPBootloaderReadyBit = 0x80000000u;
 constexpr uint32_t kPSPFwPriBufSize       = 1024u * 1024u;  // PSP_1_MEG
 
+// **** Apple Silicon page size is 16 KB, not 4 KB. ****
+//
+// All DMA-mappable buffers handed to the GPU through DART must be
+// aligned to 16 KB or DART will reject the mapping (qemu-vfio-apple
+// has explicit "rejecting DMA mapping" logging for the multi-segment
+// fallback case that fires when this is wrong). Use kASPageSize for
+// alignment everywhere, even when the GPU side only needs 4 KB
+// granularity — the cost is a few extra zero bytes per allocation,
+// the failure mode otherwise is a hard refusal at PrepareForDMA.
+constexpr uint64_t kASPageSize = 16384;
+
 // PSP GFX command frame flags — from
 // drivers/gpu/drm/amd/amdgpu/psp_gfx_if.h.
 constexpr uint32_t kPSPGfxCmdStatusMask   = 0x0000FFFFu;
@@ -150,7 +161,11 @@ constexpr uint32_t kPSPMboxRespMask = kPSPGfxCmdResponseMask
 // psp_ring_type — only KM is used outside SR-IOV.
 constexpr uint32_t kPSPRingTypeKM = 1;
 
-// 4 KB matches Linux's psp_ring_init default for km_ring.
-constexpr uint32_t kPSPKMRingSize = 0x1000;
+// PSP's protocol uses a 4 KB ring (matches Linux psp_ring_init).
+// On AS we still allocate the underlying buffer at 16 KB alignment
+// + size to satisfy the page granularity, and tell PSP that the
+// usable area is 4 KB via C2PMSG_71. The trailing 12 KB is unused.
+constexpr uint32_t kPSPKMRingSize    = 0x1000;
+constexpr uint32_t kPSPKMRingBufSize = 16384;
 
 } // namespace amdgpu

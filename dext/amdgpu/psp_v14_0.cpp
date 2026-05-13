@@ -46,8 +46,10 @@ psp_init(DeviceContext &dev, PSPContext &psp)
     }
 
     IOBufferMemoryDescriptor *buf = nullptr;
+    // AS page size is 16 KB; DART rejects mappings that aren't
+    // page-aligned. fw_pri is 1 MB so its size is already aligned.
     kern_return_t ret = IOBufferMemoryDescriptor::Create(
-        kIOMemoryDirectionOutIn, kPSPFwPriBufSize, 4096, &buf);
+        kIOMemoryDirectionOutIn, kPSPFwPriBufSize, kASPageSize, &buf);
     if (ret != kIOReturnSuccess || buf == nullptr) {
         PSP_LOG("fw_pri buffer alloc failed: %#x", ret);
         return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
@@ -294,14 +296,16 @@ psp_ring_create(DeviceContext &dev, PSPContext &psp)
         return kIOReturnNotReady;
     }
 
-    // 4 KB system-memory buffer (DART-mapped).
+    // PSP wants a 4 KB ring per its protocol; DART on AS needs a
+    // 16 KB-aligned + sized backing buffer. Allocate 16 KB, tell PSP
+    // the usable area is 4 KB via C2PMSG_71. Trailing 12 KB unused.
     IOBufferMemoryDescriptor *buf = nullptr;
     kern_return_t ret = IOBufferMemoryDescriptor::Create(
-        kIOMemoryDirectionOutIn, kPSPKMRingSize, 4096, &buf);
+        kIOMemoryDirectionOutIn, kPSPKMRingBufSize, kASPageSize, &buf);
     if (ret != kIOReturnSuccess || buf == nullptr) {
         return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
     }
-    ret = buf->SetLength(kPSPKMRingSize);
+    ret = buf->SetLength(kPSPKMRingBufSize);
     if (ret != kIOReturnSuccess) {
         buf->release();
         return ret;
@@ -322,7 +326,7 @@ psp_ring_create(DeviceContext &dev, PSPContext &psp)
     uint32_t segCount = 1;
     IOAddressSegment seg = {};
     ret = cmd->PrepareForDMA(kIODMACommandPrepareForDMANoOptions,
-                             buf, 0, kPSPKMRingSize,
+                             buf, 0, kPSPKMRingBufSize,
                              &flags, &segCount, &seg);
     if (ret != kIOReturnSuccess || segCount != 1) {
         cmd->release();

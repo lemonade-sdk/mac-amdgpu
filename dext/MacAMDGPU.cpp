@@ -199,7 +199,10 @@ mac_amdgpu_allocate_dma_buffer(MacAMDGPUUserClient *client,
 
     mac_amdgpu_release_dma_buffer(client);
 
-    uint64_t alignment = requestedAlignment == 0 ? 4096 : requestedAlignment;
+    // Apple Silicon page size is 16 KB. DART rejects mappings that
+    // aren't page-aligned; coerce upward if the caller asked for less.
+    uint64_t alignment = requestedAlignment < amdgpu::kASPageSize
+                           ? amdgpu::kASPageSize : requestedAlignment;
 
     IOBufferMemoryDescriptor *buf = nullptr;
     kern_return_t ret = IOBufferMemoryDescriptor::Create(

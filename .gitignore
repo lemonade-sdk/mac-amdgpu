@@ -2,4 +2,11 @@ upstream/
 firmware/blobs/
 *.dSYM/
 build/
+build.log
 .DS_Store
+
+# xcodegen-managed — regenerate via scripts/build.sh
+MacAMDGPU.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
