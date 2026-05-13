@@ -25,6 +25,8 @@
 #pragma once
 
 #include "amdgpu_psp.h"
+#include "amdgpu_smu.h"
+#include "amdgpu_gmc.h"
 
 namespace amdgpu {
 
@@ -53,6 +55,7 @@ enum class BringupStage : uint32_t {
 struct BringupContext {
     DeviceContext device;
     PSPContext    psp;
+    GMCContext    gmc;
 
     BringupStage  reached;   // highest stage that completed
 };
