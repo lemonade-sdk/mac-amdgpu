@@ -19,9 +19,15 @@
 #pragma once
 
 #include <stdint.h>
+
+#ifdef __APPLE__
+#include <DriverKit/IOBufferMemoryDescriptor.h>
+#include <DriverKit/IODMACommand.h>
+#endif
+
 #include "amdgpu_regs.h"
 
-namespace MacAMDGPU {
+namespace amdgpu {
 
 struct PSPContext {
     // Primary firmware buffer — PSP reads each binary from here.
@@ -122,4 +128,4 @@ kern_return_t psp_bootloader_load_component(DeviceContext &dev,
 //
 kern_return_t psp_ring_create(DeviceContext &dev, PSPContext &psp);
 
-} // namespace MacAMDGPU
+} // namespace amdgpu

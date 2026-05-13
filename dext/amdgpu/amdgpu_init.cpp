@@ -13,7 +13,7 @@
 #define INIT_LOG(fmt, ...) \
     os_log(OS_LOG_DEFAULT, "mac.amdgpu.init: " fmt, ##__VA_ARGS__)
 
-namespace MacAMDGPU {
+namespace amdgpu {
 
 //============================================================
 // IP discovery — hardcoded R9700 IP versions.
@@ -130,4 +130,4 @@ bringup_to(BringupContext &ctx, BringupStage target)
     return kIOReturnSuccess;
 }
 
-} // namespace MacAMDGPU
+} // namespace amdgpu

@@ -25,7 +25,7 @@
 #include <PCIDriverKit/IOPCIDevice.h>
 #endif
 
-namespace MacAMDGPU {
+namespace amdgpu {
 
 //============================================================
 // Per-device runtime state — owned by the driver instance,
@@ -112,12 +112,17 @@ poll_reg(const DeviceContext &ctx, uint32_t reg,
             if (outValue) *outValue = v;
             return false;
         }
-        // IOSleep is in milliseconds; we approximate by spinning briefly.
-        // TODO(phase1b): replace with absolute-time-based wait.
-        for (volatile int i = 0; i < 1000; i++) { /* busy */ }
+        // Approximate ~50 µs by reading the same register repeatedly.
+        // TODO(phase1b): replace with a real nanosecond wait once we
+        // have a portable DriverKit primitive for it.
+        uint32_t scratch = 0;
+        for (int i = 0; i < 1000; i++) {
+            scratch ^= RREG32(ctx, reg);
+        }
+        (void)scratch;
         elapsed += kStepUs;
     }
 }
 #endif
 
-} // namespace MacAMDGPU
+} // namespace amdgpu

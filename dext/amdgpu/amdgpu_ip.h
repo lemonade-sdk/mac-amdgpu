@@ -20,7 +20,7 @@
 
 #include <stdint.h>
 
-namespace MacAMDGPU {
+namespace amdgpu {
 
 // IP versions on Radeon AI PRO R9700 (gfx1201) — confirmed from
 // the devcoredump in qemu-vfio-apple/traces/:
@@ -153,4 +153,4 @@ constexpr uint32_t kPSPRingTypeKM = 1;
 // 4 KB matches Linux's psp_ring_init default for km_ring.
 constexpr uint32_t kPSPKMRingSize = 0x1000;
 
-} // namespace MacAMDGPU
+} // namespace amdgpu

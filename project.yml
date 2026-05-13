@@ -1,0 +1,117 @@
+#
+# project.yml — xcodegen spec for MacAMDGPU.
+#
+# Builds two targets:
+#   • MacAMDGPUHost  (macOS app)    — SwiftUI host that activates the dext
+#   • MacAMDGPU      (DriverKit dext) — the actual driver
+#
+# Usage:
+#   scripts/build.sh           # generate + build
+#   scripts/build.sh --gen     # generate the .xcodeproj only
+#   scripts/build.sh --open    # generate + open in Xcode
+#
+# Before building, set XCODE_TEAM_ID in your environment to your
+# Apple Developer team ID (10-char prefix). e.g.
+#   export XCODE_TEAM_ID=ABCDE12345
+#
+# To change the bundle ID prefix, edit BUNDLE_PREFIX below and the
+# matching dextBundleIdentifier constant in
+# Host/MacAMDGPUHostApp.swift.
+#
+
+name: MacAMDGPU
+
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    macOS: "14.0"
+  groupSortPosition: top
+  generateEmptyDirectories: true
+  developmentLanguage: en
+
+settings:
+  base:
+    SWIFT_VERSION: "5.10"
+    CLANG_CXX_LANGUAGE_STANDARD: "gnu++20"
+    CLANG_CXX_LIBRARY: "libc++"
+    DEVELOPMENT_TEAM: ${XCODE_TEAM_ID}
+    CODE_SIGN_STYLE: Automatic
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    DEAD_CODE_STRIPPING: YES
+    GCC_OPTIMIZATION_LEVEL: 0   # debug build by default; override with `xcodebuild -configuration Release`
+    SWIFT_OPTIMIZATION_LEVEL: -Onone
+
+#====================================================================
+# Targets
+#====================================================================
+targets:
+
+  #--------------------------------------------------------------
+  # MacAMDGPU — the DriverKit extension itself.
+  #
+  # xcodegen recognizes `driver-extension` and sets the right
+  # product type (com.apple.product-type.driver-extension) plus
+  # SDKROOT=driverkit. Sources include both the top-level PCI dext
+  # plumbing and the dext/amdgpu/ ported bringup code.
+  #--------------------------------------------------------------
+  MacAMDGPU:
+    type: driver-extension
+    platform: macOS
+    sources:
+      - path: dext
+        includes:
+          - "*.cpp"
+          - "*.iig"
+          - "*.h"
+          - "amdgpu/**/*.cpp"
+          - "amdgpu/**/*.h"
+        excludes:
+          - "README.md"
+    dependencies:
+      - sdk: PCIDriverKit.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.MacAMDGPUHost.MacAMDGPU
+        PRODUCT_NAME: MacAMDGPU
+        SDKROOT: driverkit
+        DRIVERKIT_DEPLOYMENT_TARGET: "23.0"
+        SUPPORTED_PLATFORMS: driverkit
+        INFOPLIST_FILE: dext/Info.plist
+        CODE_SIGN_ENTITLEMENTS: dext/MacAMDGPU.entitlements
+        DEAD_CODE_STRIPPING: NO    # IIG-generated symbols need to stay
+        DEFINES_MODULE: NO
+        HEADER_SEARCH_PATHS:
+          - $(inherited)
+          - $(SRCROOT)/dext
+          - $(SRCROOT)/dext/amdgpu
+        OTHER_LDFLAGS: "$(inherited) -framework DriverKit -framework PCIDriverKit"
+
+  #--------------------------------------------------------------
+  # MacAMDGPUHost — the SwiftUI parent app.
+  #
+  # Embeds the dext as a SystemExtension. The dext's bundle ID
+  # MUST be a child of this app's bundle ID per Apple's rules.
+  #--------------------------------------------------------------
+  MacAMDGPUHost:
+    type: application
+    platform: macOS
+    sources:
+      - path: Host
+        includes:
+          - "*.swift"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.MacAMDGPUHost
+        PRODUCT_NAME: MacAMDGPUHost
+        INFOPLIST_FILE: Host/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Host/Host.entitlements
+        ENABLE_HARDENED_RUNTIME: YES
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        SYSTEM_EXTENSION_TARGETS: MacAMDGPU
+    dependencies:
+      - target: MacAMDGPU
+        embed: true
+        codeSign: true
+        copy:
+          destination: plugins
+          subpath: Contents/Library/SystemExtensions

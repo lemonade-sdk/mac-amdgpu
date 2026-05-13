@@ -26,7 +26,7 @@
 
 #include "amdgpu_psp.h"
 
-namespace MacAMDGPU {
+namespace amdgpu {
 
 enum class BringupStage : uint32_t {
     None          = 0,
@@ -69,4 +69,4 @@ kern_return_t bringup_to(BringupContext &ctx, BringupStage target);
 //
 kern_return_t bringup_ip_discovery(BringupContext &ctx);
 
-} // namespace MacAMDGPU
+} // namespace amdgpu

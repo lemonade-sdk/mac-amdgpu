@@ -94,7 +94,7 @@ struct MacAMDGPU_IVars {
     // Phase 1B: per-device bringup state shared across user clients.
     // Populated lazily when PCI is opened. Stages run on demand via
     // InitDevice selector.
-    MacAMDGPU::BringupContext bringup;
+    amdgpu::BringupContext bringup;
 };
 
 //
@@ -801,8 +801,8 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             // on first BAR map. Force the client to map BAR0 first.
             return kIOReturnNotOpen;
         }
-        auto stage = (MacAMDGPU::BringupStage)arguments->scalarInput[0];
-        kern_return_t ret = MacAMDGPU::bringup_to(driver->ivars->bringup,
+        auto stage = (amdgpu::BringupStage)arguments->scalarInput[0];
+        kern_return_t ret = amdgpu::bringup_to(driver->ivars->bringup,
                                                   stage);
         arguments->scalarOutput[0] =
             (uint64_t)driver->ivars->bringup.reached;
@@ -840,35 +840,35 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         case kMacAMDGPUFwTypeSOS: {
             psp.sosFirmware     = bin;
             psp.sosFirmwareSize = fwSize;
-            kern_return_t ret = MacAMDGPU::psp_load_sos(dev, psp);
+            kern_return_t ret = amdgpu::psp_load_sos(dev, psp);
             psp.sosFirmware = nullptr;
             psp.sosFirmwareSize = 0;
             return ret;
         }
         case kMacAMDGPUFwTypeKDB:
-            return MacAMDGPU::psp_bootloader_load_component(
-                dev, psp, bin, fwSize, MacAMDGPU::PSPBootloaderCmd::LoadKeyDatabase);
+            return amdgpu::psp_bootloader_load_component(
+                dev, psp, bin, fwSize, amdgpu::PSPBootloaderCmd::LoadKeyDatabase);
         case kMacAMDGPUFwTypeSPL:
-            return MacAMDGPU::psp_bootloader_load_component(
-                dev, psp, bin, fwSize, MacAMDGPU::PSPBootloaderCmd::LoadTosSPLTable);
+            return amdgpu::psp_bootloader_load_component(
+                dev, psp, bin, fwSize, amdgpu::PSPBootloaderCmd::LoadTosSPLTable);
         case kMacAMDGPUFwTypeSysDrv:
-            return MacAMDGPU::psp_bootloader_load_component(
-                dev, psp, bin, fwSize, MacAMDGPU::PSPBootloaderCmd::LoadSysDrv);
+            return amdgpu::psp_bootloader_load_component(
+                dev, psp, bin, fwSize, amdgpu::PSPBootloaderCmd::LoadSysDrv);
         case kMacAMDGPUFwTypeSocDrv:
-            return MacAMDGPU::psp_bootloader_load_component(
-                dev, psp, bin, fwSize, MacAMDGPU::PSPBootloaderCmd::LoadSocDrv);
+            return amdgpu::psp_bootloader_load_component(
+                dev, psp, bin, fwSize, amdgpu::PSPBootloaderCmd::LoadSocDrv);
         case kMacAMDGPUFwTypeIntfDrv:
-            return MacAMDGPU::psp_bootloader_load_component(
-                dev, psp, bin, fwSize, MacAMDGPU::PSPBootloaderCmd::LoadIntfDrv);
+            return amdgpu::psp_bootloader_load_component(
+                dev, psp, bin, fwSize, amdgpu::PSPBootloaderCmd::LoadIntfDrv);
         case kMacAMDGPUFwTypeDbgDrv:
-            return MacAMDGPU::psp_bootloader_load_component(
-                dev, psp, bin, fwSize, MacAMDGPU::PSPBootloaderCmd::LoadHADDrv);
+            return amdgpu::psp_bootloader_load_component(
+                dev, psp, bin, fwSize, amdgpu::PSPBootloaderCmd::LoadHADDrv);
         case kMacAMDGPUFwTypeRASDrv:
-            return MacAMDGPU::psp_bootloader_load_component(
-                dev, psp, bin, fwSize, MacAMDGPU::PSPBootloaderCmd::LoadRASDrv);
+            return amdgpu::psp_bootloader_load_component(
+                dev, psp, bin, fwSize, amdgpu::PSPBootloaderCmd::LoadRASDrv);
         case kMacAMDGPUFwTypeIPKeyMgrDrv:
-            return MacAMDGPU::psp_bootloader_load_component(
-                dev, psp, bin, fwSize, MacAMDGPU::PSPBootloaderCmd::LoadIPKeyMgrDrv);
+            return amdgpu::psp_bootloader_load_component(
+                dev, psp, bin, fwSize, amdgpu::PSPBootloaderCmd::LoadIPKeyMgrDrv);
         default:
             MACAMDGPU_LOG("LoadFirmware: fw type %llu not yet implemented",
                           fwType);
@@ -885,11 +885,11 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         }
         uint64_t blockId = arguments->scalarInput[0];
         uint64_t base    = arguments->scalarInput[1];
-        if (blockId >= (uint64_t)MacAMDGPU::IPBlock::Count) {
+        if (blockId >= (uint64_t)amdgpu::IPBlock::Count) {
             return kIOReturnBadArgument;
         }
         driver->ivars->bringup.device.ip.set(
-            (MacAMDGPU::IPBlock)blockId, (uint32_t)base);
+            (amdgpu::IPBlock)blockId, (uint32_t)base);
         MACAMDGPU_LOG("IP base block=%llu set to %#llx", blockId, base);
         return kIOReturnSuccess;
     }
@@ -902,10 +902,10 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             return kIOReturnBadArgument;
         }
         uint64_t blockId = arguments->scalarInput[0];
-        if (blockId >= (uint64_t)MacAMDGPU::IPBlock::Count) {
+        if (blockId >= (uint64_t)amdgpu::IPBlock::Count) {
             return kIOReturnBadArgument;
         }
-        auto block = (MacAMDGPU::IPBlock)blockId;
+        auto block = (amdgpu::IPBlock)blockId;
         arguments->scalarOutput[0] = driver->ivars->bringup.device.ip.get(block);
         arguments->scalarOutput[1] =
             driver->ivars->bringup.device.ip.isResolved(block) ? 1 : 0;

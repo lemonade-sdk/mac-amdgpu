@@ -32,7 +32,7 @@
 #define PSP_LOG(fmt, ...) \
     os_log(OS_LOG_DEFAULT, "mac.amdgpu.psp: " fmt, ##__VA_ARGS__)
 
-namespace MacAMDGPU {
+namespace amdgpu {
 
 kern_return_t
 psp_init(DeviceContext &dev, PSPContext &psp)
@@ -381,4 +381,4 @@ psp_ring_create(DeviceContext &dev, PSPContext &psp)
     return kIOReturnSuccess;
 }
 
-} // namespace MacAMDGPU
+} // namespace amdgpu
