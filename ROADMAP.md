@@ -1,27 +1,34 @@
-# mac_amdgpu — Native AMD GPU Stack for macOS
+# mac_amdgpu — Native AMD GPU Stack for macOS (Apple Silicon, RDNA4)
 
-A third-party, Metal-bypassing graphics + compute stack for AMD GPUs on macOS, built from the bare metal up. This replans the original 3-phase plan and adds a Phase 0 (gates), a hard-split Phase 1 (bringup vs. UAPI), and a Phase 2 strategy that's neither "fork RADV wholesale" nor "rebuild from scratch."
-
----
-
-## 0. Reality check — read this first
-
-The original plan is structurally right but understates four killers. Phase 0 exists to flush these out before a single line of dext code:
-
-1. **DriverKit PCIe entitlement.** `com.apple.developer.driverkit.transport.pci` is gated by Apple — a manual request, not a checkbox. Without it, the dext won't load even on your own machine outside development mode. **Status: TBD — apply early, this can take weeks/months.**
-2. **Mac platform.** Intel Macs (Mac Pro 7,1; iMac Pro; Intel mini with eGPU) use VT-d/IOMMU and the legacy IOPCIFamily kext story. Apple Silicon Macs use DART for DMA, and **PCIe device enumeration over Thunderbolt for non-Apple-blessed GPUs is essentially unsupported by macOS** — Apple has dropped AMD support on AS entirely. **The realistic target is Intel Mac + eGPU enclosure or Mac Pro 7,1 MPX/PCIe slot.** Apple Silicon is a research project, not a product.
-3. **Target ASIC.** Every generation (GCN5/Vega, GFX10/RDNA1+2, GFX11/RDNA3, GFX12/RDNA4) has different register maps, firmware, packet formats, and microcode layout. **You pick one chip, you stay on it for the first year.** Recommendation: Navi 21/22/23 (RDNA2 — RX 6600/6700/6800) — widely available, well-documented in Linux, last gen Apple shipped drivers for, and supported by AMD's open firmware redistribution.
-4. **Firmware redistribution.** AMD's firmware is redistributable under their license (see `LICENSE.amdgpu` in linux-firmware) but you must ship a copy with attribution. Don't extract from macOS — use linux-firmware blobs.
-
-If any of the four can't be satisfied, the project re-shapes:
-- No PCIe entitlement → headless dev only; can't distribute.
-- AS-only → fallback to a Metal-backed compute path (defeats the purpose).
-- Unable to commit to one ASIC → scope explosion.
-- Firmware → blocked.
+A third-party, Metal-bypassing graphics + compute stack for AMD RDNA4 GPUs (gfx1201 — Radeon AI PRO R9700) on Apple Silicon M-series Macs (M5 Pro/Max with Thunderbolt 5), built from the bare metal up. Replans the original 3-phase plan into 0–4 phases with updated 2026 platform reality.
 
 ---
 
-## 1. Architecture (1000-foot view)
+## 0. Platform & target — fixed
+
+| Decision | Value | Notes |
+|---|---|---|
+| Mac platform | **Apple Silicon (M5 Pro/Max, M5 Ultra)** | TB5 controller on-die; PCIe eGPU enumeration over TB5/USB4 works. Tiny Corp's TinyGPU is the public precedent for Apple-signed third-party dext for eGPUs over TB. |
+| Bus | **Thunderbolt 5 (~80 Gbps usable bidirectional)** | Bandwidth budget for Phase 3 copy-back is real (~10 GB/s each direction), much better than the TB3 era. |
+| Target ASIC | **AMD Radeon AI PRO R9700 (RDNA4, gfx1201, 32 GB GDDR6 ECC)** | Workstation card, $1299, 96 TFLOPs FP16, 128 AI accelerators, 300 W TDP, DP 2.1a. PCIe Gen5 x16 native. |
+| GPU IP blocks | GFX12 (gfx_v12_1), GMC v12, SDMA v7_1, MES v12_1, NBIO v7_11, PSP v14_0_3, SMU v14_0_3 | Linux source maps to these versioned drivers under `drivers/gpu/drm/amd/amdgpu/`. |
+| Firmware blobs | `gc_12_0_1_*`, `psp_14_0_3_*`, `smu_14_0_3*`, `sdma_7_0_1` | All present in `upstream/linux-firmware/amdgpu/`. AMD redistributable license. |
+| Host OS | macOS 26 (Sequoia successor) — pinned to a known-good build | DriverKit ABI churn risk; pin and document. |
+| Vulkan API target | 1.3 + `VK_EXT_metal_surface` | Compute-first; graphics in Phase 3. |
+
+---
+
+## 1. Reality check — read before any code
+
+1. **Prior art: Tiny Corp's TinyGPU.** Apple has approved an open driver extension that lets AMD/NVIDIA eGPUs run on M-series Macs over TB/USB4. It is **compute-only, AI-focused, no graphics acceleration**. This is project-shaping: the entitlement path is provable, and TinyGPU's dext is the closest reference implementation. **Gate 0.X: evaluate whether TinyGPU's UAPI is sufficient for our Vulkan compute ICD — if yes, skip most of Phase 1.** If not, build our own dext but borrow lessons.
+2. **DriverKit entitlement workflow.** The correct sequence is: build the Xcode dext bundle → register bundle ID + vendor identity on Apple Developer portal → request `com.apple.developer.driverkit.transport.pci` against that bundle ID. Apple's review can take weeks. Do this in parallel with Phase 1A skeleton code, not before.
+3. **DART (Apple Silicon DMA).** On AS, PCIe DMA is mediated by DART (Device Address Resolution Table) — Apple's IOMMU. PCIDriverKit's `IODMACommand` abstracts this, but pinning, alignment, and TLB invalidation semantics differ from VT-d. Phase 1A must validate DMA round-trip before the bringup sequence depends on it.
+4. **MES, not bare MEC.** RDNA4 has graduated to MES (MicroEngine Scheduler)-managed queues for many submission paths. The Linux driver uses `mes_v12_1.c` to manage queue lifecycle. Phase 1B is meaningfully different from RDNA2 — plan around MES queue ops, not raw KIQ/MEC ring programming.
+5. **Firmware redistribution.** AMD firmware is in `upstream/linux-firmware/amdgpu/`, license is permissive with attribution. Ship `NOTICE` + `LICENSE.amdgpu` and you're clean.
+
+---
+
+## 2. Architecture (1000-foot view)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -30,212 +37,235 @@ If any of the four can't be satisfied, the project re-shapes:
                            │ Vulkan API
 ┌──────────────────────────▼──────────────────────────────────┐
 │  amdvk-mac (Vulkan ICD, userspace)                          │
-│    ├─ vk_*: dispatch tables, object lifetime, descriptors   │
-│    ├─ compiler: SPIR-V → NIR → ACO → GFX10/11 binary        │
+│    ├─ vk_*: dispatch, object lifetime, descriptors          │
+│    ├─ compiler: SPIR-V → NIR → ACO → gfx1201 binary         │
 │    │            (vendored from mesa/src/amd + compiler/nir) │
-│    ├─ packets: PM4/SDMA encoders (vendored mesa/src/amd)    │
+│    ├─ packets: PM4/SDMA encoders for GFX12/SDMA7            │
 │    ├─ winsys-mac: BO alloc, submit, fence, GART, GTT        │
-│    └─ wsi-mac: IOSurface render-to-texture + CALayer        │
+│    └─ wsi-mac: VK_EXT_metal_surface + IOSurface copyback    │
 └──────────────────────────┬──────────────────────────────────┘
                            │ IOUserClient (custom protocol)
 ┌──────────────────────────▼──────────────────────────────────┐
-│  amdgpu.dext (PCIDriverKit extension, userspace kernel-side)│
-│    ├─ pci: BAR map, MSI-X, config space                     │
-│    ├─ smu/psp: firmware load, power-up, clocks              │
-│    ├─ atom: ATOMBIOS parse (clocks, voltage, displays)      │
-│    ├─ gmc: GART/VM page tables, DART integration            │
-│    ├─ ring: GFX/SDMA/compute ring submission                │
-│    ├─ irq: interrupt routing, IH ring drain                 │
-│    └─ uapi: IOUserClient — mirrors Linux DRM amdgpu UAPI    │
+│  amdgpu.dext (PCIDriverKit, Apple Silicon, userspace-kernel)│
+│    ├─ pci: BAR map, MSI-X, config space (TB5 endpoint)      │
+│    ├─ dart: DMA through Apple's IOMMU                       │
+│    ├─ psp: PSP v14 bringup, SOS load, firmware verification │
+│    ├─ smu: SMU v14_0_3 — clocks, power, telemetry           │
+│    ├─ gmc: GMC v12 — VRAM detect, GART, VM page tables      │
+│    ├─ mes: MES v12_1 — queue creation, scheduler            │
+│    ├─ gfx/sdma: GFX12 + SDMA7 ring submission via MES       │
+│    ├─ irq: IH ring drain, MSI-X dispatch                    │
+│    └─ uapi: IOUserClient — mirrors Linux amdgpu UAPI subset │
 └──────────────────────────┬──────────────────────────────────┘
-                           │ PCIe / Thunderbolt / DART
+                           │ PCIe Gen5 / Thunderbolt 5 / DART
                   ┌────────▼─────────┐
-                  │  AMD GPU (Navi 2X) │
+                  │ Radeon AI PRO R9700│
+                  │   (gfx1201, 32GB) │
                   └────────────────────┘
 ```
 
-The split is deliberate: the dext owns hardware state and ring submission; the userspace ICD owns memory management policy, command building, and shaders. This mirrors Linux's split (DRM kernel + Mesa userspace) and lets us reuse Mesa's userspace compiler & packet code with only the winsys layer rewritten.
+Split mirrors Linux DRM/Mesa split: dext owns hardware state and queue lifecycle; ICD owns memory policy, command building, and shaders. Mesa's userspace compiler + packet code is reusable; only winsys + WSI are rewritten.
 
 ---
 
-## 2. The RADV question — answered
+## 3. The RADV question — answered
 
-> Would you fork RADV directly, or build a leaner bespoke compute-only ICD from scratch?
+> Fork RADV directly, or build a leaner bespoke compute-only ICD from scratch?
 
-**Neither. Vendor the parts that don't depend on Linux; rewrite the parts that do.**
-
-A clean "fork RADV" loses you a year fighting the Linux/DRM coupling in RADV's `winsys/amdgpu/`, sync primitives (drm syncobj), CS submit ioctls, and `radv_device.c`'s mountain of feature toggles. A "build from scratch" loses you two years re-implementing ACO, NIR-to-ACO, register encoders, packet builders, descriptor encoding for GFX10/11, and SPIR-V translation — code that already exists and is correct.
-
-The pragmatic line:
+**Neither. Vendor what's not Linux-coupled; rewrite only the kernel-facing layers.**
 
 | Component | Strategy | Source |
 |---|---|---|
-| ACO compiler | **Vendor as-is** | `mesa/src/amd/compiler/` |
-| NIR + SPIR-V→NIR | **Vendor as-is** | `mesa/src/compiler/nir`, `mesa/src/compiler/spirv` |
-| PM4/SDMA packet encoders | **Vendor as-is** | `mesa/src/amd/common/` |
-| Register definitions | **Vendor as-is** | `mesa/src/amd/registers/` |
-| `addrlib` (tiling/swizzle) | **Vendor as-is** | `mesa/src/amd/addrlib/` |
-| Vulkan dispatch (`vk_*`) | **Vendor scaffolding** | `mesa/src/vulkan/runtime/` |
-| RADV state tracker | **Reference only — rewrite minimal subset** | `mesa/src/amd/vulkan/` |
-| `winsys/amdgpu/*` (libdrm calls) | **Throw away — rewrite** | N/A |
-| WSI (X11/Wayland) | **Throw away — rewrite as Metal/IOSurface WSI** | N/A |
+| ACO compiler | Vendor as-is | `mesa/src/amd/compiler/` |
+| NIR + SPIR-V→NIR | Vendor as-is | `mesa/src/compiler/{nir,spirv}` |
+| PM4/SDMA encoders | Vendor as-is | `mesa/src/amd/common/` |
+| Register definitions (incl. gfx1201) | Vendor as-is | `mesa/src/amd/registers/` |
+| `addrlib` (tiling/swizzle) | Vendor as-is | `mesa/src/amd/addrlib/` |
+| Vulkan dispatch (`vk_*`) | Vendor scaffolding | `mesa/src/vulkan/runtime/` |
+| RADV state tracker | Reference; port compute subset | `mesa/src/amd/vulkan/` |
+| `winsys/amdgpu/*` (libdrm) | Throw away; rewrite | N/A |
+| WSI (X11/Wayland) | Throw away; rewrite as Metal/IOSurface WSI | N/A |
 
-What this gives you is **"RADV-mac"** — a Vulkan driver that's ~5–10% original code, ~90% Mesa, with the line drawn at "anything that calls into the kernel." Plumbing only. The compute-only subset is then a build flag (skip graphics pipeline, skip render passes, skip WSI), not a separate codebase.
-
-**Risk this hedges:** building compute-only from scratch means you eventually re-do all this work for graphics in Phase 3. The vendored path means Phase 3 is mostly "implement the WSI extension and wire up render passes" — already-supported code paths in the vendored RADV.
+Result is **"RADV-mac"** — ~5–10% original code, ~90% Mesa, line drawn at the kernel boundary. Compute-only is a build flag (skip render passes, skip graphics pipeline, skip WSI), not a separate codebase.
 
 ---
 
-## 3. Phased roadmap
+## 4. Phased roadmap
 
-### Phase 0 — Gates (weeks, not months)
+### Phase 0 — Gates
 
 | # | Task | Done when |
 |---|---|---|
-| 0.1 | Apply for `com.apple.developer.driverkit.transport.pci` entitlement | Apple approves or denies |
-| 0.2 | Pick target ASIC + acquire hardware | RX 6600/6700/6800 or similar Navi 2x in hand |
-| 0.3 | Pick target Mac platform | Intel Mac (Mac Pro 7,1 or eGPU-capable Intel) on macOS 14/15 |
-| 0.4 | Stand up Linux reference rig (same GPU) | Vanilla Ubuntu + amdgpu + vkcube + llama.cpp Vulkan working |
-| 0.5 | Capture a "known-good" trace | `umr` / `radeontool` dumps of register init + a vkcube submission |
-| 0.6 | Audit AMD firmware license + ship attribution | NOTICE / LICENSE files committed |
-| 0.7 | Decide on debug strategy | JTAG/serial via Thunderbolt? `vmwrite` instrumentation? `os_log` to host? |
+| 0.1 | Evaluate TinyGPU UAPI sufficiency for compute ICD | Decision: reuse TinyGPU dext, or build our own. |
+| 0.2 | Acquire R9700 + M5 Max/Ultra Mac + TB5 enclosure | Hardware in hand. |
+| 0.3 | Stand up Linux reference rig (R9700 + Ubuntu 24.04.3 + kernel 6.17+) | `vkcube` and `llama.cpp` Vulkan working. |
+| 0.4 | Capture umr/radeontool register init + vkcube submit trace | Reference traces archived under `docs/traces/`. |
+| 0.5 | Pull firmware blobs for gfx1201, record versions in `firmware/MANIFEST.md` | Manifest committed. |
+| 0.6 | Author NOTICE + LICENSE.amdgpu | Files committed. |
+| 0.7 | Decide debug strategy (`os_log` + IOUserClient debug method + Linux umr cross-ref) | `docs/DEBUG.md` written. |
+| 0.8 | Pin macOS build + capture DriverKit SDK version | `docs/HARDWARE.md` written. |
 
-**Gate to Phase 1: 0.1, 0.2, 0.3, 0.4 all green.**
+**Gate to Phase 1:** 0.1, 0.2, 0.3.
 
-### Phase 1 — Dext bringup (the hard part)
+### Phase 1A — Dext skeleton + PCI plumbing + entitlement
 
-Split into 1A (skeleton + PCI) and 1B (power-up + rings). 1A is ~weeks; 1B is ~months.
+Build the Xcode bundle first so the entitlement request has a target. Apple's review runs in parallel with code.
 
-#### 1A — PCI plumbing
-- 1A.1 Xcode project: `amdgpu.dext`, PCIDriverKit target, Info.plist with VID/DID match.
-- 1A.2 `IOPCIDevice` open, config space read (verify ASIC ID against expected).
-- 1A.3 Map BAR0 (registers), BAR2 (VRAM aperture), BAR5 (doorbells).
-- 1A.4 MSI-X allocation via `IOInterruptDispatchSource`.
-- 1A.5 DART/IOMMU setup — `IODMACommand` for DMA-able buffers.
-- 1A.6 `IOUserClient` subclass with a stub method table; round-trip a ping from userspace.
+- 1A.1 Create Xcode workspace `mac_amdgpu.xcworkspace` + `amdgpu.dext` target (PCIDriverKit).
+- 1A.2 Info.plist `IOKitPersonalities` matching VID `0x1002` / DID `0x7550` (R9700) or wildcard for the gfx1201 family.
+- 1A.3 Build, codesign with team identity → bundle ID registered on Apple Developer portal.
+- 1A.4 **Submit entitlement request** for `com.apple.developer.driverkit.transport.pci` against bundle ID — parallel to 1A.5+.
+- 1A.5 `Start()` — open `IOPCIDevice` over TB5, log VID/DID/config space.
+- 1A.6 Map BARs — BAR0 (registers, MMIO), BAR2 (VRAM aperture), BAR5 (doorbells).
+- 1A.7 Enable bus master + MSI-X; allocate N vectors via `IOInterruptDispatchSource`.
+- 1A.8 DART/DMA validation — `IODMACommand` allocate, write, GPU SDMA-copy back, bit-compare.
+- 1A.9 `IOUserClient` subclass + stub method table.
+- 1A.10 Userspace test (`scripts/dext_ping.swift`) — open service, ping round-trip.
 
-**Milestone 1A:** dext loads, claims the device, userspace can ping it. No hardware activity beyond config space reads.
+**Milestone 1A:** dext loads, claims R9700, DMA round-trip works, userspace can ping. No hardware activity beyond config space + DMA validation.
 
-#### 1B — Hardware initialization
+### Phase 1B — Hardware bringup (RDNA4-specific)
 
-Port from `linux/drivers/gpu/drm/amd/amdgpu/`. Stay generation-locked.
+Port from `upstream/linux/drivers/gpu/drm/amd/amdgpu/` against the gfx1201/v12_1/v7/v14 versioned files. Cite Linux source files in commit messages. Cross-check every register write against umr traces from the Linux reference rig.
 
-- 1B.1 ATOMBIOS parser (`amdgpu_atombios.c`) — read VBIOS from ROM, extract clock/voltage tables.
-- 1B.2 SMU firmware load + handshake (`amdgpu_psp.c`, `smu_v11_0.c` for Navi). PSP loads SOS, then drives SMU.
-- 1B.3 GMC init (`gmc_v10_0.c`) — VRAM size detect, GART aperture setup, page table format.
-- 1B.4 GFX firmware load (CP/ME/MEC/RLC microcode from `linux-firmware/amdgpu/navi*`).
-- 1B.5 IH (interrupt handler) ring init — drain into a per-source dispatch table.
-- 1B.6 GFX ring init — KIQ + GFX queue, doorbell mapping, ring buffer in VRAM.
-- 1B.7 First PM4 packet: `NOP` → `WRITE_DATA` → fence. **"Hello GFX" milestone.**
-- 1B.8 SDMA ring — async DMA copies (you'll need this for VRAM uploads).
-- 1B.9 Compute ring (MEC) — required for any compute submit.
-- 1B.10 BO management UAPI — `alloc_bo(size, domain)`, `map_bo(handle)`, `submit_cs(ring, packets, deps)`.
+- 1B.1 IP discovery — RDNA4 uses on-die IP discovery table (`amdgpu_discovery.c`).
+- 1B.2 PSP v14 bringup (`psp_v14_0.c`): load `psp_14_0_3_sos.bin`, verify SOS signature, hand off.
+- 1B.3 SMU v14_0_3 (`smu_v14_0.c` + `smu_v14_0_2_ppt.c`): handshake via SMU mailbox; enable PCIe link training and basic clocks.
+- 1B.4 GMC v12 (`gmc_v12_0.c`): detect VRAM size (32 GB), program GART aperture, VM page table format (GFX12 PTE layout — different from GFX11).
+- 1B.5 Load GFX12 firmware: `gc_12_0_1_pfp.bin`, `gc_12_0_1_me.bin`, `gc_12_0_1_mec.bin`, `gc_12_0_1_rlc.bin`, `gc_12_0_1_imu.bin`, `gc_12_0_1_mes.bin`, `gc_12_0_1_mes1.bin`, `gc_12_0_1_toc.bin`.
+- 1B.6 IMU init (image management unit — new on GFX12 path).
+- 1B.7 RLC init + microcode bringup.
+- 1B.8 MES v12_1 init (`mes_v12_0.c`): MES is the queue scheduler on RDNA4 — most submissions go through MES, not direct KIQ.
+- 1B.9 NBIO v7_11 setup (`nbio_v7_11.c`) — interrupt routing, BIF programming.
+- 1B.10 IH ring init (`ih_v7_0.c`) + MSI-X dispatch wiring.
+- 1B.11 Create GFX queue via MES — doorbell mapping, ring buffer in VRAM.
+- 1B.12 First PM4: `NOP` → `WRITE_DATA` → `RELEASE_MEM` fence → IH → userspace. **"Hello GFX12" milestone.**
+- 1B.13 SDMA v7_1 (`sdma_v7_0.c`) — async copy engine; validate VRAM↔system bit-compare.
+- 1B.14 Compute queue (via MES) — separate ring for compute submits.
+- 1B.15 UAPI: `alloc_bo`, `free_bo`, `map_bo`, `submit_cs(queue, ib, deps)`, `wait_fence`, `info`.
+- 1B.16 Stress: 10k consecutive submits + fence, no leak/hang/PSP reset.
+- 1B.17 Power cycle test: idle → load → idle without crash.
 
-**Milestone 1B:** userspace test program submits a PM4 `WRITE_DATA` to GFX ring, signals a fence, kernel-mode IH fires, userspace sees the fence value. **You now have a programmable AMD GPU on macOS.**
+**Milestone 1B:** programmable AMD R9700 under macOS via custom UAPI. (Or: TinyGPU bridged if Phase 0.1 chose reuse — Phase 1B is then much smaller.)
 
-### Phase 2 — Vulkan compute ICD
+### Phase 2A — winsys-mac
 
-#### 2A — winsys-mac
+- 2A.1 Define `winsys.h` shape matching Mesa's `radeon_winsys.h` (so RADV's expectations swap cleanly).
+- 2A.2 BO alloc/free/map/unmap over IOUserClient.
+- 2A.3 BO domain selector (VRAM / GTT / system).
+- 2A.4 CS context, IB build via `ac_pm4`, submit path packs PM4 for dext.
+- 2A.5 Fence + timeline semaphore — wrap kernel fence handles.
+- 2A.6 BO export/import via mach port (for IOSurface bridging in Phase 3).
+- 2A.7 `query_info` — surface heap sizes, queue counts, asic id (gfx1201).
+- 2A.8 Standalone test: hand-rolled PM4 stream submitted via winsys → fence completes.
 
-Replace Mesa's `winsys/amdgpu/` (which calls `libdrm_amdgpu`) with one that calls your IOUserClient.
+### Phase 2B — Vulkan ICD
 
-- 2A.1 BO struct + alloc/free over IOUserClient.
-- 2A.2 CS context, dependency tracking, fence/sync primitive.
-- 2A.3 Submit path — pack PM4 from Mesa's `ac_pm4` builder, ship to dext.
-- 2A.4 Query info — `amdgpu_query_info` equivalent (GPU info, heap sizes, queue counts).
+- 2B.1 Meson cross-file for macOS arm64; build infra.
+- 2B.2 Vendor `mesa/src/util/` with macOS shims for Linux-only bits (`futex` → `os_unfair_lock`, `inotify` → no-op, etc.).
+- 2B.3 Vendor `mesa/src/compiler/{nir,spirv}`.
+- 2B.4 Vendor `mesa/src/amd/{common,registers,addrlib,compiler}`.
+- 2B.5 Vendor `mesa/src/vulkan/runtime`.
+- 2B.6 Port `radv_instance` / `radv_physical_device` against our winsys; expose gfx1201.
+- 2B.7 Port `radv_device` — strip graphics/render-pass/WSI initially.
+- 2B.8 Port command pool + command buffer.
+- 2B.9 Port compute pipeline (`radv_pipeline_compute.c`).
+- 2B.10 Port descriptor set + pipeline layout.
+- 2B.11 Port buffer, image (compute-usable storage), memory binding.
+- 2B.12 Port fence, binary + timeline semaphore.
+- 2B.13 SPIR-V → NIR → ACO → gfx1201 ISA path.
+- 2B.14 ICD JSON installed to `/usr/local/share/vulkan/icd.d/amdvk_mac_icd.json`.
+- 2B.15 `vulkaninfo` enumerates the AMD device.
 
-#### 2B — Build the ICD
+### Phase 2C — Compute validation
 
-Vendor Mesa subtrees into `vk/`. Build with meson cross-file for macOS.
+- 2C.1 Hand-rolled "vkAdd" — two buffers, compute sum, readback.
+- 2C.2 `vkcube --compute`.
+- 2C.3 `dEQP-VK.compute.basic.*` — target 80% pass.
+- 2C.4 `dEQP-VK.api.compute.*` — collect pass/fail diff vs Linux R9700 reference.
+- 2C.5 Build llama.cpp with `GGML_VULKAN=ON`.
+- 2C.6 Load Phi-3 / Llama-3-8B GGUF, single forward pass, output bit-similar to CPU reference.
+- 2C.7 Benchmark tokens/sec vs Linux reference; expect within 10–20%.
 
-- 2B.1 Vendor `src/amd/{common,registers,addrlib,compiler}` and `src/compiler/{nir,spirv}`.
-- 2B.2 Vendor `src/vulkan/runtime` (the `vk_*` scaffolding).
-- 2B.3 Port `src/amd/vulkan` minimal subset — skip render passes, skip graphics pipeline, keep:
-  - device/physical-device/instance
-  - queue, command buffer
-  - compute pipeline, descriptor set, pipeline layout
-  - buffer, image (compute-usable only), memory
-  - fence, semaphore (timeline + binary)
-  - SPIR-V shader module + ACO compile path
-- 2B.4 Install as `MoltenVK`-style ICD JSON (`/usr/local/share/vulkan/icd.d/amdvk_mac_icd.json`).
+**Milestone 2:** llama.cpp inference on R9700 under macOS, zero Metal.
 
-#### 2C — Compute validation
+### Phase 3A — Graphics pipeline
 
-- 2C.1 `vkEnumeratePhysicalDevices` returns AMD GPU.
-- 2C.2 `vkcube` compute path or a hand-rolled "add two buffers" compute shader runs.
-- 2C.3 Vulkan CTS compute subset (`dEQP-VK.compute.*`) — aim for 80%+, not 100%.
-- 2C.4 `llama.cpp` Vulkan backend loads weights, runs a forward pass, output matches CPU reference.
+- 3A.1 Re-enable RADV render pass + framebuffer code.
+- 3A.2 Re-enable RADV graphics pipeline (vertex → fragment).
+- 3A.3 Image tiling via addrlib for GFX12 color + depth swizzle.
+- 3A.4 Offscreen `vkcube` (full graphics, BO readback, visual-diff against Linux).
 
-**Milestone 2:** llama.cpp running on an AMD GPU on a Mac with zero Metal involvement.
+### Phase 3B — WSI for macOS
 
-### Phase 3 — Graphics + presentation
+- 3B.1 Implement `VK_EXT_metal_surface`.
+- 3B.2 `VkSurfaceKHR` backed by `CAMetalLayer*` (handed in from app).
+- 3B.3 Swapchain images allocated as IOSurface-exportable BOs in R9700 VRAM.
+- 3B.4 Present routine:
+  1. GFX12 renders to VRAM IOSurface.
+  2. SDMA v7 copies VRAM → system-memory IOSurface (TB5 upstream).
+  3. Hand system IOSurface to `CAMetalLayer.contents` (or via Metal `MTLTexture` import from IOSurface).
+- 3B.5 VSync via `CVDisplayLink`.
+- 3B.6 `vkcube` (full graphics, on-screen).
+- 3B.7 Triple buffering with in-flight present pipeline.
 
-#### 3A — Graphics pipeline
-- 3A.1 Re-enable RADV's graphics state tracker (render pass, framebuffer, GFX pipeline).
-- 3A.2 Color/depth attachments — tiling via addrlib.
-- 3A.3 Validate with `vkcube` (full graphics), `vkmark`, `vkQuake`.
+### Phase 3C — Optimization
 
-#### 3B — WSI: VK_EXT_metal_surface
-- 3B.1 Implement `VkSurfaceKHR` backed by `CAMetalLayer`.
-- 3B.2 Swapchain images allocated in AMD VRAM as IOSurface-exportable BOs.
-- 3B.3 Present routine:
-  1. Render to VRAM IOSurface.
-  2. SDMA copy → system memory IOSurface (PCIe upstream).
-  3. Hand IOSurface to `CAMetalLayer` via `CALayer.contents` or Metal interop.
-- 3B.4 VSync via `CVDisplayLink` callback driving present queue.
-
-#### 3C — Optimization
-- 3C.1 Profile the copy-back — saturate PCIe upstream bandwidth (~3 GB/s TB3, ~6 GB/s TB4, ~16 GB/s PCIe 4.0 x16).
-- 3C.2 Tile-based incremental upload (only changed tiles) — addrlib helps.
-- 3C.3 Pipeline submit and copy with multiple in-flight frames.
-- 3C.4 Triple buffer, latency targets: < 16 ms at 1080p, < 33 ms at 4K.
-
-**Milestone 3:** native Vulkan game (DXVK-wrapped Windows game or Linux native via Wine) at usable framerate.
+- 3C.1 Profile copy-back — confirm TB5 upstream is saturated.
+- 3C.2 Tile-delta copy (addrlib tile coords, only changed tiles).
+- 3C.3 Pipeline submit + copy + present with N in-flight frames.
+- 3C.4 Targets: 1080p @ 120 fps for `vkmark`; 4K @ 60 fps for `vkQuake`. (TB5 budget is forgiving.)
+- 3C.5 Latency: input-to-photon < 16 ms p99 at 1080p.
 
 ### Phase 4 — Polish + distribution
 
-- 4.1 Multi-queue (graphics + compute + transfer) concurrency.
-- 4.2 Power management — clock scaling under load, idle clocks.
-- 4.3 Hot-plug handling for eGPU disconnect/reconnect.
-- 4.4 Signed dext distribution (Developer ID + notarization).
-- 4.5 Brew tap or pkg installer.
+- 4.1 Multi-queue (graphics + compute + transfer) concurrent submits.
+- 4.2 Power management — idle clocks, boost under load via SMU v14.
+- 4.3 Hot-plug — eGPU disconnect/reconnect graceful handling.
+- 4.4 Notarized signed dext build.
+- 4.5 Brew tap formula + `pkg` installer with TinyGPU-style setup UX.
+- 4.6 Public README + install guide.
 
 ---
 
-## 4. Risks & contingencies
+## 5. Risks & contingencies
 
 | Risk | Probability | Impact | Mitigation |
 |---|---|---|---|
-| DriverKit PCIe entitlement denied | Medium | Project-killer | Apply Phase 0.1. Fallback: kext-based (deprecated, but functional pre-Sequoia) or research-only. |
-| Apple silently drops PCIDriverKit class | Low | Project-killer | Pin macOS version. Maintain Sonoma VM. |
-| Firmware microcode signature mismatch | Medium | Phase 1B stall | Match linux-firmware version to ASIC PSP version exactly. |
-| PM4 packet difference between Linux & macOS reality | High | Phase 1B stall | Capture umr traces on Linux first; bit-compare submission. |
-| PCIe upstream bandwidth crushes framerate | High | Phase 3 unusable | Tile delta copies; accept 60 fps@1080p as ceiling for TB3. |
-| Mesa license (MIT + others) vs distribution | Low | Minor | Track per-file licenses; ship NOTICE. |
-| Single-developer scope (~3–5 years calendar) | High | Burnout | Compute-first ordering — ship llama.cpp Vulkan before touching graphics. |
+| DriverKit PCIe entitlement denied | Low (TinyGPU precedent) | Project-killer | Apply against the dext bundle ID early; appeal with TinyGPU as precedent. |
+| TinyGPU's UAPI insufficient for Vulkan compute | Medium | Phase 1B scope swells | Plan for our own dext from day one; reuse TinyGPU only if it cleanly fits. |
+| Apple changes DriverKit ABI mid-development | Medium | Phase 1 rework | Pin macOS version; maintain a test VM/snapshot. |
+| Firmware microcode signature mismatch / PSP rejection | Medium | Phase 1B stall | Match `linux-firmware` git SHA to validated Linux config; if PSP refuses, escalate via `psp_v14_0_3_sos_kicker.bin` path. |
+| RDNA4 GFX12 register/packet drift from Linux | Medium-High | Phase 1B stall | Bit-compare every submit against umr traces from Linux R9700. |
+| MES v12 behavioral differences from older MES | Medium | Phase 1B rework | Treat MES queue ops as "Linux-equivalent" not "documented" — diff against `mes_v12_1.c` line-by-line. |
+| TB5 upstream bandwidth caps framerate at 4K HDR | Low | Phase 3 may need quality cap | Accept 4K @ 60 fps as realistic ceiling; tile-delta to improve. |
+| Mesa license mix (MIT + various) for distribution | Low | Minor | Track per-file licenses; ship NOTICE. |
+| Single-developer scope (~2–4 years calendar) | High | Burnout | Compute-first ordering — ship llama.cpp Vulkan before graphics. |
 
 ---
 
-## 5. Out of scope (explicit)
+## 6. Out of scope (explicit)
 
-- Apple Silicon. (Different DART semantics, no public PCIe eGPU enumeration, no upstream effort.)
-- Display output direct from AMD GPU. (No DCN driver. All scanout via copy-back to Mac's iGPU.)
-- DisplayPort/HDMI output ports on the AMD card. (Same reason.)
+- Intel Mac support. (AS only.)
+- Display output direct from R9700 ports. (All scanout via copy-back to Mac's iGPU and CoreAnimation.)
+- Non-RDNA4 ASICs for the first release. (gfx1201 only until Phase 4.)
 - Non-AMD GPUs.
-- OpenGL/OpenCL frontends. (Vulkan only. ICD shape only.)
-- Multiple ASIC families simultaneously. (One ASIC, period, until Phase 4.)
+- OpenGL/OpenCL frontends. (Vulkan only.)
+- Multiple ASIC families simultaneously.
 
 ---
 
-## 6. References
+## 7. References
 
-- Linux kernel amdgpu — `upstream/linux/drivers/gpu/drm/amd/amdgpu/`
+- Linux amdgpu — `upstream/linux/drivers/gpu/drm/amd/amdgpu/` (gfx_v12_*, gmc_v12_*, mes_v12_*, psp_v14_0, smu_v14_0, sdma_v7_*, nbio_v7_11)
 - Mesa userspace — `upstream/mesa/src/amd/`, `upstream/mesa/src/compiler/`, `upstream/mesa/src/vulkan/`
-- AMD firmware — `upstream/linux-firmware/amdgpu/`
+- AMD firmware — `upstream/linux-firmware/amdgpu/` (gc_12_0_1_*, psp_14_0_3_*, smu_14_0_3*, sdma_7_0_1)
+- TinyGPU (prior art) — https://docs.tinygrad.org/tinygpu/ and https://github.com/tinygrad
 - Apple PCIDriverKit — https://developer.apple.com/documentation/pcidriverkit
 - DriverKit transport entitlements — https://developer.apple.com/documentation/bundleresources/entitlements/com_apple_developer_driverkit_transport_pci
-- GPUOpen ISA docs — https://gpuopen.com/documentation/amd-isa-documentation/
-- Mesa ACO — `upstream/mesa/src/amd/compiler/README.md`
-- AMD register reference (auto-gen) — `upstream/mesa/src/amd/registers/`
+- AMD R9700 specs — https://www.amd.com/en/products/graphics/workstations/radeon-ai-pro/ai-9000-series/amd-radeon-ai-pro-r9700.html
+- Phoronix R9700 Linux review — https://www.phoronix.com/review/amd-radeon-ai-pro-r9700
+- GPUOpen ISA — https://gpuopen.com/documentation/amd-isa-documentation/
+- Mesa ACO docs — `upstream/mesa/src/amd/compiler/README.md`
 
-See `WORKLIST.md` for tracked, granular tasks.
+See `WORKLIST.md` for tracked granular tasks.
