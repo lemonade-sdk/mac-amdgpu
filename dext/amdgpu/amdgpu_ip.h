@@ -118,6 +118,37 @@ namespace MP0Regs {
     constexpr uint32_t C2PMSG_103 = 0x00A7;
 }
 
+// SMU (MP1) mailbox registers from mp_14_0_2_offset.h. SMU is the
+// PMFW on RDNA4 — handles clocks, voltages, power management, link
+// training. Mailbox protocol (smu_cmn_send_smc_msg_with_param):
+//   1. WREG32(C2PMSG_90, 0)            — clear response slot
+//   2. WREG32(C2PMSG_82, param)        — parameter
+//   3. WREG32(C2PMSG_66, msg_id)       — kicks SMU
+//   4. poll C2PMSG_90 != 0             — response = status code
+//   5. RREG32(C2PMSG_82)               — read return value
+namespace MP1Regs {
+    constexpr uint32_t C2PMSG_66 = 0x0082;  // message id (host → SMU)
+    constexpr uint32_t C2PMSG_82 = 0x0092;  // parameter / return value
+    constexpr uint32_t C2PMSG_90 = 0x009A;  // response (SMU → host)
+}
+
+// PPSMC messages — drivers/gpu/drm/amd/pm/swsmu/inc/pmfw_if/
+// smu_v14_0_2_ppsmc.h. Tiny subset; expand as we wire up features.
+namespace PPSMC {
+    constexpr uint32_t TestMessage         = 0x01;
+    constexpr uint32_t GetSmuVersion       = 0x02;
+    constexpr uint32_t GetDriverIfVersion  = 0x03;
+}
+
+// Linux SMU mailbox response codes — smu_msg_v1_decode_response().
+namespace SMUResp {
+    constexpr uint32_t OK              = 0x01;
+    constexpr uint32_t Failed          = 0xFF;
+    constexpr uint32_t UnknownCmd      = 0xFE;
+    constexpr uint32_t CmdRejectedPrereq = 0xFD;
+    constexpr uint32_t CmdRejectedBusy = 0xFC;
+}
+
 // PSP bootloader commands —
 // drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h (enum psp_bootloader_cmd).
 namespace PSPBootloaderCmd {
