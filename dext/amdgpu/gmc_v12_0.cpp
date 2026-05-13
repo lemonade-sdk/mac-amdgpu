@@ -23,7 +23,11 @@
 
 #include <os/log.h>
 #include <string.h>
+#include <DriverKit/IOLib.h>
+#include <DriverKit/IOBufferMemoryDescriptor.h>
+#include <DriverKit/IODMACommand.h>
 #include "amdgpu_gmc.h"
+#include "amdgpu_field_defs.h"
 
 #define GMC_LOG(fmt, ...) \
     os_log(OS_LOG_DEFAULT, "mac.amdgpu.gmc: " fmt, ##__VA_ARGS__)
@@ -79,6 +83,14 @@ gmc_mc_init(DeviceContext &dev, GMCContext &gmc)
     gmc.gart_start = (gmc.vram_end + 1 + kGARTPageSize - 1)
                      & ~(kGARTPageSize - 1);
     gmc.gart_end   = gmc.gart_start + gmc.gart_size - 1;
+
+    // VM manager params for GFX12: 4-level page tables (num_level=3
+    // means depth 3, i.e. 4 levels counting root), 512-entry blocks
+    // (block_size=9 means log2(512)=9), 48-bit VA.
+    gmc.num_level   = 3;
+    gmc.block_size  = 9;
+    gmc.max_pfn     = (1ULL << 48) >> 12;   // 48-bit VA / 4 KB
+    gmc.vram_base_offset = 0;
 
     // AGP aperture — unused on our config, set to non-overlapping
     // far-away range so any stray reads are recognisable.
@@ -229,6 +241,369 @@ gmc_gfxhub_offsets_init(GMCContext &gmc)
     return kIOReturnSuccess;
 }
 
+// ============================================================
+// Resource allocation: GART page table + dummy_page + mem_scratch.
+//
+// All three live in DART-mapped system memory at 16 KB alignment.
+// GART page table size = gart_size / page_size * sizeof(pte).
+// We use the AS 16 KB page so #PTEs = 256 MB / 16 KB = 16384,
+// each 8 bytes → 128 KB page table. Tiny; pad up to 16 KB anyway.
+// ============================================================
+
+static kern_return_t
+alloc_dma_block(DeviceContext &dev, uint64_t size,
+                IOBufferMemoryDescriptor **outBuf,
+                IODMACommand             **outDma,
+                uint64_t *outBus,
+                void    **outCpu)
+{
+    *outBuf = nullptr; *outDma = nullptr; *outBus = 0; *outCpu = nullptr;
+    IOBufferMemoryDescriptor *buf = nullptr;
+    kern_return_t ret = IOBufferMemoryDescriptor::Create(
+        kIOMemoryDirectionOutIn, size, kASPageSize, &buf);
+    if (ret != kIOReturnSuccess || buf == nullptr) {
+        return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
+    }
+    buf->SetLength(size);
+
+    IODMACommandSpecification spec = {};
+    spec.options = kIODMACommandSpecificationNoOptions;
+    spec.maxAddressBits = 64;
+    IODMACommand *dma = nullptr;
+    ret = IODMACommand::Create(dev.pci, kIODMACommandCreateNoOptions,
+                               &spec, &dma);
+    if (ret != kIOReturnSuccess || dma == nullptr) {
+        buf->release();
+        return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
+    }
+
+    uint64_t flags = 0;
+    uint32_t segCount = 1;
+    IOAddressSegment seg = {};
+    ret = dma->PrepareForDMA(kIODMACommandPrepareForDMANoOptions, buf,
+                             0, size, &flags, &segCount, &seg);
+    if (ret != kIOReturnSuccess || segCount != 1) {
+        dma->release();
+        buf->release();
+        return ret != kIOReturnSuccess ? ret : kIOReturnNotAligned;
+    }
+    IOAddressSegment cpu = {};
+    buf->GetAddressRange(&cpu);
+
+    *outBuf = buf;
+    *outDma = dma;
+    *outBus = seg.address;
+    *outCpu = reinterpret_cast<void *>(cpu.address);
+    return kIOReturnSuccess;
+}
+
+kern_return_t
+gmc_alloc_resources(DeviceContext &dev, GMCContext &gmc)
+{
+    if (gmc.gart_pt_buf != nullptr) return kIOReturnSuccess;
+    if (!gmc.inited) return kIOReturnNotReady;
+
+    // GART page table — 16 KB pages, 8 B PTE, padded to AS page.
+    uint64_t pt_entries = gmc.gart_size / kASPageSize;
+    uint64_t pt_bytes   = pt_entries * 8;
+    if (pt_bytes < kASPageSize) pt_bytes = kASPageSize;
+    pt_bytes = (pt_bytes + kASPageSize - 1) & ~(kASPageSize - 1);
+    gmc.gart_pt_size = pt_bytes;
+
+    void *cpu = nullptr; uint64_t bus = 0;
+    kern_return_t r;
+    r = alloc_dma_block(dev, pt_bytes, &gmc.gart_pt_buf,
+                        &gmc.gart_pt_dma, &bus, &cpu);
+    if (r != kIOReturnSuccess) {
+        GMC_LOG("gart page table alloc failed: %#x", r);
+        return r;
+    }
+    gmc.gart_pt_bus = bus;
+    gmc.gart_pt_cpu = cpu;
+    memset(cpu, 0, pt_bytes);  // all PTEs invalid initially
+
+    // dummy_page — destination for protection-fault page redirects.
+    r = alloc_dma_block(dev, kASPageSize, &gmc.dummy_page_buf,
+                        &gmc.dummy_page_dma, &gmc.dummy_page_bus, &cpu);
+    if (r != kIOReturnSuccess) {
+        GMC_LOG("dummy_page alloc failed: %#x", r);
+        return r;
+    }
+
+    // mem_scratch — used as default system aperture address.
+    r = alloc_dma_block(dev, kASPageSize, &gmc.mem_scratch_buf,
+                        &gmc.mem_scratch_dma, &gmc.mem_scratch_bus, &cpu);
+    if (r != kIOReturnSuccess) {
+        GMC_LOG("mem_scratch alloc failed: %#x", r);
+        return r;
+    }
+
+    GMC_LOG("resources: gart_pt bus=%#llx (%llu B) "
+            "dummy bus=%#llx scratch bus=%#llx",
+            gmc.gart_pt_bus, pt_bytes,
+            gmc.dummy_page_bus, gmc.mem_scratch_bus);
+    return kIOReturnSuccess;
+}
+
+void
+gmc_release_resources(GMCContext &gmc)
+{
+    auto teardown = [](IOBufferMemoryDescriptor *&b, IODMACommand *&d) {
+        if (d != nullptr) {
+            d->CompleteDMA(kIODMACommandCompleteDMANoOptions);
+            d->release(); d = nullptr;
+        }
+        if (b != nullptr) { b->release(); b = nullptr; }
+    };
+    teardown(gmc.mem_scratch_buf, gmc.mem_scratch_dma);
+    teardown(gmc.dummy_page_buf, gmc.dummy_page_dma);
+    teardown(gmc.gart_pt_buf, gmc.gart_pt_dma);
+    gmc.gart_pt_bus = 0; gmc.gart_pt_cpu = nullptr; gmc.gart_pt_size = 0;
+    gmc.dummy_page_bus = 0; gmc.mem_scratch_bus = 0;
+}
+
+// ============================================================
+// MMHUB v4_1_0 gart_enable port.
+//
+// Sub-functions follow upstream mmhub_v4_1_0.c structure 1:1.
+// Each is parameterized by the GMCContext so they can be reused
+// by the GFXHUB twin (since the field layout is identical, just
+// the register addresses change — see amdgpu_field_defs.h aliases).
+// ============================================================
+
+// init_gart_aperture_regs: write CONTEXT0 PT base, start, end.
+static void
+hub_init_gart_aperture_regs(const DeviceContext &dev,
+                            const GMCContext &gmc, const HubContext &h)
+{
+    // PT base address (split lo/hi)
+    uint64_t pt = gmc.gart_pt_bus;
+    WREG32(dev, SOC15_REG_OFFSET(dev, h.ip, h.ctx0_pt_base_lo),
+           (uint32_t)(pt & 0xFFFFFFFFu));
+    WREG32(dev, SOC15_REG_OFFSET(dev, h.ip, h.ctx0_pt_base_hi),
+           (uint32_t)(pt >> 32));
+
+    // PT start/end: encoded as page-frame numbers, with the
+    // high half being the upper bits of the 44-bit VA.
+    WREG32(dev, SOC15_REG_OFFSET(dev, h.ip, h.ctx0_pt_start_lo),
+           (uint32_t)(gmc.gart_start >> 12));
+    WREG32(dev, SOC15_REG_OFFSET(dev, h.ip, h.ctx0_pt_start_hi),
+           (uint32_t)(gmc.gart_start >> 44));
+
+    WREG32(dev, SOC15_REG_OFFSET(dev, h.ip, h.ctx0_pt_end_lo),
+           (uint32_t)(gmc.gart_end >> 12));
+    WREG32(dev, SOC15_REG_OFFSET(dev, h.ip, h.ctx0_pt_end_hi),
+           (uint32_t)(gmc.gart_end >> 44));
+}
+
+// init_system_aperture_regs: AGP, system aperture low/high, default,
+// L2 protection-fault default.
+static void
+hub_init_system_aperture_regs(const DeviceContext &dev,
+                              const GMCContext &gmc, const HubContext &h)
+{
+    uint64_t aperture_low  = gmc.fb_start;     // agp is in non-overlapping range
+    uint64_t aperture_high = gmc.fb_end;
+
+    WREG32(dev, SOC15_REG_OFFSET(dev, h.ip, h.vm_system_aperture_low_addr),
+           (uint32_t)(aperture_low >> 18));
+    WREG32(dev, SOC15_REG_OFFSET(dev, h.ip, h.vm_system_aperture_high_addr),
+           (uint32_t)(aperture_high >> 18));
+
+    // Default page address — mem_scratch.
+    uint64_t def = gmc.mem_scratch_bus - gmc.vram_start
+                 + gmc.vram_base_offset;
+    WREG32(dev, SOC15_REG_OFFSET(dev, h.ip,
+                                 h.vm_system_aperture_default_addr_lo),
+           (uint32_t)(def >> 12));
+    WREG32(dev, SOC15_REG_OFFSET(dev, h.ip,
+                                 h.vm_system_aperture_default_addr_hi),
+           (uint32_t)(def >> 44));
+}
+
+// init_tlb_regs: enable L1 TLB, MTYPE=UC, advanced driver model.
+static void
+hub_init_tlb_regs_mmhub(const DeviceContext &dev, const HubContext &h)
+{
+    uint32_t reg = SOC15_REG_OFFSET(dev, h.ip, h.vm_l1_tlb_cntl);
+    uint32_t tmp = RREG32(dev, reg);
+    tmp = REG_SET_FIELD(tmp, MMMC_VM_MX_L1_TLB_CNTL, ENABLE_L1_TLB, 1);
+    tmp = REG_SET_FIELD(tmp, MMMC_VM_MX_L1_TLB_CNTL, SYSTEM_ACCESS_MODE, 3);
+    tmp = REG_SET_FIELD(tmp, MMMC_VM_MX_L1_TLB_CNTL,
+                        ENABLE_ADVANCED_DRIVER_MODEL, 1);
+    tmp = REG_SET_FIELD(tmp, MMMC_VM_MX_L1_TLB_CNTL,
+                        SYSTEM_APERTURE_UNMAPPED_ACCESS, 0);
+    tmp = REG_SET_FIELD(tmp, MMMC_VM_MX_L1_TLB_CNTL, ECO_BITS, 0);
+    tmp = REG_SET_FIELD(tmp, MMMC_VM_MX_L1_TLB_CNTL, MTYPE, MMHUB_MTYPE_UC);
+    WREG32(dev, reg, tmp);
+}
+
+// init_cache_regs (MMHUB variant): L2 cache enable + assorted bits.
+static void
+hub_init_cache_regs_mmhub(const DeviceContext &dev, const HubContext &h)
+{
+    uint32_t reg, tmp;
+
+    reg = SOC15_REG_OFFSET(dev, h.ip, h.vm_l2_cntl);
+    tmp = RREG32(dev, reg);
+    tmp = REG_SET_FIELD(tmp, MMVM_L2_CNTL, ENABLE_L2_CACHE, 1);
+    tmp = REG_SET_FIELD(tmp, MMVM_L2_CNTL, ENABLE_L2_FRAGMENT_PROCESSING, 0);
+    tmp = REG_SET_FIELD(tmp, MMVM_L2_CNTL,
+                        ENABLE_DEFAULT_PAGE_OUT_TO_SYSTEM_MEMORY, 1);
+    tmp = REG_SET_FIELD(tmp, MMVM_L2_CNTL,
+                        L2_PDE0_CACHE_TAG_GENERATION_MODE, 0);
+    tmp = REG_SET_FIELD(tmp, MMVM_L2_CNTL, PDE_FAULT_CLASSIFICATION, 0);
+    tmp = REG_SET_FIELD(tmp, MMVM_L2_CNTL,
+                        CONTEXT1_IDENTITY_ACCESS_MODE, 1);
+    tmp = REG_SET_FIELD(tmp, MMVM_L2_CNTL, IDENTITY_MODE_FRAGMENT_SIZE, 0);
+    WREG32(dev, reg, tmp);
+
+    reg = SOC15_REG_OFFSET(dev, h.ip, h.vm_l2_cntl2);
+    tmp = RREG32(dev, reg);
+    tmp = REG_SET_FIELD(tmp, MMVM_L2_CNTL2, INVALIDATE_ALL_L1_TLBS, 1);
+    tmp = REG_SET_FIELD(tmp, MMVM_L2_CNTL2, INVALIDATE_L2_CACHE, 1);
+    WREG32(dev, reg, tmp);
+
+    // CNTL3: bank_select=9, BIGK fragment size=6 for non-translate-further
+    reg = SOC15_REG_OFFSET(dev, h.ip, h.vm_l2_cntl3);
+    tmp = 0;
+    tmp = REG_SET_FIELD(tmp, MMVM_L2_CNTL3, BANK_SELECT, 9);
+    tmp = REG_SET_FIELD(tmp, MMVM_L2_CNTL3, L2_CACHE_BIGK_FRAGMENT_SIZE, 6);
+    WREG32(dev, reg, tmp);
+
+    reg = SOC15_REG_OFFSET(dev, h.ip, h.vm_l2_cntl4);
+    tmp = 0;
+    tmp = REG_SET_FIELD(tmp, MMVM_L2_CNTL4, VMC_TAP_PDE_REQUEST_PHYSICAL, 0);
+    tmp = REG_SET_FIELD(tmp, MMVM_L2_CNTL4, VMC_TAP_PTE_REQUEST_PHYSICAL, 0);
+    WREG32(dev, reg, tmp);
+
+    reg = SOC15_REG_OFFSET(dev, h.ip, h.vm_l2_cntl5);
+    tmp = 0;
+    tmp = REG_SET_FIELD(tmp, MMVM_L2_CNTL5, L2_CACHE_SMALLK_FRAGMENT_SIZE, 0);
+    WREG32(dev, reg, tmp);
+}
+
+// enable_system_domain: turn on CONTEXT0 with PT depth 0 (no PT for
+// CONTEXT0 — it covers the system/FB aperture).
+static void
+hub_enable_system_domain(const DeviceContext &dev, const HubContext &h)
+{
+    uint32_t reg = SOC15_REG_OFFSET(dev, h.ip, h.ctx0_cntl);
+    uint32_t tmp = RREG32(dev, reg);
+    tmp = REG_SET_FIELD(tmp, MMVM_CONTEXT0_CNTL, ENABLE_CONTEXT, 1);
+    tmp = REG_SET_FIELD(tmp, MMVM_CONTEXT0_CNTL, PAGE_TABLE_DEPTH, 0);
+    tmp = REG_SET_FIELD(tmp, MMVM_CONTEXT0_CNTL,
+                        RETRY_PERMISSION_OR_INVALID_PAGE_FAULT, 0);
+    WREG32(dev, reg, tmp);
+}
+
+// setup_vmid_config: per-VMID CONTEXT1..14 enable with fault bits.
+static void
+hub_setup_vmid_config(const DeviceContext &dev, const GMCContext &gmc,
+                      const HubContext &h)
+{
+    for (int i = 0; i <= 14; i++) {
+        // CONTEXT(i+1)_CNTL = CONTEXT1_CNTL + i * ctx_distance
+        uint32_t cntl_reg = SOC15_REG_OFFSET(dev, h.ip, h.ctx1_cntl)
+                            + i * h.ctx_distance;
+        uint32_t tmp = RREG32(dev, cntl_reg);
+        tmp = REG_SET_FIELD(tmp, MMVM_CONTEXT1_CNTL, ENABLE_CONTEXT, 1);
+        tmp = REG_SET_FIELD(tmp, MMVM_CONTEXT1_CNTL,
+                            PAGE_TABLE_DEPTH, gmc.num_level);
+        tmp = REG_SET_FIELD(tmp, MMVM_CONTEXT1_CNTL,
+                            RANGE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+        tmp = REG_SET_FIELD(tmp, MMVM_CONTEXT1_CNTL,
+                            DUMMY_PAGE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+        tmp = REG_SET_FIELD(tmp, MMVM_CONTEXT1_CNTL,
+                            PDE0_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+        tmp = REG_SET_FIELD(tmp, MMVM_CONTEXT1_CNTL,
+                            VALID_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+        tmp = REG_SET_FIELD(tmp, MMVM_CONTEXT1_CNTL,
+                            READ_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+        tmp = REG_SET_FIELD(tmp, MMVM_CONTEXT1_CNTL,
+                            WRITE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+        tmp = REG_SET_FIELD(tmp, MMVM_CONTEXT1_CNTL,
+                            EXECUTE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+        tmp = REG_SET_FIELD(tmp, MMVM_CONTEXT1_CNTL, PAGE_TABLE_BLOCK_SIZE,
+                            gmc.block_size - 9);
+        // no-retry on fault to suppress storms
+        tmp = REG_SET_FIELD(tmp, MMVM_CONTEXT1_CNTL,
+                            RETRY_PERMISSION_OR_INVALID_PAGE_FAULT, 1);
+        WREG32(dev, cntl_reg, tmp);
+
+        // Per-VMID PT start/end addresses — fresh contexts get full range.
+        // (Linux uses ctx_addr_distance; we collapse to ctx_distance.)
+        // Currently leaving CONTEXT1..14 PT start/end zeroed.
+    }
+}
+
+// program_invalidation: arm invalidation engines 0..17 over the
+// full address range.
+static void
+hub_program_invalidation(const DeviceContext &dev, const HubContext &h)
+{
+    for (int i = 0; i < 18; i++) {
+        WREG32(dev,
+               SOC15_REG_OFFSET(dev, h.ip,
+                                h.vm_invalidate_eng0_addr_range_lo32)
+               + i * h.eng_distance, 0xFFFFFFFFu);
+        WREG32(dev,
+               SOC15_REG_OFFSET(dev, h.ip,
+                                h.vm_invalidate_eng0_addr_range_hi32)
+               + i * h.eng_distance, 0x1Fu);
+    }
+}
+
+kern_return_t
+gmc_mmhub_gart_enable(DeviceContext &dev, GMCContext &gmc)
+{
+    if (!gmc.mmhub.inited) return kIOReturnNotReady;
+    if (gmc.gart_pt_bus == 0) return kIOReturnNotReady;
+    if (!dev.ip.isResolved(gmc.mmhub.ip)) {
+        GMC_LOG("mmhub_gart_enable: IP base not resolved (block=%u)",
+                (unsigned)gmc.mmhub.ip);
+        return kIOReturnNotReady;
+    }
+
+    hub_init_gart_aperture_regs(dev, gmc, gmc.mmhub);
+    hub_init_system_aperture_regs(dev, gmc, gmc.mmhub);
+    hub_init_tlb_regs_mmhub(dev, gmc.mmhub);
+    hub_init_cache_regs_mmhub(dev, gmc.mmhub);
+    hub_enable_system_domain(dev, gmc.mmhub);
+    hub_setup_vmid_config(dev, gmc, gmc.mmhub);
+    hub_program_invalidation(dev, gmc.mmhub);
+
+    GMC_LOG("mmhub_gart_enable done");
+    return kIOReturnSuccess;
+}
+
+kern_return_t
+gmc_gfxhub_gart_enable(DeviceContext &dev, GMCContext &gmc)
+{
+    if (!gmc.gfxhub.inited) return kIOReturnNotReady;
+    if (gmc.gart_pt_bus == 0) return kIOReturnNotReady;
+    if (!dev.ip.isResolved(gmc.gfxhub.ip)) {
+        GMC_LOG("gfxhub_gart_enable: IP base not resolved (block=%u)",
+                (unsigned)gmc.gfxhub.ip);
+        return kIOReturnNotReady;
+    }
+
+    // GFXHUB field layouts mirror MMHUB exactly (see field_defs aliases),
+    // and our helpers use the MMHUB-style names that REG_SET_FIELD
+    // resolves to the same SHIFT/MASK constants — so reusing the
+    // helpers is correct.
+    hub_init_gart_aperture_regs(dev, gmc, gmc.gfxhub);
+    hub_init_system_aperture_regs(dev, gmc, gmc.gfxhub);
+    hub_init_tlb_regs_mmhub(dev, gmc.gfxhub);
+    hub_init_cache_regs_mmhub(dev, gmc.gfxhub);
+    hub_enable_system_domain(dev, gmc.gfxhub);
+    hub_setup_vmid_config(dev, gmc, gmc.gfxhub);
+    hub_program_invalidation(dev, gmc.gfxhub);
+
+    GMC_LOG("gfxhub_gart_enable done");
+    return kIOReturnSuccess;
+}
+
 // ----- GMCInit orchestrator entry -----
 kern_return_t
 gmc_init(DeviceContext &dev, GMCContext &gmc)
@@ -242,10 +617,33 @@ gmc_init(DeviceContext &dev, GMCContext &gmc)
     if (r != kIOReturnSuccess) return r;
     r = gmc_gfxhub_offsets_init(gmc);
     if (r != kIOReturnSuccess) return r;
+    r = gmc_alloc_resources(dev, gmc);
+    if (r != kIOReturnSuccess) return r;
 
-    GMC_LOG("GMCInit foundation complete (MMIO programming + GART "
-            "alloc pending — see docs/port_plans/GMC_v12.md)");
-    dev.gmcReady = true;  // partial — actual hardware enable still pending
+    // MMIO programming gated on IP bases being resolved (set via
+    // SetIPBase or LoadDiscoveryBin from userspace).
+    if (dev.ip.isResolved(gmc.mmhub.ip)) {
+        r = gmc_mmhub_gart_enable(dev, gmc);
+        if (r != kIOReturnSuccess) {
+            GMC_LOG("mmhub_gart_enable failed: %#x", r);
+            return r;
+        }
+    } else {
+        GMC_LOG("skipping mmhub_gart_enable — IP base unresolved");
+    }
+    if (dev.ip.isResolved(gmc.gfxhub.ip)) {
+        r = gmc_gfxhub_gart_enable(dev, gmc);
+        if (r != kIOReturnSuccess) {
+            GMC_LOG("gfxhub_gart_enable failed: %#x", r);
+            return r;
+        }
+    } else {
+        GMC_LOG("skipping gfxhub_gart_enable — IP base unresolved");
+    }
+
+    dev.gmcReady = true;
+    GMC_LOG("GMCInit complete (HDP flush + fault-enable + tlb-flush "
+            "remain — see docs/port_plans/GMC_v12.md steps 14-17)");
     return kIOReturnSuccess;
 }
 

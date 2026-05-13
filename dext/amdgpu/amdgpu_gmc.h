@@ -15,6 +15,12 @@
 #pragma once
 
 #include <stdint.h>
+
+#ifdef __APPLE__
+#include <DriverKit/IOBufferMemoryDescriptor.h>
+#include <DriverKit/IODMACommand.h>
+#endif
+
 #include "amdgpu_ip.h"
 #include "amdgpu_regs.h"
 #include "amdgpu_vram.h"
@@ -91,8 +97,29 @@ struct GMCContext {
     uint64_t  agp_start;
     uint64_t  agp_end;
 
+    // VM manager parameters (mirrors upstream adev->vm_manager).
+    uint32_t  num_level;            // 3 for GFX12 (4-level PTs)
+    uint32_t  block_size;           // 9 — log2 of entries per block
+    uint64_t  max_pfn;              // (1 << 48) / 4 KB for GFX12
+    uint64_t  vram_base_offset;     // GPU-VA base of FB in physical address space
+
     // Bump allocator over the visible VRAM aperture (top-down).
     VRAMBumpAllocator vram_alloc;
+
+    // Resources allocated at gart_init time. All DART-mapped sysmem.
+#ifdef __APPLE__
+    IOBufferMemoryDescriptor *gart_pt_buf;
+    IODMACommand             *gart_pt_dma;
+    IOBufferMemoryDescriptor *dummy_page_buf;
+    IODMACommand             *dummy_page_dma;
+    IOBufferMemoryDescriptor *mem_scratch_buf;
+    IODMACommand             *mem_scratch_dma;
+#endif
+    uint64_t  gart_pt_bus;          // GPU-side bus address of GART page table
+    void     *gart_pt_cpu;
+    uint64_t  gart_pt_size;         // page table size in bytes
+    uint64_t  dummy_page_bus;       // for protection-fault redirect
+    uint64_t  mem_scratch_bus;      // default aperture address
 
     // Hub register offset tables.
     HubContext mmhub;     // MMHUB v4_1_0
@@ -117,6 +144,29 @@ kern_return_t gmc_mmhub_offsets_init(GMCContext &gmc);
 // Populate GFXHUB v12_0 hub offsets. No MMIO.
 // Source: gfxhub_v12_0_init (drivers/gpu/drm/amd/amdgpu/gfxhub_v12_0.c)
 kern_return_t gmc_gfxhub_offsets_init(GMCContext &gmc);
+
+// Allocate GART page table + dummy_page + mem_scratch in DART-mapped
+// system memory. ~128 KB + 16 KB + 16 KB total — well under DART
+// ceiling. Mirrors amdgpu_gart_table_ram_alloc + the dummy_page +
+// mem_scratch allocations Linux does in gmc_v12_0_sw_init.
+kern_return_t gmc_alloc_resources(DeviceContext &dev, GMCContext &gmc);
+
+// Free everything alloc_resources allocated.
+void gmc_release_resources(GMCContext &gmc);
+
+// Hub-level gart_enable: actual register programming. Each is a
+// port of upstream mmhub_v4_1_0_gart_enable / gfxhub_v12_0_gart_enable
+// composed of the six sub-functions Linux structures it into:
+//   init_gart_aperture_regs   — CONTEXT0 PT base/start/end
+//   init_system_aperture_regs — AGP, system aperture, default page
+//   init_tlb_regs             — L1 TLB on, MTYPE_UC, advanced model
+//   init_cache_regs           — L2 cache fields
+//   enable_system_domain      — CONTEXT0 enable
+//   disable_identity_aperture — close the identity range
+//   setup_vmid_config         — VMID 1..14 contexts
+//   program_invalidation      — invalidation engines 0..17
+kern_return_t gmc_mmhub_gart_enable(DeviceContext &dev, GMCContext &gmc);
+kern_return_t gmc_gfxhub_gart_enable(DeviceContext &dev, GMCContext &gmc);
 
 // Top-level GMCInit stage entry — runs the chain.
 kern_return_t gmc_init(DeviceContext &dev, GMCContext &gmc);

@@ -25,6 +25,24 @@
 #include <PCIDriverKit/IOPCIDevice.h>
 #endif
 
+//============================================================
+// REG_SET_FIELD — mirrors upstream's drm/amd/include/soc15_common.h
+// macro. Reads a register-value, clears the field, ORs in the new
+// value shifted into place.
+//
+//     uint32_t tmp = RREG32(dev, reg);
+//     tmp = REG_SET_FIELD(tmp, MMMC_VM_MX_L1_TLB_CNTL, ENABLE_L1_TLB, 1);
+//     WREG32(dev, reg, tmp);
+//
+// Requires reg##__##field##__SHIFT and reg##__##field##_MASK to
+// be defined for every (reg, field) pair touched. See
+// amdgpu_field_defs.h for the vendored definitions we need.
+//============================================================
+#define REG_SET_FIELD(value, reg, field, val) \
+    ((((value) & ~(reg##__##field##_MASK))) | \
+     ((((uint32_t)(val)) << (reg##__##field##__SHIFT)) & \
+      (reg##__##field##_MASK)))
+
 namespace amdgpu {
 
 //============================================================
