@@ -24,8 +24,8 @@
 namespace MacAMDGPU {
 
 struct PSPContext {
-    // Primary firmware buffer — PSP reads SOS image from here.
-    // Must be DMA-mappable; we allocate via IOBufferMemoryDescriptor
+    // Primary firmware buffer — PSP reads each binary from here.
+    // Must be DMA-mappable; allocated via IOBufferMemoryDescriptor
     // + IODMACommand::PrepareForDMA. Size = PSP_1_MEG.
 #ifdef __APPLE__
     IOBufferMemoryDescriptor *fwPriBuffer;
@@ -35,13 +35,26 @@ struct PSPContext {
     void     *fwPriCPUAddr;   // CPU-side ptr for memcpy of firmware
     uint64_t  fwPriSize;
 
-    // SOS firmware blob (loaded from psp_14_0_3_sos.bin by the
-    // userspace host app, handed in via an upcoming SetFirmware
-    // selector).
+    // SOS firmware blob (handed in via LoadFirmware selector).
+    // For other bootloader components (KDB, SysDrv, etc.) we pass
+    // the binary directly through psp_bootloader_load_component and
+    // don't keep a long-lived pointer.
     const uint8_t *sosFirmware;
     uint64_t       sosFirmwareSize;
 
     bool sosAlive;
+
+    // PSP command ring (km_ring). Allocated via psp_ring_create.
+    // The ring lives in system memory mapped through DART (we don't
+    // yet have a VRAM allocator). 4 KB matches Linux's default.
+#ifdef __APPLE__
+    IOBufferMemoryDescriptor *ringBuffer;
+    IODMACommand             *ringDMACommand;
+#endif
+    uint64_t  ringBusAddr;
+    void     *ringCPUAddr;
+    uint64_t  ringSize;
+    bool      ringCreated;
 };
 
 //
@@ -75,5 +88,38 @@ bool psp_wait_for_bootloader(const DeviceContext &dev);
 // alive. Caller must have set psp.sosFirmware + size before calling.
 //
 kern_return_t psp_load_sos(DeviceContext &dev, PSPContext &psp);
+
+//
+// psp_bootloader_load_component — port of psp_v14_0_bootloader_load_component.
+// Copies a binary into fw_pri, writes the address + command, and
+// waits for the bootloader ready bit. Used for the pre-SOS components:
+//   PSPBootloaderCmd::LoadKeyDatabase   → KDB
+//   PSPBootloaderCmd::LoadTosSPLTable   → SPL
+//   PSPBootloaderCmd::LoadSysDrv        → SysDrv
+//   PSPBootloaderCmd::LoadSocDrv        → SocDrv
+//   PSPBootloaderCmd::LoadIntfDrv       → IntfDrv
+//   PSPBootloaderCmd::LoadHADDrv        → DbgDrv (renamed to HAD in v14)
+//   PSPBootloaderCmd::LoadRASDrv        → RASDrv
+//   PSPBootloaderCmd::LoadIPKeyMgrDrv   → IPKeyMgrDrv
+// Returns immediately with success if SOS is already alive (the
+// caller is too late — these only matter before SOS).
+//
+kern_return_t psp_bootloader_load_component(DeviceContext &dev,
+                                            PSPContext &psp,
+                                            const uint8_t *bin,
+                                            uint64_t binSize,
+                                            uint32_t bl_cmd);
+
+//
+// psp_ring_create — port of psp_v14_0_ring_create (non-SR-IOV path).
+// Allocates a 4 KB DMA-backed buffer in system memory, programs its
+// address+size+type into PSP via C2PMSG_69..71+64, waits for bit 31
+// in C2PMSG_64 to come back set. After this, PSP commands can be
+// submitted by writing into the ring + ringing the doorbell.
+//
+// Ring type is hardcoded to PSP_RING_TYPE__KM (1) — the kernel-mode
+// ring. We don't use UM ring (userspace-mode, SR-IOV-only).
+//
+kern_return_t psp_ring_create(DeviceContext &dev, PSPContext &psp);
 
 } // namespace MacAMDGPU

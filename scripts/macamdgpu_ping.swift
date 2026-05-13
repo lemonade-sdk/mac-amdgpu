@@ -40,14 +40,26 @@ private let kMemBAR2:           UInt32 = 2
 private let kMemDMABuffer:      UInt32 = 6
 private let kMemIRQState:       UInt32 = 7
 
-// Firmware types (match MacAMDGPU.cpp).
+// Firmware type for SOS (matches kMacAMDGPUFwTypeSOS).
 private let kFwSOS:             UInt64 = 0
 
 // Bringup stages (match amdgpu_init.h).
-private let kStageNone:         UInt64 = 0
-private let kStageIPDiscovery:  UInt64 = 1
-private let kStagePSPInit:      UInt64 = 2
-private let kStagePSPLoadSOS:   UInt64 = 3
+private let kStageNone:           UInt64 = 0
+private let kStageIPDiscovery:    UInt64 = 1
+private let kStagePSPInit:        UInt64 = 2
+private let kStagePSPLoadSOS:     UInt64 = 3
+private let kStagePSPRingCreate:  UInt64 = 4
+private let kStageSMUInit:        UInt64 = 5
+
+// Firmware types (match MacAMDGPU.cpp).
+private let kFwKDB:               UInt64 = 1
+private let kFwSPL:               UInt64 = 2
+private let kFwSysDrv:            UInt64 = 3
+private let kFwSocDrv:            UInt64 = 4
+private let kFwIntfDrv:           UInt64 = 5
+private let kFwDbgDrv:            UInt64 = 6
+private let kFwRASDrv:            UInt64 = 7
+private let kFwIPKeyMgrDrv:       UInt64 = 8
 
 // IP block ids (match amdgpu_ip.h IPBlock enum).
 private let kBlockGC:    UInt64 = 0

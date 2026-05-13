@@ -102,6 +102,20 @@ psp_init(DeviceContext &dev, PSPContext &psp)
 void
 psp_release(PSPContext &psp)
 {
+    if (psp.ringDMACommand != nullptr) {
+        psp.ringDMACommand->CompleteDMA(kIODMACommandCompleteDMANoOptions);
+        psp.ringDMACommand->release();
+        psp.ringDMACommand = nullptr;
+    }
+    if (psp.ringBuffer != nullptr) {
+        psp.ringBuffer->release();
+        psp.ringBuffer = nullptr;
+    }
+    psp.ringCPUAddr = nullptr;
+    psp.ringBusAddr = 0;
+    psp.ringSize    = 0;
+    psp.ringCreated = false;
+
     if (psp.fwPriDMACommand != nullptr) {
         psp.fwPriDMACommand->CompleteDMA(kIODMACommandCompleteDMANoOptions);
         psp.fwPriDMACommand->release();
@@ -218,6 +232,153 @@ psp_load_sos(DeviceContext &dev, PSPContext &psp)
 
     PSP_LOG("SOS load timeout — C2PMSG_81 stayed %#010x", v);
     return kIOReturnTimeout;
+}
+
+kern_return_t
+psp_bootloader_load_component(DeviceContext &dev, PSPContext &psp,
+                              const uint8_t *bin, uint64_t binSize,
+                              uint32_t bl_cmd)
+{
+    if (psp.fwPriCPUAddr == nullptr) {
+        PSP_LOG("load_component(cmd=%#x): psp_init not called", bl_cmd);
+        return kIOReturnNotReady;
+    }
+    if (bin == nullptr || binSize == 0 || binSize > psp.fwPriSize) {
+        return kIOReturnBadArgument;
+    }
+    if (!dev.ip.isResolved(IPBlock::MP0)) {
+        return kIOReturnNotReady;
+    }
+
+    // If SOS is already alive the bootloader window has closed —
+    // these components only matter pre-SOS.
+    if (psp_is_sos_alive(dev)) {
+        PSP_LOG("load_component(cmd=%#x): SOS already alive — skip", bl_cmd);
+        return kIOReturnSuccess;
+    }
+
+    if (!psp_wait_for_bootloader(dev)) {
+        return kIOReturnTimeout;
+    }
+
+    memset(psp.fwPriCPUAddr, 0, psp.fwPriSize);
+    memcpy(psp.fwPriCPUAddr, bin, binSize);
+
+    const uint32_t regAddr = SOC15_REG_OFFSET(dev, IPBlock::MP0,
+                                              MP0Regs::C2PMSG_36);
+    const uint32_t regCmd  = SOC15_REG_OFFSET(dev, IPBlock::MP0,
+                                              MP0Regs::C2PMSG_35);
+
+    WREG32(dev, regAddr, static_cast<uint32_t>(psp.fwPriBusAddr >> 20));
+    WREG32(dev, regCmd,  bl_cmd);
+
+    if (!psp_wait_for_bootloader(dev)) {
+        PSP_LOG("load_component(cmd=%#x): post-load wait timed out", bl_cmd);
+        return kIOReturnTimeout;
+    }
+    PSP_LOG("load_component(cmd=%#x): ok", bl_cmd);
+    return kIOReturnSuccess;
+}
+
+kern_return_t
+psp_ring_create(DeviceContext &dev, PSPContext &psp)
+{
+    if (psp.ringCreated) {
+        return kIOReturnSuccess;
+    }
+    if (!psp.sosAlive) {
+        PSP_LOG("ring_create: SOS not alive yet");
+        return kIOReturnNotReady;
+    }
+    if (!dev.ip.isResolved(IPBlock::MP0)) {
+        return kIOReturnNotReady;
+    }
+
+    // 4 KB system-memory buffer (DART-mapped).
+    IOBufferMemoryDescriptor *buf = nullptr;
+    kern_return_t ret = IOBufferMemoryDescriptor::Create(
+        kIOMemoryDirectionOutIn, kPSPKMRingSize, 4096, &buf);
+    if (ret != kIOReturnSuccess || buf == nullptr) {
+        return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
+    }
+    ret = buf->SetLength(kPSPKMRingSize);
+    if (ret != kIOReturnSuccess) {
+        buf->release();
+        return ret;
+    }
+
+    IODMACommandSpecification spec = {};
+    spec.options        = kIODMACommandSpecificationNoOptions;
+    spec.maxAddressBits = 64;
+
+    IODMACommand *cmd = nullptr;
+    ret = IODMACommand::Create(dev.pci, kIODMACommandCreateNoOptions,
+                               &spec, &cmd);
+    if (ret != kIOReturnSuccess || cmd == nullptr) {
+        buf->release();
+        return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
+    }
+    uint64_t flags = 0;
+    uint32_t segCount = 1;
+    IOAddressSegment seg = {};
+    ret = cmd->PrepareForDMA(kIODMACommandPrepareForDMANoOptions,
+                             buf, 0, kPSPKMRingSize,
+                             &flags, &segCount, &seg);
+    if (ret != kIOReturnSuccess || segCount != 1) {
+        cmd->release();
+        buf->release();
+        return ret != kIOReturnSuccess ? ret : kIOReturnNotAligned;
+    }
+    IOAddressSegment cpuSeg = {};
+    buf->GetAddressRange(&cpuSeg);
+
+    psp.ringBuffer      = buf;
+    psp.ringDMACommand  = cmd;
+    psp.ringBusAddr     = seg.address;
+    psp.ringCPUAddr     = reinterpret_cast<void *>(cpuSeg.address);
+    psp.ringSize        = kPSPKMRingSize;
+
+    const uint32_t reg64 = SOC15_REG_OFFSET(dev, IPBlock::MP0,
+                                            MP0Regs::C2PMSG_64);
+    const uint32_t reg69 = SOC15_REG_OFFSET(dev, IPBlock::MP0,
+                                            MP0Regs::C2PMSG_69);
+    const uint32_t reg70 = SOC15_REG_OFFSET(dev, IPBlock::MP0,
+                                            MP0Regs::C2PMSG_70);
+    const uint32_t reg71 = SOC15_REG_OFFSET(dev, IPBlock::MP0,
+                                            MP0Regs::C2PMSG_71);
+
+    // 1. Wait for SOS ready to accept ring creation.
+    uint32_t v = 0;
+    if (!poll_reg(dev, reg64, kPSPMboxRespMask, kPSPMboxRespFlag,
+                  5 * 1000000, &v)) {
+        PSP_LOG("ring_create: SOS not ready — C2PMSG_64=%#010x", v);
+        psp.ringDMACommand->CompleteDMA(kIODMACommandCompleteDMANoOptions);
+        psp.ringDMACommand->release();
+        psp.ringDMACommand = nullptr;
+        psp.ringBuffer->release();
+        psp.ringBuffer = nullptr;
+        return kIOReturnTimeout;
+    }
+
+    // 2. Program ring address (low + high) + size, then kick.
+    WREG32(dev, reg69, static_cast<uint32_t>(psp.ringBusAddr & 0xFFFFFFFFu));
+    WREG32(dev, reg70, static_cast<uint32_t>(psp.ringBusAddr >> 32));
+    WREG32(dev, reg71, static_cast<uint32_t>(psp.ringSize));
+    WREG32(dev, reg64, kPSPRingTypeKM << 16);
+
+    IOSleep(20);
+
+    // 3. Wait for response flag.
+    if (!poll_reg(dev, reg64, kPSPMboxRespMask, kPSPMboxRespFlag,
+                  5 * 1000000, &v)) {
+        PSP_LOG("ring_create: response wait timed out — C2PMSG_64=%#010x", v);
+        return kIOReturnTimeout;
+    }
+
+    psp.ringCreated = true;
+    PSP_LOG("ring_created bus=%#llx size=%llu (response=%#010x)",
+            psp.ringBusAddr, psp.ringSize, v);
+    return kIOReturnSuccess;
 }
 
 } // namespace MacAMDGPU

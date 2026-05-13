@@ -63,19 +63,20 @@ static const char *
 stage_name(BringupStage s)
 {
     switch (s) {
-    case BringupStage::None:        return "None";
-    case BringupStage::IPDiscovery: return "IPDiscovery";
-    case BringupStage::PSPInit:     return "PSPInit";
-    case BringupStage::PSPLoadSOS:  return "PSPLoadSOS";
-    case BringupStage::SMUInit:     return "SMUInit";
-    case BringupStage::GMCInit:     return "GMCInit";
-    case BringupStage::IMUInit:     return "IMUInit";
-    case BringupStage::RLCInit:     return "RLCInit";
-    case BringupStage::CPInit:      return "CPInit";
-    case BringupStage::MESInit:     return "MESInit";
-    case BringupStage::IHInit:      return "IHInit";
-    case BringupStage::GFXInit:     return "GFXInit";
-    case BringupStage::SDMAInit:    return "SDMAInit";
+    case BringupStage::None:          return "None";
+    case BringupStage::IPDiscovery:   return "IPDiscovery";
+    case BringupStage::PSPInit:       return "PSPInit";
+    case BringupStage::PSPLoadSOS:    return "PSPLoadSOS";
+    case BringupStage::PSPRingCreate: return "PSPRingCreate";
+    case BringupStage::SMUInit:       return "SMUInit";
+    case BringupStage::GMCInit:       return "GMCInit";
+    case BringupStage::IMUInit:       return "IMUInit";
+    case BringupStage::RLCInit:       return "RLCInit";
+    case BringupStage::CPInit:        return "CPInit";
+    case BringupStage::MESInit:       return "MESInit";
+    case BringupStage::IHInit:        return "IHInit";
+    case BringupStage::GFXInit:       return "GFXInit";
+    case BringupStage::SDMAInit:      return "SDMAInit";
     }
     return "?";
 }
@@ -93,6 +94,8 @@ run_stage(BringupContext &ctx, BringupStage s)
         return psp_init(ctx.device, ctx.psp);
     case BringupStage::PSPLoadSOS:
         return psp_load_sos(ctx.device, ctx.psp);
+    case BringupStage::PSPRingCreate:
+        return psp_ring_create(ctx.device, ctx.psp);
     // Stubs — return kIOReturnUnsupported until ported.
     case BringupStage::SMUInit:
     case BringupStage::GMCInit:

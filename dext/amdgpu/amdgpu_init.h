@@ -29,19 +29,20 @@
 namespace MacAMDGPU {
 
 enum class BringupStage : uint32_t {
-    None         = 0,
-    IPDiscovery  = 1,
-    PSPInit      = 2,
-    PSPLoadSOS   = 3,
-    SMUInit      = 4,
-    GMCInit      = 5,
-    IMUInit      = 6,
-    RLCInit      = 7,
-    CPInit       = 8,
-    MESInit      = 9,
-    IHInit       = 10,
-    GFXInit      = 11,
-    SDMAInit     = 12,
+    None          = 0,
+    IPDiscovery   = 1,
+    PSPInit       = 2,
+    PSPLoadSOS    = 3,
+    PSPRingCreate = 4,
+    SMUInit       = 5,
+    GMCInit       = 6,
+    IMUInit       = 7,
+    RLCInit       = 8,
+    CPInit        = 9,
+    MESInit       = 10,
+    IHInit        = 11,
+    GFXInit       = 12,
+    SDMAInit      = 13,
 };
 
 //

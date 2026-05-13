@@ -53,13 +53,19 @@ enum {
     kMacAMDGPUMethodGetIPBase         = 12,
 };
 
-// Firmware type tags used by LoadFirmware.
+// Firmware type tags used by LoadFirmware. Pre-SOS components route
+// through psp_bootloader_load_component; SOS is special (psp_load_sos).
 enum {
-    kMacAMDGPUFwTypeSOS   = 0,  // psp_14_0_3_sos.bin → PSPLoadSOS
-    kMacAMDGPUFwTypeTA    = 1,  // psp_14_0_3_ta.bin
-    kMacAMDGPUFwTypeKDB   = 2,
-    kMacAMDGPUFwTypeSysDrv= 3,
-    kMacAMDGPUFwTypeSocDrv= 4,
+    kMacAMDGPUFwTypeSOS         = 0,
+    kMacAMDGPUFwTypeKDB         = 1,
+    kMacAMDGPUFwTypeSPL         = 2,
+    kMacAMDGPUFwTypeSysDrv      = 3,
+    kMacAMDGPUFwTypeSocDrv      = 4,
+    kMacAMDGPUFwTypeIntfDrv     = 5,
+    kMacAMDGPUFwTypeDbgDrv      = 6,   // a.k.a. HAD on v14
+    kMacAMDGPUFwTypeRASDrv      = 7,
+    kMacAMDGPUFwTypeIPKeyMgrDrv = 8,
+    kMacAMDGPUFwTypeTA          = 9,
 };
 
 enum {
@@ -826,22 +832,43 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             return kIOReturnInternalError;
         }
 
+        auto &dev = driver->ivars->bringup.device;
+        auto &psp = driver->ivars->bringup.psp;
+        const uint8_t *bin = reinterpret_cast<const uint8_t *>(seg.address);
+
         switch (fwType) {
         case kMacAMDGPUFwTypeSOS: {
-            auto &psp = driver->ivars->bringup.psp;
-            // psp_load_sos memcpys this into fw_pri before returning.
-            // The CPU-side pointer is stable for the duration of the
-            // synchronous call.
-            psp.sosFirmware     = reinterpret_cast<const uint8_t *>(
-                                      seg.address);
+            psp.sosFirmware     = bin;
             psp.sosFirmwareSize = fwSize;
-            kern_return_t ret = MacAMDGPU::psp_load_sos(
-                driver->ivars->bringup.device, psp);
-            // Clear our hold on the client-side pointer immediately.
+            kern_return_t ret = MacAMDGPU::psp_load_sos(dev, psp);
             psp.sosFirmware = nullptr;
             psp.sosFirmwareSize = 0;
             return ret;
         }
+        case kMacAMDGPUFwTypeKDB:
+            return MacAMDGPU::psp_bootloader_load_component(
+                dev, psp, bin, fwSize, MacAMDGPU::PSPBootloaderCmd::LoadKeyDatabase);
+        case kMacAMDGPUFwTypeSPL:
+            return MacAMDGPU::psp_bootloader_load_component(
+                dev, psp, bin, fwSize, MacAMDGPU::PSPBootloaderCmd::LoadTosSPLTable);
+        case kMacAMDGPUFwTypeSysDrv:
+            return MacAMDGPU::psp_bootloader_load_component(
+                dev, psp, bin, fwSize, MacAMDGPU::PSPBootloaderCmd::LoadSysDrv);
+        case kMacAMDGPUFwTypeSocDrv:
+            return MacAMDGPU::psp_bootloader_load_component(
+                dev, psp, bin, fwSize, MacAMDGPU::PSPBootloaderCmd::LoadSocDrv);
+        case kMacAMDGPUFwTypeIntfDrv:
+            return MacAMDGPU::psp_bootloader_load_component(
+                dev, psp, bin, fwSize, MacAMDGPU::PSPBootloaderCmd::LoadIntfDrv);
+        case kMacAMDGPUFwTypeDbgDrv:
+            return MacAMDGPU::psp_bootloader_load_component(
+                dev, psp, bin, fwSize, MacAMDGPU::PSPBootloaderCmd::LoadHADDrv);
+        case kMacAMDGPUFwTypeRASDrv:
+            return MacAMDGPU::psp_bootloader_load_component(
+                dev, psp, bin, fwSize, MacAMDGPU::PSPBootloaderCmd::LoadRASDrv);
+        case kMacAMDGPUFwTypeIPKeyMgrDrv:
+            return MacAMDGPU::psp_bootloader_load_component(
+                dev, psp, bin, fwSize, MacAMDGPU::PSPBootloaderCmd::LoadIPKeyMgrDrv);
         default:
             MACAMDGPU_LOG("LoadFirmware: fw type %llu not yet implemented",
                           fwType);

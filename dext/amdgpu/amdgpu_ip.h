@@ -95,17 +95,27 @@ struct IPBaseTable {
 //
 //   regMPASP_SMN_C2PMSG_35  = 0x0063  (bootloader cmd / status)
 //   regMPASP_SMN_C2PMSG_36  = 0x0064  (binary fw_pri_mc_addr >> 20)
-//   regMPASP_SMN_C2PMSG_64  = 0x0080  (ring create)
+//   regMPASP_SMN_C2PMSG_64  = 0x0080  (ring create cmd)
+//   regMPASP_SMN_C2PMSG_69  = 0x0085  (ring low addr)
+//   regMPASP_SMN_C2PMSG_70  = 0x0086  (ring high addr)
+//   regMPASP_SMN_C2PMSG_71  = 0x0087  (ring size)
 //   regMPASP_SMN_C2PMSG_81  = 0x0091  (SOS sign-of-life)
-//   regMPASP_SMN_C2PMSG_101 = 0x00a5  (ring destroy, SR-IOV)
+//   regMPASP_SMN_C2PMSG_101 = 0x00A5  (ring destroy, SR-IOV)
+//   regMPASP_SMN_C2PMSG_102 = 0x00A6  (SR-IOV ring low)
+//   regMPASP_SMN_C2PMSG_103 = 0x00A7  (SR-IOV ring high)
 //
-// These are added to the MP0 IP base.
+// All added to the MP0 IP base.
 namespace MP0Regs {
     constexpr uint32_t C2PMSG_35  = 0x0063;
     constexpr uint32_t C2PMSG_36  = 0x0064;
     constexpr uint32_t C2PMSG_64  = 0x0080;
+    constexpr uint32_t C2PMSG_69  = 0x0085;
+    constexpr uint32_t C2PMSG_70  = 0x0086;
+    constexpr uint32_t C2PMSG_71  = 0x0087;
     constexpr uint32_t C2PMSG_81  = 0x0091;
     constexpr uint32_t C2PMSG_101 = 0x00A5;
+    constexpr uint32_t C2PMSG_102 = 0x00A6;
+    constexpr uint32_t C2PMSG_103 = 0x00A7;
 }
 
 // PSP bootloader commands —
@@ -124,5 +134,23 @@ namespace PSPBootloaderCmd {
 
 constexpr uint32_t kPSPBootloaderReadyBit = 0x80000000u;
 constexpr uint32_t kPSPFwPriBufSize       = 1024u * 1024u;  // PSP_1_MEG
+
+// PSP GFX command frame flags — from
+// drivers/gpu/drm/amd/amdgpu/psp_gfx_if.h.
+constexpr uint32_t kPSPGfxCmdStatusMask   = 0x0000FFFFu;
+constexpr uint32_t kPSPGfxCmdResponseMask = 0x80000000u;
+constexpr uint32_t kPSPGfxFlagResponse    = 0x80000000u;
+
+// Combined response handshake. C2PMSG_64 should latch
+// (val & MASK) == FLAG once the bootloader finishes.
+constexpr uint32_t kPSPMboxRespFlag = kPSPGfxFlagResponse;
+constexpr uint32_t kPSPMboxRespMask = kPSPGfxCmdResponseMask
+                                    | kPSPGfxCmdStatusMask;
+
+// psp_ring_type — only KM is used outside SR-IOV.
+constexpr uint32_t kPSPRingTypeKM = 1;
+
+// 4 KB matches Linux's psp_ring_init default for km_ring.
+constexpr uint32_t kPSPKMRingSize = 0x1000;
 
 } // namespace MacAMDGPU
