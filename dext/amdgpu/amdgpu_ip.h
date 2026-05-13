@@ -109,6 +109,7 @@ namespace MP0Regs {
     constexpr uint32_t C2PMSG_35  = 0x0063;
     constexpr uint32_t C2PMSG_36  = 0x0064;
     constexpr uint32_t C2PMSG_64  = 0x0080;
+    constexpr uint32_t C2PMSG_67  = 0x0083;  // PSP ring wptr (non-SR-IOV)
     constexpr uint32_t C2PMSG_69  = 0x0085;
     constexpr uint32_t C2PMSG_70  = 0x0086;
     constexpr uint32_t C2PMSG_71  = 0x0087;

@@ -61,6 +61,22 @@ struct PSPContext {
     void     *ringCPUAddr;
     uint64_t  ringSize;
     bool      ringCreated;
+
+    // PSP command buffer + fence buffer for ring-submitted commands.
+    // The command buffer holds a single psp_gfx_cmd_resp struct (1 KB);
+    // the fence buffer is a small 64 B word that PSP writes after the
+    // command completes. Both DART-mapped.
+#ifdef __APPLE__
+    IOBufferMemoryDescriptor *cmdBuffer;
+    IODMACommand             *cmdDMACommand;
+    IOBufferMemoryDescriptor *fenceBuffer;
+    IODMACommand             *fenceDMACommand;
+#endif
+    uint64_t  cmdBusAddr;
+    void     *cmdCPUAddr;
+    uint64_t  fenceBusAddr;
+    void     *fenceCPUAddr;
+    uint32_t  fenceCounter;
 };
 
 //
@@ -127,5 +143,22 @@ kern_return_t psp_bootloader_load_component(DeviceContext &dev,
 // ring. We don't use UM ring (userspace-mode, SR-IOV-only).
 //
 kern_return_t psp_ring_create(DeviceContext &dev, PSPContext &psp);
+
+//
+// psp_ring_cmd_submit — port of upstream psp_ring_cmd_submit +
+// psp_cmd_submit_buf. Synchronously submits a single PSP GFX command
+// frame, waits for the fence to come back. Returns the PSP response
+// status via *outRespStatus (PSP convention: 0 = success).
+//
+// The caller fills `cmd` (a psp_gfx_cmd_resp-sized buffer); we memcpy
+// it into psp.cmdCPUAddr, then build a psp_gfx_rb_frame in the ring
+// that points to it, then bump the wptr.
+//
+// cmdSize is the user-provided struct size — must match the upstream
+// sizeof(psp_gfx_cmd_resp) = 1024 bytes.
+//
+kern_return_t psp_ring_cmd_submit(DeviceContext &dev, PSPContext &psp,
+                                  const void *cmd, uint32_t cmdSize,
+                                  uint32_t *outRespStatus);
 
 } // namespace amdgpu
