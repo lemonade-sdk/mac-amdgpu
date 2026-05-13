@@ -32,6 +32,7 @@
 #include "amdgpu/amdgpu_init.h"
 #include "amdgpu/amdgpu_discovery.h"
 #include "amdgpu/amdgpu_ih.h"
+#include "amdgpu/amdgpu_cp.h"
 
 #define MACAMDGPU_LOG(fmt, ...) \
     os_log(OS_LOG_DEFAULT, "mac.amdgpu: " fmt, ##__VA_ARGS__)
@@ -54,6 +55,7 @@ enum {
     kMacAMDGPUMethodSetIPBase         = 11,
     kMacAMDGPUMethodGetIPBase         = 12,
     kMacAMDGPUMethodLoadDiscoveryBin  = 13,
+    kMacAMDGPUMethodSubmitTestPM4     = 14,
 };
 
 // Firmware type tags used by LoadFirmware. Pre-SOS components route
@@ -967,6 +969,27 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         arguments->scalarOutput[1] =
             driver->ivars->bringup.device.ip.isResolved(block) ? 1 : 0;
         return kIOReturnSuccess;
+    }
+
+    case kMacAMDGPUMethodSubmitTestPM4: {
+        // scalarInput[0] = timeout_us
+        // scalarOutput[0] = fence value if observed, 0 on timeout
+        if (arguments->scalarInput == nullptr ||
+            arguments->scalarInputCount < 1 ||
+            arguments->scalarOutput == nullptr ||
+            arguments->scalarOutputCount < 1) {
+            return kIOReturnBadArgument;
+        }
+        if (!driver->ivars->pciOpen) return kIOReturnNotOpen;
+        uint64_t timeout_us = arguments->scalarInput[0];
+        if (timeout_us == 0) timeout_us = 1000000;  // 1 s default
+        uint32_t fence = 0;
+        kern_return_t r = amdgpu::cp_submit_eop_test(
+            driver->ivars->bringup.device,
+            driver->ivars->bringup.cp,
+            timeout_us, &fence);
+        arguments->scalarOutput[0] = fence;
+        return r;
     }
 
     case kMacAMDGPUMethodLoadDiscoveryBin: {

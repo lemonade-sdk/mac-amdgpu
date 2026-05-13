@@ -35,6 +35,7 @@ private let kLoadFirmware:      UInt32 = 10
 private let kSetIPBase:         UInt32 = 11
 private let kGetIPBase:         UInt32 = 12
 private let kLoadDiscoveryBin:  UInt32 = 13
+private let kSubmitTestPM4:     UInt32 = 14
 
 private let kMemBAR0:           UInt32 = 0
 private let kMemBAR2:           UInt32 = 2
@@ -354,6 +355,19 @@ func resetDevice(_ conn: io_connect_t) {
     print("reset:     issued")
 }
 
+func submitTestPM4(_ conn: io_connect_t, timeoutUs: UInt64 = 1_000_000) {
+    print("pm4 test:  emitting NOP + RELEASE_MEM (timeout \(timeoutUs) µs)")
+    let (kr, out) = callScalar(conn, kSubmitTestPM4,
+                               input: [timeoutUs], outputCount: 1)
+    let fence = out.first ?? 0
+    if kr == KERN_SUCCESS && fence != 0 {
+        print("pm4 test:  EOP fence \(fence) observed")
+    } else {
+        warn("pm4 test: kr=\(String(format: "%#x", kr)) fence=\(fence) "
+             + "(needs IP bases resolved + CP HQD programmed; check os_log)")
+    }
+}
+
 // --- Main ---------------------------------------------------------------
 
 let args = CommandLine.arguments
@@ -367,6 +381,7 @@ var discoveryPath: String? = nil
 if let i = args.firstIndex(of: "--load-discovery"), i + 1 < args.count {
     discoveryPath = args[i + 1]
 }
+let wantSubmitTest = args.contains("--submit-test")
 
 print("opening MacAMDGPU service…")
 let conn = openService()
@@ -401,6 +416,10 @@ if wantInit || sosPath != nil {
         // cleanly with a useful error.
         initDevice(conn, stage: kStagePSPLoadSOS)
     }
+}
+
+if wantSubmitTest {
+    submitTestPM4(conn)
 }
 
 if wantReset {
