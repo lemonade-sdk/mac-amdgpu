@@ -8,7 +8,7 @@ A third-party, Metal-bypassing graphics + compute stack for AMD RDNA4 GPUs (gfx1
 
 | Decision | Value | Notes |
 |---|---|---|
-| Mac platform | **Apple Silicon (M5 Pro/Max, M5 Ultra)** | TB5 controller on-die; PCIe eGPU enumeration over TB5/USB4 works. Tiny Corp's TinyGPU is the public precedent for Apple-signed third-party dext for eGPUs over TB. |
+| Mac platform | **Apple Silicon (M5 Pro/Max, M5 Ultra) — no Intel support** | TB5 controller on-die; PCIe eGPU enumeration over TB5/USB4 works. User's `qemu-vfio-apple` fork is the local working precedent (R9700 via VFIO passthrough through a PCIDriverKit dext into a Linux VM). TinyGPU is a public precedent. |
 | Bus | **Thunderbolt 5 (~80 Gbps usable bidirectional)** | Bandwidth budget for Phase 3 copy-back is real (~10 GB/s each direction), much better than the TB3 era. |
 | Target ASIC | **AMD Radeon AI PRO R9700 (RDNA4, gfx1201, 32 GB GDDR6 ECC)** | Workstation card, $1299, 96 TFLOPs FP16, 128 AI accelerators, 300 W TDP, DP 2.1a. PCIe Gen5 x16 native. |
 | GPU IP blocks | GFX12 (gfx_v12_1), GMC v12, SDMA v7_1, MES v12_1, NBIO v7_11, PSP v14_0_3, SMU v14_0_3 | Linux source maps to these versioned drivers under `drivers/gpu/drm/amd/amdgpu/`. |
@@ -20,11 +20,13 @@ A third-party, Metal-bypassing graphics + compute stack for AMD RDNA4 GPUs (gfx1
 
 ## 1. Reality check — read before any code
 
-1. **Prior art: Tiny Corp's TinyGPU.** Apple has approved an open driver extension that lets AMD/NVIDIA eGPUs run on M-series Macs over TB/USB4. It is **compute-only, AI-focused, no graphics acceleration**. This is project-shaping: the entitlement path is provable, and TinyGPU's dext is the closest reference implementation. **Gate 0.X: evaluate whether TinyGPU's UAPI is sufficient for our Vulkan compute ICD — if yes, skip most of Phase 1.** If not, build our own dext but borrow lessons.
-2. **DriverKit entitlement workflow.** The correct sequence is: build the Xcode dext bundle → register bundle ID + vendor identity on Apple Developer portal → request `com.apple.developer.driverkit.transport.pci` against that bundle ID. Apple's review can take weeks. Do this in parallel with Phase 1A skeleton code, not before.
-3. **DART (Apple Silicon DMA).** On AS, PCIe DMA is mediated by DART (Device Address Resolution Table) — Apple's IOMMU. PCIDriverKit's `IODMACommand` abstracts this, but pinning, alignment, and TLB invalidation semantics differ from VT-d. Phase 1A must validate DMA round-trip before the bringup sequence depends on it.
-4. **MES, not bare MEC.** RDNA4 has graduated to MES (MicroEngine Scheduler)-managed queues for many submission paths. The Linux driver uses `mes_v12_1.c` to manage queue lifecycle. Phase 1B is meaningfully different from RDNA2 — plan around MES queue ops, not raw KIQ/MEC ring programming.
-5. **Firmware redistribution.** AMD firmware is in `upstream/linux-firmware/amdgpu/`, license is permissive with attribution. Ship `NOTICE` + `LICENSE.amdgpu` and you're clean.
+1. **Local prior art: `~/Documents/qemu-vfio-apple`.** The user maintains a QEMU fork with **PCI passthrough on Apple Silicon via a PCIDriverKit dext** (`contrib/apple-vfio/VFIOUserPCIDriver/`). It already runs the R9700 (VID `0x1002`, DID `0x7551`) under VFIO into a Linux VM. This is the architectural reference for our own dext: same framework, same DMA semantics, same host signing posture. **Traces in `qemu-vfio-apple/traces/` (3.5 GB, May 2026) capture real R9700 init sequences via `apple_dext_config_*` events and `guest-trace-amdgpu.sh` ftrace dumps** — these are our ground truth instead of needing a separate Linux box.
+2. **Tiny Corp's TinyGPU** is the public precedent for an Apple-signed dext for eGPUs on AS. Reference only; not reusable directly (closed binary, compute-only via tinygrad).
+3. **DriverKit entitlement workflow.** Correct sequence: build the Xcode dext bundle → register bundle ID + vendor identity on Apple Developer portal → request `com.apple.developer.driverkit.transport.pci` against that bundle ID. Apple's review can take weeks. Do this in parallel with Phase 1A skeleton code. The user's qemu-vfio-apple project is already entitlement-aware (its README documents the same gate); reuse the same Apple Developer team.
+4. **DART (Apple Silicon DMA).** On AS, PCIe DMA is mediated by DART — Apple's IOMMU. PCIDriverKit's `IODMACommand` abstracts this; pinning, alignment, and TLB invalidation semantics are AS-specific. The apple-vfio dext already handles this correctly — port the pattern.
+5. **HVF limitation noted in qemu-vfio-apple:** HVF cannot decode all trapping load/store instructions on AS, so BAR MMIO can't be traced from the host hypervisor side. The user works around this by capturing from inside the guest with ftrace on `amdgpu_device_rreg/wreg`. Our native driver doesn't have this constraint (we own the MMIO) but the captured traces are the canonical reference for register sequences.
+6. **MES, not bare MEC.** RDNA4 has graduated to MES (MicroEngine Scheduler)-managed queues. Linux uses `mes_v12_1.c` for queue lifecycle. Phase 1B is structured around MES queue ops, not raw KIQ/MEC ring programming.
+7. **Firmware redistribution.** AMD firmware in `upstream/linux-firmware/amdgpu/` is permissive with attribution. Ship `NOTICE` + `LICENSE.amdgpu`.
 
 ---
 
@@ -96,14 +98,15 @@ Result is **"RADV-mac"** — ~5–10% original code, ~90% Mesa, line drawn at th
 
 | # | Task | Done when |
 |---|---|---|
-| 0.1 | Evaluate TinyGPU UAPI sufficiency for compute ICD | Decision: reuse TinyGPU dext, or build our own. |
-| 0.2 | Acquire R9700 + M5 Max/Ultra Mac + TB5 enclosure | Hardware in hand. |
-| 0.3 | Stand up Linux reference rig (R9700 + Ubuntu 24.04.3 + kernel 6.17+) | `vkcube` and `llama.cpp` Vulkan working. |
-| 0.4 | Capture umr/radeontool register init + vkcube submit trace | Reference traces archived under `docs/traces/`. |
+| 0.1 | Read `qemu-vfio-apple/contrib/apple-vfio/VFIOUserPCIDriver/` end-to-end | Architecture, IIG interfaces, entitlements, Start/Stop lifecycle understood. |
+| 0.2 | Index `qemu-vfio-apple/traces/` by trace event type | Catalog of `apple_dext_config_*`, `vfio_*`, ftrace amdgpu sequences, devcoredumps. |
+| 0.3 | Replay a representative trace into a parser; reconstruct R9700 init register sequence | `docs/INIT_SEQUENCE.md` derived from real captures. |
+| 0.4 | Confirm hardware: R9700 + M5 Pro/Max/Ultra + TB5 enclosure in hand | Already true (qemu-vfio-apple runs on this rig). |
 | 0.5 | Pull firmware blobs for gfx1201, record versions in `firmware/MANIFEST.md` | Manifest committed. |
 | 0.6 | Author NOTICE + LICENSE.amdgpu | Files committed. |
-| 0.7 | Decide debug strategy (`os_log` + IOUserClient debug method + Linux umr cross-ref) | `docs/DEBUG.md` written. |
+| 0.7 | Decide debug strategy (`os_log` + IOUserClient debug method + cross-ref vs qemu-vfio-apple traces) | `docs/DEBUG.md` written. |
 | 0.8 | Pin macOS build + capture DriverKit SDK version | `docs/HARDWARE.md` written. |
+| 0.9 | Confirm Apple Developer team + entitlement plan (reuse qemu-vfio-apple's team or new one) | Decision recorded. |
 
 **Gate to Phase 1:** 0.1, 0.2, 0.3.
 
@@ -111,14 +114,14 @@ Result is **"RADV-mac"** — ~5–10% original code, ~90% Mesa, line drawn at th
 
 Build the Xcode bundle first so the entitlement request has a target. Apple's review runs in parallel with code.
 
-- 1A.1 Create Xcode workspace `mac_amdgpu.xcworkspace` + `amdgpu.dext` target (PCIDriverKit).
-- 1A.2 Info.plist `IOKitPersonalities` matching VID `0x1002` / DID `0x7550` (R9700) or wildcard for the gfx1201 family.
+- 1A.1 Create Xcode workspace `mac_amdgpu.xcworkspace` + `amdgpu.dext` target (PCIDriverKit). Mirror layout of `qemu-vfio-apple/contrib/apple-vfio/VFIOUserPCIDriver/`.
+- 1A.2 Info.plist `IOKitPersonalities` matching VID `0x1002` / DID `0x7551` (R9700) — confirmed from trace `value=0x75511002` at config offset 0x0.
 - 1A.3 Build, codesign with team identity → bundle ID registered on Apple Developer portal.
 - 1A.4 **Submit entitlement request** for `com.apple.developer.driverkit.transport.pci` against bundle ID — parallel to 1A.5+.
-- 1A.5 `Start()` — open `IOPCIDevice` over TB5, log VID/DID/config space.
-- 1A.6 Map BARs — BAR0 (registers, MMIO), BAR2 (VRAM aperture), BAR5 (doorbells).
+- 1A.5 `Start()` — open `IOPCIDevice` over TB5, log VID/DID/config space; compare against `qemu-vfio-apple/traces/linux-pre-driver-init.txt`.
+- 1A.6 Map BARs — BAR0 (registers, MMIO), BAR2 (VRAM aperture), BAR5 (doorbells). Cross-check sizes against config space reads from the captured traces.
 - 1A.7 Enable bus master + MSI-X; allocate N vectors via `IOInterruptDispatchSource`.
-- 1A.8 DART/DMA validation — `IODMACommand` allocate, write, GPU SDMA-copy back, bit-compare.
+- 1A.8 DART/DMA validation — `IODMACommand` allocate, write, GPU SDMA-copy back, bit-compare. Pattern after `VFIOUserPCIDriver.cpp` DMA paths.
 - 1A.9 `IOUserClient` subclass + stub method table.
 - 1A.10 Userspace test (`scripts/dext_ping.swift`) — open service, ping round-trip.
 
@@ -126,7 +129,7 @@ Build the Xcode bundle first so the entitlement request has a target. Apple's re
 
 ### Phase 1B — Hardware bringup (RDNA4-specific)
 
-Port from `upstream/linux/drivers/gpu/drm/amd/amdgpu/` against the gfx1201/v12_1/v7/v14 versioned files. Cite Linux source files in commit messages. Cross-check every register write against umr traces from the Linux reference rig.
+Port from `upstream/linux/drivers/gpu/drm/amd/amdgpu/` against the gfx1201/v12_1/v7/v14 versioned files. Cite Linux source files in commit messages. Cross-check every register write against the ftrace captures in `qemu-vfio-apple/traces/` (those are the exact RREG32/WREG32 sequences amdgpu emits when bringing up our R9700 on our actual hardware).
 
 - 1B.1 IP discovery — RDNA4 uses on-die IP discovery table (`amdgpu_discovery.c`).
 - 1B.2 PSP v14 bringup (`psp_v14_0.c`): load `psp_14_0_3_sos.bin`, verify SOS signature, hand off.
@@ -232,8 +235,8 @@ Port from `upstream/linux/drivers/gpu/drm/amd/amdgpu/` against the gfx1201/v12_1
 
 | Risk | Probability | Impact | Mitigation |
 |---|---|---|---|
-| DriverKit PCIe entitlement denied | Low (TinyGPU precedent) | Project-killer | Apply against the dext bundle ID early; appeal with TinyGPU as precedent. |
-| TinyGPU's UAPI insufficient for Vulkan compute | Medium | Phase 1B scope swells | Plan for our own dext from day one; reuse TinyGPU only if it cleanly fits. |
+| DriverKit PCIe entitlement denied | Low (TinyGPU + qemu-vfio-apple precedents) | Project-killer | Apply against the dext bundle ID early; appeal with TinyGPU and qemu-vfio-apple as precedents. |
+| qemu-vfio-apple dext architecture proves insufficient pattern for full amdgpu lifecycle | Medium | Phase 1A rework | Treat apple-vfio dext as "PCI plumbing reference," not "everything"; the amdgpu lifecycle (MES, fences, queues) is added on top, not inherited. |
 | Apple changes DriverKit ABI mid-development | Medium | Phase 1 rework | Pin macOS version; maintain a test VM/snapshot. |
 | Firmware microcode signature mismatch / PSP rejection | Medium | Phase 1B stall | Match `linux-firmware` git SHA to validated Linux config; if PSP refuses, escalate via `psp_v14_0_3_sos_kicker.bin` path. |
 | RDNA4 GFX12 register/packet drift from Linux | Medium-High | Phase 1B stall | Bit-compare every submit against umr traces from Linux R9700. |
@@ -246,7 +249,6 @@ Port from `upstream/linux/drivers/gpu/drm/amd/amdgpu/` against the gfx1201/v12_1
 
 ## 6. Out of scope (explicit)
 
-- Intel Mac support. (AS only.)
 - Display output direct from R9700 ports. (All scanout via copy-back to Mac's iGPU and CoreAnimation.)
 - Non-RDNA4 ASICs for the first release. (gfx1201 only until Phase 4.)
 - Non-AMD GPUs.
@@ -257,10 +259,11 @@ Port from `upstream/linux/drivers/gpu/drm/amd/amdgpu/` against the gfx1201/v12_1
 
 ## 7. References
 
+- **qemu-vfio-apple (local prior art)** — `~/Documents/qemu-vfio-apple/contrib/apple-vfio/VFIOUserPCIDriver/`: working AS PCIDriverKit dext + IIG interfaces. `~/Documents/qemu-vfio-apple/traces/`: 3.5 GB of real R9700 captures (config space, ftrace amdgpu RREG/WREG, devcoredumps). `guest-trace-amdgpu.sh` is the capture tool to extend.
 - Linux amdgpu — `upstream/linux/drivers/gpu/drm/amd/amdgpu/` (gfx_v12_*, gmc_v12_*, mes_v12_*, psp_v14_0, smu_v14_0, sdma_v7_*, nbio_v7_11)
 - Mesa userspace — `upstream/mesa/src/amd/`, `upstream/mesa/src/compiler/`, `upstream/mesa/src/vulkan/`
 - AMD firmware — `upstream/linux-firmware/amdgpu/` (gc_12_0_1_*, psp_14_0_3_*, smu_14_0_3*, sdma_7_0_1)
-- TinyGPU (prior art) — https://docs.tinygrad.org/tinygpu/ and https://github.com/tinygrad
+- TinyGPU (public prior art) — https://docs.tinygrad.org/tinygpu/ and https://github.com/tinygrad
 - Apple PCIDriverKit — https://developer.apple.com/documentation/pcidriverkit
 - DriverKit transport entitlements — https://developer.apple.com/documentation/bundleresources/entitlements/com_apple_developer_driverkit_transport_pci
 - AMD R9700 specs — https://www.amd.com/en/products/graphics/workstations/radeon-ai-pro/ai-9000-series/amd-radeon-ai-pro-r9700.html

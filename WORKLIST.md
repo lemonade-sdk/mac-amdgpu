@@ -15,42 +15,41 @@ Phase numbers match `ROADMAP.md`. Target hardware fixed: Apple Silicon M5 Pro/Ma
 - [x] 004  Clone linux-firmware (sparse: `amdgpu/`)
 - [x] 005  Verify GFX12/RDNA4 firmware blobs present in `linux-firmware/amdgpu/` (`gc_12_0_1_*`, `psp_14_0_3_*`, `smu_14_0_3*`, `sdma_7_0_1`) — confirmed
 - [x] 006  Verify Linux source has gfx_v12_1, gmc_v12, mes_v12_1, psp_v14_0, sdma_v7_1, nbio_v7_11 — confirmed
-- [ ] 007  Evaluate TinyGPU UAPI — does it expose enough for a Vulkan compute ICD? (Read tinygrad runtime code, talk to TC if needed)
-- [ ] 008  Acquire AMD Radeon AI PRO R9700
-- [ ] 009  Acquire M5 Max or M5 Ultra Mac + TB5 PCIe enclosure rated for 300W
-- [ ] 010  Stand up Linux reference rig (Ubuntu 24.04.3 + kernel 6.17+ + R9700 + amdgpu)
-- [ ] 011  Install ROCm 7.0.2+ and Mesa 25.2.8+ on Linux rig
-- [ ] 012  Install `umr` on Linux rig
-- [ ] 013  Capture `umr` register dump at idle (baseline, archive in `docs/traces/`)
-- [ ] 014  Capture `umr` submit trace of vkcube on Linux rig
-- [ ] 015  Capture `umr` submit trace of `llama.cpp` forward pass on Linux rig
-- [ ] 016  Validate llama.cpp Vulkan backend with R9700 on Linux (tokens/sec baseline)
-- [ ] 017  Write `firmware/MANIFEST.md` — exact linux-firmware git SHA + file list for gfx1201
-- [ ] 018  Author `NOTICE` + `LICENSE.amdgpu` (AMD's firmware license text)
-- [ ] 019  Pin macOS version (likely macOS 26 latest) + DriverKit SDK version; write `docs/HARDWARE.md`
-- [ ] 020  Decide debug strategy: `os_log` channel, IOUserClient debug method, Linux umr cross-ref; write `docs/DEBUG.md`
+- [ ] 007  Read `~/Documents/qemu-vfio-apple/contrib/apple-vfio/VFIOUserPCIDriver/` end-to-end (Info.plist, .iig × 2, .cpp, entitlements)
+- [ ] 008  Document apple-vfio dext architecture: Start/Stop, NewUserClient, BAR mapping pattern, DMA pattern, MSI-X path → `docs/APPLE_VFIO_NOTES.md`
+- [ ] 009  Index `~/Documents/qemu-vfio-apple/traces/` by event type — `apple_dext_config_*`, `vfio_*`, ftrace `amdgpu_*`, `psp_*`, `smu_v14_*`, devcoredumps → `docs/TRACE_INDEX.md`
+- [ ] 010  Write trace parser (`scripts/parse_trace.py`) that ingests `run-*.txt` and reconstructs config space init, register write sequences, MSI-X mappings
+- [ ] 011  Derive R9700 init sequence from `linux-pre-driver-init.txt` + the longest `run-*` capture → `docs/INIT_SEQUENCE.md`
+- [ ] 012  Extend `guest-trace-amdgpu.sh` filters if needed (add MES v12, PSP v14 entry points) and re-capture a clean init + vkcube + llama.cpp run
+- [ ] 013  Cross-reference captured register writes with `upstream/linux/drivers/gpu/drm/amd/amdgpu/gfx_v12_1.c` etc. — confirm version match
+- [ ] 014  Confirm hardware in hand: R9700 + M5 Pro/Max/Ultra + TB5 enclosure (already true per qemu-vfio-apple usage)
+- [ ] 015  Write `firmware/MANIFEST.md` — exact linux-firmware git SHA + file list for gfx1201
+- [ ] 016  Author `NOTICE` + `LICENSE.amdgpu` (AMD's firmware license text)
+- [ ] 017  Pin macOS version (macOS 26 Tahoe per qemu-vfio-apple README) + DriverKit SDK version; write `docs/HARDWARE.md`
+- [ ] 018  Decide debug strategy: `os_log` channel + IOUserClient debug method + cross-ref vs qemu-vfio-apple traces; write `docs/DEBUG.md`
+- [ ] 019  Confirm Apple Developer team — reuse the one used for qemu-vfio-apple if it has the right entitlements pending, or register fresh
 
-**Gate to Phase 1:** 007 (TinyGPU decision), 008, 009, 010, 016.
+**Gate to Phase 1:** 007, 008, 009, 010, 011 (real init sequence reconstructed from captured traces).
 
 ---
 
 ## Phase 1A — Dext skeleton + entitlement (run in parallel)
 
-- [ ] 100  Create Xcode workspace `mac_amdgpu.xcworkspace`
+- [ ] 100  Create Xcode workspace `mac_amdgpu.xcworkspace`, mirror layout of `qemu-vfio-apple/contrib/apple-vfio/`
 - [ ] 101  Add `amdgpu.dext` target with PCIDriverKit framework
-- [ ] 102  Info.plist `IOKitPersonalities` with VID `0x1002` / DID `0x7550` (or wildcard for gfx1201 family)
-- [ ] 103  Entitlements file referencing `com.apple.developer.driverkit.transport.pci`
-- [ ] 104  Configure team identity + code signing
+- [ ] 102  Info.plist `IOKitPersonalities` with VID `0x1002` / DID `0x7551` (R9700, confirmed in trace `value=0x75511002` at config offset 0)
+- [ ] 103  Entitlements file referencing `com.apple.developer.driverkit.transport.pci` (copy pattern from `VFIOUserPCIDriver.entitlements`)
+- [ ] 104  Configure team identity + code signing (reuse qemu-vfio-apple's Apple Developer team if applicable)
 - [ ] 105  Build empty dext bundle → register bundle ID + vendor identity on Apple Developer portal
 - [ ] 106  **Submit entitlement request** against the registered bundle ID (PARALLEL — Apple review can run while we code)
-- [ ] 107  Implement `Start()` — open `IOPCIDevice`, log VID/DID/revision/config space
+- [ ] 107  Implement `Start()` — open `IOPCIDevice`, log VID/DID/revision/config space; bit-compare against `qemu-vfio-apple/traces/linux-pre-driver-init.txt`
 - [ ] 108  Map BAR0 (registers) via `IOMemoryMap`; sanity-check register read
-- [ ] 109  Map BAR2 (VRAM aperture) — log size, verify against R9700 spec (32 GB)
+- [ ] 109  Map BAR2 (VRAM aperture) — log size, verify against R9700 spec (32 GB) and trace-derived value
 - [ ] 110  Map BAR5 (doorbells)
 - [ ] 111  Enable PCI bus master + MSI-X
 - [ ] 112  Allocate N MSI-X vectors via `IOInterruptDispatchSource`
-- [ ] 113  DART/DMA path — `IODMACommand` for a system-memory buffer
-- [ ] 114  DART validation test: write pattern to system buffer, SDMA-copy via raw register poke (later replace with proper SDMA submit), read back, bit-compare
+- [ ] 113  DART/DMA path — `IODMACommand` for a system-memory buffer (pattern from `VFIOUserPCIDriver.cpp` DMA paths)
+- [ ] 114  DART validation: write pattern to system buffer, SDMA-copy via raw register poke, read back, bit-compare
 - [ ] 115  Subclass `IOUserClient`, method table with `Ping` stub
 - [ ] 116  Write `scripts/dext_ping.swift` — open service, call `Ping`, verify
 - [ ] 117  Stub IH ring memory allocation (don't process yet)
@@ -130,7 +129,7 @@ Cite Linux source file in every commit message (e.g. `psp_v14_0.c:psp_v14_0_boot
 - [ ] 253  Vendor `mesa/src/amd/{common,registers,addrlib,compiler}`
 - [ ] 254  Vendor `mesa/src/vulkan/runtime/`
 - [ ] 255  Port `radv_instance` + `radv_physical_device` (point at our winsys)
-- [ ] 256  Expose gfx1201 properties: vendor `0x1002`, device `0x7550`, driver name
+- [ ] 256  Expose gfx1201 properties: vendor `0x1002`, device `0x7551`, driver name
 - [ ] 257  Port `radv_device` — strip render-pass/WSI/graphics for compute-only build
 - [ ] 258  Port command pool + command buffer
 - [ ] 259  Port compute pipeline (`radv_pipeline_compute.c`)
@@ -207,7 +206,7 @@ Cite Linux source file in every commit message (e.g. `psp_v14_0.c:psp_v14_0_boot
 
 ## Cross-cutting
 
-- [ ] 600  Bit-compare every PM4 stream against umr trace from Linux rig
+- [ ] 600  Bit-compare every PM4 stream and register write against `qemu-vfio-apple/traces/` ftrace captures
 - [ ] 601  CI: load dext, ping, alloc BO, submit NOP per-commit
 - [ ] 602  ASAN/UBSAN builds of userspace ICD
 - [ ] 603  Memory leak audit (BO lifetime, fence cleanup)
