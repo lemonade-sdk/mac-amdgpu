@@ -22,6 +22,8 @@
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
 	<key>NSSystemExtensionUsageDescription</key>
 	<string>MacAMDGPU installs a DriverKit system extension that drives the AMD Radeon AI PRO R9700 over Thunderbolt 5.</string>
+	<key>NSSystemExtensionCreationCategory</key>
+	<string>com.apple.system_extension.driver_extension</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.developer-tools</string>
 </dict>

@@ -113,6 +113,10 @@ targets:
     dependencies:
       # xcodegen handles the destination based on the embedded target's
       # type (driver-extension → Contents/Library/SystemExtensions).
+      # codeSign: false matches what qemu-vfio-apple's working
+      # project does — keeping CodeSignOnCopy off so the dext's
+      # original signature (with the transport.pci entitlement) is
+      # preserved during embed instead of being re-signed without it.
       - target: MacAMDGPU
         embed: true
-        codeSign: true
+        codeSign: false
