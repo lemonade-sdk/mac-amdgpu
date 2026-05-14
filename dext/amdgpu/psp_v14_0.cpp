@@ -234,7 +234,13 @@ psp_is_sos_alive(const DeviceContext &dev)
     if (!dev.ip.isResolved(IPBlock::MP0)) return false;
     uint32_t sol = RREG32(dev,
         SOC15_REG_OFFSET(dev, IPBlock::MP0, MP0Regs::C2PMSG_81));
-    return sol != 0u;
+    // Upstream Linux psp_v14_0_is_sos_alive() returns `sol != 0`,
+    // but that's loose: on a cold boot C2PMSG_81 can hold arbitrary
+    // non-zero garbage (we've observed 0x31c5a3aa on TB5 R9700).
+    // psp_v14_0_bootloader_load_sos itself waits for the high bit
+    // (0x80000000) to latch after the load — use the same gate
+    // here so we don't falsely skip the SOS load.
+    return (sol & 0x80000000u) == 0x80000000u;
 }
 
 bool
