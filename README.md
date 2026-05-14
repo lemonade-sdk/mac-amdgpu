@@ -1,20 +1,8 @@
 # STATUS
 
-**The driver loads and talks to a real AMD GPU on a Mac. It can't render
-anything yet.** The card is detected, the driver attaches over Thunderbolt 5,
-identity reads back correctly (VID=0x1002 DID=0x7551), and the first two
-hardware init steps (IP discovery and PSP setup) work. We haven't gotten
-all the way to "actually run a graphics command" yet — that needs the rest
-of the firmware loading + a handful more init steps that are written but
-not yet tested on the physical card.
-
-Translation for non-experts: the foundation is in place. Lighting up
-graphics / compute is the next milestone.
-
-Details:
-- `ROADMAP.md` — phase plan (0 through 4)
-- `WORKLIST.md` — granular per-task state
-- `docs/PORTING_NOTES.md` — divergences from Linux amdgpu
+The driver loads and talks to a real AMD GPU on a Mac. It can't render anything yet. 
+The card is detected, the driver attaches over Thunderbolt 5, identity reads back correctly (VID=0x1002 DID=0x7551), and the first two hardware init steps (IP discovery and PSP setup) work. 
+We haven't run a graphics command yet, which needs the rest of the firmware loading + a handful more init steps that are written but not yet tested on the physical card.
 
   
 # mac_amdgpu
