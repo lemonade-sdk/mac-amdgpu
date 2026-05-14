@@ -648,12 +648,14 @@ final class DriverController: NSObject, ObservableObject,
             append("loadFirmware: can't read \(url.path)")
             return false
         }
-        // Map the BAR-DMA buffer at memory type kMemDMABuffer = 6
-        // and copy the firmware bytes into it.
+        // Map the DMA buffer (memory type 6 = kMacAMDGPUMemoryTypeDMABuffer)
+        // into our address space. kIOMapAnywhere = 1 → let the kernel
+        // pick the address; without it, options=0 means "map AT
+        // *addr" which is bad-arg when addr=0.
         var addr: mach_vm_address_t = 0
         var sz: mach_vm_size_t = 0
         let mapKr = IOConnectMapMemory64(ucConn, 6, mach_task_self_,
-                                         &addr, &sz, 0)
+                                         &addr, &sz, 1 /* kIOMapAnywhere */)
         if mapKr != KERN_SUCCESS {
             append(String(format: "DMA map: kr=%#x", mapKr))
             return false

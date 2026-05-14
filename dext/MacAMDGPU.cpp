@@ -1003,11 +1003,29 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
 
         switch (fwType) {
         case kMacAMDGPUFwTypeSOS: {
+            // Ensure the PSP storage is allocated (PSPInit stage 2)
+            // before trying to load SOS — psp_load_sos requires
+            // fw_pri to be allocated.
+            auto &br = driver->ivars->bringup;
+            if (br.reached < amdgpu::BringupStage::PSPInit) {
+                kern_return_t pir = amdgpu::bringup_to(br,
+                    amdgpu::BringupStage::PSPInit);
+                if (pir != kIOReturnSuccess) return pir;
+            }
             psp.sosFirmware     = bin;
             psp.sosFirmwareSize = fwSize;
             kern_return_t ret = amdgpu::psp_load_sos(dev, psp);
             psp.sosFirmware = nullptr;
             psp.sosFirmwareSize = 0;
+            if (ret == kIOReturnSuccess) {
+                // Mark PSPLoadSOS as done so a subsequent
+                // InitDevice(stage>=3) doesn't re-run psp_load_sos
+                // with empty firmware bytes and fail with
+                // kIOReturnBadArgument.
+                if (br.reached < amdgpu::BringupStage::PSPLoadSOS) {
+                    br.reached = amdgpu::BringupStage::PSPLoadSOS;
+                }
+            }
             return ret;
         }
         case kMacAMDGPUFwTypeKDB:
