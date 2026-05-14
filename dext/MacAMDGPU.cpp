@@ -95,6 +95,7 @@ enum {
     // Encoded as 0x100 + psp_gfx_fw_type so userspace doesn't collide
     // with the pre-SOS namespace.
     kMacAMDGPUFwTypeIP_SMU         = 0x100 + 18,
+    kMacAMDGPUFwTypeIP_PPTABLE     = 0x100 + 73,
     kMacAMDGPUFwTypeIP_SDMA0       = 0x100 + 9,
     kMacAMDGPUFwTypeIP_SDMA1       = 0x100 + 10,
     kMacAMDGPUFwTypeIP_RLC_G       = 0x100 + 8,

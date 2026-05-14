@@ -91,8 +91,8 @@ Cite Linux source file in commit messages.
 - [x] 171  Port `smu_cmn_wait_for_response`
 - [x] 172  `smu_test_message`, `smu_get_version` wrappers (PPSMC msgs 0x01, 0x02)
 - [ ] 173  End-to-end: LoadFirmware(PMFW=0x112) → InitDevice(SMUInit) → SMU TestMessage responds. *Currently gated on entitlement + IP bases.*
-- [ ] 174  Port `smu_v14_0_init_pptable_microcode` + pptable upload via PSP ring
-- [ ] 175  Port `smu_v14_0_setup_pptable` + `smu_v14_0_init_smc_tables` (driver tables, tool table, allowed mask)
+- [~] 174  Port `smu_v14_0_init_pptable_microcode` + pptable upload — chunk 29. LoadFirmware now accepts `kMacAMDGPUFwTypeIP_PPTABLE` (0x149 = 0x100 + GFX_FW_TYPE_PPTABLE 73) so userspace can upload a pptable blob through the standard psp_load_ip_fw path. SMU then ingests it via PPSMC table-transfer protocol (see 175). Upstream's pptable-from-VBIOS path is not implemented (no ATOM on AS).
+- [~] 175  Port `smu_v14_0_setup_pptable` + `smu_v14_0_init_smc_tables` — chunk 29. Implemented as the underlying PPSMC primitives: `smu_set_driver_dram_addr` (msg 0x0E/0x0F), `smu_set_tools_dram_addr` (msg 0x10/0x11), `smu_transfer_table_dram_to_smu` (msg 0x13), `smu_transfer_table_smu_to_dram` (msg 0x12). The upstream tables zoo (driver_pptable / overdrive / combo / max_sustainable_clocks etc.) is not allocated kernel-side — userspace ICD is expected to allocate a single sysmem region, point SMU at it via set_driver_dram_addr, and drive per-table transfers as needed. Same protocol as upstream just without the in-kernel struct wrappers.
 - [ ] 176  Enable basic clocks via SMU + verify telemetry readback (gfx clock, mem clock)
 
 ### 1B.3 GMC v12 — pending (see `docs/port_plans/GMC_v12.md`)

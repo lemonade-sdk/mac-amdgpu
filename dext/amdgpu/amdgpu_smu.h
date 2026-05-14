@@ -59,4 +59,58 @@ kern_return_t smu_test_message(const DeviceContext &dev,
 //
 kern_return_t smu_get_version(const DeviceContext &dev, uint32_t *outVer);
 
+//
+// PPSMC IDs for the driver-table transfer protocol. We use these
+// to point SMU at a DRAM-resident copy of the SMU driver table so
+// the SMU can DMA tool/config tables in and out of our sysmem.
+// Subset of smu_v14_0_2_ppsmc.h — full file is per-ASIC.
+//
+namespace PPSMCTable {
+    constexpr uint32_t SetDriverDramAddrHigh = 0x0E;
+    constexpr uint32_t SetDriverDramAddrLow  = 0x0F;
+    constexpr uint32_t SetToolsDramAddrHigh  = 0x10;
+    constexpr uint32_t SetToolsDramAddrLow   = 0x11;
+    constexpr uint32_t TransferTableSmu2Dram = 0x12;
+    constexpr uint32_t TransferTableDram2Smu = 0x13;
+}
+
+// PSP firmware type id for the pptable blob (GFX_FW_TYPE_PPTABLE).
+constexpr uint32_t kPSP_FW_TYPE_PPTABLE = 73;
+
+//
+// smu_set_driver_dram_addr — point SMU at a DRAM-resident driver
+// table buffer. Caller owns a single DART-mapped sysmem buffer
+// (e.g. 64 KB, 16 KB-aligned) and passes its bus address.
+// Splits the address across the LOW/HIGH PPSMC messages.
+//
+// This is the equivalent of upstream's amdgpu_table_setup flow for
+// smu14: see smu_v14_0.c smu_v14_0_set_tool_table_location +
+// the driver_pptable / driver_table allocations in init_smc_tables.
+// We don't allocate the upstream zoo of tables; we expose the
+// primitive and let userspace (or a future port chunk) decide which
+// tables to upload via TransferTableDram2Smu.
+//
+kern_return_t smu_set_driver_dram_addr(const DeviceContext &dev,
+                                       uint64_t bus_addr);
+
+// Same shape for the SMU tool (telemetry) DRAM area.
+kern_return_t smu_set_tools_dram_addr(const DeviceContext &dev,
+                                      uint64_t bus_addr);
+
+//
+// smu_transfer_table_dram_to_smu — instruct SMU to consume the
+// driver table at the current DRAM addr. `table_id` is the SMU's
+// internal table index (asic-specific subset of `SMU_TABLE_*`).
+//
+kern_return_t smu_transfer_table_dram_to_smu(const DeviceContext &dev,
+                                             uint32_t table_id);
+
+//
+// smu_transfer_table_smu_to_dram — opposite direction. SMU writes
+// the current table contents into our DRAM buffer (telemetry
+// snapshots, OD readback, etc.).
+//
+kern_return_t smu_transfer_table_smu_to_dram(const DeviceContext &dev,
+                                             uint32_t table_id);
+
 } // namespace amdgpu

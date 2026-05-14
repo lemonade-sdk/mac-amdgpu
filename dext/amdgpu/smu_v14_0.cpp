@@ -134,6 +134,51 @@ smu_test_message(const DeviceContext &dev, uint32_t *outEcho)
     return kIOReturnSuccess;
 }
 
+//
+// SMU table-transfer wrappers — see amdgpu_smu.h for shape.
+// Linux equivalents live in smu_v14_0.c (smu_v14_0_set_driver_table_location,
+// smu_v14_0_set_tool_table_location, smu_v14_0_transfer_table_*).
+//
+kern_return_t
+smu_set_driver_dram_addr(const DeviceContext &dev, uint64_t bus_addr)
+{
+    kern_return_t r = smu_send_msg_with_param(
+        dev, PPSMCTable::SetDriverDramAddrHigh,
+        static_cast<uint32_t>(bus_addr >> 32), nullptr);
+    if (r != kIOReturnSuccess) return r;
+    return smu_send_msg_with_param(
+        dev, PPSMCTable::SetDriverDramAddrLow,
+        static_cast<uint32_t>(bus_addr & 0xFFFFFFFFu), nullptr);
+}
+
+kern_return_t
+smu_set_tools_dram_addr(const DeviceContext &dev, uint64_t bus_addr)
+{
+    kern_return_t r = smu_send_msg_with_param(
+        dev, PPSMCTable::SetToolsDramAddrHigh,
+        static_cast<uint32_t>(bus_addr >> 32), nullptr);
+    if (r != kIOReturnSuccess) return r;
+    return smu_send_msg_with_param(
+        dev, PPSMCTable::SetToolsDramAddrLow,
+        static_cast<uint32_t>(bus_addr & 0xFFFFFFFFu), nullptr);
+}
+
+kern_return_t
+smu_transfer_table_dram_to_smu(const DeviceContext &dev, uint32_t table_id)
+{
+    return smu_send_msg_with_param(dev,
+                                   PPSMCTable::TransferTableDram2Smu,
+                                   table_id, nullptr);
+}
+
+kern_return_t
+smu_transfer_table_smu_to_dram(const DeviceContext &dev, uint32_t table_id)
+{
+    return smu_send_msg_with_param(dev,
+                                   PPSMCTable::TransferTableSmu2Dram,
+                                   table_id, nullptr);
+}
+
 kern_return_t
 smu_get_version(const DeviceContext &dev, uint32_t *outVer)
 {
