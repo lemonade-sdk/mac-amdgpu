@@ -147,7 +147,7 @@ Cite Linux source file in commit messages.
 - [~] 250  LoadFirmware: uni_mes (`gc_12_0_1_uni_mes.bin`) — psp_load_ip_fw path works for RS64_MES (76); LoadFirmware now parses the firmware header and stashes `mes_uc_start_addr` on the SCHED pipe so mes_enable can program CP_MES_PRGRM_CNTR_START. **Caller still has to upload the actual firmware.**
 - [x] 251  Port `mes_v12_1_sw_init` — `mes_alloc_storage` allocates EOP (2K), MQD (4K), ring (64K), and cmd buf (16K) per pipe in DART-mapped sysmem — chunk 22.
 - [x] 252  Port `mes_v12_1_enable` — CP_MES_CNTL pipeline reset + PRGRM_CNTR_START + PIPE0_ACTIVE — chunk 22 (`mes_enable`, uni_mes pipe 0 only).
-- [ ] 253  Port `mes_v12_1_queue_init` — SCHED ring HQD register programming via GRBM select
+- [x] 253  Port `mes_v12_1_queue_init` — SCHED ring HQD register programming via GRBM select + matching MQD-in-memory population at upstream v12_compute_mqd byte offsets — chunk 23 (`mes_queue_init`).
 - [ ] 254  Port `mes_v12_1_set_hw_resources` — MESAPI_SET_HW_RSRC payload (vmid masks, HQD masks, IP bases)
 - [ ] 255  Port `mes_v12_1_submit_pkt_and_poll_completion` — analogous to PSP ring submit
 - [ ] 256  Port `mes_v12_1_query_sched_status` — verify scheduler responds

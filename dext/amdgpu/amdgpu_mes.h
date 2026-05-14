@@ -72,7 +72,66 @@ namespace MESRegs {
     constexpr uint32_t CP_MES_IC_BASE_HI          = 0x5851;
     constexpr uint32_t CP_MES_DC_BASE_LO          = 0x5854;
     constexpr uint32_t CP_MES_DC_BASE_HI          = 0x5855;
+
+    // HQD registers (for mes_queue_init).
+    constexpr uint32_t CP_MQD_BASE_ADDR             = 0x1fa9;
+    constexpr uint32_t CP_MQD_BASE_ADDR_HI          = 0x1faa;
+    constexpr uint32_t CP_HQD_ACTIVE                = 0x1fab;
+    constexpr uint32_t CP_HQD_VMID                  = 0x1fac;
+    constexpr uint32_t CP_HQD_PERSISTENT_STATE      = 0x1fad;
+    constexpr uint32_t CP_HQD_PQ_BASE               = 0x1fb1;
+    constexpr uint32_t CP_HQD_PQ_BASE_HI            = 0x1fb2;
+    constexpr uint32_t CP_HQD_PQ_RPTR_REPORT_ADDR   = 0x1fb4;
+    constexpr uint32_t CP_HQD_PQ_RPTR_REPORT_ADDR_HI= 0x1fb5;
+    constexpr uint32_t CP_HQD_PQ_WPTR_POLL_ADDR     = 0x1fb6;
+    constexpr uint32_t CP_HQD_PQ_WPTR_POLL_ADDR_HI  = 0x1fb7;
+    constexpr uint32_t CP_HQD_PQ_DOORBELL_CONTROL   = 0x1fb8;
+    constexpr uint32_t CP_HQD_PQ_CONTROL            = 0x1fba;
+    constexpr uint32_t CP_HQD_EOP_BASE_ADDR         = 0x1fce;
+    constexpr uint32_t CP_HQD_EOP_BASE_ADDR_HI      = 0x1fcf;
+    constexpr uint32_t CP_HQD_EOP_CONTROL           = 0x1fd0;
+    constexpr uint32_t CP_HQD_PQ_WPTR_LO            = 0x1fdf;
+    constexpr uint32_t CP_HQD_PQ_WPTR_HI            = 0x1fe0;
+    constexpr uint32_t CP_MQD_CONTROL               = 0x1fcb;
 }
+
+//
+// HQD register field shift/mask defs and defaults — gfx12.
+//
+#define CP_HQD_PQ_CONTROL__QUEUE_SIZE__SHIFT       0x0
+#define CP_HQD_PQ_CONTROL__QUEUE_SIZE_MASK         0x0000003F
+#define CP_HQD_PQ_CONTROL__RPTR_BLOCK_SIZE__SHIFT  0x8
+#define CP_HQD_PQ_CONTROL__RPTR_BLOCK_SIZE_MASK    0x00003F00
+#define CP_HQD_PQ_CONTROL__NO_UPDATE_RPTR__SHIFT   0x1b
+#define CP_HQD_PQ_CONTROL__NO_UPDATE_RPTR_MASK     0x08000000
+#define CP_HQD_PQ_CONTROL__UNORD_DISPATCH__SHIFT   0x1c
+#define CP_HQD_PQ_CONTROL__UNORD_DISPATCH_MASK     0x10000000
+#define CP_HQD_PQ_CONTROL__TUNNEL_DISPATCH__SHIFT  0x1d
+#define CP_HQD_PQ_CONTROL__TUNNEL_DISPATCH_MASK    0x20000000
+#define CP_HQD_PQ_CONTROL__PRIV_STATE__SHIFT       0x1e
+#define CP_HQD_PQ_CONTROL__PRIV_STATE_MASK         0x40000000
+#define CP_HQD_PQ_CONTROL__KMD_QUEUE__SHIFT        0x1f
+#define CP_HQD_PQ_CONTROL__KMD_QUEUE_MASK          0x80000000
+
+#define CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_OFFSET__SHIFT  0x2
+#define CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_OFFSET_MASK    0x0FFFFFFC
+#define CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_EN__SHIFT      0x1e
+#define CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_EN_MASK        0x40000000
+
+#define CP_HQD_PERSISTENT_STATE__PRELOAD_SIZE__SHIFT 0x8
+#define CP_HQD_PERSISTENT_STATE__PRELOAD_SIZE_MASK   0x0003FF00
+
+#define CP_HQD_VMID__VMID__SHIFT  0x0
+#define CP_HQD_VMID__VMID_MASK    0x0000000F
+
+#define CP_MQD_CONTROL__VMID__SHIFT  0x0
+#define CP_MQD_CONTROL__VMID_MASK    0x0000000F
+
+// Documented defaults from gfx_v12_0.c.
+constexpr uint32_t kCP_HQD_PQ_CONTROL_DEFAULT      = 0x00308509u;
+constexpr uint32_t kCP_HQD_PERSISTENT_STATE_DEFAULT= 0x0be05501u;
+constexpr uint32_t kCP_MQD_CONTROL_DEFAULT         = 0x00000100u;
+constexpr uint32_t kCP_HQD_EOP_CONTROL_DEFAULT     = 0x00000006u;
 
 // CP_MES_CNTL — fields from gc_12_0_0_sh_mask.h
 #define CP_MES_CNTL__MES_INVALIDATE_ICACHE__SHIFT 0x4
@@ -114,17 +173,28 @@ struct MESInstance {
     IODMACommand             *ring_dma;
     IOBufferMemoryDescriptor *cmd_buf;
     IODMACommand             *cmd_dma;
+    IOBufferMemoryDescriptor *wb_buf;
+    IODMACommand             *wb_dma;
 #endif
     uint64_t  eop_bus;  void *eop_cpu;
     uint64_t  mqd_bus;  void *mqd_cpu;
     uint64_t  ring_bus; void *ring_cpu;
     uint64_t  cmd_bus;  void *cmd_cpu;
+    uint64_t  wb_bus;   void *wb_cpu;   // rptr/wptr shadow page
 
     // Stashed from the MES firmware header (mes_uc_start_addr_lo/hi)
     // when LoadFirmware processes the matching IP fw type. Set this
     // before mes_enable() — mes_enable programs CP_MES_PRGRM_CNTR_START
     // with `uc_start_addr >> 2`.
     uint64_t  uc_start_addr;
+
+    // Per-pipe ring write-back state derived during queue_init. The
+    // GPU writes the ring's read-pointer + (optional) write-pointer
+    // poll shadow into wb_bus + wb_rptr_offset / wb_wptr_offset.
+    uint64_t  ring_rptr_gpu_addr;     // wb base + 0
+    uint64_t  ring_wptr_gpu_addr;     // wb base + 0x40
+    uint32_t  ring_size_dwords;
+    uint32_t  doorbell_index;         // BAR5 doorbell slot for this ring
 };
 
 struct MESContext {
@@ -176,6 +246,19 @@ kern_return_t mes_enable(const DeviceContext &dev,
 // (NOT pre-shifted; mes_enable does the >> 2 itself).
 kern_return_t mes_set_uc_start_addr(MESContext &mes, MESPipe pipe,
                                     uint64_t uc_start_addr);
+
+// Program the MES SCHED pipe's HQD registers. Mirrors upstream's
+// mes_v12_0_queue_init_register + the field defaults from
+// mes_v12_0_mqd_init. Caller must have run mes_alloc_storage on
+// the matching pipe. Does NOT depend on the MES microcode being
+// loaded — the writes happen via GRBM_GFX_CNTL select to the MES
+// pipe and program the queue state for when MES is later activated.
+//
+// We also stash the same values into the MQD memory at the
+// upstream v12_compute_mqd byte offsets so that MES, once
+// running, sees a consistent picture if it re-loads context.
+kern_return_t mes_queue_init(const DeviceContext &dev,
+                             MESContext &mes, MESPipe pipe);
 
 // MESInit stage entry — alloc storage for every pipe we plan to
 // drive, then (if microcode is already loaded) call mes_enable.
