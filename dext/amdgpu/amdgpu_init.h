@@ -31,6 +31,7 @@
 #include "amdgpu_rlc.h"
 #include "amdgpu_cp.h"
 #include "amdgpu_sdma.h"
+#include "amdgpu_mes.h"
 #include "amdgpu_discovery.h"
 
 namespace amdgpu {
@@ -65,6 +66,7 @@ struct BringupContext {
     RLCContext    rlc;
     CPContext     cp;
     SDMAContext   sdma;
+    MESContext    mes;
 
     BringupStage  reached;   // highest stage that completed
 };

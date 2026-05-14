@@ -34,6 +34,7 @@
 #include "amdgpu/amdgpu_ih.h"
 #include "amdgpu/amdgpu_cp.h"
 #include "amdgpu/amdgpu_sdma.h"
+#include "amdgpu/amdgpu_mes.h"
 
 #define MACAMDGPU_LOG(fmt, ...) \
     os_log(OS_LOG_DEFAULT, "mac.amdgpu: " fmt, ##__VA_ARGS__)
@@ -936,6 +937,32 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                     if (gfxFwType == amdgpu::PSPGfxFwType::SDMA0 ||
                         gfxFwType == amdgpu::PSPGfxFwType::SDMA1) {
                         driver->ivars->bringup.sdma.microcode_loaded = true;
+                    }
+                    // For MES, parse the firmware header to extract
+                    // mes_uc_start_addr_lo/hi and stash on the right pipe.
+                    // mes_firmware_header_v1_0 layout (amdgpu_ucode.h):
+                    //   common_firmware_header (10 dwords, 40 bytes)
+                    //   then: ucode_version (4), ucode_size_bytes (4),
+                    //         ucode_offset_bytes (4), data_version (4),
+                    //         data_size_bytes (4), data_offset_bytes (4),
+                    //         mes_uc_start_addr_lo (4), mes_uc_start_addr_hi (4)
+                    if (gfxFwType == amdgpu::PSPGfxFwType::RS64_MES ||
+                        gfxFwType == amdgpu::PSPGfxFwType::RS64_KIQ) {
+                        if (fwSize >= 0x40 + 8) {
+                            const uint32_t *hdr32 = reinterpret_cast<const uint32_t *>(bin);
+                            // common header = 10 dwords; mes header adds
+                            // 6 dwords before the start_addr_lo/hi pair.
+                            const uint32_t off_dw = 10 + 6;
+                            uint64_t uc_lo = hdr32[off_dw + 0];
+                            uint64_t uc_hi = hdr32[off_dw + 1];
+                            uint64_t uc_addr = uc_lo | (uc_hi << 32);
+                            amdgpu::MESPipe pipe =
+                                (gfxFwType == amdgpu::PSPGfxFwType::RS64_MES)
+                                ? amdgpu::MESPipe::Sched
+                                : amdgpu::MESPipe::KIQ;
+                            amdgpu::mes_set_uc_start_addr(
+                                driver->ivars->bringup.mes, pipe, uc_addr);
+                        }
                     }
                 }
                 return r;
