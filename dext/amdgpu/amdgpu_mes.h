@@ -93,7 +93,28 @@ namespace MESRegs {
     constexpr uint32_t CP_HQD_PQ_WPTR_LO            = 0x1fdf;
     constexpr uint32_t CP_HQD_PQ_WPTR_HI            = 0x1fe0;
     constexpr uint32_t CP_MQD_CONTROL               = 0x1fcb;
+    // Aggregated doorbell + GFX gate registers.
+    constexpr uint32_t CP_HQD_GFX_CONTROL           = 0x1e9f;
+    constexpr uint32_t CP_UNMAPPED_DOORBELL         = 0x0880;
+    constexpr uint32_t CP_MES_DOORBELL_CONTROL1     = 0x283c;
+    constexpr uint32_t CP_MES_DOORBELL_CONTROL2     = 0x283d;
+    constexpr uint32_t CP_MES_DOORBELL_CONTROL3     = 0x283e;
+    constexpr uint32_t CP_MES_DOORBELL_CONTROL4     = 0x283f;
+    constexpr uint32_t CP_MES_DOORBELL_CONTROL5     = 0x2840;
 }
+
+// CP_MES_DOORBELL_CONTROL1..5 share the same field layout —
+// DOORBELL_OFFSET[27:2], DOORBELL_EN[30], DOORBELL_HIT[31].
+#define CP_MES_DOORBELL_CONTROL1__DOORBELL_OFFSET__SHIFT 0x2
+#define CP_MES_DOORBELL_CONTROL1__DOORBELL_OFFSET_MASK   0x0FFFFFFC
+#define CP_MES_DOORBELL_CONTROL1__DOORBELL_EN__SHIFT     0x1e
+#define CP_MES_DOORBELL_CONTROL1__DOORBELL_EN_MASK       0x40000000
+#define CP_MES_DOORBELL_CONTROL1__DOORBELL_HIT_MASK      0x80000000
+
+// CP_HQD_GFX_CONTROL.DB_UPDATED_MSG_EN — required to route doorbell
+// updated messages to MES for gfx queues.
+#define CP_HQD_GFX_CONTROL__DB_UPDATED_MSG_EN__SHIFT     0xf
+#define CP_HQD_GFX_CONTROL__DB_UPDATED_MSG_EN_MASK       0x00008000
 
 //
 // HQD register field shift/mask defs and defaults — gfx12.
@@ -202,6 +223,17 @@ struct MESContext {
     bool        sched_ucode_loaded;   // RS64_MES (76) seen via LoadFirmware
     bool        kiq_ucode_loaded;     // RS64_KIQ  (78) seen — N/A for uni
     bool        uni_mes_active;
+
+    // Lazy-allocated by mes_set_hw_resources on first call. Lifetime
+    // is tied to the MESContext (i.e. the driver instance).
+#ifdef __APPLE__
+    IOBufferMemoryDescriptor *sch_ctx_buf;
+    IODMACommand             *sch_ctx_dma;
+    IOBufferMemoryDescriptor *status_fence_buf;
+    IODMACommand             *status_fence_dma;
+#endif
+    uint64_t  sch_ctx_bus;
+    uint64_t  status_fence_bus;
 };
 
 //------------------------------------------------------------------
@@ -309,6 +341,169 @@ kern_return_t mes_submit_pkt(const DeviceContext &dev, MESContext &mes,
 // the given pipe. Returns kIOReturnSuccess on a successful echo.
 kern_return_t mes_query_sched_status(const DeviceContext &dev,
                                      MESContext &mes, MESPipe pipe);
+
+// SET_HW_RESOURCES bus addresses (scheduler context + status fence)
+// live alongside the regular MES storage. Allocated lazily by
+// mes_set_hw_resources on first call, kept alive thereafter.
+constexpr uint32_t kMES_SchCtxBytes      = 4096;
+constexpr uint32_t kMES_StatusFenceBytes = 4096;
+
+// Doorbell offsets handed to MES for the 5 priority levels.
+// We carve a 5-slot window starting at 0x100 (well clear of the
+// CP/SDMA/MES SCHED slots we already use).
+constexpr uint32_t kMES_AggregatedDoorbellsBase = 0x100;
+
+//------------------------------------------------------------------
+// Wire-format structs for the MES API messages.
+//
+// Natural alignment matches upstream's Linux/x86_64 layout exactly
+// (alignof(uint64_t) == 8 on both platforms), so as long as we
+// keep field order + types verbatim from mes_v12_api_def.h the
+// resulting byte layout is bit-compatible. The trailing
+// `padding[…]` arrays round each frame up to API_FRAME_SIZE_IN_DWORDS.
+//------------------------------------------------------------------
+
+constexpr uint32_t kMES_PriorityLevels = 5;  // AMD_PRIORITY_NUM_LEVELS
+
+struct MES_Header_Wire {
+    uint32_t u32All;            // type[3:0] | opcode[11:4] | dwsize[19:12]
+};
+
+struct MES_SetHwResources {
+    MES_Header_Wire header;
+    uint32_t vmid_mask_mmhub;
+    uint32_t vmid_mask_gfxhub;
+    uint32_t gds_size;
+    uint32_t paging_vmid;
+    uint32_t compute_hqd_mask[8];
+    uint32_t gfx_hqd_mask[2];
+    uint32_t sdma_hqd_mask[2];
+    uint32_t aggregated_doorbells[5];
+    uint64_t g_sch_ctx_gpu_mc_ptr;
+    uint64_t query_status_fence_gpu_mc_ptr;
+    uint32_t gc_base[8];
+    uint32_t mmhub_base[8];
+    uint32_t osssys_base[8];
+    MES_API_Status api_status;
+    uint32_t flags;
+    uint32_t oversubscription_timer;
+    uint64_t doorbell_info;
+    uint64_t event_intr_history_gpu_mc_ptr;
+    uint64_t timestamp;
+    uint32_t os_tdr_timeout_in_sec;
+    uint32_t pad[1];  // bring total to 64 dw = 256 bytes
+};
+static_assert(sizeof(MES_SetHwResources) == 64 * 4,
+              "MES_SetHwResources must be 64 dwords");
+
+// SET_HW_RESOURCES flag bit positions (mirrors upstream bitfield).
+constexpr uint32_t kSetHwRsrcFlag_disable_reset                      = 1u <<  0;
+constexpr uint32_t kSetHwRsrcFlag_use_different_vmid_compute         = 1u <<  1;
+constexpr uint32_t kSetHwRsrcFlag_disable_mes_log                    = 1u <<  2;
+constexpr uint32_t kSetHwRsrcFlag_enable_level_process_quantum_check = 1u <<  6;
+constexpr uint32_t kSetHwRsrcFlag_enable_reg_active_poll             = 1u << 10;
+
+struct MES_AddQueue {
+    MES_Header_Wire header;
+    uint32_t process_id;
+    uint64_t page_table_base_addr;
+    uint64_t process_va_start;
+    uint64_t process_va_end;
+    uint64_t process_quantum;
+    uint64_t process_context_addr;
+    uint64_t gang_quantum;
+    uint64_t gang_context_addr;
+    uint32_t inprocess_gang_priority;
+    uint32_t gang_global_priority_level;
+    uint32_t doorbell_offset;
+    uint32_t _pad0;             // align mqd_addr to 8
+    uint64_t mqd_addr;
+    uint64_t wptr_addr;
+    uint64_t h_context;
+    uint64_t h_queue;
+    uint32_t queue_type;
+    uint32_t gds_size;          // union with kfd_queue_size
+    uint32_t gws_base;
+    uint32_t gws_size;
+    uint32_t oa_mask;
+    uint32_t _pad1;             // align trap_handler_addr to 8
+    uint64_t trap_handler_addr;
+    uint32_t vm_context_cntl;
+    uint32_t flags;             // packed bitfield
+    MES_API_Status api_status;
+    uint64_t tma_addr;
+    uint32_t sch_id;
+    uint32_t _pad2;             // align timestamp to 8
+    uint64_t timestamp;
+    uint32_t process_context_array_index;
+    uint32_t gang_context_array_index;
+    uint32_t pipe_id;
+    uint32_t queue_id;
+    uint32_t alignment_mode_setting;
+    uint32_t full_sh_mem_config_data;
+    uint32_t pad[10];           // round to 64 dw
+};
+static_assert(sizeof(MES_AddQueue) == 64 * 4,
+              "MES_AddQueue must be 64 dwords");
+
+// MES_AddQueue flags bitfield encoding (bit position).
+constexpr uint32_t kAddQueueFlag_paging                = 1u <<  0;
+constexpr uint32_t kAddQueueFlag_program_gds           = 1u <<  5;
+constexpr uint32_t kAddQueueFlag_is_kfd_process        = 1u <<  8;
+constexpr uint32_t kAddQueueFlag_trap_en               = 1u <<  9;
+constexpr uint32_t kAddQueueFlag_is_aql_queue          = 1u << 10;
+constexpr uint32_t kAddQueueFlag_skip_process_ctx_clear= 1u << 11;
+constexpr uint32_t kAddQueueFlag_map_legacy_kq         = 1u << 12;
+
+// MES queue types (mirrors enum MES_QUEUE_TYPE).
+constexpr uint32_t kMESQueueType_GFX     = 0;
+constexpr uint32_t kMESQueueType_COMPUTE = 1;
+constexpr uint32_t kMESQueueType_SDMA    = 2;
+
+//------------------------------------------------------------------
+// Inputs for the high-level helpers.
+//------------------------------------------------------------------
+struct MESSetHwResourcesInput {
+    uint32_t vmid_mask_mmhub;
+    uint32_t vmid_mask_gfxhub;
+    uint32_t compute_hqd_mask[8];
+    uint32_t gfx_hqd_mask[2];
+    uint32_t sdma_hqd_mask[2];
+    uint32_t aggregated_doorbells[kMES_PriorityLevels];
+    // gc_base / mmhub_base / osssys_base copied from DeviceContext.
+};
+
+struct MESAddQueueInput {
+    uint32_t process_id;
+    uint64_t mqd_addr;
+    uint64_t wptr_addr;          // GPU bus address of wptr shadow
+    uint32_t doorbell_offset;
+    uint32_t queue_type;         // kMESQueueType_*
+    uint32_t pipe_id;
+    uint32_t queue_id;
+    uint32_t inprocess_gang_priority;       // 0..4 (AMD_PRIORITY_LEVEL_*)
+    uint32_t gang_global_priority_level;    // 0..4
+    uint64_t gang_context_addr;             // 4 KB sysmem allocated by user
+    uint64_t process_context_addr;          // 4 KB sysmem allocated by user
+    uint64_t page_table_base_addr;          // GART PD base — VMID 0 path
+    uint32_t flags;                         // bitwise-OR of kAddQueueFlag_*
+};
+
+// Build + submit a SET_HW_RESOURCES message on the SCHED pipe.
+// Lazy-allocates the scheduler context + query-status fence buffers
+// on first call and stashes them on MESContext.
+kern_return_t mes_set_hw_resources(DeviceContext &dev, MESContext &mes,
+                                   const MESSetHwResourcesInput &in);
+
+// Build + submit an ADD_QUEUE message. Pipes always SCHED.
+kern_return_t mes_add_hw_queue(const DeviceContext &dev, MESContext &mes,
+                               const MESAddQueueInput &in);
+
+// Program CP_MES_DOORBELL_CONTROL{1..5} with the 5 aggregated
+// doorbell offsets + CP_HQD_GFX_CONTROL.DB_UPDATED_MSG_EN.
+// Doorbell offsets are bytes (already shifted via OFFSET field write).
+kern_return_t mes_init_aggregated_doorbell(const DeviceContext &dev,
+                                           const uint32_t doorbells[5]);
 
 // Program the MES SCHED pipe's HQD registers. Mirrors upstream's
 // mes_v12_0_queue_init_register + the field defaults from

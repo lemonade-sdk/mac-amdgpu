@@ -65,6 +65,7 @@ enum {
     kMacAMDGPUMethodSubmitIB          = 19,
     kMacAMDGPUMethodWaitFence         = 20,
     kMacAMDGPUMethodQueryInfo         = 21,
+    kMacAMDGPUMethodMESAddQueue       = 22,
 };
 
 // QueryInfo "info type" tags — input scalarInput[0]. Output shape
@@ -1294,6 +1295,51 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
 
         arguments->scalarOutput[0] = fence;
         return kIOReturnSuccess;
+    }
+
+    case kMacAMDGPUMethodMESAddQueue: {
+        // scalarInput[0] = queue_type (0=GFX, 1=COMPUTE, 2=SDMA)
+        // scalarInput[1] = doorbell_offset
+        // scalarInput[2] = mqd BO handle (must be allocated by BOAlloc)
+        // scalarInput[3] = wptr BO handle (or 0 for none)
+        // scalarInput[4] = inprocess priority (0..4)
+        // scalarOutput[0] = kIOReturn from mes_add_hw_queue
+        if (arguments->scalarInput == nullptr ||
+            arguments->scalarInputCount < 5 ||
+            arguments->scalarOutput == nullptr ||
+            arguments->scalarOutputCount < 1) {
+            return kIOReturnBadArgument;
+        }
+        BOEntry *mqd_bo  = mac_amdgpu_bo_lookup(ivars, arguments->scalarInput[2]);
+        BOEntry *wptr_bo = arguments->scalarInput[3] == 0
+                          ? nullptr
+                          : mac_amdgpu_bo_lookup(ivars, arguments->scalarInput[3]);
+        if (mqd_bo == nullptr) return kIOReturnBadArgument;
+        const uint64_t bus_base = ivars->dmaSegments[0].address;
+
+        amdgpu::MESAddQueueInput in{};
+        in.process_id    = 1;
+        in.queue_type    = static_cast<uint32_t>(arguments->scalarInput[0]);
+        in.doorbell_offset = static_cast<uint32_t>(arguments->scalarInput[1]);
+        in.mqd_addr      = bus_base + mqd_bo->byte_offset;
+        in.wptr_addr     = wptr_bo ? (bus_base + wptr_bo->byte_offset) : 0;
+        in.inprocess_gang_priority    =
+            static_cast<uint32_t>(arguments->scalarInput[4]);
+        in.gang_global_priority_level =
+            static_cast<uint32_t>(arguments->scalarInput[4]);
+        in.page_table_base_addr = 0;  // VMID 0 GART path
+        in.gang_context_addr    = 0;
+        in.process_context_addr = 0;
+        in.pipe_id  = 0;
+        in.queue_id = 0;
+        in.flags    = 0;
+
+        kern_return_t r = amdgpu::mes_add_hw_queue(
+            driver->ivars->bringup.device,
+            driver->ivars->bringup.mes,
+            in);
+        arguments->scalarOutput[0] = static_cast<uint64_t>(r);
+        return r;
     }
 
     case kMacAMDGPUMethodQueryInfo: {

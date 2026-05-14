@@ -572,6 +572,170 @@ mes_query_sched_status(const DeviceContext &dev, MESContext &mes,
 }
 
 //------------------------------------------------------------------
+// mes_set_hw_resources — port of mes_v12_0_set_hw_resources for
+// the SCHED pipe. Lazy-allocates the scheduler context + status-
+// fence buffers (4 KB sysmem each) on first call.
+//------------------------------------------------------------------
+kern_return_t
+mes_set_hw_resources(DeviceContext &dev, MESContext &mes,
+                     const MESSetHwResourcesInput &in)
+{
+    if (!mes.pipe[0].inited || !mes.pipe[0].enabled) return kIOReturnNotReady;
+    if (!dev.ip.isResolved(IPBlock::GC)) return kIOReturnNotReady;
+
+    // 1) Lazy-alloc scheduler context + status fence.
+    if (mes.sch_ctx_bus == 0) {
+        void *cpu = nullptr;
+        kern_return_t r = mes_alloc_dma_block(dev, kMES_SchCtxBytes,
+                                              &mes.sch_ctx_buf,
+                                              &mes.sch_ctx_dma,
+                                              &mes.sch_ctx_bus, &cpu);
+        if (r != kIOReturnSuccess) return r;
+        memset(cpu, 0, kMES_SchCtxBytes);
+    }
+    if (mes.status_fence_bus == 0) {
+        void *cpu = nullptr;
+        kern_return_t r = mes_alloc_dma_block(dev, kMES_StatusFenceBytes,
+                                              &mes.status_fence_buf,
+                                              &mes.status_fence_dma,
+                                              &mes.status_fence_bus, &cpu);
+        if (r != kIOReturnSuccess) return r;
+        memset(cpu, 0, kMES_StatusFenceBytes);
+    }
+
+    // 2) Build the 64-dword frame.
+    MES_SetHwResources pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.header.u32All = mes_api_header(kMES_API_TYPE_SCHEDULER,
+                                       MESSchOp::SET_HW_RSRC,
+                                       kMES_API_FRAME_DWORDS);
+    pkt.vmid_mask_mmhub  = in.vmid_mask_mmhub;
+    pkt.vmid_mask_gfxhub = in.vmid_mask_gfxhub;
+    pkt.gds_size         = 0;
+    pkt.paging_vmid      = 0;
+    for (int i = 0; i < 8; i++) pkt.compute_hqd_mask[i] = in.compute_hqd_mask[i];
+    for (int i = 0; i < 2; i++) pkt.gfx_hqd_mask[i]     = in.gfx_hqd_mask[i];
+    for (int i = 0; i < 2; i++) pkt.sdma_hqd_mask[i]    = in.sdma_hqd_mask[i];
+    for (int i = 0; i < 5; i++) pkt.aggregated_doorbells[i] = in.aggregated_doorbells[i];
+
+    pkt.g_sch_ctx_gpu_mc_ptr              = mes.sch_ctx_bus;
+    pkt.query_status_fence_gpu_mc_ptr     = mes.status_fence_bus;
+
+    // gc_base / mmhub_base / osssys_base — upstream copies the first
+    // 5 entries of reg_offset[][0]. Our IPBaseTable has one entry per
+    // IP (we don't track the multi-segment SOC15 view), so we
+    // populate the first slot with our resolved base and zero the
+    // rest. That matches every upstream gfx12 path that touches
+    // these fields (they're consumed by MES only for SMN routing).
+    pkt.gc_base[0]     = dev.ip.get(IPBlock::GC);
+    // Linux uses MMHUB_HWIP as a distinct block; we share the IP base
+    // table entry with GMC (RDNA4 MMHUB doesn't have a separate IP
+    // base — see amdgpu_discovery commits for soc24). Reuse GMC.
+    pkt.mmhub_base[0]  = dev.ip.get(IPBlock::GMC);
+    pkt.osssys_base[0] = dev.ip.get(IPBlock::OSSSYS);
+
+    pkt.flags = kSetHwRsrcFlag_disable_reset
+              | kSetHwRsrcFlag_disable_mes_log
+              | kSetHwRsrcFlag_use_different_vmid_compute
+              | kSetHwRsrcFlag_enable_reg_active_poll
+              | kSetHwRsrcFlag_enable_level_process_quantum_check;
+    pkt.oversubscription_timer = 50;
+
+    // 3) Submit. api_status sits at byte offsetof(MES_SetHwResources,
+    //    api_status); convert to dword offset for mes_submit_pkt.
+    const uint32_t api_status_dw =
+        offsetof(MES_SetHwResources, api_status) / 4;
+    return mes_submit_pkt(dev, mes, MESPipe::Sched,
+                          reinterpret_cast<const uint32_t *>(&pkt),
+                          api_status_dw,
+                          /*timeout_us=*/2'000'000);
+}
+
+//------------------------------------------------------------------
+// mes_add_hw_queue — port of mes_v12_0_add_hw_queue.
+//------------------------------------------------------------------
+kern_return_t
+mes_add_hw_queue(const DeviceContext &dev, MESContext &mes,
+                 const MESAddQueueInput &in)
+{
+    if (!mes.pipe[0].inited || !mes.pipe[0].enabled) return kIOReturnNotReady;
+    if (!dev.ip.isResolved(IPBlock::GC)) return kIOReturnNotReady;
+
+    MES_AddQueue pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.header.u32All = mes_api_header(kMES_API_TYPE_SCHEDULER,
+                                       MESSchOp::ADD_QUEUE,
+                                       kMES_API_FRAME_DWORDS);
+    pkt.process_id              = in.process_id;
+    pkt.page_table_base_addr    = in.page_table_base_addr;
+    pkt.process_va_start        = 0;
+    pkt.process_va_end          = 0;
+    pkt.process_quantum         = 0;
+    pkt.process_context_addr    = in.process_context_addr;
+    pkt.gang_quantum            = 0;
+    pkt.gang_context_addr       = in.gang_context_addr;
+    pkt.inprocess_gang_priority = in.inprocess_gang_priority;
+    pkt.gang_global_priority_level = in.gang_global_priority_level;
+    pkt.doorbell_offset         = in.doorbell_offset;
+    pkt.mqd_addr                = in.mqd_addr;
+    pkt.wptr_addr               = in.wptr_addr;
+    pkt.queue_type              = in.queue_type;
+    pkt.pipe_id                 = in.pipe_id;
+    pkt.queue_id                = in.queue_id;
+    pkt.flags                   = in.flags;
+
+    const uint32_t api_status_dw =
+        offsetof(MES_AddQueue, api_status) / 4;
+    return mes_submit_pkt(dev, mes, MESPipe::Sched,
+                          reinterpret_cast<const uint32_t *>(&pkt),
+                          api_status_dw,
+                          /*timeout_us=*/2'000'000);
+}
+
+//------------------------------------------------------------------
+// mes_init_aggregated_doorbell — port of mes_v12_0_init_aggregated_doorbell.
+// Programs CP_MES_DOORBELL_CONTROL1..5 with the 5 priority doorbells
+// and sets CP_HQD_GFX_CONTROL.DB_UPDATED_MSG_EN.
+//------------------------------------------------------------------
+kern_return_t
+mes_init_aggregated_doorbell(const DeviceContext &dev,
+                             const uint32_t doorbells[5])
+{
+    if (!dev.ip.isResolved(IPBlock::GC)) return kIOReturnNotReady;
+
+    auto reg = [&](uint32_t r) { return SOC15_REG_OFFSET(dev, IPBlock::GC, r); };
+
+    const uint32_t ctrl_regs[5] = {
+        MESRegs::CP_MES_DOORBELL_CONTROL1,
+        MESRegs::CP_MES_DOORBELL_CONTROL2,
+        MESRegs::CP_MES_DOORBELL_CONTROL3,
+        MESRegs::CP_MES_DOORBELL_CONTROL4,
+        MESRegs::CP_MES_DOORBELL_CONTROL5,
+    };
+    const uint32_t clear_mask =
+        CP_MES_DOORBELL_CONTROL1__DOORBELL_OFFSET_MASK
+      | CP_MES_DOORBELL_CONTROL1__DOORBELL_EN_MASK
+      | CP_MES_DOORBELL_CONTROL1__DOORBELL_HIT_MASK;
+
+    for (int i = 0; i < 5; i++) {
+        uint32_t v = RREG32(dev, reg(ctrl_regs[i]));
+        v &= ~clear_mask;
+        v = REG_SET_FIELD(v, CP_MES_DOORBELL_CONTROL1,
+                          DOORBELL_OFFSET, doorbells[i]);
+        v = REG_SET_FIELD(v, CP_MES_DOORBELL_CONTROL1, DOORBELL_EN, 1);
+        WREG32(dev, reg(ctrl_regs[i]), v);
+    }
+
+    // Final touch: gate the GFX queue update msg through to MES.
+    uint32_t v = (1u << CP_HQD_GFX_CONTROL__DB_UPDATED_MSG_EN__SHIFT);
+    WREG32(dev, reg(MESRegs::CP_HQD_GFX_CONTROL), v);
+
+    MES_LOG("aggregated_doorbell: LOW=%#x NORMAL=%#x MED=%#x HIGH=%#x RT=%#x",
+            doorbells[0], doorbells[1], doorbells[2], doorbells[3], doorbells[4]);
+    return kIOReturnSuccess;
+}
+
+//------------------------------------------------------------------
 // mes_init_full — MESInit bringup stage.
 //------------------------------------------------------------------
 kern_return_t
@@ -607,7 +771,43 @@ mes_init_full(DeviceContext &dev, PSPContext &psp,
     r = mes_queue_init(dev, mes, MESPipe::Sched);
     if (r != kIOReturnSuccess) return r;
 
-    return mes_enable(dev, mes, true);
+    r = mes_enable(dev, mes, true);
+    if (r != kIOReturnSuccess) return r;
+
+    // Program aggregated doorbells (5 priority levels). We pick a
+    // 5-slot window starting at kMES_AggregatedDoorbellsBase.
+    uint32_t doorbells[kMES_PriorityLevels];
+    for (uint32_t i = 0; i < kMES_PriorityLevels; i++) {
+        doorbells[i] = kMES_AggregatedDoorbellsBase + i;
+    }
+    mes_init_aggregated_doorbell(dev, doorbells);
+
+    // Tell MES which hw resources it owns. VMID 0 stays kernel-only;
+    // VMIDs 1..7 are MES-scheduled compute VMIDs. We keep GFX HQD 0
+    // for the direct CP_RB0 path (used by SubmitIB/SubmitTestPM4)
+    // so gfx_hqd_mask[0] = 0xFE — MES owns 1..7. Compute HQDs are
+    // all owned by MES; SDMA HQDs likewise.
+    MESSetHwResourcesInput in{};
+    in.vmid_mask_mmhub  = 0xFE;
+    in.vmid_mask_gfxhub = 0xFE;
+    for (int i = 0; i < 8; i++) in.compute_hqd_mask[i] = 0xFF;
+    in.gfx_hqd_mask[0]  = 0xFE;
+    in.gfx_hqd_mask[1]  = 0x00;
+    in.sdma_hqd_mask[0] = 0x0F;
+    in.sdma_hqd_mask[1] = 0x0F;
+    for (uint32_t i = 0; i < kMES_PriorityLevels; i++) {
+        in.aggregated_doorbells[i] = doorbells[i];
+    }
+    // Failure here is non-fatal: storage + enable succeeded, but the
+    // scheduler may not have echoed our SET_HW_RSRC (e.g. microcode
+    // version mismatch). Log and continue — userspace can re-attempt
+    // via a future selector once we add one.
+    kern_return_t sr = mes_set_hw_resources(dev, mes, in);
+    if (sr != kIOReturnSuccess) {
+        MES_LOG("init_full: set_hw_resources failed (%#x) — MES enabled "
+                "but scheduler not configured", sr);
+    }
+    return kIOReturnSuccess;
 }
 
 } // namespace amdgpu

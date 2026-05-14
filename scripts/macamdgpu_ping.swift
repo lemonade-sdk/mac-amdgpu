@@ -24,6 +24,10 @@
 //          # Asks the dext to issue an SDMA COPY_LINEAR over two
 //          # halves of the DMABuffer (requires SDMA microcode loaded
 //          # + InitDevice(SDMAInit) reached on real hardware).
+//      ./build/macamdgpu_ping --mes-add-queue
+//          # Allocates an MQD + wptr BO, submits MES ADD_QUEUE to
+//          # create a compute queue. Requires MES microcode loaded
+//          # + InitDevice(MESInit) reached on real hardware.
 //      ./build/macamdgpu_ping --submit-test
 //          # Existing direct-CP test: SubmitTestPM4 emits NOP +
 //          # RELEASE_MEM, polls EOP fence. Needs CP HQD programmed.
@@ -55,6 +59,12 @@ private let kBOGetInfo:         UInt32 = 18
 private let kSubmitIB:          UInt32 = 19
 private let kWaitFence:         UInt32 = 20
 private let kQueryInfo:         UInt32 = 21
+private let kMESAddQueue:       UInt32 = 22
+
+// MES queue types.
+private let kMESQueueGFX:     UInt64 = 0
+private let kMESQueueCompute: UInt64 = 1
+private let kMESQueueSDMA:    UInt64 = 2
 
 // QueryInfo type tags (match MacAMDGPU.cpp).
 private let kInfoGFXVersion:     UInt64 = 1
@@ -445,6 +455,38 @@ func boTest(_ conn: io_connect_t) {
     print("bo test:     free kr=\(String(format: "%#x", kr3))")
 }
 
+func mesAddQueueTest(_ conn: io_connect_t) {
+    // Allocate a 4 KB BO for the MQD + a 16 KB BO for the wptr shadow.
+    // (Doorbell offset 0x40 is arbitrary; the MES has been told the
+    // aggregated doorbells start at 0x100, so anything below that is
+    // available as a per-queue slot.)
+    print("mes add:   alloc MQD + wptr BOs, submit MESAddQueue")
+    let (kr1, mqdOut) = callScalar(conn, kBOAlloc, input: [4096], outputCount: 3)
+    if kr1 != KERN_SUCCESS || mqdOut.count < 1 {
+        warn("mes add: MQD BOAlloc kr=\(String(format: "%#x", kr1))")
+        return
+    }
+    let mqdHandle = mqdOut[0]
+    let (kr2, wptrOut) = callScalar(conn, kBOAlloc, input: [16384], outputCount: 3)
+    if kr2 != KERN_SUCCESS || wptrOut.count < 1 {
+        warn("mes add: wptr BOAlloc kr=\(String(format: "%#x", kr2))")
+        return
+    }
+    let wptrHandle = wptrOut[0]
+    let (kr, o) = callScalar(conn, kMESAddQueue,
+                             input: [kMESQueueCompute, 0x40,
+                                     mqdHandle, wptrHandle, 1 /*NORMAL*/],
+                             outputCount: 1)
+    let inner = o.first ?? UInt64.max
+    if kr == KERN_SUCCESS && Int64(bitPattern: inner) == 0 {
+        print("mes add:     queue created")
+    } else {
+        warn("mes add: kr=\(String(format: "%#x", kr)) "
+             + "inner=\(String(format: "%#x", inner)) "
+             + "(needs MES microcode loaded + SET_HW_RESOURCES ok)")
+    }
+}
+
 func sdmaCopyTest(_ conn: io_connect_t) {
     // Userspace must have already AllocateDMABuffer'd a region big enough
     // for src+dst; here we use offsets 0 and 64 KB into a 1 MB region.
@@ -494,6 +536,7 @@ let wantSubmitTest = args.contains("--submit-test")
 let wantQueryInfo  = args.contains("--query-info")
 let wantBOTest     = args.contains("--bo-test")
 let wantSDMATest   = args.contains("--sdma-test")
+let wantMESAddQ    = args.contains("--mes-add-queue")
 
 print("opening MacAMDGPU service…")
 let conn = openService()
@@ -540,6 +583,10 @@ if wantBOTest {
 
 if wantSDMATest {
     sdmaCopyTest(conn)
+}
+
+if wantMESAddQ {
+    mesAddQueueTest(conn)
 }
 
 if wantSubmitTest {

@@ -4,7 +4,7 @@ Granular tasks. Status legend: `[ ]` open · `[~]` in progress · `[x]` done · 
 
 Phase numbers match `ROADMAP.md`. Target hardware fixed: Apple Silicon M5 Pro/Max/Ultra + TB5 + AMD Radeon AI PRO R9700 (gfx1201, RDNA4).
 
-Last sync against `git log`: commit `8794423` (Phase 1B chunk 19 — gfx_v12_0_constants_init) + chunk 20 in this commit (sdma_v7_0 ring resume).
+Last sync against `git log`: chunk 28 (MES SET_HW_RESOURCES + ADD_QUEUE + aggregated_doorbell, item 186 + 290 + 604 closed, item 153 narrowed).
 
 ---
 
@@ -74,7 +74,7 @@ Cite Linux source file in commit messages.
 - [x] 150  Port IP discovery parser (`amdgpu_discovery.c` header + IPDS walker) → `dext/amdgpu/amdgpu_discovery.cpp`
 - [x] 151  LoadDiscoveryBinary selector — host uploads a captured binary via DMABuffer, dext parses
 - [x] 152  On-die discovery read — RREG32(mmRCC_CONFIG_MEMSIZE) → BAR2 read of binary at `(vram_size_MB << 20) - 0x100000` — chunk 18; IP bases now populated automatically by `InitDevice(IPDiscovery)`.
-- [ ] 153  Cross-validate parser against `docs/reference/gfx1151_discovery.bin` — standalone parser test
+- [~] 153  Cross-validate parser against `docs/reference/gfx1151_discovery.bin` — exercised via `kMacAMDGPUMethodLoadDiscoveryBin` (selector 13) and `scripts/macamdgpu_ping.swift --load-discovery docs/reference/gfx1151_discovery.bin` (which then calls `showIPBases` to dump every populated IP base). Standalone host-only parser test would need the dext code compiled for macOS instead of DriverKit — deferred until we add a unit-test harness.
 
 ### 1B.1 PSP v14 — done
 - [x] 160  Port PSP v14 bootloader wait (`psp_v14_0_wait_for_bootloader`)
@@ -102,7 +102,7 @@ Cite Linux source file in commit messages.
 - [x] 183  Port `gfxhub_v12_0_init` — populate GFXHUB register offset table
 - [ ] 184  Port `amdgpu_gmc_get_vram_info` — ATOM table parse for VRAM type + width + vendor
 - [x] 185  VM manager config (num_level=3, block_size=9, 48-bit VA)
-- [ ] 186  Register VM fault + ECC interrupt IDs with our IH dispatch table
+- [x] 186  Register VM fault + ECC interrupt IDs with our IH dispatch table — done implicitly: `mac_amdgpu_ih_dispatch` routes (CLIENT_ATHUB, SRC_UTCL2_FAULT) → kIRQBitVMFault, (CLIENT_GFX, SRC_CP_ECC_ERROR) → kIRQBitGFXRASError, (CLIENT_SDMA*, SRC_SDMA_TRAP) → kIRQBitSDMA{0,1}Trap (chunk 14).
 - [x] 187  **Minimal VRAM allocator** — even a 16 MB bump allocator carved off the top of visible VRAM lets RLC CSB + KIQ MQD land. Required by `GMC_v12.md` step 10.
 - [x] 188  Port `gmc_v12_0_gart_init` — GART in **system memory** (Path B from `GMC_v12.md`), 256 MB initial
 - [x] 189  Port `gmc_v12_0_vram_gtt_location` — gart_start/end + fb_start/end + agp_start/end
@@ -148,11 +148,11 @@ Cite Linux source file in commit messages.
 - [x] 251  Port `mes_v12_1_sw_init` — `mes_alloc_storage` allocates EOP (2K), MQD (4K), ring (64K), and cmd buf (16K) per pipe in DART-mapped sysmem — chunk 22.
 - [x] 252  Port `mes_v12_1_enable` — CP_MES_CNTL pipeline reset + PRGRM_CNTR_START + PIPE0_ACTIVE — chunk 22 (`mes_enable`, uni_mes pipe 0 only).
 - [x] 253  Port `mes_v12_1_queue_init` — SCHED ring HQD register programming via GRBM select + matching MQD-in-memory population at upstream v12_compute_mqd byte offsets — chunk 23 (`mes_queue_init`).
-- [ ] 254  Port `mes_v12_1_set_hw_resources` — MESAPI_SET_HW_RSRC payload (vmid masks, HQD masks, IP bases)
+- [x] 254  Port `mes_v12_1_set_hw_resources` — chunk 28. Packed wire-format struct `MES_SetHwResources` (64 dw, validated by static_assert), lazy-allocs sch_ctx + status_fence buffers (4 KB sysmem each), submits with sensible defaults (VMID 0 kernel-reserved, GFX HQD0 reserved for direct CP path, all SDMA/compute HQDs handed to MES, disable_reset + disable_mes_log + enable_reg_active_poll + enable_level_process_quantum_check + use_different_vmid_compute flags set).
 - [x] 255  Port `mes_v12_1_submit_pkt_and_poll_completion` → `mes_submit_pkt` — chunk 26. Patches embedded `MES_API_Status` fence_addr/value, writes the 64-dword frame to the SCHED ring, chains a QUERY_SCHEDULER_STATUS frame for fence acknowledgement, kicks the BAR5 doorbell, polls the status slot.
 - [x] 256  Port `mes_v12_1_query_sched_status` → `mes_query_sched_status` — chunk 26. Thin wrapper around `mes_submit_pkt` with the QUERY opcode.
-- [ ] 257  Port `mes_v12_1_add_hw_queue` — MESAPI_ADD_QUEUE for the first user-facing GFX queue
-- [ ] 258  Port `mes_v12_1_init_aggregated_doorbell` — 5 priority levels
+- [x] 257  Port `mes_v12_1_add_hw_queue` — chunk 28. Packed `MES_AddQueue` (64 dw), exposed as `mes_add_hw_queue(dev, mes, input)`. User selector `kMacAMDGPUMethodMESAddQueue` (22) maps BO handles to MQD/wptr GPU addresses + submits.
+- [x] 258  Port `mes_v12_1_init_aggregated_doorbell` — chunk 28. Writes CP_MES_DOORBELL_CONTROL1..5 with the 5 priority doorbells starting at `kMES_AggregatedDoorbellsBase = 0x100`, then CP_HQD_GFX_CONTROL.DB_UPDATED_MSG_EN. Called automatically at the end of `mes_init_full`.
 
 ### 1B.7 SDMA v7_1 — ring bringup landed (chunk 20)
 - [x] 270  Port `sdma_v7_0_init_microcode` — generic LoadFirmware path now flips `sdma.microcode_loaded` after PSP LOAD_IP_FW for SDMA0 (`0x109`) / SDMA1 (`0x10A`).
@@ -162,7 +162,7 @@ Cite Linux source file in commit messages.
 - [ ] 274  Submit sysmem→VRAM copy via GART; validate via BAR2 readback within visible window
 
 ### 1B.8 Compute queue + UAPI
-- [ ] 290  Create compute queue via MES ADD_QUEUE (queue_type=COMPUTE) — needs full MES API msg marshalling (items 254–258).
+- [x] 290  Create compute queue via MES ADD_QUEUE — chunk 28. `kMacAMDGPUMethodMESAddQueue` (selector 22) builds a `MES_AddQueue` frame from caller-supplied (queue_type, doorbell_offset, mqd BO handle, wptr BO handle, priority) and submits via `mes_add_hw_queue`. UNTESTED on real hw (gated on MES microcode being live + SET_HW_RESOURCES succeeding).
 - [x] 291  UAPI selector: `BOAlloc(size) → handle, bus_addr, byte_offset` — chunk 24. Per-client bump allocator over the existing DMABuffer; userspace mmap of the DMABuffer gives direct CPU access to BO bytes.
 - [x] 292  UAPI selector: `BOFree(handle)` — chunk 24 (bump-only, doesn't reclaim).
 - [~] 293  Map BO — N/A in current design; userspace maps the DMABuffer once via `kMacAMDGPUMemoryTypeDMABuffer` and the BOAlloc byte_offset selects the window inside it. `BOGetInfo(handle)` returns bus_addr + byte_offset + size.
@@ -197,7 +197,7 @@ Cite Linux source file in commit messages.
 - [ ] 601  CI: load dext, ping, alloc BO, submit NOP per-commit (after Phase 1B Hello GFX12)
 - [ ] 602  ASAN/UBSAN builds of userspace ICD (Phase 2)
 - [ ] 603  Memory leak audit (Phase 2)
-- [ ] 604  `docs/PORTING_NOTES.md` — divergences from Linux + rationales
+- [x] 604  `docs/PORTING_NOTES.md` — divergences from Linux + rationales — chunk 28. Covers DART vs Linux IOMMU, VBIOS/ATOM unavailability, IP base resolution, dual CP_RB0 + MES path, firmware loading, doorbell layout, SRBM mutex, PM gaps, and the upstream subsystems we chose not to port.
 - [x] 605  `docs/APPLE_VFIO_NOTES.md` (reading notes on qemu-vfio-apple dext)
 - [x] 606  `docs/AS_DART_LIMITS.md` (DART 1.5 GB ceiling / 64k mapping cap / 16 KB pages / 10× MMIO penalty / BAR config-reg synthesis)
 - [x] 607  `docs/port_plans/{GMC_v12,IH_v7,MES_v12_1,HELLO_PM4}.md` (sourced from research agents)
