@@ -130,6 +130,11 @@ targets:
       - path: Host
         includes:
           - "*.swift"
+      # Bundle the AMD microcode blobs into Contents/Resources/firmware
+      # so end-users don't have to clone linux-firmware separately.
+      - path: firmware
+        buildPhase: resources
+        type: folder
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.geramyloveless.MacAMDGPUHost

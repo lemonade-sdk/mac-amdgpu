@@ -4,9 +4,8 @@ upstream/linux-firmware/
 upstream/mesa/
 upstream/
 
-# Firmware blobs (sourced separately by each developer from linux-firmware).
-firmware/
-firmware/blobs/
+# Firmware blobs — vendored under firmware/. Sourced from
+# linux-firmware (license headers in firmware/LICENSE.* preserved).
 
 # Build output.
 build/

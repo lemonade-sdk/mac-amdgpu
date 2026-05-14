@@ -29,7 +29,27 @@ private let kSelGetIdentity:     UInt32 = 1
 private let kSelGetBARInfo:      UInt32 = 2
 private let kSelAllocateDMA:     UInt32 = 6
 private let kSelInitDevice:      UInt32 = 9
+private let kSelLoadFirmware:    UInt32 = 10
 private let kSelQueryInfo:       UInt32 = 21
+
+// Firmware type tags — match MacAMDGPU.cpp enum.
+private let kFwSOS:         UInt64 = 0
+private let kFwKDB:         UInt64 = 1
+private let kFwSPL:         UInt64 = 2
+private let kFwSysDrv:      UInt64 = 3
+private let kFwSocDrv:      UInt64 = 4
+private let kFwIntfDrv:     UInt64 = 5
+private let kFwDbgDrv:      UInt64 = 6
+private let kFwRASDrv:      UInt64 = 7
+private let kFwIPKeyMgrDrv: UInt64 = 8
+private let kFwIP_SMU:      UInt64 = 0x100 + 18
+private let kFwIP_SDMA0:    UInt64 = 0x100 + 9
+private let kFwIP_SDMA1:    UInt64 = 0x100 + 10
+private let kFwIP_RLC_G:    UInt64 = 0x100 + 8
+private let kFwIP_CP_ME:    UInt64 = 0x100 + 1
+private let kFwIP_CP_PFP:   UInt64 = 0x100 + 2
+private let kFwIP_CP_MEC:   UInt64 = 0x100 + 4
+private let kFwIP_RS64_MES: UInt64 = 0x100 + 76
 
 // Bringup stages — match amdgpu_init.h.
 private let kStageIPDiscovery:   UInt64 = 1
@@ -132,14 +152,35 @@ struct ContentView: View {
                 Button("BARs") { controller.testGetBARInfo() }
                 Button("Query") { controller.testQueryInfo() }
                 Spacer()
-                Button("InitDevice → IPDiscovery") {
-                    controller.testInitDeviceUpTo(1)
-                }
-                Button("→ PSPInit") {
-                    controller.testInitDeviceUpTo(2)
+                Button("Pick Firmware Folder…") {
+                    controller.pickFirmwareFolder()
                 }
             }
             .font(.caption)
+
+            // Bring-up stage ladder. Click each in order; each runs
+            // every stage up to and including the requested target.
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Bringup stages").font(.caption2).foregroundStyle(.secondary)
+                HStack(spacing: 4) {
+                    Button("1. IPDiscovery")   { controller.testInitDeviceUpTo(1) }
+                    Button("2. PSPInit")       { controller.testInitDeviceUpTo(2) }
+                    Button("3. LoadSOS+...")   { controller.loadSOSAndContinue() }
+                    Button("4. PSPRingCreate") { controller.testInitDeviceUpTo(4) }
+                    Button("5. TMRSetup")      { controller.testInitDeviceUpTo(5) }
+                }
+                .font(.caption)
+                HStack(spacing: 4) {
+                    Button("6. SMUInit")  { controller.testInitDeviceUpTo(6) }
+                    Button("7. GMCInit")  { controller.testInitDeviceUpTo(7) }
+                    Button("9. RLCInit")  { controller.testInitDeviceUpTo(9) }
+                    Button("10. CPInit")  { controller.testInitDeviceUpTo(10) }
+                    Button("12. IHInit")  { controller.testInitDeviceUpTo(12) }
+                    Button("14. SDMA")    { controller.testInitDeviceUpTo(14) }
+                }
+                .font(.caption)
+            }
+            .padding(.vertical, 4)
 
             ScrollView {
                 Text(controller.log)
@@ -554,7 +595,6 @@ final class DriverController: NSObject, ObservableObject,
 
     func testInitDeviceUpTo(_ stage: UInt64) {
         guard openUserClient() else { return }
-        // Need at least one DMA buffer for some bringup steps.
         let (kr, out) = callScalar(kSelInitDevice,
                                    input: [stage],
                                    outCount: 1)
@@ -563,6 +603,137 @@ final class DriverController: NSObject, ObservableObject,
         } else {
             append(String(format:
                 "InitDevice(stage=\(stage)): kr=%#x", kr))
+        }
+    }
+
+    // MARK: Firmware
+
+    /// Folder containing AMD microcode blobs. Defaults to the
+    /// `firmware/` directory embedded inside the app bundle's
+    /// Resources (populated by Xcode's "Copy Files" build phase
+    /// from project.yml). The "Pick Firmware Folder…" button lets
+    /// the user override with an external directory if needed.
+    private lazy var firmwareDir: URL? = {
+        return Bundle.main.resourceURL?
+            .appendingPathComponent("firmware", isDirectory: true)
+    }()
+
+    func pickFirmwareFolder() {
+        let panel = NSOpenPanel()
+        panel.title = "Override firmware folder (defaults to bundled)"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        if let bundled = Bundle.main.resourceURL?
+            .appendingPathComponent("firmware") {
+            panel.directoryURL = bundled
+        }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        firmwareDir = url
+        append("firmware dir override: \(url.path)")
+    }
+
+    /// Allocate a 32MB DMA buffer if we don't have one.
+    private func ensureDMABuffer() -> Bool {
+        guard openUserClient() else { return false }
+        let size: UInt64 = 32 * 1024 * 1024
+        let align: UInt64 = 16 * 1024
+        let (kr, out) = callScalar(kSelAllocateDMA,
+                                   input: [size, align],
+                                   outCount: 2)
+        if kr != KERN_SUCCESS {
+            append(String(format: "AllocateDMABuffer: kr=%#x", kr))
+            return false
+        }
+        if let segs = out.first, segs >= 1 {
+            append("DMA buffer: \(segs) segment(s)")
+        }
+        return true
+    }
+
+    /// Load a single firmware file by type tag.
+    private func loadFirmware(_ type: UInt64, _ filename: String) -> Bool {
+        guard let dir = firmwareDir else {
+            append("loadFirmware: no firmware dir set; click "
+                   + "'Pick Firmware Folder…' first")
+            return false
+        }
+        let url = dir.appendingPathComponent(filename)
+        guard let data = try? Data(contentsOf: url) else {
+            append("loadFirmware: can't read \(url.path)")
+            return false
+        }
+        // Map the BAR-DMA buffer at memory type kMemDMABuffer = 6
+        // and copy the firmware bytes into it.
+        var addr: mach_vm_address_t = 0
+        var sz: mach_vm_size_t = 0
+        let mapKr = IOConnectMapMemory64(ucConn, 6, mach_task_self_,
+                                         &addr, &sz, 0)
+        if mapKr != KERN_SUCCESS {
+            append(String(format: "DMA map: kr=%#x", mapKr))
+            return false
+        }
+        defer {
+            IOConnectUnmapMemory64(ucConn, 6, mach_task_self_, addr)
+        }
+        if UInt64(data.count) > sz {
+            append("loadFirmware: \(filename) is \(data.count) B "
+                   + "but DMA buffer is only \(sz) B")
+            return false
+        }
+        data.withUnsafeBytes { src in
+            guard let base = src.baseAddress else { return }
+            let dst = UnsafeMutableRawPointer(bitPattern: UInt(addr))!
+            dst.copyMemory(from: base, byteCount: data.count)
+        }
+        let (kr, _) = callScalar(kSelLoadFirmware,
+                                 input: [type, UInt64(data.count)],
+                                 outCount: 1)
+        if kr != KERN_SUCCESS {
+            append(String(format:
+                "LoadFirmware(%@) %@: kr=%#x",
+                String(type, radix: 16), filename, kr))
+            return false
+        }
+        append("LoadFirmware \(filename) (type=\(type)): ok")
+        return true
+    }
+
+    /// Load the SOS bootloader chain, then drive bringup through
+    /// stage 5 (TMRSetup). Stops at the first failure.
+    func loadSOSAndContinue() {
+        guard openUserClient() else { return }
+        // firmwareDir defaults to the bundled firmware/ folder.
+        guard let dir = firmwareDir,
+              FileManager.default.fileExists(atPath: dir.path) else {
+            append("loadSOSAndContinue: bundled firmware/ folder missing; "
+                   + "use 'Pick Firmware Folder…' to choose one")
+            return
+        }
+        append("firmware: \(dir.path)")
+        guard ensureDMABuffer() else { return }
+        // PSP bootloader chain — R9700 / PSP v14.0.3. Order from
+        // psp_v14_0_bootloader_load_sos.
+        let chain: [(UInt64, String)] = [
+            (kFwKDB,         "psp_14_0_3_kdb.bin"),
+            (kFwSPL,         "psp_14_0_3_spl.bin"),
+            (kFwSysDrv,      "psp_14_0_3_sys_drv.bin"),
+            (kFwSocDrv,      "psp_14_0_3_soc_drv.bin"),
+            (kFwIntfDrv,     "psp_14_0_3_intf_drv.bin"),
+            (kFwDbgDrv,      "psp_14_0_3_dbg_drv.bin"),
+            (kFwRASDrv,      "psp_14_0_3_ras_drv.bin"),
+            (kFwIPKeyMgrDrv, "psp_14_0_3_ipkeymgr_drv.bin"),
+            (kFwSOS,         "psp_14_0_3_sos.bin"),
+        ]
+        for (type, fname) in chain {
+            if !loadFirmware(type, fname) {
+                append("PSP chain stopped at \(fname)")
+                return
+            }
+        }
+        // Drive PSPLoadSOS → PSPRingCreate → TMRSetup.
+        for stage: UInt64 in [3, 4, 5] {
+            testInitDeviceUpTo(stage)
         }
     }
 

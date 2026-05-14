@@ -47,7 +47,7 @@ not yet exercised on hardware.
 - `xcodegen` (`brew install xcodegen`).
 - A paid Apple Developer Program membership with one specific entitlement
   request granted (see below).
-- `linux-firmware` microcode blobs for the R9700 (sourced separately).
+- AMD microcode blobs — vendored in [`firmware/`](firmware/) already.
 
 ## Apple Developer Portal setup
 
@@ -93,14 +93,13 @@ The repo ships pinned to team `YBQ9BU6Q6F` and bundle prefix
 
 ## Firmware blob setup
 
-The dext needs AMD microcode blobs from `linux-firmware` for the first PM4
-("Hello GFX12") milestone:
+The repo vendors AMD microcode for the GFX11 (RDNA3) and GFX12 (RDNA4)
+families directly under [`firmware/`](firmware/). Files are copied
+verbatim from [linux-firmware](https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git);
+their license (`firmware/LICENSE.amdgpu`) and provenance metadata
+(`firmware/WHENCE.amdgpu`) ship alongside.
 
-```
-git clone --depth 1 https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git ~/linux-firmware
-```
-
-Required files (all under `amdgpu/` in linux-firmware):
+For the R9700 specifically, the bring-up flow uses:
 
 | File                    | Purpose                          |
 | ----------------------- | -------------------------------- |
@@ -114,8 +113,16 @@ Required files (all under `amdgpu/` in linux-firmware):
 | `gc_12_0_1_mec.bin`     | CP — Microcode Engine Compute    |
 | `gc_12_0_1_uni_mes.bin` | MES scheduler (unified)          |
 
-Copy these into a directory of your choice. At runtime, the host app's
-"Pick Firmware Folder…" button points the dext at that directory.
+Other RDNA3/4 cards use their own IP subversion prefix
+(`gc_11_0_0_*` for the RX 7900 family, etc.). See
+[`firmware/README.md`](firmware/README.md) for the full mapping.
+
+At runtime the host app reads firmware from its own bundle —
+xcodegen's `project.yml` adds the repo's `firmware/` directory to
+the host target as a "Copy Files: Resources" build phase, so the
+binaries land at `MacAMDGPUHost.app/Contents/Resources/firmware/`
+during the build and no manual selection is needed. The
+**Pick Firmware Folder…** button exists only as an override.
 
 ## Build + install
 
@@ -248,7 +255,8 @@ These four surprises eat most of an afternoon if you don't know about them.
 - `docs/` — porting notes, Apple-VFIO reference notes, AS/DART limit
   cheat-sheets, and the phase-by-phase port plans.
 - `upstream/` — vendored Linux + Mesa source for reference. Gitignored.
-- `firmware/` — local firmware staging. Gitignored.
+- `firmware/` — AMD GPU microcode (GFX11 + GFX12 families), copied
+  from linux-firmware. Tracked in the repo.
 
 For granular task state see [`WORKLIST.md`](WORKLIST.md). For the phase
 plan see [`ROADMAP.md`](ROADMAP.md). For the divergences-from-Linux
