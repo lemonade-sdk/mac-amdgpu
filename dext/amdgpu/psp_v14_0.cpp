@@ -446,43 +446,51 @@ psp_ring_create(DeviceContext &dev, PSPContext &psp)
     const uint32_t reg71 = SOC15_REG_OFFSET(dev, IPBlock::MP0,
                                             MP0Regs::C2PMSG_71);
 
-    // 1. Wait for SOS ready to accept ring creation.
-    //
-    // When the GPU is warm-booting and SOS is already alive (e.g.
-    // we re-loaded the dext without power-cycling the card), the
-    // C2PMSG_64 mailbox is in the post-command state from whatever
-    // ran before us, not the SOS-idle state. The "ready" check then
-    // never fires and we wait the full timeout. Short-circuit it
-    // when sosAlive is already set — SOS is always idle/ready once
-    // it's running.
+    // Diagnostic: read C2PMSG_64 + C2PMSG_81 (SOS sign-of-life)
+    // before we touch anything.
     uint32_t v = 0;
-    if (!psp.sosAlive) {
-        if (!poll_reg(dev, reg64, kPSPMboxRespMask, kPSPMboxRespFlag,
-                      5 * 1000000, &v)) {
-            PSP_LOG("ring_create: SOS not ready — C2PMSG_64=%#010x", v);
-            psp.ringDMACommand->CompleteDMA(kIODMACommandCompleteDMANoOptions);
-            psp.ringDMACommand->release();
-            psp.ringDMACommand = nullptr;
-            psp.ringBuffer->release();
-            psp.ringBuffer = nullptr;
-            return kIOReturnTimeout;
-        }
-    } else {
-        PSP_LOG("ring_create: SOS already alive — skipping ready check");
+    uint32_t reg81 = SOC15_REG_OFFSET(dev, IPBlock::MP0, MP0Regs::C2PMSG_81);
+    uint32_t pre64 = RREG32(dev, reg64);
+    uint32_t pre81 = RREG32(dev, reg81);
+    PSP_LOG("ring_create entry: C2PMSG_64=%#010x C2PMSG_81=%#010x sosAlive=%d",
+            pre64, pre81, (int)psp.sosAlive);
+
+    // 1. Wait for SOS ready to accept ring creation. Always do this
+    //    (Linux does it unconditionally) — the previous skip-on-
+    //    warm-SOS optimisation was based on bad assumptions.
+    if (!poll_reg(dev, reg64, kPSPMboxRespMask, kPSPMboxRespFlag,
+                  5 * 1000000, &v)) {
+        PSP_LOG("ring_create: SOS not ready — C2PMSG_64=%#010x "
+                "(masked=%#010x, want %#010x)",
+                v, v & kPSPMboxRespMask, kPSPMboxRespFlag);
+        psp.ringDMACommand->CompleteDMA(kIODMACommandCompleteDMANoOptions);
+        psp.ringDMACommand->release();
+        psp.ringDMACommand = nullptr;
+        psp.ringBuffer->release();
+        psp.ringBuffer = nullptr;
+        return kIOReturnTimeout;
     }
+    PSP_LOG("ring_create: SOS ready, C2PMSG_64=%#010x", v);
 
     // 2. Program ring address (low + high) + size, then kick.
     WREG32(dev, reg69, static_cast<uint32_t>(psp.ringBusAddr & 0xFFFFFFFFu));
     WREG32(dev, reg70, static_cast<uint32_t>(psp.ringBusAddr >> 32));
     WREG32(dev, reg71, static_cast<uint32_t>(psp.ringSize));
     WREG32(dev, reg64, kPSPRingTypeKM << 16);
+    PSP_LOG("ring_create: wrote ring addr=%#llx size=%u type=%u (kick=%#x)",
+            psp.ringBusAddr, (unsigned)psp.ringSize,
+            kPSPRingTypeKM, kPSPRingTypeKM << 16);
 
     IOSleep(20);
 
     // 3. Wait for response flag.
     if (!poll_reg(dev, reg64, kPSPMboxRespMask, kPSPMboxRespFlag,
                   5 * 1000000, &v)) {
-        PSP_LOG("ring_create: response wait timed out — C2PMSG_64=%#010x", v);
+        uint32_t now64 = RREG32(dev, reg64);
+        uint32_t now81 = RREG32(dev, reg81);
+        PSP_LOG("ring_create: response wait timed out — "
+                "final C2PMSG_64=%#010x C2PMSG_81=%#010x",
+                now64, now81);
         return kIOReturnTimeout;
     }
 
