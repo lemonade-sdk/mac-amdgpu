@@ -15,6 +15,18 @@
 //          # PSPLoadSOS. Needs IP base for MP0 to be set first.
 //      ./build/macamdgpu_ping --reset
 //          # Issues FLR at the end (will quiesce + re-init device).
+//      ./build/macamdgpu_ping --query-info
+//          # Calls QueryInfo for every known type and prints the result.
+//      ./build/macamdgpu_ping --bo-test
+//          # Exercises BOAlloc + BOGetInfo + BOFree against the per-
+//          # client DMABuffer.
+//      ./build/macamdgpu_ping --sdma-test
+//          # Asks the dext to issue an SDMA COPY_LINEAR over two
+//          # halves of the DMABuffer (requires SDMA microcode loaded
+//          # + InitDevice(SDMAInit) reached on real hardware).
+//      ./build/macamdgpu_ping --submit-test
+//          # Existing direct-CP test: SubmitTestPM4 emits NOP +
+//          # RELEASE_MEM, polls EOP fence. Needs CP HQD programmed.
 //
 
 import Foundation
@@ -36,6 +48,19 @@ private let kSetIPBase:         UInt32 = 11
 private let kGetIPBase:         UInt32 = 12
 private let kLoadDiscoveryBin:  UInt32 = 13
 private let kSubmitTestPM4:     UInt32 = 14
+private let kSDMACopyTest:      UInt32 = 15
+private let kBOAlloc:           UInt32 = 16
+private let kBOFree:            UInt32 = 17
+private let kBOGetInfo:         UInt32 = 18
+private let kSubmitIB:          UInt32 = 19
+private let kWaitFence:         UInt32 = 20
+private let kQueryInfo:         UInt32 = 21
+
+// QueryInfo type tags (match MacAMDGPU.cpp).
+private let kInfoGFXVersion:     UInt64 = 1
+private let kInfoVRAMSizes:      UInt64 = 2
+private let kInfoIPVersions:     UInt64 = 3
+private let kInfoBringupReached: UInt64 = 4
 
 private let kMemBAR0:           UInt32 = 0
 private let kMemBAR2:           UInt32 = 2
@@ -355,6 +380,90 @@ func resetDevice(_ conn: io_connect_t) {
     print("reset:     issued")
 }
 
+func queryInfo(_ conn: io_connect_t) {
+    print("query:     listing QueryInfo facts")
+    do {
+        let (kr, o) = callScalar(conn, kQueryInfo,
+                                 input: [kInfoGFXVersion], outputCount: 3)
+        if kr == KERN_SUCCESS && o.count >= 3 {
+            print("query:       gfx version \(o[0]).\(o[1]).\(o[2])")
+        } else {
+            warn("query: gfx version kr=\(String(format: "%#x", kr))")
+        }
+    }
+    do {
+        let (kr, o) = callScalar(conn, kQueryInfo,
+                                 input: [kInfoVRAMSizes], outputCount: 2)
+        if kr == KERN_SUCCESS && o.count >= 2 {
+            print("query:       vram visible=\(o[0]) total=\(o[1]) bytes")
+        }
+    }
+    do {
+        let (kr, o) = callScalar(conn, kQueryInfo,
+                                 input: [kInfoIPVersions], outputCount: 4)
+        if kr == KERN_SUCCESS && o.count >= 4 {
+            func unpack(_ v: UInt64) -> String {
+                let mj = (v >> 16) & 0xFF
+                let mi = (v >> 8) & 0xFF
+                let rv = v & 0xFF
+                return "\(mj).\(mi).\(rv)"
+            }
+            print("query:       gmc=\(unpack(o[0])) sdma=\(unpack(o[1])) "
+                  + "psp=\(unpack(o[2])) smu=\(unpack(o[3]))")
+        }
+    }
+    do {
+        let (kr, o) = callScalar(conn, kQueryInfo,
+                                 input: [kInfoBringupReached], outputCount: 1)
+        if kr == KERN_SUCCESS && o.count >= 1 {
+            print("query:       bringup reached stage \(o[0])")
+        }
+    }
+}
+
+func boTest(_ conn: io_connect_t) {
+    print("bo test:   alloc 16KB BO")
+    let (kr, o) = callScalar(conn, kBOAlloc, input: [16384], outputCount: 3)
+    if kr != KERN_SUCCESS || o.count < 3 {
+        warn("bo test: BOAlloc kr=\(String(format: "%#x", kr))")
+        return
+    }
+    let handle = o[0]
+    let bus    = o[1]
+    let off    = o[2]
+    print("bo test:     handle=\(String(format: "%#llx", handle)) "
+          + "bus=\(String(format: "%#llx", bus)) "
+          + "off=\(String(format: "%#llx", off))")
+
+    let (kr2, oi) = callScalar(conn, kBOGetInfo, input: [handle], outputCount: 3)
+    if kr2 == KERN_SUCCESS && oi.count >= 3 {
+        print("bo test:     info bus=\(String(format: "%#llx", oi[0])) "
+              + "off=\(String(format: "%#llx", oi[1])) size=\(oi[2])")
+    }
+
+    let (kr3, _) = callScalar(conn, kBOFree, input: [handle], outputCount: 0)
+    print("bo test:     free kr=\(String(format: "%#x", kr3))")
+}
+
+func sdmaCopyTest(_ conn: io_connect_t) {
+    // Userspace must have already AllocateDMABuffer'd a region big enough
+    // for src+dst; here we use offsets 0 and 64 KB into a 1 MB region.
+    print("sdma test: COPY_LINEAR 4 KB src→dst within DMA buf")
+    let src:  UInt64 = 0
+    let dst:  UInt64 = 64 * 1024
+    let cnt:  UInt64 = 4 * 1024
+    let to:   UInt64 = 1_000_000
+    let (kr, o) = callScalar(conn, kSDMACopyTest,
+                             input: [0, src, dst, cnt, to], outputCount: 1)
+    let st = o.first ?? UInt64.max
+    if kr == KERN_SUCCESS && Int64(bitPattern: st) == 0 {
+        print("sdma test:   ok")
+    } else {
+        warn("sdma test: kr=\(String(format: "%#x", kr)) "
+             + "inner=\(String(format: "%#x", st))")
+    }
+}
+
 func submitTestPM4(_ conn: io_connect_t, timeoutUs: UInt64 = 1_000_000) {
     print("pm4 test:  emitting NOP + RELEASE_MEM (timeout \(timeoutUs) µs)")
     let (kr, out) = callScalar(conn, kSubmitTestPM4,
@@ -382,6 +491,9 @@ if let i = args.firstIndex(of: "--load-discovery"), i + 1 < args.count {
     discoveryPath = args[i + 1]
 }
 let wantSubmitTest = args.contains("--submit-test")
+let wantQueryInfo  = args.contains("--query-info")
+let wantBOTest     = args.contains("--bo-test")
+let wantSDMATest   = args.contains("--sdma-test")
 
 print("opening MacAMDGPU service…")
 let conn = openService()
@@ -416,6 +528,18 @@ if wantInit || sosPath != nil {
         // cleanly with a useful error.
         initDevice(conn, stage: kStagePSPLoadSOS)
     }
+}
+
+if wantQueryInfo {
+    queryInfo(conn)
+}
+
+if wantBOTest {
+    boTest(conn)
+}
+
+if wantSDMATest {
+    sdmaCopyTest(conn)
 }
 
 if wantSubmitTest {
