@@ -166,7 +166,7 @@ struct ContentView: View {
                 HStack(spacing: 4) {
                     Button("1. IPDiscovery")   { controller.testInitDeviceUpTo(1) }
                     Button("2. PSPInit")       { controller.testInitDeviceUpTo(2) }
-                    Button("3. LoadSOS+...")   { controller.loadSOSAndContinue() }
+                    Button("3. LoadSOS+...")   { controller.runFullBringup() }
                     Button("4. PSPRingCreate") { controller.testInitDeviceUpTo(4) }
                     Button("5. TMRSetup")      { controller.testInitDeviceUpTo(5) }
                 }
@@ -684,50 +684,119 @@ final class DriverController: NSObject, ObservableObject,
         return true
     }
 
-    /// Load the SOS firmware then drive bringup through TMRSetup.
-    /// Firmware path is fixed at the bundled `firmware/` folder.
-    func loadSOSAndContinue() {
-        guard openUserClient() else { return }
-        guard ensureDMABuffer() else { return }
-        // PSP v14.0.3 ships only sos.bin in linux-firmware (the
-        // pre-SOS components are bundled inside sos.bin).
-        if !loadFirmware(kFwSOS, "psp_14_0_3_sos.bin") {
-            append("PSP chain stopped at psp_14_0_3_sos.bin")
-            return
+    // MARK: Firmware filename construction (mirrors upstream amdgpu)
+
+    /// IP version triple in the same packed encoding as QueryInfo's
+    /// kInfoIPVersions output: `(major << 16) | (minor << 8) | rev`.
+    private struct IPVer {
+        let major: Int
+        let minor: Int
+        let rev:   Int
+        init(_ packed: UInt64) {
+            major = Int((packed >> 16) & 0xFF)
+            minor = Int((packed >> 8)  & 0xFF)
+            rev   = Int(packed         & 0xFF)
         }
-        // Drive PSPLoadSOS → PSPRingCreate → TMRSetup.
-        for stage: UInt64 in [3, 4, 5] {
-            testInitDeviceUpTo(stage)
-        }
+        var path: String { "\(major)_\(minor)_\(rev)" }
     }
 
-    /// One-shot: open user client, load firmware, drive every
-    /// bring-up stage in order. Stops at the first failure.
+    /// Discovered IP versions, filled by `runFullBringup`. We mirror
+    /// upstream amdgpu_ucode's naming convention: each IP block has
+    /// a per-version filename — `psp_<maj>_<min>_<rev>_sos.bin`,
+    /// `smu_<maj>_<min>_<rev>.bin`, `gc_<maj>_<min>_<rev>_<part>.bin`,
+    /// `sdma_<maj>_<min>_<rev>.bin`.
+    private var ipPSP:  IPVer?
+    private var ipSMU:  IPVer?
+    private var ipSDMA: IPVer?
+    private var ipGFX:  IPVer?
+
+    /// Run IPDiscovery then read IP versions out of the dext via the
+    /// QueryInfo selector. Sets the ipXxx fields.
+    private func discoverIPs() -> Bool {
+        // IPDiscovery first — populates the dext's IP base table.
+        let (kr, _) = callScalar(kSelInitDevice, input: [1], outCount: 1)
+        if kr != KERN_SUCCESS {
+            append(String(format: "discoverIPs: IPDiscovery kr=%#x", kr))
+            return false
+        }
+        // QueryInfo(IPVersions) → packed [GMC, SDMA, PSP, SMU].
+        let (k1, ips) = callScalar(kSelQueryInfo,
+                                   input: [kInfoIPVersions],
+                                   outCount: 4)
+        guard k1 == KERN_SUCCESS, ips.count >= 4 else {
+            append("discoverIPs: QueryInfo(IPVersions) failed")
+            return false
+        }
+        ipSDMA = IPVer(ips[1])
+        ipPSP  = IPVer(ips[2])
+        ipSMU  = IPVer(ips[3])
+        // QueryInfo(GFXVersion) → three scalars [major, minor, rev].
+        let (k2, gfx) = callScalar(kSelQueryInfo,
+                                   input: [kInfoGFXVersion],
+                                   outCount: 3)
+        guard k2 == KERN_SUCCESS, gfx.count >= 3 else {
+            append("discoverIPs: QueryInfo(GFXVersion) failed")
+            return false
+        }
+        ipGFX = IPVer((gfx[0] << 16) | (gfx[1] << 8) | gfx[2])
+        append("IP versions:"
+               + " GFX=\(ipGFX!.path)"
+               + " PSP=\(ipPSP!.path)"
+               + " SMU=\(ipSMU!.path)"
+               + " SDMA=\(ipSDMA!.path)")
+        return true
+    }
+
+    /// One-shot: open user client, detect IP versions, load every
+    /// firmware that amdgpu needs by name, drive every bring-up
+    /// stage in order. Stops at the first failure for stages that
+    /// gate later ones; logs and continues for ones that don't.
     func runFullBringup() {
         guard openUserClient() else { return }
-        // Stages 1+2: IPDiscovery + PSPInit. No firmware needed.
+        guard ensureDMABuffer() else { return }
+        guard discoverIPs() else { return }
+
+        // Filenames derived from the discovered IP versions, mirroring
+        // upstream amdgpu's per-IP fw_name construction:
+        //   psp_v14_0_init_microcode  → psp_{v}_sos.bin
+        //   smu_v14_0_init_microcode  → smu_{v}.bin
+        //   sdma_v7_0_init_microcode  → sdma_{v}.bin
+        //   gfx_v12_0_init_microcode  → gc_{v}_<part>.bin
+        let psp  = ipPSP!.path
+        let smu  = ipSMU!.path
+        let sdma = ipSDMA!.path
+        let gfx  = ipGFX!.path
+
+        // Stage 2: PSPInit (no firmware needed — just alloc fw_pri).
         testInitDeviceUpTo(2)
-        // Stages 3..5: needs PSP SOS firmware.
-        loadSOSAndContinue()
-        // SMU needs PMFW; load it then SMUInit.
-        if loadFirmware(kFwIP_SMU, "smu_14_0_3.bin") {
+
+        // Stages 3–5: PSPLoadSOS → PSPRingCreate → TMRSetup.
+        if !loadFirmware(kFwSOS, "psp_\(psp)_sos.bin") {
+            append("runFullBringup: stop — PSP SOS load failed")
+            return
+        }
+        for s: UInt64 in [3, 4, 5] { testInitDeviceUpTo(s) }
+
+        // Stage 6: SMUInit (needs PMFW).
+        if loadFirmware(kFwIP_SMU, "smu_\(smu).bin") {
             testInitDeviceUpTo(6)
         }
-        // GMC + IH + RLC + CP — no extra firmware needed for the
-        // ones we already loaded; SDMA needs its own microcode.
-        for stage: UInt64 in [7, 12, 9] {
-            testInitDeviceUpTo(stage)
+
+        // Stages 7/12/9: GMCInit, IHInit, RLCInit — no firmware.
+        for s: UInt64 in [7, 12, 9] { testInitDeviceUpTo(s) }
+
+        // SDMA microcode (per-instance, same IP version on RDNA4).
+        if loadFirmware(kFwIP_SDMA0, "sdma_\(sdma).bin") {
+            _ = loadFirmware(kFwIP_SDMA1, "sdma_\(sdma).bin")
+            testInitDeviceUpTo(14)  // SDMAInit
         }
-        // SDMA0 + SDMA1 firmware, then SDMAInit + CPInit.
-        if loadFirmware(kFwIP_SDMA0, "sdma_7_0_1.bin") {
-            _ = loadFirmware(kFwIP_SDMA1, "sdma_7_0_1.bin")
-            testInitDeviceUpTo(14)
-        }
-        // RLC + MES microcode for the GFX path.
-        _ = loadFirmware(kFwIP_RLC_G,    "gc_12_0_1_rlc.bin")
-        _ = loadFirmware(kFwIP_RS64_MES, "gc_12_0_1_uni_mes.bin")
+
+        // GFX microcode: RLC + uni-MES — then MES + CP init.
+        _ = loadFirmware(kFwIP_RLC_G,    "gc_\(gfx)_rlc.bin")
+        _ = loadFirmware(kFwIP_RS64_MES, "gc_\(gfx)_uni_mes.bin")
         testInitDeviceUpTo(11)  // MESInit
         testInitDeviceUpTo(10)  // CPInit
+
         append("runFullBringup: done — see log for stage outcomes")
     }
 
