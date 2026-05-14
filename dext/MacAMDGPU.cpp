@@ -64,6 +64,16 @@ enum {
     kMacAMDGPUMethodBOGetInfo         = 18,
     kMacAMDGPUMethodSubmitIB          = 19,
     kMacAMDGPUMethodWaitFence         = 20,
+    kMacAMDGPUMethodQueryInfo         = 21,
+};
+
+// QueryInfo "info type" tags — input scalarInput[0]. Output shape
+// is type-specific; we document each below.
+enum {
+    kMacAMDGPUInfoGFXVersion     = 1, // out[0]=major, [1]=minor, [2]=rev
+    kMacAMDGPUInfoVRAMSizes      = 2, // out[0]=visible, [1]=total (bytes)
+    kMacAMDGPUInfoIPVersions     = 3, // out[0]=GMC pack, [1]=SDMA pack, [2]=PSP pack, [3]=SMU pack
+    kMacAMDGPUInfoBringupReached = 4, // out[0]=BringupStage (highest reached)
 };
 
 // Firmware type tags used by LoadFirmware. Pre-SOS components route
@@ -1284,6 +1294,48 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
 
         arguments->scalarOutput[0] = fence;
         return kIOReturnSuccess;
+    }
+
+    case kMacAMDGPUMethodQueryInfo: {
+        // scalarInput[0] = info type tag
+        // scalarOutput[N] = type-specific payload
+        if (arguments->scalarInput == nullptr ||
+            arguments->scalarInputCount < 1 ||
+            arguments->scalarOutput == nullptr ||
+            arguments->scalarOutputCount < 1) {
+            return kIOReturnBadArgument;
+        }
+        const uint64_t infoType = arguments->scalarInput[0];
+        auto &b = driver->ivars->bringup;
+        switch (infoType) {
+        case kMacAMDGPUInfoGFXVersion:
+            if (arguments->scalarOutputCount < 3) return kIOReturnBadArgument;
+            arguments->scalarOutput[0] = amdgpu::kIP_GFX.major;
+            arguments->scalarOutput[1] = amdgpu::kIP_GFX.minor;
+            arguments->scalarOutput[2] = amdgpu::kIP_GFX.rev;
+            return kIOReturnSuccess;
+        case kMacAMDGPUInfoVRAMSizes:
+            if (arguments->scalarOutputCount < 2) return kIOReturnBadArgument;
+            arguments->scalarOutput[0] = b.gmc.visible_vram_size;
+            arguments->scalarOutput[1] = b.gmc.real_vram_size;
+            return kIOReturnSuccess;
+        case kMacAMDGPUInfoIPVersions: {
+            if (arguments->scalarOutputCount < 4) return kIOReturnBadArgument;
+            auto pack = [](amdgpu::IPVersion v) {
+                return (uint64_t(v.major) << 16) | (uint64_t(v.minor) << 8) | v.rev;
+            };
+            arguments->scalarOutput[0] = pack(amdgpu::kIP_GMC);
+            arguments->scalarOutput[1] = pack(amdgpu::kIP_SDMA);
+            arguments->scalarOutput[2] = pack(amdgpu::kIP_PSP);
+            arguments->scalarOutput[3] = pack(amdgpu::kIP_SMU);
+            return kIOReturnSuccess;
+        }
+        case kMacAMDGPUInfoBringupReached:
+            arguments->scalarOutput[0] = static_cast<uint64_t>(b.reached);
+            return kIOReturnSuccess;
+        default:
+            return kIOReturnUnsupported;
+        }
     }
 
     case kMacAMDGPUMethodWaitFence: {

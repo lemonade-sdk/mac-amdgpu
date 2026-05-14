@@ -168,7 +168,7 @@ Cite Linux source file in commit messages.
 - [~] 293  Map BO — N/A in current design; userspace maps the DMABuffer once via `kMacAMDGPUMemoryTypeDMABuffer` and the BOAlloc byte_offset selects the window inside it. `BOGetInfo(handle)` returns bus_addr + byte_offset + size.
 - [x] 294  UAPI selector: `SubmitIB(ib_handle, ib_size_dw, queue=0) → fence_value` — chunk 24. Copies BO bytes into the CP_RB0 ring via `cp_ring_write`, emits an EOP fence, kicks the doorbell.
 - [x] 295  UAPI selector: `WaitFence(target_value, timeout_us) → observed_value` — chunk 24. Polls `cp.fence_cpu` from the WB page.
-- [ ] 296  UAPI selector: `query_info(type) → blob` (heap sizes, queue ids, asic id, gfx_version)
+- [x] 296  UAPI selector: `QueryInfo(type) → blob` — chunk 25. Currently exposes GFX_VERSION, VRAM sizes (visible + total), packed IP versions for GMC/SDMA/PSP/SMU, and the highest BringupStage reached.
 - [ ] 297  UAPI selector: `bo_export(handle) → mach_port` (for IOSurface bridging later)
 - [ ] 298  Stress test: 10k consecutive submits + fence waits
 - [ ] 299  Power cycle: D0 → D3 → D0 without PSP reset
