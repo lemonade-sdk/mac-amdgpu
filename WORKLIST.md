@@ -149,8 +149,8 @@ Cite Linux source file in commit messages.
 - [x] 252  Port `mes_v12_1_enable` — CP_MES_CNTL pipeline reset + PRGRM_CNTR_START + PIPE0_ACTIVE — chunk 22 (`mes_enable`, uni_mes pipe 0 only).
 - [x] 253  Port `mes_v12_1_queue_init` — SCHED ring HQD register programming via GRBM select + matching MQD-in-memory population at upstream v12_compute_mqd byte offsets — chunk 23 (`mes_queue_init`).
 - [ ] 254  Port `mes_v12_1_set_hw_resources` — MESAPI_SET_HW_RSRC payload (vmid masks, HQD masks, IP bases)
-- [ ] 255  Port `mes_v12_1_submit_pkt_and_poll_completion` — analogous to PSP ring submit
-- [ ] 256  Port `mes_v12_1_query_sched_status` — verify scheduler responds
+- [x] 255  Port `mes_v12_1_submit_pkt_and_poll_completion` → `mes_submit_pkt` — chunk 26. Patches embedded `MES_API_Status` fence_addr/value, writes the 64-dword frame to the SCHED ring, chains a QUERY_SCHEDULER_STATUS frame for fence acknowledgement, kicks the BAR5 doorbell, polls the status slot.
+- [x] 256  Port `mes_v12_1_query_sched_status` → `mes_query_sched_status` — chunk 26. Thin wrapper around `mes_submit_pkt` with the QUERY opcode.
 - [ ] 257  Port `mes_v12_1_add_hw_queue` — MESAPI_ADD_QUEUE for the first user-facing GFX queue
 - [ ] 258  Port `mes_v12_1_init_aggregated_doorbell` — 5 priority levels
 

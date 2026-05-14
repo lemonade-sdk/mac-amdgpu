@@ -421,6 +421,157 @@ mes_queue_init(const DeviceContext &dev, MESContext &mes, MESPipe pipe)
 }
 
 //------------------------------------------------------------------
+// mes_ring_write — write `n_dw` dwords to the SCHED ring at the
+// current software wptr (wraps modulo ring size).
+//------------------------------------------------------------------
+static uint32_t
+mes_ring_write(MESInstance &inst, const uint32_t *src, uint32_t n_dw)
+{
+    if (!inst.inited || n_dw == 0) return 0;
+    if (n_dw > inst.ring_size_dwords) return 0;
+    auto *ring = static_cast<uint32_t *>(inst.ring_cpu);
+    // Track wptr inside the cmd_buf slot we never use — reuse the
+    // upper part of the wb page after the rptr/wptr shadow.
+    auto *wb_bytes = static_cast<volatile uint8_t *>(inst.wb_cpu);
+    volatile uint32_t *sw_wptr = reinterpret_cast<volatile uint32_t *>(
+        wb_bytes + 0x80);
+    uint32_t wptr = *sw_wptr;
+    const uint32_t mask = inst.ring_size_dwords - 1u;
+    for (uint32_t i = 0; i < n_dw; i++) {
+        ring[(wptr + i) & mask] = src[i];
+    }
+    wptr = (wptr + n_dw) & mask;
+    *sw_wptr = wptr;
+    return n_dw;
+}
+
+//------------------------------------------------------------------
+// mes_kick_doorbell — BAR5 write at (doorbell_index * 8). The
+// MES sees a new wptr value and dispatches packets up to it.
+//------------------------------------------------------------------
+static kern_return_t
+mes_kick_doorbell(const DeviceContext &dev, const MESInstance &inst)
+{
+    if (!inst.inited) return kIOReturnNotReady;
+    auto *wb_bytes = static_cast<volatile uint8_t *>(inst.wb_cpu);
+    volatile uint32_t *sw_wptr = reinterpret_cast<volatile uint32_t *>(
+        wb_bytes + 0x80);
+    const uint64_t offs = static_cast<uint64_t>(inst.doorbell_index) * 8ull;
+    const uint32_t v = *sw_wptr << 2;
+    dev.pci->MemoryWrite32(dev.bar5MemIndex, offs, v);
+    return kIOReturnSuccess;
+}
+
+//------------------------------------------------------------------
+// mes_submit_pkt — write a 64-dword API frame to the ring, chain a
+// QUERY_SCHEDULER_STATUS frame for fence acknowledgement, kick the
+// doorbell, poll the status slot.
+//------------------------------------------------------------------
+kern_return_t
+mes_submit_pkt(const DeviceContext &dev, MESContext &mes, MESPipe pipe,
+               const uint32_t *pkt, uint32_t api_status_off_dw,
+               uint64_t timeout_us)
+{
+    const uint32_t p = static_cast<uint32_t>(pipe);
+    if (p >= kMaxMESPipes) return kIOReturnBadArgument;
+    MESInstance &inst = mes.pipe[p];
+    if (!inst.inited || !inst.enabled) return kIOReturnNotReady;
+    if (pkt == nullptr || api_status_off_dw + 4 > kMES_API_FRAME_DWORDS) {
+        return kIOReturnBadArgument;
+    }
+
+    // Status slot in the WB page at +0xC0 (reserved area beyond
+    // rptr/wptr/wptr-poll). MES writes our 64-bit fence_value here.
+    auto *wb_bytes = static_cast<volatile uint8_t *>(inst.wb_cpu);
+    volatile uint64_t *status_slot = reinterpret_cast<volatile uint64_t *>(
+        wb_bytes + 0xC0);
+    *status_slot = 0;
+    const uint64_t status_gpu = inst.wb_bus + 0xC0;
+    const uint64_t fence_value = 1;
+
+    // Patch the embedded MES_API_Status fence_addr / fence_value.
+    uint32_t frame[kMES_API_FRAME_DWORDS];
+    memcpy(frame, pkt, sizeof(frame));
+    auto *st = reinterpret_cast<MES_API_Status *>(
+        reinterpret_cast<uint8_t *>(frame) + api_status_off_dw * 4u);
+    st->fence_addr  = status_gpu;
+    st->fence_value = fence_value;
+
+    if (mes_ring_write(inst, frame, kMES_API_FRAME_DWORDS) !=
+        kMES_API_FRAME_DWORDS) {
+        return kIOReturnNoSpace;
+    }
+
+    // Chain a QUERY_SCHEDULER_STATUS — its own status slot at +0xD0.
+    volatile uint64_t *q_slot = reinterpret_cast<volatile uint64_t *>(
+        wb_bytes + 0xD0);
+    *q_slot = 0;
+    uint32_t q[kMES_API_FRAME_DWORDS];
+    memset(q, 0, sizeof(q));
+    q[0] = mes_api_header(kMES_API_TYPE_SCHEDULER,
+                          MESSchOp::QUERY_SCHEDULER_STATUS,
+                          kMES_API_FRAME_DWORDS);
+    // status footprint also at the end of QUERY frame — upstream
+    // places it at the same offset as SET_HW_RSRC. We'll put it
+    // at dword 60 (16-byte aligned, 4 dwords) for simplicity.
+    auto *qst = reinterpret_cast<MES_API_Status *>(
+        reinterpret_cast<uint8_t *>(q) + 60u * 4u);
+    qst->fence_addr  = inst.wb_bus + 0xD0;
+    qst->fence_value = fence_value;
+
+    if (mes_ring_write(inst, q, kMES_API_FRAME_DWORDS) !=
+        kMES_API_FRAME_DWORDS) {
+        return kIOReturnNoSpace;
+    }
+
+    kern_return_t r = mes_kick_doorbell(dev, inst);
+    if (r != kIOReturnSuccess) return r;
+
+    // Poll status_slot. Success = lower 32 bits == 1.
+    const uint64_t step_us = 100;
+    uint64_t elapsed = 0;
+    while (elapsed < timeout_us) {
+        uint64_t v = *status_slot;
+        if ((v & 0xFFFFFFFFull) == fence_value) {
+            MES_LOG("submit_pkt: pipe %u ok in ~%llu us",
+                    p, (unsigned long long)elapsed);
+            return kIOReturnSuccess;
+        }
+        if ((v >> 31) & 0x1) {
+            MES_LOG("submit_pkt: pipe %u error status=%#llx",
+                    p, (unsigned long long)v);
+            return kIOReturnInternalError;
+        }
+        uint32_t scratch = 0;
+        for (int i = 0; i < 2000; i++) {
+            scratch ^= static_cast<uint32_t>(*status_slot);
+        }
+        (void)scratch;
+        elapsed += step_us;
+    }
+    MES_LOG("submit_pkt: pipe %u timeout (last status=%#llx)",
+            p, (unsigned long long)*status_slot);
+    return kIOReturnTimeout;
+}
+
+//------------------------------------------------------------------
+// mes_query_sched_status — convenience wrapper. Sends a no-payload
+// QUERY frame and checks MES echoes the fence.
+//------------------------------------------------------------------
+kern_return_t
+mes_query_sched_status(const DeviceContext &dev, MESContext &mes,
+                       MESPipe pipe)
+{
+    uint32_t pkt[kMES_API_FRAME_DWORDS];
+    memset(pkt, 0, sizeof(pkt));
+    pkt[0] = mes_api_header(kMES_API_TYPE_SCHEDULER,
+                            MESSchOp::QUERY_SCHEDULER_STATUS,
+                            kMES_API_FRAME_DWORDS);
+    // Place MES_API_Status at dword 60 — last 4 dwords of the frame.
+    return mes_submit_pkt(dev, mes, pipe, pkt, /*status_off=*/60, 2'000'000);
+}
+
+//------------------------------------------------------------------
 // mes_init_full — MESInit bringup stage.
 //------------------------------------------------------------------
 kern_return_t

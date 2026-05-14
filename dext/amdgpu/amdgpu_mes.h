@@ -247,6 +247,69 @@ kern_return_t mes_enable(const DeviceContext &dev,
 kern_return_t mes_set_uc_start_addr(MESContext &mes, MESPipe pipe,
                                     uint64_t uc_start_addr);
 
+//------------------------------------------------------------------
+// MES API wire format — abridged subset of mes_v12_api_def.h
+//------------------------------------------------------------------
+constexpr uint32_t kMES_API_FRAME_DWORDS = 64;          // every msg is 64 dw
+constexpr uint32_t kMES_API_TYPE_SCHEDULER = 1;
+
+// MES_SCH_API_OPCODE subset (the ones we care about for first PM4):
+namespace MESSchOp {
+    constexpr uint32_t SET_HW_RSRC               = 0;
+    constexpr uint32_t SET_SCHEDULING_CONFIG     = 1;
+    constexpr uint32_t ADD_QUEUE                 = 2;
+    constexpr uint32_t REMOVE_QUEUE              = 3;
+    constexpr uint32_t QUERY_SCHEDULER_STATUS    = 11;
+    constexpr uint32_t SET_HW_RSRC_1             = 19;
+}
+
+// MES_API_HEADER bit layout — type[3:0], opcode[11:4], dwsize[19:12],
+// reserved[31:20].
+static inline uint32_t
+mes_api_header(uint32_t type, uint32_t opcode, uint32_t dwsize)
+{
+    return (type   & 0xFu)
+         | ((opcode & 0xFFu) << 4)
+         | ((dwsize & 0xFFu) << 12);
+}
+
+//------------------------------------------------------------------
+// Per-call API status footprint that lives inside every MES message.
+// The dext sets `fence_addr` to a 64-bit GPU-side WB slot and
+// `fence_value` to 1; MES writes that value into the slot once the
+// API completes. (Failure encoding lives in the high 32 bits — see
+// upstream comment in mes_v12_api_def.h.)
+//------------------------------------------------------------------
+struct MES_API_Status {
+    uint64_t fence_addr;
+    uint64_t fence_value;
+};
+
+//------------------------------------------------------------------
+// mes_submit_pkt — port of mes_v12_0_submit_pkt_and_poll_completion.
+//
+// `pkt` must point to a buffer of exactly kMES_API_FRAME_DWORDS
+// dwords. `api_status_off_dw` is the dword offset *inside* `pkt`
+// where the embedded MES_API_Status starts. We patch fence_addr +
+// fence_value into that slot, write the whole frame into the
+// scheduler ring, append a QUERY_SCHEDULER_STATUS that chains a
+// second fence on the ring's own fence area, kick the ring's
+// doorbell, then poll the status slot.
+//
+// Returns kIOReturnSuccess if the status slot latches lower-32 == 1
+// (the MES success indicator) within timeout_us.
+//------------------------------------------------------------------
+kern_return_t mes_submit_pkt(const DeviceContext &dev, MESContext &mes,
+                             MESPipe pipe,
+                             const uint32_t *pkt,
+                             uint32_t api_status_off_dw,
+                             uint64_t timeout_us);
+
+// Convenience wrapper — sends MES_SCH_API_QUERY_SCHEDULER_STATUS to
+// the given pipe. Returns kIOReturnSuccess on a successful echo.
+kern_return_t mes_query_sched_status(const DeviceContext &dev,
+                                     MESContext &mes, MESPipe pipe);
+
 // Program the MES SCHED pipe's HQD registers. Mirrors upstream's
 // mes_v12_0_queue_init_register + the field defaults from
 // mes_v12_0_mqd_init. Caller must have run mes_alloc_storage on
