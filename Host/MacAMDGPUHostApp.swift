@@ -394,10 +394,17 @@ final class DriverController: NSObject, ObservableObject,
             versionMatch = false
             return
         }
-        // Pick the active one if there are multiple staged copies
-        // (e.g. an old + a pending replacement).
-        let active = properties.first { $0.isEnabled }
-                  ?? properties.first { $0.isAwaitingUserApproval == false }
+        // macOS keeps zombie 'waiting to uninstall on reboot' entries
+        // alongside the live one across version bumps. Prefer the
+        // genuinely-running one (isEnabled && !isUninstalling), else
+        // fall back to the highest version we have on disk.
+        let active = properties.first {
+                        $0.isEnabled && !$0.isUninstalling
+                     }
+                  ?? properties.sorted { lhs, rhs in
+                        lhs.bundleVersion.compare(rhs.bundleVersion,
+                            options: .numeric) == .orderedDescending
+                     }.first
                   ?? properties[0]
         let short = active.bundleShortVersion
         let build = active.bundleVersion

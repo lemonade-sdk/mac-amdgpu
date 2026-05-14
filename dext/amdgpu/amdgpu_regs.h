@@ -23,6 +23,7 @@
 
 #ifdef __APPLE__
 #include <PCIDriverKit/IOPCIDevice.h>
+#include <DriverKit/IOLib.h>
 #endif
 
 //============================================================
@@ -139,11 +140,15 @@ poll_reg(const DeviceContext &ctx, uint32_t reg,
          uint32_t mask, uint32_t expected,
          uint64_t timeout_us, uint32_t *outValue = nullptr)
 {
-    // Conservative ~50 µs sleep per iteration. Real implementation
-    // should use IOSleep or absolute time, but for Phase 1B we keep
-    // it simple. PSP bootloader waits often complete in <1 ms.
-    const uint64_t kStepUs = 50;
-    uint64_t elapsed = 0;
+    // 1 ms IOSleep between probes. On Apple Silicon each MMIO read
+    // over the DART path is ~10× the latency of a native PCI read,
+    // so the previous "busy spin 1000 RREG32 = 50 µs" approximation
+    // actually burned tens of ms per iteration and stretched a
+    // nominal 5 s timeout into minutes while pegging a CPU. IOSleep
+    // yields the dispatcher and gives a deterministic wall-clock
+    // timeout.
+    const uint64_t kStepMs = 1;
+    uint64_t elapsed_us = 0;
     uint32_t v = 0;
     while (true) {
         v = RREG32(ctx, reg);
@@ -151,19 +156,12 @@ poll_reg(const DeviceContext &ctx, uint32_t reg,
             if (outValue) *outValue = v;
             return true;
         }
-        if (elapsed >= timeout_us) {
+        if (elapsed_us >= timeout_us) {
             if (outValue) *outValue = v;
             return false;
         }
-        // Approximate ~50 µs by reading the same register repeatedly.
-        // TODO(phase1b): replace with a real nanosecond wait once we
-        // have a portable DriverKit primitive for it.
-        uint32_t scratch = 0;
-        for (int i = 0; i < 1000; i++) {
-            scratch ^= RREG32(ctx, reg);
-        }
-        (void)scratch;
-        elapsed += kStepUs;
+        IOSleep(kStepMs);
+        elapsed_us += kStepMs * 1000;
     }
 }
 #endif
