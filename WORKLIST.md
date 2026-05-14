@@ -162,12 +162,12 @@ Cite Linux source file in commit messages.
 - [ ] 274  Submit sysmem→VRAM copy via GART; validate via BAR2 readback within visible window
 
 ### 1B.8 Compute queue + UAPI
-- [ ] 290  Create compute queue via MES ADD_QUEUE (queue_type=COMPUTE)
-- [ ] 291  UAPI selector: `alloc_bo(size, domain, flags) → handle` (sysmem domain for now)
-- [ ] 292  UAPI selector: `free_bo(handle)`
-- [ ] 293  UAPI selector: `map_bo(handle) → memory type id` (returns id for IOConnectMapMemory64)
-- [ ] 294  UAPI selector: `submit_cs(queue_id, ib_handle, ib_size_dw, deps[]) → fence_handle`
-- [ ] 295  UAPI selector: `wait_fence(handle, timeout_ns) → status`
+- [ ] 290  Create compute queue via MES ADD_QUEUE (queue_type=COMPUTE) — needs full MES API msg marshalling (items 254–258).
+- [x] 291  UAPI selector: `BOAlloc(size) → handle, bus_addr, byte_offset` — chunk 24. Per-client bump allocator over the existing DMABuffer; userspace mmap of the DMABuffer gives direct CPU access to BO bytes.
+- [x] 292  UAPI selector: `BOFree(handle)` — chunk 24 (bump-only, doesn't reclaim).
+- [~] 293  Map BO — N/A in current design; userspace maps the DMABuffer once via `kMacAMDGPUMemoryTypeDMABuffer` and the BOAlloc byte_offset selects the window inside it. `BOGetInfo(handle)` returns bus_addr + byte_offset + size.
+- [x] 294  UAPI selector: `SubmitIB(ib_handle, ib_size_dw, queue=0) → fence_value` — chunk 24. Copies BO bytes into the CP_RB0 ring via `cp_ring_write`, emits an EOP fence, kicks the doorbell.
+- [x] 295  UAPI selector: `WaitFence(target_value, timeout_us) → observed_value` — chunk 24. Polls `cp.fence_cpu` from the WB page.
 - [ ] 296  UAPI selector: `query_info(type) → blob` (heap sizes, queue ids, asic id, gfx_version)
 - [ ] 297  UAPI selector: `bo_export(handle) → mach_port` (for IOSurface bridging later)
 - [ ] 298  Stress test: 10k consecutive submits + fence waits

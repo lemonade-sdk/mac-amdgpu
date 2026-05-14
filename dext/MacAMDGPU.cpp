@@ -59,6 +59,11 @@ enum {
     kMacAMDGPUMethodLoadDiscoveryBin  = 13,
     kMacAMDGPUMethodSubmitTestPM4     = 14,
     kMacAMDGPUMethodSDMACopyTest      = 15,
+    kMacAMDGPUMethodBOAlloc           = 16,
+    kMacAMDGPUMethodBOFree            = 17,
+    kMacAMDGPUMethodBOGetInfo         = 18,
+    kMacAMDGPUMethodSubmitIB          = 19,
+    kMacAMDGPUMethodWaitFence         = 20,
 };
 
 // Firmware type tags used by LoadFirmware. Pre-SOS components route
@@ -108,6 +113,23 @@ enum {
 #define MACAMDGPU_IRQ_PENDING_WORDS  4   // 4 × 64 = 256 vectors
 #define MACAMDGPU_MAX_DMA_SEGMENTS   32
 #define MACAMDGPU_DMA_BUFFER_MAX     (1536ULL * 1024ULL * 1024ULL)
+#define MACAMDGPU_MAX_BO             64
+#define MACAMDGPU_BO_ALIGN           amdgpu::kASPageSize  // 16 KB
+
+// Per-client BO sub-range allocator.
+// Each BO is a [byte_offset, byte_offset+size) window inside the
+// client's single DMABuffer. Userspace owns the mmap of the
+// DMABuffer (Path A) so it can fill / read BOs directly via memcpy;
+// the dext only validates the range and translates byte_offset →
+// GPU bus address when stitching submissions. Allocation is bump-
+// only for now; BOFree marks the entry free but doesn't reclaim
+// space (free-list is a Phase 2 follow-up).
+struct BOEntry {
+    bool      in_use;
+    uint64_t  byte_offset;
+    uint64_t  size;
+    uint32_t  generation;
+};
 
 // Bits 0..127 of irqPending track raw MSI-X vector firings (one bit
 // per vector, capped at 128 — anything beyond would land in word 2+,
@@ -170,7 +192,34 @@ struct MacAMDGPUUserClient_IVars {
     volatile uint64_t         *irqPending;
     volatile uint64_t         *irqEnabled;
     OSAction                  *pendingInterruptNotify;  // outstanding WaitInterrupt
+
+    // BO sub-range allocator (bump-only) — see BOEntry above.
+    BOEntry   bos[MACAMDGPU_MAX_BO];
+    uint64_t  boBumpOffset;
+    uint32_t  boGenCounter;
 };
+
+//
+// BO helpers — pack/unpack handle, lookup entry from handle.
+//
+static inline uint64_t
+mac_amdgpu_bo_make_handle(uint32_t generation, uint32_t index)
+{
+    return (static_cast<uint64_t>(generation) << 32) |
+           (static_cast<uint64_t>(index) & 0xFFFFFFFFull);
+}
+
+static BOEntry *
+mac_amdgpu_bo_lookup(MacAMDGPUUserClient_IVars *ivars, uint64_t handle)
+{
+    if (ivars == nullptr) return nullptr;
+    uint32_t idx = static_cast<uint32_t>(handle & 0xFFFFFFFFull);
+    uint32_t gen = static_cast<uint32_t>(handle >> 32);
+    if (idx >= MACAMDGPU_MAX_BO) return nullptr;
+    BOEntry *e = &ivars->bos[idx];
+    if (!e->in_use || e->generation != gen) return nullptr;
+    return e;
+}
 
 //============================================================
 // Helpers.
@@ -1106,6 +1155,171 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             MACAMDGPU_LOG("discovery parse failed: %{public}s", res.err);
         }
         return r;
+    }
+
+    case kMacAMDGPUMethodBOAlloc: {
+        // scalarInput[0] = size in bytes
+        // scalarOutput[0] = handle (or 0 on failure)
+        // scalarOutput[1] = bus address of the BO's first byte
+        // scalarOutput[2] = byte offset within the client DMABuffer
+        if (arguments->scalarInput == nullptr ||
+            arguments->scalarInputCount < 1 ||
+            arguments->scalarOutput == nullptr ||
+            arguments->scalarOutputCount < 3) {
+            return kIOReturnBadArgument;
+        }
+        if (ivars == nullptr || ivars->dmaBuffer == nullptr ||
+            ivars->dmaSegmentsCount < 1) {
+            return kIOReturnNotReady;
+        }
+        uint64_t size = arguments->scalarInput[0];
+        if (size == 0) return kIOReturnBadArgument;
+        // Round size up to a 16 KB multiple (AS DART page granularity).
+        size = (size + MACAMDGPU_BO_ALIGN - 1) & ~(MACAMDGPU_BO_ALIGN - 1);
+        // Bump-align the cursor too.
+        ivars->boBumpOffset = (ivars->boBumpOffset + MACAMDGPU_BO_ALIGN - 1)
+                            & ~(MACAMDGPU_BO_ALIGN - 1);
+        if (ivars->boBumpOffset + size > ivars->dmaBufferSize) {
+            return kIOReturnNoSpace;
+        }
+        // Find a free slot.
+        uint32_t idx = MACAMDGPU_MAX_BO;
+        for (uint32_t i = 0; i < MACAMDGPU_MAX_BO; i++) {
+            if (!ivars->bos[i].in_use) { idx = i; break; }
+        }
+        if (idx == MACAMDGPU_MAX_BO) return kIOReturnNoResources;
+
+        BOEntry &e = ivars->bos[idx];
+        e.in_use      = true;
+        e.byte_offset = ivars->boBumpOffset;
+        e.size        = size;
+        e.generation  = ++ivars->boGenCounter;
+        ivars->boBumpOffset += size;
+
+        const uint64_t handle = mac_amdgpu_bo_make_handle(e.generation, idx);
+        arguments->scalarOutput[0] = handle;
+        arguments->scalarOutput[1] =
+            ivars->dmaSegments[0].address + e.byte_offset;
+        arguments->scalarOutput[2] = e.byte_offset;
+        MACAMDGPU_LOG("BOAlloc: handle=%#llx off=%#llx size=%llu",
+                      handle, e.byte_offset, size);
+        return kIOReturnSuccess;
+    }
+
+    case kMacAMDGPUMethodBOFree: {
+        // scalarInput[0] = handle
+        if (arguments->scalarInput == nullptr ||
+            arguments->scalarInputCount < 1) {
+            return kIOReturnBadArgument;
+        }
+        BOEntry *e = mac_amdgpu_bo_lookup(ivars, arguments->scalarInput[0]);
+        if (e == nullptr) return kIOReturnBadArgument;
+        e->in_use = false;
+        // size + byte_offset stay set so a stale handle keeps failing.
+        return kIOReturnSuccess;
+    }
+
+    case kMacAMDGPUMethodBOGetInfo: {
+        // scalarInput[0] = handle
+        // scalarOutput[0] = bus address
+        // scalarOutput[1] = byte offset within the DMABuffer
+        // scalarOutput[2] = size
+        if (arguments->scalarInput == nullptr ||
+            arguments->scalarInputCount < 1 ||
+            arguments->scalarOutput == nullptr ||
+            arguments->scalarOutputCount < 3) {
+            return kIOReturnBadArgument;
+        }
+        BOEntry *e = mac_amdgpu_bo_lookup(ivars, arguments->scalarInput[0]);
+        if (e == nullptr || ivars->dmaSegmentsCount < 1) {
+            return kIOReturnBadArgument;
+        }
+        arguments->scalarOutput[0] =
+            ivars->dmaSegments[0].address + e->byte_offset;
+        arguments->scalarOutput[1] = e->byte_offset;
+        arguments->scalarOutput[2] = e->size;
+        return kIOReturnSuccess;
+    }
+
+    case kMacAMDGPUMethodSubmitIB: {
+        // scalarInput[0] = ib BO handle
+        // scalarInput[1] = ib size in dwords
+        // scalarInput[2] = (reserved — queue id, must be 0 for now)
+        // scalarOutput[0] = fence_value to wait on (returns 0 on err)
+        if (arguments->scalarInput == nullptr ||
+            arguments->scalarInputCount < 3 ||
+            arguments->scalarOutput == nullptr ||
+            arguments->scalarOutputCount < 1) {
+            return kIOReturnBadArgument;
+        }
+        BOEntry *e = mac_amdgpu_bo_lookup(ivars, arguments->scalarInput[0]);
+        if (e == nullptr) return kIOReturnBadArgument;
+        uint64_t ib_dw = arguments->scalarInput[1];
+        if (ib_dw == 0 || ib_dw * 4 > e->size) {
+            return kIOReturnBadArgument;
+        }
+        if (arguments->scalarInput[2] != 0) return kIOReturnUnsupported;
+        if (!driver->ivars->pciOpen) return kIOReturnNotOpen;
+
+        // The BO bytes live in our DMABuffer; map a CPU pointer via
+        // GetAddressRange to copy them into the CP ring.
+        IOAddressSegment seg = {};
+        if (ivars->dmaBuffer->GetAddressRange(&seg) != kIOReturnSuccess) {
+            return kIOReturnInternalError;
+        }
+        const uint32_t *ib_words = reinterpret_cast<const uint32_t *>(
+            seg.address + e->byte_offset);
+
+        auto &cp = driver->ivars->bringup.cp;
+        // Stage the IB body into the ring, then append a fence so we
+        // know when the CP has drained it.
+        uint32_t wrote = amdgpu::cp_ring_write(cp, ib_words,
+                                               static_cast<uint32_t>(ib_dw));
+        if (wrote != ib_dw) return kIOReturnNoSpace;
+
+        uint32_t fence = amdgpu::cp_emit_eop_fence(cp);
+        kern_return_t r = amdgpu::cp_kick_doorbell(
+            driver->ivars->bringup.device, cp);
+        if (r != kIOReturnSuccess) return r;
+
+        arguments->scalarOutput[0] = fence;
+        return kIOReturnSuccess;
+    }
+
+    case kMacAMDGPUMethodWaitFence: {
+        // scalarInput[0] = fence_value to wait for
+        // scalarInput[1] = timeout_us
+        // scalarOutput[0] = observed fence value
+        if (arguments->scalarInput == nullptr ||
+            arguments->scalarInputCount < 2 ||
+            arguments->scalarOutput == nullptr ||
+            arguments->scalarOutputCount < 1) {
+            return kIOReturnBadArgument;
+        }
+        uint64_t target  = arguments->scalarInput[0];
+        uint64_t to_us   = arguments->scalarInput[1];
+        if (to_us == 0) to_us = 1000000ull;
+
+        auto &cp = driver->ivars->bringup.cp;
+        if (cp.fence_cpu == nullptr) return kIOReturnNotReady;
+
+        const uint64_t step_us = 50;
+        uint64_t elapsed = 0;
+        while (elapsed < to_us) {
+            uint64_t observed = *cp.fence_cpu;
+            if (observed >= target) {
+                arguments->scalarOutput[0] = observed;
+                return kIOReturnSuccess;
+            }
+            uint32_t scratch = 0;
+            for (int i = 0; i < 1000; i++) {
+                scratch ^= static_cast<uint32_t>(*cp.fence_cpu);
+            }
+            (void)scratch;
+            elapsed += step_us;
+        }
+        arguments->scalarOutput[0] = *cp.fence_cpu;
+        return kIOReturnTimeout;
     }
 
     default:
