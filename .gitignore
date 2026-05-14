@@ -1,12 +1,31 @@
+# Vendored third-party trees — referenced for porting, not published.
+upstream/linux/
+upstream/linux-firmware/
+upstream/mesa/
 upstream/
+
+# Firmware blobs (sourced separately by each developer from linux-firmware).
+firmware/
 firmware/blobs/
-*.dSYM/
+
+# Build output.
 build/
 build.log
-.DS_Store
+*.dSYM/
 
 # xcodegen-managed — regenerate via scripts/build.sh
+*.xcodeproj/
 MacAMDGPU.xcodeproj/
 *.xcworkspace/
 xcuserdata/
 DerivedData/
+~/Library/Developer/Xcode/DerivedData/MacAMDGPU-*
+
+# macOS junk.
+.DS_Store
+
+# Temp scratch files written by host/scripts during bringup.
+/tmp/dext_open_trace.log
+/tmp/macamdgpu_activate.log
+/tmp/ping_entitlements.plist
+/tmp/minimal_dext_entitlements.plist
