@@ -152,9 +152,10 @@ struct ContentView: View {
                 Button("BARs") { controller.testGetBARInfo() }
                 Button("Query") { controller.testQueryInfo() }
                 Spacer()
-                Button("Pick Firmware Folder…") {
-                    controller.pickFirmwareFolder()
+                Button("Run Full Bringup") {
+                    controller.runFullBringup()
                 }
+                .help("Loads PSP firmware then runs every InitDevice stage.")
             }
             .font(.caption)
 
@@ -608,29 +609,13 @@ final class DriverController: NSObject, ObservableObject,
 
     // MARK: Firmware
 
-    /// Folder containing AMD microcode blobs. Defaults to the
-    /// `firmware/` directory embedded inside the app bundle's
-    /// Resources (populated by Xcode's "Copy Files" build phase
-    /// from project.yml). The "Pick Firmware Folder…" button lets
-    /// the user override with an external directory if needed.
-    private lazy var firmwareDir: URL? = {
-        return Bundle.main.resourceURL?
+    /// Folder containing AMD microcode blobs. Always the
+    /// `firmware/` directory inside the app bundle's Resources
+    /// (Xcode's "Copy Files" build phase copies firmware/ in
+    /// from the repo at build time — see project.yml).
+    private var firmwareDir: URL? {
+        Bundle.main.resourceURL?
             .appendingPathComponent("firmware", isDirectory: true)
-    }()
-
-    func pickFirmwareFolder() {
-        let panel = NSOpenPanel()
-        panel.title = "Override firmware folder (defaults to bundled)"
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        if let bundled = Bundle.main.resourceURL?
-            .appendingPathComponent("firmware") {
-            panel.directoryURL = bundled
-        }
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        firmwareDir = url
-        append("firmware dir override: \(url.path)")
     }
 
     /// Allocate a 32MB DMA buffer if we don't have one.
@@ -699,42 +684,51 @@ final class DriverController: NSObject, ObservableObject,
         return true
     }
 
-    /// Load the SOS bootloader chain, then drive bringup through
-    /// stage 5 (TMRSetup). Stops at the first failure.
+    /// Load the SOS firmware then drive bringup through TMRSetup.
+    /// Firmware path is fixed at the bundled `firmware/` folder.
     func loadSOSAndContinue() {
         guard openUserClient() else { return }
-        // firmwareDir defaults to the bundled firmware/ folder.
-        guard let dir = firmwareDir,
-              FileManager.default.fileExists(atPath: dir.path) else {
-            append("loadSOSAndContinue: bundled firmware/ folder missing; "
-                   + "use 'Pick Firmware Folder…' to choose one")
-            return
-        }
-        append("firmware: \(dir.path)")
         guard ensureDMABuffer() else { return }
-        // PSP bootloader chain — R9700 / PSP v14.0.3. Order from
-        // psp_v14_0_bootloader_load_sos.
-        let chain: [(UInt64, String)] = [
-            (kFwKDB,         "psp_14_0_3_kdb.bin"),
-            (kFwSPL,         "psp_14_0_3_spl.bin"),
-            (kFwSysDrv,      "psp_14_0_3_sys_drv.bin"),
-            (kFwSocDrv,      "psp_14_0_3_soc_drv.bin"),
-            (kFwIntfDrv,     "psp_14_0_3_intf_drv.bin"),
-            (kFwDbgDrv,      "psp_14_0_3_dbg_drv.bin"),
-            (kFwRASDrv,      "psp_14_0_3_ras_drv.bin"),
-            (kFwIPKeyMgrDrv, "psp_14_0_3_ipkeymgr_drv.bin"),
-            (kFwSOS,         "psp_14_0_3_sos.bin"),
-        ]
-        for (type, fname) in chain {
-            if !loadFirmware(type, fname) {
-                append("PSP chain stopped at \(fname)")
-                return
-            }
+        // PSP v14.0.3 ships only sos.bin in linux-firmware (the
+        // pre-SOS components are bundled inside sos.bin).
+        if !loadFirmware(kFwSOS, "psp_14_0_3_sos.bin") {
+            append("PSP chain stopped at psp_14_0_3_sos.bin")
+            return
         }
         // Drive PSPLoadSOS → PSPRingCreate → TMRSetup.
         for stage: UInt64 in [3, 4, 5] {
             testInitDeviceUpTo(stage)
         }
+    }
+
+    /// One-shot: open user client, load firmware, drive every
+    /// bring-up stage in order. Stops at the first failure.
+    func runFullBringup() {
+        guard openUserClient() else { return }
+        // Stages 1+2: IPDiscovery + PSPInit. No firmware needed.
+        testInitDeviceUpTo(2)
+        // Stages 3..5: needs PSP SOS firmware.
+        loadSOSAndContinue()
+        // SMU needs PMFW; load it then SMUInit.
+        if loadFirmware(kFwIP_SMU, "smu_14_0_3.bin") {
+            testInitDeviceUpTo(6)
+        }
+        // GMC + IH + RLC + CP — no extra firmware needed for the
+        // ones we already loaded; SDMA needs its own microcode.
+        for stage: UInt64 in [7, 12, 9] {
+            testInitDeviceUpTo(stage)
+        }
+        // SDMA0 + SDMA1 firmware, then SDMAInit + CPInit.
+        if loadFirmware(kFwIP_SDMA0, "sdma_7_0_1.bin") {
+            _ = loadFirmware(kFwIP_SDMA1, "sdma_7_0_1.bin")
+            testInitDeviceUpTo(14)
+        }
+        // RLC + MES microcode for the GFX path.
+        _ = loadFirmware(kFwIP_RLC_G,    "gc_12_0_1_rlc.bin")
+        _ = loadFirmware(kFwIP_RS64_MES, "gc_12_0_1_uni_mes.bin")
+        testInitDeviceUpTo(11)  // MESInit
+        testInitDeviceUpTo(10)  // CPInit
+        append("runFullBringup: done — see log for stage outcomes")
     }
 
     // MARK: Version reporting
