@@ -447,16 +447,28 @@ psp_ring_create(DeviceContext &dev, PSPContext &psp)
                                             MP0Regs::C2PMSG_71);
 
     // 1. Wait for SOS ready to accept ring creation.
+    //
+    // When the GPU is warm-booting and SOS is already alive (e.g.
+    // we re-loaded the dext without power-cycling the card), the
+    // C2PMSG_64 mailbox is in the post-command state from whatever
+    // ran before us, not the SOS-idle state. The "ready" check then
+    // never fires and we wait the full timeout. Short-circuit it
+    // when sosAlive is already set — SOS is always idle/ready once
+    // it's running.
     uint32_t v = 0;
-    if (!poll_reg(dev, reg64, kPSPMboxRespMask, kPSPMboxRespFlag,
-                  5 * 1000000, &v)) {
-        PSP_LOG("ring_create: SOS not ready — C2PMSG_64=%#010x", v);
-        psp.ringDMACommand->CompleteDMA(kIODMACommandCompleteDMANoOptions);
-        psp.ringDMACommand->release();
-        psp.ringDMACommand = nullptr;
-        psp.ringBuffer->release();
-        psp.ringBuffer = nullptr;
-        return kIOReturnTimeout;
+    if (!psp.sosAlive) {
+        if (!poll_reg(dev, reg64, kPSPMboxRespMask, kPSPMboxRespFlag,
+                      5 * 1000000, &v)) {
+            PSP_LOG("ring_create: SOS not ready — C2PMSG_64=%#010x", v);
+            psp.ringDMACommand->CompleteDMA(kIODMACommandCompleteDMANoOptions);
+            psp.ringDMACommand->release();
+            psp.ringDMACommand = nullptr;
+            psp.ringBuffer->release();
+            psp.ringBuffer = nullptr;
+            return kIOReturnTimeout;
+        }
+    } else {
+        PSP_LOG("ring_create: SOS already alive — skipping ready check");
     }
 
     // 2. Program ring address (low + high) + size, then kick.

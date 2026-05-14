@@ -753,7 +753,29 @@ final class DriverController: NSObject, ObservableObject,
     /// firmware that amdgpu needs by name, drive every bring-up
     /// stage in order. Stops at the first failure for stages that
     /// gate later ones; logs and continues for ones that don't.
+    ///
+    /// Runs on a background task so the UI stays responsive — each
+    /// InitDevice / LoadFirmware can block for up to ~10 s waiting
+    /// for PSP / SMU mailbox responses.
     func runFullBringup() {
+        guard !isWorking else {
+            append("runFullBringup: already running")
+            return
+        }
+        isWorking = true
+        status = "bringup running…"
+        statusColor = .orange
+        Task.detached(priority: .userInitiated) { [weak self] in
+            await self?.runFullBringupBlocking()
+            await MainActor.run {
+                self?.isWorking = false
+                self?.status = "bringup done"
+                self?.statusColor = .green
+            }
+        }
+    }
+
+    private func runFullBringupBlocking() async {
         guard openUserClient() else { return }
         guard ensureDMABuffer() else { return }
         guard discoverIPs() else { return }
