@@ -1,19 +1,4 @@
-# mac_amdgpu
-
-A third-party native PCIDriverKit-based driver for AMD GPUs on macOS Tahoe
-(26.x) running on Apple Silicon. The goal is to talk to a discrete AMD GPU
-directly over PCIe — bypassing Metal entirely — by porting the relevant
-slices of the Linux `amdgpu` kernel driver into a DriverKit system extension.
-
-Primary target hardware is the **AMD Radeon AI PRO R9700** (RDNA4, gfx1201,
-PCI `0x1002:0x7551`) connected via Thunderbolt 5 to an Apple Silicon Mac.
-Other RDNA4 / gfx1201 cards should work with the same firmware images.
-
-See [`docs/PORTING_NOTES.md`](docs/PORTING_NOTES.md) for the summary of how
-this project diverges from upstream Linux `amdgpu` (memory model, IRQ model,
-firmware loading, DART constraints, etc.).
-
-## STATUS
+# STATUS
 
 **The driver loads and talks to a real AMD GPU on a Mac. It can't render
 anything yet.** The card is detected, the driver attaches over Thunderbolt 5,
@@ -30,6 +15,22 @@ Details:
 - `ROADMAP.md` — phase plan (0 through 4)
 - `WORKLIST.md` — granular per-task state
 - `docs/PORTING_NOTES.md` — divergences from Linux amdgpu
+
+  
+# mac_amdgpu
+
+A third-party native PCIDriverKit-based driver for AMD GPUs on macOS Tahoe
+(26.x) running on Apple Silicon. The goal is to talk to a discrete AMD GPU
+directly over PCIe — bypassing Metal entirely — by porting the relevant
+slices of the Linux `amdgpu` kernel driver into a DriverKit system extension.
+
+Primary target hardware is the **AMD Radeon AI PRO R9700** (RDNA4, gfx1201,
+PCI `0x1002:0x7551`) connected via Thunderbolt 5 to an Apple Silicon Mac.
+Other RDNA4 / gfx1201 cards should work with the same firmware images.
+
+See [`docs/PORTING_NOTES.md`](docs/PORTING_NOTES.md) for the summary of how
+this project diverges from upstream Linux `amdgpu` (memory model, IRQ model,
+firmware loading, DART constraints, etc.).
 
 ## Hardware requirements
 
