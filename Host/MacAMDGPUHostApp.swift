@@ -20,6 +20,26 @@
 import SwiftUI
 import SystemExtensions
 import AppKit
+import IOKit
+
+// MARK: - User-client selectors (must match dext/MacAMDGPU.cpp)
+
+private let kSelPing:            UInt32 = 0
+private let kSelGetIdentity:     UInt32 = 1
+private let kSelGetBARInfo:      UInt32 = 2
+private let kSelAllocateDMA:     UInt32 = 6
+private let kSelInitDevice:      UInt32 = 9
+private let kSelQueryInfo:       UInt32 = 21
+
+// Bringup stages — match amdgpu_init.h.
+private let kStageIPDiscovery:   UInt64 = 1
+private let kStagePSPInit:       UInt64 = 2
+
+// QueryInfo type tags
+private let kInfoGFXVersion:     UInt64 = 1
+private let kInfoVRAMSizes:      UInt64 = 2
+private let kInfoIPVersions:     UInt64 = 3
+private let kInfoBringupReached: UInt64 = 4
 
 @main
 struct MacAMDGPUHostApp: App {
@@ -56,6 +76,24 @@ struct ContentView: View {
             Text("Third-party AMD GPU driver for Radeon AI PRO R9700 over Thunderbolt 5.")
                 .foregroundStyle(.secondary)
 
+            HStack(spacing: 16) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Bundled").font(.caption2).foregroundStyle(.secondary)
+                    Text(controller.bundledVersion)
+                        .font(.system(.callout, design: .monospaced))
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Installed").font(.caption2).foregroundStyle(.secondary)
+                    Text(controller.installedVersion)
+                        .font(.system(.callout, design: .monospaced))
+                        .foregroundStyle(controller.versionMatch ? Color.green : Color.orange)
+                }
+                Spacer()
+                Button("Refresh") { controller.refreshVersions() }
+                    .controlSize(.small)
+            }
+            .padding(.vertical, 4)
+
             Divider()
 
             HStack(spacing: 8) {
@@ -82,6 +120,26 @@ struct ContentView: View {
                 }
                 .help("Opens System Settings → Privacy & Security where blocked extensions are approved.")
             }
+
+            // Test buttons — drive dext selectors from inside the host
+            // process. Useful for bring-up before we have a userspace
+            // ICD; the dext's allow-any-userclient-access entitlement
+            // makes external clients work too once Apple grants the
+            // matching capability to a separate tool.
+            HStack(spacing: 6) {
+                Button("Ping") { controller.testPing() }
+                Button("Identity") { controller.testGetIdentity() }
+                Button("BARs") { controller.testGetBARInfo() }
+                Button("Query") { controller.testQueryInfo() }
+                Spacer()
+                Button("InitDevice → IPDiscovery") {
+                    controller.testInitDeviceUpTo(1)
+                }
+                Button("→ PSPInit") {
+                    controller.testInitDeviceUpTo(2)
+                }
+            }
+            .font(.caption)
 
             ScrollView {
                 Text(controller.log)
@@ -113,6 +171,9 @@ final class DriverController: NSObject, ObservableObject,
     @Published var statusColor: Color = .secondary
     @Published var isWorking: Bool = false
     @Published var needsMoveToApplications: Bool = false
+    @Published var bundledVersion: String = "—"
+    @Published var installedVersion: String = "—"
+    @Published var versionMatch: Bool = false
 
     private var didAutoActivate = false
 
@@ -121,6 +182,7 @@ final class DriverController: NSObject, ObservableObject,
     func runStartupFlow() async {
         let bundlePath = Bundle.main.bundlePath
         append("launched from \(bundlePath)")
+        refreshVersions()
 
         if !bundlePath.hasPrefix("/Applications/") {
             // Step 1: not in /Applications. Need user to opt in.
@@ -246,13 +308,20 @@ final class DriverController: NSObject, ObservableObject,
     }
 
     func requestNeedsUserApproval(_ request: OSSystemExtensionRequest) {
-        append("user approval required — open System Settings → "
-               + "Privacy & Security and click Allow next to MacAMDGPU")
+        append("user approval required — open System Settings → General "
+               + "→ Login Items & Extensions → Driver Extensions, toggle "
+               + "MacAMDGPU on")
         status = "approval required"
         statusColor = .yellow
-        // Pop System Settings to the right pane.
-        NSWorkspace.shared.open(URL(fileURLWithPath:
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_SystemServices"))
+        // Don't keep the buttons greyed out — the OS hands the
+        // approval flow to System Settings; the user may take a while
+        // and we want to let them retry / deactivate manually.
+        isWorking = false
+        // Pop System Settings to the right pane (Tahoe path).
+        if let url = URL(string:
+            "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     func request(_ request: OSSystemExtensionRequest,
@@ -276,6 +345,35 @@ final class DriverController: NSObject, ObservableObject,
     }
 
     func request(_ request: OSSystemExtensionRequest,
+                 foundProperties properties: [OSSystemExtensionProperties])
+    {
+        if properties.isEmpty {
+            installedVersion = "not installed"
+            versionMatch = false
+            return
+        }
+        // Pick the active one if there are multiple staged copies
+        // (e.g. an old + a pending replacement).
+        let active = properties.first { $0.isEnabled }
+                  ?? properties.first { $0.isAwaitingUserApproval == false }
+                  ?? properties[0]
+        let short = active.bundleShortVersion
+        let build = active.bundleVersion
+        installedVersion = "\(short) (\(build))"
+        // Compare against the bundled one we already computed.
+        let bundledShort = (bundledVersion as NSString)
+            .components(separatedBy: " ").first ?? ""
+        versionMatch = bundledShort == short
+        let stateBits: [String] = [
+            active.isEnabled ? "enabled" : "",
+            active.isAwaitingUserApproval ? "awaiting-approval" : "",
+            active.isUninstalling ? "uninstalling" : "",
+        ].filter { !$0.isEmpty }
+        append("installed dext: \(short) (\(build)) "
+               + (stateBits.isEmpty ? "" : "[\(stateBits.joined(separator: ","))]"))
+    }
+
+    func request(_ request: OSSystemExtensionRequest,
                  didFailWithError error: any Error)
     {
         isWorking = false
@@ -285,6 +383,218 @@ final class DriverController: NSObject, ObservableObject,
         }
         status = "error"
         statusColor = .red
+    }
+
+    // MARK: User-client connection (talks to the dext directly)
+
+    private var ucConn: io_connect_t = 0
+
+    /// Open the dext's IOUserUserClient. Idempotent.
+    ///
+    /// Matching dexts requires iterating IOUserService instances and
+    /// checking each candidate's CFBundleIdentifier in the registry,
+    /// because `IOUserClass` is *not* a queryable registry property —
+    /// it lives only on `IOMatchedPersonality`. Filtering on
+    /// `IOUserClass` in the matching dict silently matches the FIRST
+    /// IOUserService in the iterator (often an Apple system dext),
+    /// then IOServiceOpen fails with kIOReturnNotPermitted (0xe00002e2)
+    /// because it tried to open the wrong dext. The kernel log
+    /// `DK: <SomeAppleDext>:UC failed userclient-access check, needed
+    /// bundle ID com.apple.DriverKit-...` is the giveaway.
+    @discardableResult
+    func openUserClient() -> Bool {
+        if ucConn != 0 { return true }
+        guard let raw = IOServiceMatching("IOUserService") else {
+            append("openUserClient: IOServiceMatching nil")
+            return false
+        }
+        var iter: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault,
+                                           raw as CFDictionary,
+                                           &iter) == KERN_SUCCESS else {
+            append("openUserClient: IOServiceGetMatchingServices failed")
+            return false
+        }
+        defer { IOObjectRelease(iter) }
+
+        var svc: io_service_t = IOIteratorNext(iter)
+        var candidates = 0
+        while svc != 0 {
+            candidates += 1
+            // Pull CFBundleIdentifier from the matched personality and
+            // compare to our dext bundle ID.
+            var props: Unmanaged<CFMutableDictionary>?
+            let kr = IORegistryEntryCreateCFProperties(
+                svc, &props, kCFAllocatorDefault, 0)
+            if kr == KERN_SUCCESS, let dict = props?.takeRetainedValue()
+                as? [String: Any]
+            {
+                let bid = dict["CFBundleIdentifier"] as? String
+                let userClass = dict["IOUserClass"] as? String
+                if bid == dextBundleIdentifier ||
+                   userClass == "MacAMDGPU"
+                {
+                    var conn: io_connect_t = 0
+                    let ok = IOServiceOpen(svc, mach_task_self_, 0, &conn)
+                    IOObjectRelease(svc)
+                    guard ok == KERN_SUCCESS else {
+                        append(String(format:
+                            "openUserClient: matched bid=%@ but "
+                          + "IOServiceOpen kr=%#x",
+                            bid ?? "?", ok))
+                        return false
+                    }
+                    ucConn = conn
+                    append("openUserClient: connected to "
+                           + "\(bid ?? "?") (handle=\(conn))")
+                    return true
+                }
+            }
+            IOObjectRelease(svc)
+            svc = IOIteratorNext(iter)
+        }
+        append("openUserClient: scanned \(candidates) IOUserService "
+               + "candidates, none matched bundle id \(dextBundleIdentifier)")
+        return false
+    }
+
+    private func callScalar(_ selector: UInt32,
+                            input: [UInt64] = [],
+                            outCount: Int = 1) -> (Int32, [UInt64]) {
+        guard ucConn != 0 else { return (KERN_INVALID_ARGUMENT, []) }
+        let inCount = UInt32(input.count)
+        var outArr = [UInt64](repeating: 0, count: max(1, outCount))
+        var outN = UInt32(outArr.count)
+        let kr: Int32 = input.withUnsafeBufferPointer { ibuf in
+            outArr.withUnsafeMutableBufferPointer { obuf in
+                IOConnectCallScalarMethod(ucConn, selector,
+                                          ibuf.baseAddress,
+                                          inCount,
+                                          obuf.baseAddress,
+                                          &outN)
+            }
+        }
+        return (kr, Array(outArr.prefix(Int(outN))))
+    }
+
+    // MARK: Test buttons
+
+    func testPing() {
+        guard openUserClient() else { return }
+        let (kr, out) = callScalar(kSelPing, input: [0xCAFEBABE], outCount: 1)
+        if kr == KERN_SUCCESS, let echoed = out.first {
+            append(String(format: "ping: ok, echo=%#llx", echoed))
+        } else {
+            append(String(format: "ping: failed kr=%#x", kr))
+        }
+    }
+
+    func testGetIdentity() {
+        guard openUserClient() else { return }
+        let (kr, out) = callScalar(kSelGetIdentity, outCount: 6)
+        if kr == KERN_SUCCESS && out.count >= 6 {
+            // dext returns [bus, dev, fn, vid, did, classRev]
+            let bus      = UInt8(out[0] & 0xFF)
+            let dev      = UInt8(out[1] & 0xFF)
+            let fn       = UInt8(out[2] & 0xFF)
+            let vid      = UInt16(out[3] & 0xFFFF)
+            let did      = UInt16(out[4] & 0xFFFF)
+            let classRev = UInt32(out[5] & 0xFFFFFF)
+            append(String(format:
+                "identity: %02x:%02x.%x VID=%04x DID=%04x class+rev=%06x",
+                bus, dev, fn, vid, did, classRev))
+        } else {
+            append(String(format: "identity: failed kr=%#x", kr))
+        }
+    }
+
+    func testGetBARInfo() {
+        guard openUserClient() else { return }
+        for i in 0..<6 {
+            let (kr, out) = callScalar(kSelGetBARInfo,
+                                       input: [UInt64(i)],
+                                       outCount: 3)
+            if kr == KERN_SUCCESS && out.count >= 3 {
+                let type = out[0]
+                let size = out[1]
+                let pref = out[2]
+                if size != 0 {
+                    append(String(format:
+                        "bar[%d]: type=%d size=%#llx pref=%d",
+                        i, Int(type), size, Int(pref)))
+                }
+            }
+        }
+    }
+
+    func testQueryInfo() {
+        guard openUserClient() else { return }
+        // GFX version
+        let (k1, o1) = callScalar(kSelQueryInfo,
+                                  input: [kInfoGFXVersion],
+                                  outCount: 3)
+        if k1 == KERN_SUCCESS && o1.count >= 3 {
+            append("gfx version: \(o1[0]).\(o1[1]).\(o1[2])")
+        }
+        // VRAM
+        let (k2, o2) = callScalar(kSelQueryInfo,
+                                  input: [kInfoVRAMSizes],
+                                  outCount: 2)
+        if k2 == KERN_SUCCESS && o2.count >= 2 {
+            append("vram: visible=\(o2[0]) total=\(o2[1]) bytes")
+        }
+        // BringupReached
+        let (k3, o3) = callScalar(kSelQueryInfo,
+                                  input: [kInfoBringupReached],
+                                  outCount: 1)
+        if k3 == KERN_SUCCESS, let r = o3.first {
+            append("bringup reached stage: \(r)")
+        }
+    }
+
+    func testInitDeviceUpTo(_ stage: UInt64) {
+        guard openUserClient() else { return }
+        // Need at least one DMA buffer for some bringup steps.
+        let (kr, out) = callScalar(kSelInitDevice,
+                                   input: [stage],
+                                   outCount: 1)
+        if kr == KERN_SUCCESS, let reached = out.first {
+            append("InitDevice(stage=\(stage)): ok, reached=\(reached)")
+        } else {
+            append(String(format:
+                "InitDevice(stage=\(stage)): kr=%#x", kr))
+        }
+    }
+
+    // MARK: Version reporting
+
+    /// Read the version from the dext embedded inside this app bundle.
+    private func readBundledVersion() -> String {
+        let dextURL = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/Library/SystemExtensions")
+            .appendingPathComponent(dextBundleIdentifier + ".dext")
+        let plistURL = dextURL.appendingPathComponent("Info.plist")
+        guard let data = try? Data(contentsOf: plistURL),
+              let plist = try? PropertyListSerialization.propertyList(
+                  from: data, options: [], format: nil) as? [String: Any]
+        else { return "?" }
+        let short = plist["CFBundleShortVersionString"] as? String ?? "?"
+        let build = plist["CFBundleVersion"] as? String ?? "?"
+        return "\(short) (\(build))"
+    }
+
+    /// Kick a propertiesRequest at sysextd to get the installed dext's
+    /// version. Result comes back via the delegate
+    /// `request(_:foundProperties:)`.
+    func refreshVersions() {
+        bundledVersion = readBundledVersion()
+        installedVersion = "checking…"
+        versionMatch = false
+        let req = OSSystemExtensionRequest.propertiesRequest(
+            forExtensionWithIdentifier: dextBundleIdentifier,
+            queue: .main)
+        req.delegate = self
+        OSSystemExtensionManager.shared.submitRequest(req)
     }
 
     // MARK: helpers

@@ -15,9 +15,9 @@
 	<key>CFBundlePackageType</key>
 	<string>DEXT</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.0.1</string>
+	<string>0.0.7</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>7</string>
 	<key>OSBundleUsageDescription</key>
 	<string>Native AMD GPU driver for Radeon AI PRO R9700 (RDNA4, gfx1201) over Thunderbolt 5.</string>
 	<!--
@@ -44,15 +44,18 @@
 			<key>IOPCITunnelCompatible</key>
 			<true/>
 			<!--
-			    Match: VID=0x1002 (AMD), DID=0x7551 (Radeon AI PRO R9700, gfx1201).
-			    Format is "value&mask" — both 32-bit, value is (DID<<16)|VID.
-			    Mask 0xFFFFFFFF requires both halves to match exactly.
-			    To widen to "any RDNA4 from AMD", change mask to 0x0000FFFF
-			    so only VID is required, then add a sibling personality per
-			    target ASIC.
+			    Match AMD vendor (VID=0x1002) only. Format is
+			    "value&mask"; mask 0x0000FFFF means only the low 16 bits
+			    (vendor ID) are required to match. Apple's wildcard
+			    transport.pci entitlement scope (0xFFFFFFFF&0x00000000)
+			    permits this narrowing.
 			-->
 			<key>IOPCIPrimaryMatch</key>
-			<string>0x75511002&amp;0xFFFFFFFF</string>
+			<string>0x00001002&amp;0x0000FFFF</string>
+			<!-- Class match: only graphics-class PCI devices
+			     (class-code 0x030000 / display controller). -->
+			<key>IOPCIClassMatch</key>
+			<string>0x03000000&amp;0xFF000000</string>
 			<!--
 			    IOProbeScore — sentinel above default (0). Wins against
 			    the qemu-vfio-apple VFIOUserPCIDriver dext which matches

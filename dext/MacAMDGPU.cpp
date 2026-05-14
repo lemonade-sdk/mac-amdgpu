@@ -264,6 +264,58 @@ mac_amdgpu_bar_type_string(uint8_t barType)
 // All static so they don't pollute the IIG-generated dispatch.
 //============================================================
 
+// Open the PCI device (idempotent) and populate the bringup
+// DeviceContext from BAR info + enable Memory Space + Bus Master.
+// Called from every selector that touches MMIO/config so the order
+// of selector calls doesn't matter.
+static kern_return_t
+mac_amdgpu_ensure_open(IOService *opener, MacAMDGPU *driver,
+                       IOPCIDevice *pci)
+{
+    if (driver == nullptr || driver->ivars == nullptr || pci == nullptr) {
+        return kIOReturnNotReady;
+    }
+    if (driver->ivars->pciOpen) return kIOReturnSuccess;
+
+    kern_return_t ret = pci->Open(opener, 0);
+    if (ret != kIOReturnSuccess) {
+        MACAMDGPU_LOG("ensure_open: PCI Open failed: %#x", ret);
+        return ret;
+    }
+    driver->ivars->pciOpen = true;
+    driver->ivars->openerUserClient = opener;
+
+    uint16_t cmd = 0;
+    pci->ConfigurationRead16(0x04, &cmd);
+    uint16_t wanted = cmd | 0x0006;  // bit 1 = MEM, bit 2 = BUSMASTER
+    if (wanted != cmd) {
+        pci->ConfigurationWrite16(0x04, wanted);
+        pci->ConfigurationRead16(0x04, &cmd);
+    }
+
+    auto &bdev = driver->ivars->bringup.device;
+    bdev.pci = pci;
+    bdev.psoCAlive = false;
+    bdev.smuOnline = false;
+    bdev.gmcReady  = false;
+    for (uint8_t bar = 0; bar < 6; bar++) {
+        uint8_t  mi = 0;
+        uint64_t sz = 0;
+        uint8_t  ty = 0;
+        if (pci->GetBARInfo(bar, &mi, &sz, &ty) != kIOReturnSuccess) continue;
+        switch (bar) {
+        case 0: bdev.bar0MemIndex = mi; bdev.bar0Size = sz; break;
+        case 2: bdev.bar2MemIndex = mi; bdev.bar2VisibleVRAMSize = sz; break;
+        case 5: bdev.bar5MemIndex = mi; break;
+        default: break;
+        }
+    }
+    MACAMDGPU_LOG("ensure_open: PCI opened, cmd=%#x, BAR0=%llu B, "
+                  "BAR2(visible VRAM)=%llu B",
+                  (unsigned)cmd, bdev.bar0Size, bdev.bar2VisibleVRAMSize);
+    return kIOReturnSuccess;
+}
+
 static void
 mac_amdgpu_release_dma_buffer(MacAMDGPUUserClient *client)
 {
@@ -778,6 +830,11 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             arguments->scalarOutputCount < 6) {
             return kIOReturnBadArgument;
         }
+        // Config-space reads need the PCI device to be Open()'d.
+        // Force lazy open + populate DeviceContext so subsequent
+        // InitDevice / SubmitTestPM4 / etc. paths see a ready ctx.
+        kern_return_t openRet = mac_amdgpu_ensure_open(this, driver, pci);
+        if (openRet != kIOReturnSuccess) return openRet;
         uint8_t  bus = 0, dev = 0, fn = 0;
         uint16_t vid = 0xFFFF, did = 0xFFFF;
         uint32_t classRev = 0;
@@ -905,11 +962,10 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             arguments->scalarOutputCount < 1) {
             return kIOReturnBadArgument;
         }
-        if (!driver->ivars->pciOpen) {
-            // Bringup needs the device context populated, which happens
-            // on first BAR map. Force the client to map BAR0 first.
-            return kIOReturnNotOpen;
-        }
+        // Lazy open + populate DeviceContext so any order of selector
+        // calls works.
+        kern_return_t openRet = mac_amdgpu_ensure_open(this, driver, pci);
+        if (openRet != kIOReturnSuccess) return openRet;
         auto stage = (amdgpu::BringupStage)arguments->scalarInput[0];
         kern_return_t ret = amdgpu::bringup_to(driver->ivars->bringup,
                                                   stage);

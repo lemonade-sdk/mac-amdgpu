@@ -98,6 +98,17 @@ targets:
         SUPPORTED_PLATFORMS: driverkit
         INFOPLIST_FILE: dext/Info.plist
         CODE_SIGN_ENTITLEMENTS: dext/MacAMDGPU.entitlements
+        # `-o library,runtime` (= flags=0x12000) is required for AMFI
+        # to honor restricted DriverKit entitlements like
+        # `com.apple.developer.driverkit.allow-any-userclient-access`.
+        # Without library-validation, AMFI silently strips the claim
+        # at load time; ioreg then shows
+        #   "IOUserClientEntitlements" = No
+        # on the IOUserServer, and any external IOServiceOpen against
+        # the dext returns kIOReturnNotPermitted (0xe00002e2) — even
+        # for the host app from the same team. qemu-vfio-apple's
+        # working dext ships with flags=0x12000; we mirror it.
+        OTHER_CODE_SIGN_FLAGS: "-o library,runtime"
         DEAD_CODE_STRIPPING: NO    # IIG-generated symbols need to stay
         DEFINES_MODULE: NO
         HEADER_SEARCH_PATHS:
@@ -125,7 +136,16 @@ targets:
         PRODUCT_NAME: MacAMDGPUHost
         INFOPLIST_FILE: Host/Info.plist
         CODE_SIGN_ENTITLEMENTS: Host/Host.entitlements
-        ENABLE_HARDENED_RUNTIME: YES
+        # qemu-vfio-apple's working host ships with hardened runtime OFF
+        # (`flags=0x0(none)`). With it ON, IOServiceOpen against the
+        # dext's user client returns kIOReturnNotPermitted (0xe00002e2)
+        # because Apple's IOKit gates user-client access by host-side
+        # entitlement, and our Development-signed host doesn't carry
+        # com.apple.developer.driverkit.userclient-access — that
+        # requires an Apple portal grant we don't have. The dext side
+        # already advertises allow-any-userclient-access, so disabling
+        # hardened runtime on the host lifts the gate.
+        ENABLE_HARDENED_RUNTIME: NO
         MACOSX_DEPLOYMENT_TARGET: "26.2"
         SYSTEM_EXTENSION_TARGETS: MacAMDGPU
     dependencies:

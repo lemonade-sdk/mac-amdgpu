@@ -132,17 +132,25 @@ func warn(_ msg: String) {
 }
 
 func openService() -> io_connect_t {
-    guard let matching = IOServiceMatching("MacAMDGPU") else {
+    // DriverKit dexts always register with IOClass = "IOUserService".
+    // Our actual class name lives in the IOUserClass property. Match
+    // on the parent class + filter by our user class.
+    guard let raw = IOServiceMatching("IOUserService") else {
         die("IOServiceMatching returned nil")
     }
+    let matching = raw as NSMutableDictionary
+    matching["IOUserClass"] = "MacAMDGPU"
     var iter: io_iterator_t = 0
-    let kr = IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iter)
+    let kr = IOServiceGetMatchingServices(kIOMainPortDefault,
+                                          matching as CFDictionary,
+                                          &iter)
     if kr != KERN_SUCCESS { die("IOServiceGetMatchingServices: \(kr)") }
     defer { IOObjectRelease(iter) }
     let svc = IOIteratorNext(iter)
     if svc == 0 {
-        die("MacAMDGPU service not found — "
-            + "`systemextensionsctl list` should show the dext activated.")
+        die("MacAMDGPU IOUserService not found in ioreg — confirm "
+            + "`systemextensionsctl list` shows the dext activated enabled, "
+            + "and `ioreg -l | grep MacAMDGPU` shows a registered node.")
     }
     defer { IOObjectRelease(svc) }
     var conn: io_connect_t = 0
