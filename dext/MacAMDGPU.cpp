@@ -925,9 +925,18 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                 // single-segment mappings).
                 if (ivars->dmaSegmentsCount < 1) return kIOReturnNotReady;
                 uint64_t fwBusAddr = ivars->dmaSegments[0].address;
-                return amdgpu::psp_load_ip_fw(dev, psp, fwBusAddr,
+                kern_return_t r = amdgpu::psp_load_ip_fw(dev, psp, fwBusAddr,
                                               static_cast<uint32_t>(fwSize),
                                               gfxFwType);
+                if (r == kIOReturnSuccess) {
+                    // Flip per-IP microcode flags so the corresponding
+                    // BringupStage knows it can proceed with HQD program.
+                    if (gfxFwType == amdgpu::PSPGfxFwType::SDMA0 ||
+                        gfxFwType == amdgpu::PSPGfxFwType::SDMA1) {
+                        driver->ivars->bringup.sdma.microcode_loaded = true;
+                    }
+                }
+                return r;
             }
             MACAMDGPU_LOG("LoadFirmware: fw type %llu not yet implemented",
                           fwType);

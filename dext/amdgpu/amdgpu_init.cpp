@@ -138,11 +138,12 @@ run_stage(BringupContext &ctx, BringupStage s)
         return rlc_init_full(ctx.device, ctx.gmc, ctx.rlc);
     case BringupStage::CPInit:
         return cp_init_full(ctx.device, ctx.gmc, ctx.cp);
+    case BringupStage::SDMAInit:
+        return sdma_init_full(ctx.device, ctx.psp, ctx.gmc, ctx.sdma);
     // Still-stubs — return Unsupported until ported.
     case BringupStage::IMUInit:
     case BringupStage::MESInit:
     case BringupStage::GFXInit:
-    case BringupStage::SDMAInit:
         INIT_LOG("stage %{public}s: NOT YET IMPLEMENTED", stage_name(s));
         return kIOReturnUnsupported;
     }

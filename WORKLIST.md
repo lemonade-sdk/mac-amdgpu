@@ -4,7 +4,7 @@ Granular tasks. Status legend: `[ ]` open · `[~]` in progress · `[x]` done · 
 
 Phase numbers match `ROADMAP.md`. Target hardware fixed: Apple Silicon M5 Pro/Max/Ultra + TB5 + AMD Radeon AI PRO R9700 (gfx1201, RDNA4).
 
-Last sync against `git log`: commit `8a04754` (Phase 1B chunk 17 — HQD program + CP enable + SubmitTestPM4, Hello PM4 plumbing complete).
+Last sync against `git log`: commit `8794423` (Phase 1B chunk 19 — gfx_v12_0_constants_init) + chunk 20 in this commit (sdma_v7_0 ring resume).
 
 ---
 
@@ -73,7 +73,7 @@ Cite Linux source file in commit messages.
 ### 1B.0 IP discovery
 - [x] 150  Port IP discovery parser (`amdgpu_discovery.c` header + IPDS walker) → `dext/amdgpu/amdgpu_discovery.cpp`
 - [x] 151  LoadDiscoveryBinary selector — host uploads a captured binary via DMABuffer, dext parses
-- [ ] 152  On-die discovery read — RREG32(mmRCC_CONFIG_MEMSIZE) → BAR2 read of binary at `(vram_size_MB << 20) - 0x100000`. (Manual SetIPBase or LoadDiscoveryBinary works in the meantime.)
+- [x] 152  On-die discovery read — RREG32(mmRCC_CONFIG_MEMSIZE) → BAR2 read of binary at `(vram_size_MB << 20) - 0x100000` — chunk 18; IP bases now populated automatically by `InitDevice(IPDiscovery)`.
 - [ ] 153  Cross-validate parser against `docs/reference/gfx1151_discovery.bin` — standalone parser test
 
 ### 1B.1 PSP v14 — done
@@ -133,14 +133,14 @@ Cite Linux source file in commit messages.
 - [x] 223  Port `gfx_v12_0_gfxhub_enable` — GFXHUB enable + UTCL1 fault enable + TLB flush — done as part of gmc_init in chunk 11
 - [x] 224  Allocate GFX ring buffer (16 KB **GTT**; sysmem-backed) — chunk 16 (`cp_alloc_storage`)
 - [x] 225  Allocate write-back page (rptr + wptr + fence offsets, 4 KB sysmem) — chunk 16
-- [ ] 226  Port `gfx_v12_0_constants_init` — tile mode tables + cache configs
+- [x] 226  Port `gfx_v12_0_constants_init` — GRBM_CNTL.READ_TIMEOUT + SH_MEM_CONFIG(VMID 0) — chunk 19 (`gfx_constants_init`)
 - [x] 227  Port `gfx_v12_0_cp_gfx_resume` — CP_RB0_BASE/BASE_HI/CNTL/WPTR/RPTR_ADDR + doorbell control — chunk 17 (`cp_hqd_program`)
 - [~] 228  Port `gfx_v12_0_kiq_resume` — deferred; using direct CP_RB0 path. MES-managed queue setup is Phase 1B chunk 18+.
 - [x] 229  Port `gfx_v12_0_cp_gfx_start` — set CP_ME_CNTL ME0_ACTIVE=1 — chunk 17 (`cp_enable`)
 - [x] 230  PM4 packet builders (NOP, WRITE_DATA, RELEASE_MEM) → `dext/amdgpu/amdgpu_pm4.h` — chunk 16
 - [x] 231  Submit NOP via doorbell, observe CP_RB0_RPTR advance — chunk 17 (`cp_emit_eop_fence` + SubmitTestPM4 selector)
 - [x] 232  Submit WRITE_DATA + RELEASE_MEM EOP fence; observe fence_value in WB page — chunk 17 (same)
-- [~] 233  **"Hello GFX12" milestone** — codebase path complete but UNTESTED on hardware; see chunk 17 commit `8a04754`.
+- [~] 233  **"Hello GFX12" milestone** — codebase path complete including automatic on-die IP discovery — bringup is fully self-bootstrapping on hardware; the milestone is still UNTESTED on real hw. See chunk 17 commit `8a04754` and chunk 18 commit `34470dd`.
 - [x] 234  Register EOP/RAS/VM-fault interrupt source handlers via `amdgpu_irq_add_id` analog — chunk 14 (`mac_amdgpu_ih_dispatch`)
 
 ### 1B.6 MES v12_1 — pending (see `docs/port_plans/MES_v12_1.md`)
@@ -154,11 +154,11 @@ Cite Linux source file in commit messages.
 - [ ] 257  Port `mes_v12_1_add_hw_queue` — MESAPI_ADD_QUEUE for the first user-facing GFX queue
 - [ ] 258  Port `mes_v12_1_init_aggregated_doorbell` — 5 priority levels
 
-### 1B.7 SDMA v7_1 — pending
-- [ ] 270  Port `sdma_v7_0_init_microcode` (via LoadFirmware → PSP LOAD_IP_FW for SDMA0/SDMA1)
-- [ ] 271  Allocate SDMA ring (16 KB GTT)
-- [ ] 272  Port `sdma_v7_0_gfx_resume` — SDMA0_QUEUE0_RB_* + doorbell
-- [ ] 273  Submit SDMA copy packet; sysmem→sysmem bit-compare
+### 1B.7 SDMA v7_1 — ring bringup landed (chunk 20)
+- [x] 270  Port `sdma_v7_0_init_microcode` — generic LoadFirmware path now flips `sdma.microcode_loaded` after PSP LOAD_IP_FW for SDMA0 (`0x109`) / SDMA1 (`0x10A`).
+- [x] 271  Allocate SDMA ring + WB page (16 KB sysmem, 16 KB-aligned) per instance via `sdma_alloc_storage` — chunk 20.
+- [x] 272  Port `sdma_v7_0_gfx_resume_instance` — RB_CNTL/BASE/RPTR/WPTR/DOORBELL + MCU_CNTL unhalt + RB_ENABLE/IB_ENABLE — chunk 20 (`sdma_gfx_resume_instance`).
+- [~] 273  SDMA FENCE-packet ring test — wired into `sdma_init_full`, untested on real hw.
 - [ ] 274  Submit sysmem→VRAM copy via GART; validate via BAR2 readback within visible window
 
 ### 1B.8 Compute queue + UAPI
