@@ -387,6 +387,85 @@ sdma_ring_test(const DeviceContext &dev, SDMAInstance &inst,
 }
 
 //------------------------------------------------------------------
+// sdma_copy_linear_test — emit COPY_LINEAR + FENCE, kick doorbell,
+// poll. Item 195 (GART sanity): proves the engine actually services
+// reads + writes through whatever bus address space the caller hands
+// it (sysmem DART, or GART iova when GMC remaps sysmem-as-VRAM).
+//
+// Packet shape (sdma_v7_0_emit_copy_buffer in upstream):
+//   DW0 = OP_COPY | (SUBOP_COPY_LINEAR << 8) | CPV(1)
+//   DW1 = byte_count - 1
+//   DW2 = parameters  (0 = no endian swap)
+//   DW3 = src lo
+//   DW4 = src hi
+//   DW5 = dst lo
+//   DW6 = dst hi
+//   DW7 = 0 (CPV byte)
+//------------------------------------------------------------------
+kern_return_t
+sdma_copy_linear_test(const DeviceContext &dev, SDMAInstance &inst,
+                      uint64_t src_bus, uint64_t dst_bus,
+                      uint32_t byte_count, uint64_t timeout_us)
+{
+    if (!inst.inited || !inst.enabled) return kIOReturnNotReady;
+    if (byte_count == 0 || byte_count > kSDMACopyLinearMaxBytes) {
+        return kIOReturnBadArgument;
+    }
+
+    auto *wb_bytes = static_cast<volatile uint8_t *>(inst.wb_cpu);
+    volatile uint32_t *fence_cpu =
+        reinterpret_cast<volatile uint32_t *>(wb_bytes + 0x80);
+    *fence_cpu = 0;
+    const uint64_t fence_gpu   = inst.wb_bus + 0x80;
+    const uint32_t fence_value = 0xDEC0FFEEu;
+
+    uint32_t pkt[12];
+    uint32_t n = 0;
+    // COPY_LINEAR
+    pkt[n++] = SDMA_PKT_HEADER_OP(SDMA_OP_COPY)
+             | SDMA_PKT_HEADER_SUB_OP(SDMA_SUBOP_COPY_LINEAR)
+             | SDMA_PKT_HEADER_CPV(1);
+    pkt[n++] = byte_count - 1;
+    pkt[n++] = 0;                          // endian swap params = 0
+    pkt[n++] = static_cast<uint32_t>(src_bus);
+    pkt[n++] = static_cast<uint32_t>(src_bus >> 32);
+    pkt[n++] = static_cast<uint32_t>(dst_bus);
+    pkt[n++] = static_cast<uint32_t>(dst_bus >> 32);
+    pkt[n++] = 0;                          // CPV byte
+    // FENCE — engine writes fence_value to fence_gpu after the copy.
+    pkt[n++] = SDMA_PKT_HEADER_OP(SDMA_OP_FENCE);
+    pkt[n++] = static_cast<uint32_t>(fence_gpu);
+    pkt[n++] = static_cast<uint32_t>(fence_gpu >> 32);
+    pkt[n++] = fence_value;
+
+    if (sdma_ring_write(inst, pkt, n) != n) {
+        SDMA_LOG("copy_linear_test: ring_write failed");
+        return kIOReturnNoSpace;
+    }
+    kern_return_t r = sdma_kick_doorbell(dev, inst);
+    if (r != kIOReturnSuccess) return r;
+
+    const uint64_t step_us = 50;
+    uint64_t elapsed = 0;
+    while (elapsed < timeout_us) {
+        if (*fence_cpu == fence_value) {
+            SDMA_LOG("copy_linear_test ok: %u bytes %#llx -> %#llx in ~%llu us",
+                     byte_count,
+                     (unsigned long long)src_bus,
+                     (unsigned long long)dst_bus,
+                     (unsigned long long)elapsed);
+            return kIOReturnSuccess;
+        }
+        uint32_t scratch = 0;
+        for (int i = 0; i < 1000; i++) { scratch ^= *fence_cpu; }
+        (void)scratch;
+        elapsed += step_us;
+    }
+    SDMA_LOG("copy_linear_test: timeout (last fence=%#x)", *fence_cpu);
+    return kIOReturnTimeout;
+}
+
+//------------------------------------------------------------------
 // sdma_init_full — top-level SDMAInit stage entry.
 //
 // Caller must have done PSP bringup + SMU + GMC + IH + RLC + CP

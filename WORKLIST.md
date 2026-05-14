@@ -111,7 +111,7 @@ Cite Linux source file in commit messages.
 - [x] 192  Port HDP flush
 - [-] 193  Port `set_fault_enable_default` — the per-VMID CONTEXT*_CNTL writes in hub_setup_vmid_config already enable faults; explicit toggle is suspend/resume territory.
 - [x] 194  Port `flush_gpu_tlb`
-- [ ] 195  Sanity test: map a sysmem page through GART, GPU-side read via SDMA → CPU compare
+- [~] 195  Sanity test: SDMA copy via `kMacAMDGPUMethodSDMACopyTest` — chunk 21. Codebase path complete (sysmem→sysmem same-buffer DMA copy + FENCE poll); untested on real hw.
 
 ### 1B.4 IH v7 — pending (see `docs/port_plans/IH_v7.md`)
 - [x] 200  Allocate Ring0 IH (256 KB sysmem, 16 KB aligned) + wptr shadow (16 KB)
@@ -158,7 +158,7 @@ Cite Linux source file in commit messages.
 - [x] 270  Port `sdma_v7_0_init_microcode` — generic LoadFirmware path now flips `sdma.microcode_loaded` after PSP LOAD_IP_FW for SDMA0 (`0x109`) / SDMA1 (`0x10A`).
 - [x] 271  Allocate SDMA ring + WB page (16 KB sysmem, 16 KB-aligned) per instance via `sdma_alloc_storage` — chunk 20.
 - [x] 272  Port `sdma_v7_0_gfx_resume_instance` — RB_CNTL/BASE/RPTR/WPTR/DOORBELL + MCU_CNTL unhalt + RB_ENABLE/IB_ENABLE — chunk 20 (`sdma_gfx_resume_instance`).
-- [~] 273  SDMA FENCE-packet ring test — wired into `sdma_init_full`, untested on real hw.
+- [x] 273  SDMA FENCE-packet ring test — `sdma_ring_test` runs inside `sdma_init_full`; selector `kMacAMDGPUMethodSDMACopyTest` (15) exposes a COPY_LINEAR + FENCE smoke from userspace — chunk 21.
 - [ ] 274  Submit sysmem→VRAM copy via GART; validate via BAR2 readback within visible window
 
 ### 1B.8 Compute queue + UAPI

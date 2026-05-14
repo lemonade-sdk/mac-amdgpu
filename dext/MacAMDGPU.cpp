@@ -33,6 +33,7 @@
 #include "amdgpu/amdgpu_discovery.h"
 #include "amdgpu/amdgpu_ih.h"
 #include "amdgpu/amdgpu_cp.h"
+#include "amdgpu/amdgpu_sdma.h"
 
 #define MACAMDGPU_LOG(fmt, ...) \
     os_log(OS_LOG_DEFAULT, "mac.amdgpu: " fmt, ##__VA_ARGS__)
@@ -56,6 +57,7 @@ enum {
     kMacAMDGPUMethodGetIPBase         = 12,
     kMacAMDGPUMethodLoadDiscoveryBin  = 13,
     kMacAMDGPUMethodSubmitTestPM4     = 14,
+    kMacAMDGPUMethodSDMACopyTest      = 15,
 };
 
 // Firmware type tags used by LoadFirmware. Pre-SOS components route
@@ -998,6 +1000,46 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             driver->ivars->bringup.cp,
             timeout_us, &fence);
         arguments->scalarOutput[0] = fence;
+        return r;
+    }
+
+    case kMacAMDGPUMethodSDMACopyTest: {
+        // scalarInput[0] = SDMA instance (0 or 1)
+        // scalarInput[1] = src byte offset within DMABuffer
+        // scalarInput[2] = dst byte offset within DMABuffer
+        // scalarInput[3] = byte count
+        // scalarInput[4] = timeout_us
+        // scalarOutput[0] = kIOReturn from sdma_copy_linear_test
+        if (arguments->scalarInput == nullptr ||
+            arguments->scalarInputCount < 5 ||
+            arguments->scalarOutput == nullptr ||
+            arguments->scalarOutputCount < 1) {
+            return kIOReturnBadArgument;
+        }
+        if (ivars == nullptr || ivars->dmaBuffer == nullptr ||
+            ivars->dmaSegmentsCount < 1) {
+            return kIOReturnNotReady;
+        }
+        uint64_t inst    = arguments->scalarInput[0];
+        uint64_t src_off = arguments->scalarInput[1];
+        uint64_t dst_off = arguments->scalarInput[2];
+        uint64_t count   = arguments->scalarInput[3];
+        uint64_t to_us   = arguments->scalarInput[4];
+        if (inst >= amdgpu::kSDMAInstanceCount || count == 0 ||
+            src_off + count > ivars->dmaBufferSize ||
+            dst_off + count > ivars->dmaBufferSize) {
+            return kIOReturnBadArgument;
+        }
+        // First segment bus base — we already enforce single-segment
+        // mappings, so contiguous offsets are valid bus addresses.
+        const uint64_t bus_base = ivars->dmaSegments[0].address;
+        kern_return_t r = amdgpu::sdma_copy_linear_test(
+            driver->ivars->bringup.device,
+            driver->ivars->bringup.sdma.instance[inst],
+            bus_base + src_off, bus_base + dst_off,
+            static_cast<uint32_t>(count),
+            to_us ? to_us : 1000000ull);
+        arguments->scalarOutput[0] = static_cast<uint64_t>(r);
         return r;
     }
 

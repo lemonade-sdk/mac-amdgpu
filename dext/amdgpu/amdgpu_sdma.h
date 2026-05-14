@@ -122,11 +122,20 @@ namespace SDMARegs {
 // TRAP. Enough to emit a ring test that the host can wait on.
 //------------------------------------------------------------------
 constexpr uint32_t SDMA_OP_NOP    = 0;
+constexpr uint32_t SDMA_OP_COPY   = 1;
 constexpr uint32_t SDMA_OP_FENCE  = 5;
 constexpr uint32_t SDMA_OP_TRAP   = 6;
 constexpr uint32_t SDMA_OP_TIMESTAMP = 13;
 
-static inline uint32_t SDMA_PKT_HEADER_OP(uint32_t op) { return (op & 0xff); }
+constexpr uint32_t SDMA_SUBOP_COPY_LINEAR = 0;
+
+static inline uint32_t SDMA_PKT_HEADER_OP(uint32_t op)         { return (op & 0xff); }
+static inline uint32_t SDMA_PKT_HEADER_SUB_OP(uint32_t sub_op) { return ((sub_op & 0xff) << 8); }
+static inline uint32_t SDMA_PKT_HEADER_CPV(uint32_t v)         { return ((v & 0x1) << 28); }
+
+// COPY_LINEAR max byte count is 0x400000 - 1 on RDNA4
+// (HW counter is a 22-bit field, byte_count - 1).
+constexpr uint32_t kSDMACopyLinearMaxBytes = 0x00400000u;
 
 //------------------------------------------------------------------
 // Per-instance ring state. Two instances live side by side; we
@@ -210,6 +219,16 @@ kern_return_t sdma_kick_doorbell(const DeviceContext &dev,
 // Returns the number of dwords actually written (0 on overflow).
 uint32_t sdma_ring_write(SDMAInstance &inst,
                          const uint32_t *src, uint32_t dwords);
+
+// Submit an SDMA COPY_LINEAR + FENCE pair, kick doorbell, poll fence.
+// Used by item 195: GART sanity test. src/dst are GPU-visible bus
+// addresses (either DART iovas for sysmem or GART iovas for mapped
+// sysmem-as-VRAM aliases). byte_count must be ≤ kSDMACopyLinearMaxBytes.
+kern_return_t sdma_copy_linear_test(const DeviceContext &dev,
+                                    SDMAInstance &inst,
+                                    uint64_t src_bus, uint64_t dst_bus,
+                                    uint32_t byte_count,
+                                    uint64_t timeout_us);
 
 // End-to-end ring test: emit FENCE + TRAP, poll the fence word.
 // Returns kIOReturnSuccess if fence materialised, else the
