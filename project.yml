@@ -76,7 +76,16 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.geramyloveless.MacAMDGPUHost.MacAMDGPU
         PRODUCT_NAME: MacAMDGPU
         SDKROOT: driverkit
-        DRIVERKIT_DEPLOYMENT_TARGET: "23.0"
+        # Match the DK SDK shipped with macOS 26 (Tahoe). 23.0 worked
+        # on older macOS but Tahoe's sysextd appears to reject dexts
+        # declaring OSMinimumDriverKitVersion < ~25.0 with a vague
+        # "Extension not found in App bundle" error.
+        DRIVERKIT_DEPLOYMENT_TARGET: "25.2"
+        # arm64-only on Apple Silicon. Universal builds were causing
+        # the staging layer to reject the dext on macOS Tahoe.
+        ARCHS: "arm64"
+        EXCLUDED_ARCHS[sdk=driverkit*]: "x86_64"
+        ONLY_ACTIVE_ARCH: "NO"
         SUPPORTED_PLATFORMS: driverkit
         INFOPLIST_FILE: dext/Info.plist
         CODE_SIGN_ENTITLEMENTS: dext/MacAMDGPU.entitlements
