@@ -24,7 +24,7 @@ name: MacAMDGPU
 options:
   bundleIdPrefix: com.geramyloveless
   deploymentTarget:
-    macOS: "14.0"
+    macOS: "26.2"
   groupSortPosition: top
   generateEmptyDirectories: true
   developmentLanguage: en
@@ -74,7 +74,16 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.geramyloveless.MacAMDGPUHost.MacAMDGPU
-        PRODUCT_NAME: MacAMDGPU
+        # MUST equal PRODUCT_BUNDLE_IDENTIFIER on macOS Tahoe (26.x).
+        # sysextd matches the embedded .dext by directory name, which
+        # is derived from PRODUCT_NAME. If the dext is named anything
+        # other than its bundle ID, activation fails with code 4
+        # "Extension not found in App bundle" before sysextd even
+        # reaches the validation stage. qemu-vfio-apple's working
+        # dext is shipped as
+        # com.geramyloveless.vfiohostapp.VFIOUserPCIDriver.dext;
+        # we mirror that.
+        PRODUCT_NAME: com.geramyloveless.MacAMDGPUHost.MacAMDGPU
         SDKROOT: driverkit
         # Match the DK SDK shipped with macOS 26 (Tahoe). 23.0 worked
         # on older macOS but Tahoe's sysextd appears to reject dexts
@@ -117,7 +126,7 @@ targets:
         INFOPLIST_FILE: Host/Info.plist
         CODE_SIGN_ENTITLEMENTS: Host/Host.entitlements
         ENABLE_HARDENED_RUNTIME: YES
-        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        MACOSX_DEPLOYMENT_TARGET: "26.2"
         SYSTEM_EXTENSION_TARGETS: MacAMDGPU
     dependencies:
       # xcodegen handles the destination based on the embedded target's

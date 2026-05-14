@@ -20,6 +20,15 @@
 	<string>1</string>
 	<key>OSBundleUsageDescription</key>
 	<string>Native AMD GPU driver for Radeon AI PRO R9700 (RDNA4, gfx1201) over Thunderbolt 5.</string>
+	<!--
+	    OSSystemExtensionCategory — required on macOS Tahoe for sysextd
+	    to register a driver-extension as a candidate during activation.
+	    Without this key, sysextd rejects the request as "Extension not
+	    found in App bundle" even when the .dext is physically present.
+	    Same value qemu-vfio-apple ships.
+	-->
+	<key>OSSystemExtensionCategory</key>
+	<string>com.apple.system_extension.driver_extension</string>
 	<key>IOKitPersonalities</key>
 	<dict>
 		<key>MacAMDGPU</key>
