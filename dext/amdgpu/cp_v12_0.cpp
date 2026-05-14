@@ -18,6 +18,7 @@
 
 #include "amdgpu_cp.h"
 #include "amdgpu_gmc.h"
+#include "amdgpu_gfx.h"
 
 #define CP_LOG(fmt, ...) \
     os_log(OS_LOG_DEFAULT, "mac.amdgpu.cp: " fmt, ##__VA_ARGS__)
@@ -377,6 +378,15 @@ cp_init_full(DeviceContext &dev, GMCContext &gmc, CPContext &cp)
 
     // Halt CP while we reprogram registers (safety, matches upstream).
     cp_enable(dev, false);
+
+    // GFX top-level constants (GRBM_CNTL.READ_TIMEOUT, SH_MEM_CONFIG)
+    // must be programmed before the CP starts fetching from the ring.
+    r = gfx_constants_init(dev);
+    if (r != kIOReturnSuccess) {
+        CP_LOG("gfx_constants_init failed: %#x", r);
+        return r;
+    }
+
     r = cp_hqd_program(dev, cp);
     if (r != kIOReturnSuccess) return r;
     cp_enable(dev, true);
