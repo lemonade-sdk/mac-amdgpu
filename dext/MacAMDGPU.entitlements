@@ -3,28 +3,23 @@
 <plist version="1.0">
 <dict>
 	<!--
-	    The narrower the entitlement scope, the easier the Apple review.
-	    Match scope is exact R9700 (VID 0x1002, DID 0x7551) here.
-	    Widening to all AMD VID later requires a new entitlement grant.
+	    transport.pci entitlement match-string MUST exactly match what
+	    the embedded provisioning profile allows. Apple's portal granted
+	    our team the wildcard "0xFFFFFFFF&0x00000000" (same scope they
+	    gave qemu-vfio-apple), not a per-device narrow match.
+
+	    Device-binding restriction to the R9700 happens via the
+	    IOPCIPrimaryMatch key in dext/Info.plist — that's a separate
+	    mechanism and stays R9700-specific (0x75511002&0xFFFFFFFF).
 	-->
 	<key>com.apple.developer.driverkit.transport.pci</key>
 	<array>
 		<dict>
 			<key>IOPCIPrimaryMatch</key>
-			<string>0x75511002&amp;0xFFFFFFFF</string>
+			<string>0xFFFFFFFF&amp;0x00000000</string>
 		</dict>
 	</array>
-	<!--
-	    Allow any signed userspace process to open a UserClient against
-	    the dext. We may tighten this later to a specific bundle ID.
-	-->
 	<key>com.apple.developer.driverkit.allow-any-userclient-access</key>
-	<true/>
-	<!--
-	    Required for any DriverKit extension that runs as a user-space
-	    kext replacement.
-	-->
-	<key>com.apple.developer.driverkit</key>
 	<true/>
 </dict>
 </plist>
