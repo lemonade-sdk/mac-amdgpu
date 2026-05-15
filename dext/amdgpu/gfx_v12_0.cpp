@@ -1,60 +1,734 @@
 //
 //  gfx_v12_0.cpp — GFX12 top-level configuration.
 //
-//  Currently: gfx_v12_0_constants_init only.
+//  Implements the gfx_v12_0_constants_init bringup helpers:
+//      - get_gb_addr_config        (gfx_v12_0.c:3575)
+//      - setup_rb                  (gfx_v12_0.c:1731)
+//      - get_sa_active_bitmap      (gfx_v12_0.c:1694)
+//      - get_rb_active_bitmap      (gfx_v12_0.c:1712)
+//      - select_se_sh              (gfx_v12_0.c:1667)
+//      - get_cu_info               (gfx_v12_0.c:5737)
+//      - get_wgp_active_bitmap_per_sh (gfx_v12_0.c:5704)
+//      - get_cu_active_bitmap_per_sh  (gfx_v12_0.c:5719)
+//      - init_compute_vmid         (gfx_v12_0.c:1766)
+//      - constants_init            (gfx_v12_0.c:1806)
 //
-//  Source: drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c:1806
+//  Audit-7 #8.
 //
 
 #include <os/log.h>
+#include <string.h>
 #include "amdgpu_gfx.h"
+#include "amdgpu_mes.h"   // shares CP_HQD_PQ_CONTROL_DEFAULT + field defs
 
 #define GFX_LOG(fmt, ...) \
     os_log(OS_LOG_DEFAULT, "mac.amdgpu.gfx: " fmt, ##__VA_ARGS__)
 
 namespace amdgpu {
 
+//------------------------------------------------------------------
+// Helpers — bit math.
+//------------------------------------------------------------------
+static inline uint32_t
+gfx_create_bitmask(uint32_t bit_width)
+{
+    // amdgpu_gfx.c:amdgpu_gfx_create_bitmask. Returns (1 << bw) - 1.
+    if (bit_width >= 32) return 0xFFFFFFFFu;
+    return (1u << bit_width) - 1u;
+}
+
+static inline uint32_t
+gfx_hweight32(uint32_t v)
+{
+    // Standard popcount.
+    v = v - ((v >> 1) & 0x55555555u);
+    v = (v & 0x33333333u) + ((v >> 2) & 0x33333333u);
+    v = (v + (v >> 4)) & 0x0F0F0F0Fu;
+    return (v * 0x01010101u) >> 24;
+}
+
+//------------------------------------------------------------------
+// gfx_select_se_sh — port of gfx_v12_0_select_se_sh (gfx_v12_0.c:1667).
+//
+// Writes GRBM_GFX_INDEX to scope subsequent reads to a particular
+// (SE, SH, instance) tuple. 0xffffffff means broadcast.
+//------------------------------------------------------------------
+static void
+gfx_select_se_sh(const DeviceContext &dev, uint32_t se_num,
+                 uint32_t sh_num, uint32_t instance)
+{
+    uint32_t data = 0;
+
+    if (instance == 0xFFFFFFFFu) {
+        data = REG_SET_FIELD(0,    GRBM_GFX_INDEX, INSTANCE_BROADCAST_WRITES, 1);
+    } else {
+        data = REG_SET_FIELD(0,    GRBM_GFX_INDEX, INSTANCE_INDEX, instance);
+    }
+    if (se_num == 0xFFFFFFFFu) {
+        data = REG_SET_FIELD(data, GRBM_GFX_INDEX, SE_BROADCAST_WRITES, 1);
+    } else {
+        data = REG_SET_FIELD(data, GRBM_GFX_INDEX, SE_INDEX, se_num);
+    }
+    if (sh_num == 0xFFFFFFFFu) {
+        data = REG_SET_FIELD(data, GRBM_GFX_INDEX, SA_BROADCAST_WRITES, 1);
+    } else {
+        data = REG_SET_FIELD(data, GRBM_GFX_INDEX, SA_INDEX, sh_num);
+    }
+
+    WREG32(dev,
+           SOC15_REG_OFFSET(dev, IPBlock::GC, GFXRegs::GRBM_GFX_INDEX),
+           data);
+}
+
+//------------------------------------------------------------------
+// gfx_get_sa_active_bitmap — port of gfx_v12_0_get_sa_active_bitmap
+// (gfx_v12_0.c:1694). Combines CC + USER SA-disable masks.
+//------------------------------------------------------------------
+static uint32_t
+gfx_get_sa_active_bitmap(const DeviceContext &dev, const GFXConfig &cfg)
+{
+    const uint32_t cc_dis =
+        (RREG32(dev,
+            SOC15_REG_OFFSET(dev, IPBlock::GC,
+                             GFXRegs::GRBM_CC_GC_SA_UNIT_DISABLE))
+         & GRBM_CC_GC_SA_UNIT_DISABLE__SA_DISABLE_MASK)
+        >> GRBM_CC_GC_SA_UNIT_DISABLE__SA_DISABLE__SHIFT;
+
+    const uint32_t user_dis =
+        (RREG32(dev,
+            SOC15_REG_OFFSET(dev, IPBlock::GC,
+                             GFXRegs::GRBM_GC_USER_SA_UNIT_DISABLE))
+         & GRBM_GC_USER_SA_UNIT_DISABLE__SA_DISABLE_MASK)
+        >> GRBM_GC_USER_SA_UNIT_DISABLE__SA_DISABLE__SHIFT;
+
+    const uint32_t sa_mask =
+        gfx_create_bitmask(cfg.max_sh_per_se * cfg.max_shader_engines);
+    return sa_mask & ~(cc_dis | user_dis);
+}
+
+//------------------------------------------------------------------
+// gfx_get_rb_active_bitmap — port of gfx_v12_0_get_rb_active_bitmap
+// (gfx_v12_0.c:1712).
+//------------------------------------------------------------------
+static uint32_t
+gfx_get_rb_active_bitmap(const DeviceContext &dev, const GFXConfig &cfg)
+{
+    const uint32_t cc_dis =
+        (RREG32(dev,
+            SOC15_REG_OFFSET(dev, IPBlock::GC,
+                             GFXRegs::CC_RB_BACKEND_DISABLE))
+         & CC_RB_BACKEND_DISABLE__BACKEND_DISABLE_MASK)
+        >> CC_RB_BACKEND_DISABLE__BACKEND_DISABLE__SHIFT;
+
+    const uint32_t user_dis =
+        (RREG32(dev,
+            SOC15_REG_OFFSET(dev, IPBlock::GC,
+                             GFXRegs::GC_USER_RB_BACKEND_DISABLE))
+         & GC_USER_RB_BACKEND_DISABLE__BACKEND_DISABLE_MASK)
+        >> GC_USER_RB_BACKEND_DISABLE__BACKEND_DISABLE__SHIFT;
+
+    const uint32_t rb_mask =
+        gfx_create_bitmask(cfg.max_backends_per_se * cfg.max_shader_engines);
+    return rb_mask & ~(cc_dis | user_dis);
+}
+
+//------------------------------------------------------------------
+// gfx_get_wgp_active_bitmap_per_sh — port of
+// gfx_v12_0_get_wgp_active_bitmap_per_sh (gfx_v12_0.c:5704).
+//
+// Combines CC + USER INACTIVE_WGPS, inverts to active, masks by
+// max_cu_per_sh >> 1 (1 WGP = 2 CUs).
+//------------------------------------------------------------------
+static uint32_t
+gfx_get_wgp_active_bitmap_per_sh(const DeviceContext &dev,
+                                 const GFXConfig &cfg)
+{
+    uint32_t data =
+        RREG32(dev,
+            SOC15_REG_OFFSET(dev, IPBlock::GC,
+                             GFXRegs::CC_GC_SHADER_ARRAY_CONFIG));
+    data |=
+        RREG32(dev,
+            SOC15_REG_OFFSET(dev, IPBlock::GC,
+                             GFXRegs::GC_USER_SHADER_ARRAY_CONFIG));
+
+    data &= CC_GC_SHADER_ARRAY_CONFIG__INACTIVE_WGPS_MASK;
+    data >>= CC_GC_SHADER_ARRAY_CONFIG__INACTIVE_WGPS__SHIFT;
+
+    const uint32_t wgp_bitmask = gfx_create_bitmask(cfg.max_cu_per_sh >> 1);
+    return (~data) & wgp_bitmask;
+}
+
+//------------------------------------------------------------------
+// gfx_get_cu_active_bitmap_per_sh — port of
+// gfx_v12_0_get_cu_active_bitmap_per_sh (gfx_v12_0.c:5719).
+//
+// Expand each WGP bit into 2 adjacent CU bits.
+//------------------------------------------------------------------
+static uint32_t
+gfx_get_cu_active_bitmap_per_sh(const DeviceContext &dev,
+                                const GFXConfig &cfg)
+{
+    const uint32_t wgp_bitmap = gfx_get_wgp_active_bitmap_per_sh(dev, cfg);
+    uint32_t cu_bitmap = 0;
+    for (uint32_t wgp_idx = 0; wgp_idx < 16; wgp_idx++) {
+        const uint32_t cu_bitmap_per_wgp = 3u << (2u * wgp_idx);
+        if (wgp_bitmap & (1u << wgp_idx)) {
+            cu_bitmap |= cu_bitmap_per_wgp;
+        }
+    }
+    return cu_bitmap;
+}
+
+//==================================================================
+// Public API
+//==================================================================
+
 kern_return_t
-gfx_constants_init(const DeviceContext &dev)
+gfx_get_gb_addr_config(const DeviceContext &dev, GFXConfig &cfg)
+{
+    if (!dev.ip.isResolved(IPBlock::GC)) return kIOReturnNotReady;
+
+    // gfx_v12_0.c:3579 — read regGB_ADDR_CONFIG.
+    const uint32_t gb = RREG32(dev,
+        SOC15_REG_OFFSET(dev, IPBlock::GC, GFXRegs::GB_ADDR_CONFIG));
+    if (gb == 0 || gb == 0xFFFFFFFFu) {
+        GFX_LOG("get_gb_addr_config: GB_ADDR_CONFIG=%#x (driver may be "
+                "racing with PSP/RLC autoload)", gb);
+        return kIOReturnNotReady;
+    }
+
+    cfg.gb_addr_config_raw   = gb;
+    cfg.num_pipes            = 1u << ((gb & GB_ADDR_CONFIG__NUM_PIPES_MASK)
+                                     >> GB_ADDR_CONFIG__NUM_PIPES__SHIFT);
+    cfg.num_shader_engines   =
+        1u << ((gb & GB_ADDR_CONFIG__NUM_SHADER_ENGINES_MASK)
+              >> GB_ADDR_CONFIG__NUM_SHADER_ENGINES__SHIFT);
+    cfg.num_rb_per_se        =
+        1u << ((gb & GB_ADDR_CONFIG__NUM_RB_PER_SE_MASK)
+              >> GB_ADDR_CONFIG__NUM_RB_PER_SE__SHIFT);
+    cfg.num_pkrs             =
+        1u << ((gb & GB_ADDR_CONFIG__NUM_PKRS_MASK)
+              >> GB_ADDR_CONFIG__NUM_PKRS__SHIFT);
+    cfg.pipe_interleave_size =
+        1u << (8u + ((gb & GB_ADDR_CONFIG__PIPE_INTERLEAVE_SIZE_MASK)
+                    >> GB_ADDR_CONFIG__PIPE_INTERLEAVE_SIZE__SHIFT));
+    cfg.max_compressed_frags =
+        1u << ((gb & GB_ADDR_CONFIG__MAX_COMPRESSED_FRAGS_MASK)
+              >> GB_ADDR_CONFIG__MAX_COMPRESSED_FRAGS__SHIFT);
+
+    GFX_LOG("gb_addr_config=%#010x num_pipes=%u num_se=%u num_rb_per_se=%u "
+            "num_pkrs=%u pipe_interleave=%u",
+            gb, cfg.num_pipes, cfg.num_shader_engines,
+            cfg.num_rb_per_se, cfg.num_pkrs, cfg.pipe_interleave_size);
+    return kIOReturnSuccess;
+}
+
+//------------------------------------------------------------------
+// gfx_setup_rb — port of gfx_v12_0_setup_rb (gfx_v12_0.c:1731).
+//------------------------------------------------------------------
+kern_return_t
+gfx_setup_rb(const DeviceContext &dev, GFXConfig &cfg)
+{
+    if (!dev.ip.isResolved(IPBlock::GC)) return kIOReturnNotReady;
+    if (cfg.max_shader_engines == 0 || cfg.max_sh_per_se == 0 ||
+        cfg.max_backends_per_se == 0) {
+        return kIOReturnNotReady;
+    }
+
+    // gfx_v12_0.c:1741-1744 — read SA + RB harvest masks under broadcast.
+    gfx_select_se_sh(dev, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
+    const uint32_t active_sa = gfx_get_sa_active_bitmap(dev, cfg);
+    const uint32_t global_active_rb = gfx_get_rb_active_bitmap(dev, cfg);
+
+    // gfx_v12_0.c:1747-1751 — derive active_rb_bitmap from active_sa.
+    const uint32_t max_sa = cfg.max_shader_engines * cfg.max_sh_per_se;
+    const uint32_t rb_bitmap_width_per_sa =
+        cfg.max_backends_per_se / cfg.max_sh_per_se;
+    const uint32_t rb_bitmap_per_sa =
+        gfx_create_bitmask(rb_bitmap_width_per_sa);
+
+    uint32_t active_rb_bitmap = 0;
+    for (uint32_t i = 0; i < max_sa; i++) {
+        if (active_sa & (1u << i)) {
+            active_rb_bitmap |= rb_bitmap_per_sa << (i * rb_bitmap_width_per_sa);
+        }
+    }
+    active_rb_bitmap &= global_active_rb;
+
+    cfg.active_rb_bitmap = active_rb_bitmap;
+    cfg.num_rbs          = gfx_hweight32(active_rb_bitmap);
+
+    GFX_LOG("setup_rb: active_sa=%#x global_active_rb=%#x "
+            "active_rb_bitmap=%#x num_rbs=%u",
+            active_sa, global_active_rb, active_rb_bitmap, cfg.num_rbs);
+    return kIOReturnSuccess;
+}
+
+//------------------------------------------------------------------
+// gfx_get_cu_info — port of gfx_v12_0_get_cu_info (gfx_v12_0.c:5737).
+//------------------------------------------------------------------
+kern_return_t
+gfx_get_cu_info(const DeviceContext &dev, GFXConfig &cfg)
+{
+    if (!dev.ip.isResolved(IPBlock::GC)) return kIOReturnNotReady;
+
+    cfg.num_active_cus = 0;
+    memset(cfg.active_cu_bitmap, 0, sizeof(cfg.active_cu_bitmap));
+
+    // gfx_v12_0.c:5750-5790 — for each (SE, SH) tuple that's active
+    // per the SA harvest mask, GRBM-select that (SE, SH), read the
+    // CU active bitmap, popcount it, and stash into cu_info.
+    for (uint32_t i = 0; i < cfg.max_shader_engines; i++) {
+        for (uint32_t j = 0; j < cfg.max_sh_per_se; j++) {
+            const uint32_t sa_idx = i * cfg.max_sh_per_se + j;
+            if (!((gfx_get_sa_active_bitmap(dev, cfg) >> sa_idx) & 1u)) {
+                continue;
+            }
+
+            gfx_select_se_sh(dev, i, j, 0xFFFFFFFFu);
+            const uint32_t bitmap = gfx_get_cu_active_bitmap_per_sh(dev, cfg);
+
+            // Mirror upstream's "GFX12 can have > 4 SEs but ioctl
+            // table is 4x4" layout (gfx_v12_0.c:5778). Our config
+            // limits the array to 4x2 (R9700 has 4 SEs × 1 SH), so
+            // for i ∈ [0..3] and j ∈ [0..1] this is straightforward.
+            if (i < 4 && j < 2) {
+                cfg.active_cu_bitmap[i % 4][j + (i / 4) * 2] = bitmap;
+            }
+
+            // popcount up to max_cu_per_sh.
+            uint32_t mask = 1u;
+            for (uint32_t k = 0; k < cfg.max_cu_per_sh; k++) {
+                if (bitmap & mask) cfg.num_active_cus++;
+                mask <<= 1;
+            }
+        }
+    }
+
+    gfx_select_se_sh(dev, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
+
+    GFX_LOG("get_cu_info: num_active_cus=%u", cfg.num_active_cus);
+    return kIOReturnSuccess;
+}
+
+//------------------------------------------------------------------
+// gfx_init_compute_vmid — port of gfx_v12_0_init_compute_vmid
+// (gfx_v12_0.c:1766).
+//
+// VMIDs first_kfd_vmid..AMDGPU_NUM_VMID-1 get LDS/Scratch aperture
+// bases programmed and SPI_GDBG_PER_VMID_CNTL.TRAP_EN = 1.
+//
+// AMDGPU_NUM_VMID = 16. KFD VMIDs are 8..15 (first_kfd_vmid = 8 on
+// gfx12 with default num_kfd_vmids).
+//------------------------------------------------------------------
+kern_return_t
+gfx_init_compute_vmid(const DeviceContext &dev)
+{
+    if (!dev.ip.isResolved(IPBlock::GC)) return kIOReturnNotReady;
+
+    // gfx_v12_0.c:1763-1764 + 1778-1779.
+    //   LDS_APP_BASE     = 0x1
+    //   SCRATCH_APP_BASE = 0x2
+    //   sh_mem_bases     = (LDS_APP_BASE << SHARED_BASE__SHIFT) | SCRATCH_APP_BASE
+    constexpr uint32_t kLDS_APP_BASE     = 0x1;
+    constexpr uint32_t kSCRATCH_APP_BASE = 0x2;
+    const uint32_t sh_mem_bases =
+        (kLDS_APP_BASE << SH_MEM_BASES__SHARED_BASE__SHIFT)
+        | kSCRATCH_APP_BASE;
+
+    constexpr uint32_t kFirstKFDVmid = 8;
+    constexpr uint32_t kNumVmid      = 16;
+
+    const uint32_t reg_mem_config =
+        SOC15_REG_OFFSET(dev, IPBlock::GC, GFXRegs::SH_MEM_CONFIG);
+    const uint32_t reg_mem_bases  =
+        SOC15_REG_OFFSET(dev, IPBlock::GC, GFXRegs::SH_MEM_BASES);
+    const uint32_t reg_gdbg       =
+        SOC15_REG_OFFSET(dev, IPBlock::GC, GFXRegs::SPI_GDBG_PER_VMID_CNTL);
+    const uint32_t reg_grbm_cntl  =
+        SOC15_REG_OFFSET(dev, IPBlock::GC, GFXRegs::GRBM_GFX_CNTL);
+
+    for (uint32_t i = kFirstKFDVmid; i < kNumVmid; i++) {
+        // Equivalent of soc24_grbm_select(adev, me=0, pipe=0, queue=0, vmid=i).
+        uint32_t sel = 0;
+        sel = REG_SET_FIELD(sel, GRBM_GFX_CNTL, VMID, i);
+        WREG32(dev, reg_grbm_cntl, sel);
+
+        // gfx_v12_0.c:1785-1786 — config + bases.
+        WREG32(dev, reg_mem_config, kDefaultSHMemConfig);
+        WREG32(dev, reg_mem_bases,  sh_mem_bases);
+
+        // gfx_v12_0.c:1789-1791 — TRAP_EN = 1 for each KFD vmid.
+        uint32_t data = RREG32(dev, reg_gdbg);
+        data = REG_SET_FIELD(data, SPI_GDBG_PER_VMID_CNTL, TRAP_EN, 1);
+        WREG32(dev, reg_gdbg, data);
+    }
+    // Deselect.
+    WREG32(dev, reg_grbm_cntl, 0);
+
+    GFX_LOG("init_compute_vmid: programmed VMIDs %u..%u (sh_mem_bases=%#x)",
+            kFirstKFDVmid, kNumVmid - 1, sh_mem_bases);
+    return kIOReturnSuccess;
+}
+
+//------------------------------------------------------------------
+// gfx_constants_init — direct port of gfx_v12_0_constants_init
+// (gfx_v12_0.c:1806).
+//
+// Audit-7 #8.
+//------------------------------------------------------------------
+kern_return_t
+gfx_constants_init(const DeviceContext &dev, GFXConfig &cfg)
 {
     if (!dev.ip.isResolved(IPBlock::GC)) {
         GFX_LOG("constants_init: GC IP base not resolved");
         return kIOReturnNotReady;
     }
 
+    // R9700 (gfx1201) early-init caps — upstream sets these in
+    // gfx_v12_0_gpu_early_init's IP_VERSION(12, 0, 1) branch.
+    // The values are from the public RDNA4 datasheet: 4 SEs × 1 SA ×
+    // 4 RBs/SE × 8 CUs/SA. 8 hw contexts.
+    cfg.max_shader_engines  = 4;
+    cfg.max_sh_per_se       = 1;
+    cfg.max_backends_per_se = 4;
+    cfg.max_cu_per_sh       = 8;
+    cfg.max_hw_contexts     = 8;
+
     auto reg = [&](uint32_t off) {
         return SOC15_REG_OFFSET(dev, IPBlock::GC, off);
     };
 
-    // 1) GRBM_CNTL.READ_TIMEOUT = 0xFF. Sets the MMIO read timeout
-    //    register so the GRBM doesn't bail too early on a slow path.
+    // gfx_v12_0.c:1812 — GRBM_CNTL.READ_TIMEOUT = 0xFF.
     {
         uint32_t v = RREG32(dev, reg(GFXRegs::GRBM_CNTL));
         v = (v & ~kGRBM_CNTL_READ_TIMEOUT_MASK) | kGRBM_CNTL_READ_TIMEOUT_VALUE;
         WREG32(dev, reg(GFXRegs::GRBM_CNTL), v);
     }
 
-    // 2) SH_MEM_CONFIG for the kernel-driver VMID (0). Default
-    //    config: 64-bit address mode + unaligned alignment + initial
-    //    instruction prefetch of 3.
+    // gfx_v12_0.c:1814-1816 — setup_rb + get_cu_info + get_tcc_info.
+    // get_tcc_info is empty upstream on gfx12 (gfx_v12_0.c:1802).
     //
-    //    Upstream loops over all VMIDs and selects each via
-    //    soc24_grbm_select(adev, me=0, pipe=0, queue=0, vmid=i)
-    //    before writing SH_MEM_BASES/SH_MEM_CONFIG. For first PM4
-    //    we only touch VMID 0 — the kernel context. User VMIDs are
-    //    Phase 2 (when we wire up user-mode queues + compute).
-    WREG32(dev, reg(GFXRegs::SH_MEM_CONFIG), kDefaultSHMemConfig);
+    // Both setup_rb and get_cu_info NEED gb_addr_config populated for
+    // some fields, but on RDNA4 the caps we use are hardcoded — the
+    // gb_addr_config read is best-effort and non-fatal.
+    (void)gfx_get_gb_addr_config(dev, cfg);
+    kern_return_t r;
+    r = gfx_setup_rb(dev, cfg);
+    if (r != kIOReturnSuccess) {
+        GFX_LOG("setup_rb failed: %#x (continuing)", r);
+    }
+    r = gfx_get_cu_info(dev, cfg);
+    if (r != kIOReturnSuccess) {
+        GFX_LOG("get_cu_info failed: %#x (continuing)", r);
+    }
 
-    // pa_sc_tile_steering_override = 0 — Linux explicitly sets the
-    // value on adev->gfx.config but doesn't WREG32 it during
-    // constants_init. The register write happens elsewhere (in
-    // setup_rb when harvested config is known). We skip both for
-    // now; default is 0.
+    // gfx_v12_0.c:1820-1836 — per-VMID SH_MEM_CONFIG + SH_MEM_BASES.
+    // Iterate VMIDs 0..num_ids-1 (typically 8 — the system + gfx VMIDs).
+    {
+        constexpr uint32_t kNumGfxVmids = 8;
+        const uint32_t reg_mem_config = reg(GFXRegs::SH_MEM_CONFIG);
+        const uint32_t reg_mem_bases  = reg(GFXRegs::SH_MEM_BASES);
+        const uint32_t reg_grbm_cntl  = reg(GFXRegs::GRBM_GFX_CNTL);
 
-    GFX_LOG("constants_init: GRBM_CNTL.READ_TIMEOUT=%#x, "
-            "SH_MEM_CONFIG=%#x (vmid 0)",
-            kGRBM_CNTL_READ_TIMEOUT_VALUE, kDefaultSHMemConfig);
+        for (uint32_t i = 0; i < kNumGfxVmids; i++) {
+            // grbm-select with vmid = i, others = 0.
+            uint32_t sel = 0;
+            sel = REG_SET_FIELD(sel, GRBM_GFX_CNTL, VMID, i);
+            WREG32(dev, reg_grbm_cntl, sel);
+
+            // gfx_v12_0.c:1825 — SH_MEM_CONFIG = DEFAULT for every VMID.
+            WREG32(dev, reg_mem_config, kDefaultSHMemConfig);
+
+            if (i != 0) {
+                // gfx_v12_0.c:1827-1831 — VMID i ≥ 1 gets the gmc
+                // private/shared aperture bases. Both apertures are
+                // 48-bit GPU-VA tops; we don't yet track the
+                // private_aperture_start / shared_aperture_start
+                // values in GMCContext, so use the same hardcoded
+                // KFD apertures that gfx_init_compute_vmid uses
+                // (LDS=0x1, SCRATCH=0x2) — RDNA4 default per
+                // gmc_v12_0_init_default_aperture in upstream.
+                uint32_t bases = 0;
+                bases = REG_SET_FIELD(bases, SH_MEM_BASES, PRIVATE_BASE, 0x2);
+                bases = REG_SET_FIELD(bases, SH_MEM_BASES, SHARED_BASE,  0x1);
+                WREG32(dev, reg_mem_bases, bases);
+            }
+        }
+        // grbm-deselect.
+        WREG32(dev, reg_grbm_cntl, 0);
+    }
+
+    // gfx_v12_0.c:1838 — init_compute_vmid.
+    gfx_init_compute_vmid(dev);
+
+    cfg.inited = true;
+    GFX_LOG("constants_init complete: max_se=%u max_sh=%u max_be=%u "
+            "max_cu_per_sh=%u (active_rbs=%u active_cus=%u)",
+            cfg.max_shader_engines, cfg.max_sh_per_se,
+            cfg.max_backends_per_se, cfg.max_cu_per_sh,
+            cfg.num_rbs, cfg.num_active_cus);
     return kIOReturnSuccess;
 }
+
+// Convenience overload — uses a static GFXConfig for callers that
+// don't yet have a real GFXContext. Should be migrated in a follow-up.
+kern_return_t
+gfx_constants_init(const DeviceContext &dev)
+{
+    static GFXConfig s_cfg{};
+    return gfx_constants_init(dev, s_cfg);
+}
+
+//==================================================================
+// MQD builders — port the field math from gfx_v12_0_compute_mqd_init
+// and gfx_v12_0_gfx_mqd_init.  Audit-7 #9.
+//==================================================================
+
+static inline uint32_t
+order_base_2_local(uint32_t x)
+{
+    uint32_t r = 0;
+    while ((1u << r) < x) r++;
+    return r;
+}
+
+kern_return_t
+gfx_build_compute_mqd(uint32_t *mqd_cpu, const GFXMqdProps &p)
+{
+    if (mqd_cpu == nullptr) return kIOReturnBadArgument;
+
+    // Zero everything first — gfx_v12_0_kiq_init_queue / kcq_init_queue
+    // do memset((void*)mqd, 0, sizeof(*mqd)) before this. (Caller did
+    // the same; defensive re-zero is harmless.)
+    memset(mqd_cpu, 0, kGFX_MQDPageBytes);
+
+    // gfx_v12_0.c:3150-3156 — magic header + per-SE thread-mgmt masks.
+    mqd_cpu[ComputeMqdOff::header]                         = 0xC0310800u;
+    mqd_cpu[ComputeMqdOff::compute_pipelinestat_enable]    = 0x00000001u;
+    mqd_cpu[ComputeMqdOff::compute_static_thread_mgmt_se0] = 0xFFFFFFFFu;
+    mqd_cpu[ComputeMqdOff::compute_static_thread_mgmt_se1] = 0xFFFFFFFFu;
+    mqd_cpu[ComputeMqdOff::compute_static_thread_mgmt_se2] = 0xFFFFFFFFu;
+    mqd_cpu[ComputeMqdOff::compute_static_thread_mgmt_se3] = 0xFFFFFFFFu;
+    mqd_cpu[ComputeMqdOff::compute_misc_reserved]          = 0x00000007u;
+
+    // gfx_v12_0.c:3158-3167 — EOP base + size.
+    const uint64_t eop_base_addr = p.eop_gpu_addr >> 8;
+    mqd_cpu[ComputeMqdOff::cp_hqd_eop_base_addr_lo] =
+        static_cast<uint32_t>(eop_base_addr);
+    mqd_cpu[ComputeMqdOff::cp_hqd_eop_base_addr_hi] =
+        static_cast<uint32_t>(eop_base_addr >> 32);
+    uint32_t eop_ctrl = kCP_HQD_EOP_CONTROL_DEFAULT;
+    if (p.eop_size_bytes > 0) {
+        const uint32_t eop_log =
+            order_base_2_local(p.eop_size_bytes / 4u) - 1u;
+        eop_ctrl = REG_SET_FIELD(eop_ctrl, CP_HQD_EOP_CONTROL,
+                                 EOP_SIZE, eop_log);
+    }
+    mqd_cpu[ComputeMqdOff::cp_hqd_eop_control] = eop_ctrl;
+
+    // gfx_v12_0.c:3170-3186 — doorbell control.
+    uint32_t db_ctrl = kRegCP_HQD_PQ_DOORBELL_CONTROL_DEFAULT;
+    if (p.use_doorbell) {
+        db_ctrl = REG_SET_FIELD(db_ctrl, CP_HQD_PQ_DOORBELL_CONTROL,
+                                DOORBELL_OFFSET, p.doorbell_index);
+        db_ctrl = REG_SET_FIELD(db_ctrl, CP_HQD_PQ_DOORBELL_CONTROL,
+                                DOORBELL_EN, 1);
+        db_ctrl = REG_SET_FIELD(db_ctrl, CP_HQD_PQ_DOORBELL_CONTROL,
+                                DOORBELL_SOURCE, 0);
+        db_ctrl = REG_SET_FIELD(db_ctrl, CP_HQD_PQ_DOORBELL_CONTROL,
+                                DOORBELL_HIT, 0);
+    } else {
+        db_ctrl = REG_SET_FIELD(db_ctrl, CP_HQD_PQ_DOORBELL_CONTROL,
+                                DOORBELL_EN, 0);
+    }
+    mqd_cpu[ComputeMqdOff::cp_hqd_pq_doorbell_control] = db_ctrl;
+
+    // gfx_v12_0.c:3189-3196 — disable + MQD base pointer.
+    mqd_cpu[ComputeMqdOff::cp_hqd_dequeue_request]     = 0;
+    mqd_cpu[ComputeMqdOff::cp_hqd_pq_rptr]             = 0;
+    mqd_cpu[ComputeMqdOff::cp_hqd_pq_wptr_lo]          = 0;
+    mqd_cpu[ComputeMqdOff::cp_hqd_pq_wptr_hi]          = 0;
+    mqd_cpu[ComputeMqdOff::cp_mqd_base_addr_lo] =
+        static_cast<uint32_t>(p.mqd_gpu_addr & 0xFFFFFFFCu);
+    mqd_cpu[ComputeMqdOff::cp_mqd_base_addr_hi] =
+        static_cast<uint32_t>(p.mqd_gpu_addr >> 32);
+
+    // gfx_v12_0.c:3199-3201 — MQD VMID = 0.
+    {
+        uint32_t v = kCP_MQD_CONTROL_DEFAULT;
+        v = REG_SET_FIELD(v, CP_MQD_CONTROL, VMID, 0);
+        mqd_cpu[ComputeMqdOff::cp_mqd_control] = v;
+    }
+
+    // gfx_v12_0.c:3203-3206 — HQD PQ base.
+    const uint64_t hqd_gpu_addr = p.hqd_base_gpu_addr >> 8;
+    mqd_cpu[ComputeMqdOff::cp_hqd_pq_base_lo] =
+        static_cast<uint32_t>(hqd_gpu_addr);
+    mqd_cpu[ComputeMqdOff::cp_hqd_pq_base_hi] =
+        static_cast<uint32_t>(hqd_gpu_addr >> 32);
+
+    // gfx_v12_0.c:3209-3222 — HQD PQ control.
+    {
+        uint32_t v = kCP_HQD_PQ_CONTROL_DEFAULT;
+        v = REG_SET_FIELD(v, CP_HQD_PQ_CONTROL, QUEUE_SIZE,
+                          order_base_2_local(p.queue_size_bytes / 4u) - 1u);
+        v = REG_SET_FIELD(v, CP_HQD_PQ_CONTROL, RPTR_BLOCK_SIZE,
+                          order_base_2_local(4096u / 4u) - 1u);
+        v = REG_SET_FIELD(v, CP_HQD_PQ_CONTROL, UNORD_DISPATCH,  1);
+        v = REG_SET_FIELD(v, CP_HQD_PQ_CONTROL, TUNNEL_DISPATCH, 0);
+        if (p.kernel_queue) {
+            v = REG_SET_FIELD(v, CP_HQD_PQ_CONTROL, PRIV_STATE, 1);
+            v = REG_SET_FIELD(v, CP_HQD_PQ_CONTROL, KMD_QUEUE,  1);
+        }
+        mqd_cpu[ComputeMqdOff::cp_hqd_pq_control] = v;
+    }
+
+    // gfx_v12_0.c:3224-3233 — rptr/wptr write-back/poll addresses.
+    mqd_cpu[ComputeMqdOff::cp_hqd_pq_rptr_report_addr_lo] =
+        static_cast<uint32_t>(p.rptr_gpu_addr & 0xFFFFFFFCu);
+    mqd_cpu[ComputeMqdOff::cp_hqd_pq_rptr_report_addr_hi] =
+        static_cast<uint32_t>(p.rptr_gpu_addr >> 32) & 0xFFFFu;
+    mqd_cpu[ComputeMqdOff::cp_hqd_pq_wptr_poll_addr_lo] =
+        static_cast<uint32_t>(p.wptr_gpu_addr & 0xFFFFFFFCu);
+    mqd_cpu[ComputeMqdOff::cp_hqd_pq_wptr_poll_addr_hi] =
+        static_cast<uint32_t>(p.wptr_gpu_addr >> 32) & 0xFFFFu;
+
+    // gfx_v12_0.c:3253 — initial rptr value (DEFAULT).
+    mqd_cpu[ComputeMqdOff::cp_hqd_pq_rptr] = kRegCP_HQD_PQ_RPTR_DEFAULT;
+
+    // gfx_v12_0.c:3256 — VMID.
+    mqd_cpu[ComputeMqdOff::cp_hqd_vmid] = 0;
+
+    // gfx_v12_0.c:3258-3260 — persistent state with PRELOAD_SIZE = 0x55.
+    {
+        uint32_t v = kCP_HQD_PERSISTENT_STATE_DEFAULT;
+        v = REG_SET_FIELD(v, CP_HQD_PERSISTENT_STATE, PRELOAD_SIZE, 0x55);
+        mqd_cpu[ComputeMqdOff::cp_hqd_persistent_state] = v;
+    }
+
+    // gfx_v12_0.c:3263-3265 — IB control.
+    {
+        uint32_t v = kRegCP_HQD_IB_CONTROL_DEFAULT;
+        v = REG_SET_FIELD(v, CP_HQD_IB_CONTROL, MIN_IB_AVAIL_SIZE, 3);
+        mqd_cpu[ComputeMqdOff::cp_hqd_ib_control] = v;
+    }
+
+    // gfx_v12_0.c:3268-3271 — pipe/queue priorities + active flag.
+    mqd_cpu[ComputeMqdOff::cp_hqd_pipe_priority]  = 0;
+    mqd_cpu[ComputeMqdOff::cp_hqd_queue_priority] = 0;
+    mqd_cpu[ComputeMqdOff::cp_hqd_active]         = 1;
+
+    return kIOReturnSuccess;
+}
+
+kern_return_t
+gfx_build_gfx_mqd(uint32_t *mqd_cpu, const GFXMqdProps &p)
+{
+    if (mqd_cpu == nullptr) return kIOReturnBadArgument;
+
+    memset(mqd_cpu, 0, kGFX_MQDPageBytes);
+
+    // gfx_v12_0.c:2978-2979 — wptr starts at 0.
+    mqd_cpu[GfxMqdOff::cp_gfx_hqd_wptr]    = 0;
+    mqd_cpu[GfxMqdOff::cp_gfx_hqd_wptr_hi] = 0;
+
+    // gfx_v12_0.c:2982-2983 — MQD base.
+    mqd_cpu[GfxMqdOff::cp_mqd_base_addr] =
+        static_cast<uint32_t>(p.mqd_gpu_addr & 0xFFFFFFFCu);
+    mqd_cpu[GfxMqdOff::cp_mqd_base_addr_hi] =
+        static_cast<uint32_t>(p.mqd_gpu_addr >> 32);
+
+    // gfx_v12_0.c:2986-2990 — MQD control: VMID 0, PRIV_STATE = 1.
+    {
+        uint32_t v = kRegCP_GFX_MQD_CONTROL_DEFAULT;
+        v = REG_SET_FIELD(v, CP_GFX_MQD_CONTROL, VMID, 0);
+        v = REG_SET_FIELD(v, CP_GFX_MQD_CONTROL, PRIV_STATE, 1);
+        v = REG_SET_FIELD(v, CP_GFX_MQD_CONTROL, CACHE_POLICY, 0);
+        mqd_cpu[GfxMqdOff::cp_gfx_mqd_control] = v;
+    }
+
+    // gfx_v12_0.c:2993-2995 — HQD VMID. Note upstream writes 0
+    // directly into mqd->cp_gfx_hqd_vmid (line 2995) despite the
+    // REG_SET_FIELD above; both lines set the same value, just keep
+    // it consistent with upstream's last write wins.
+    mqd_cpu[GfxMqdOff::cp_gfx_hqd_vmid] = 0;
+
+    // gfx_v12_0.c:2999-3001 — priority.
+    {
+        uint32_t v = kRegCP_GFX_HQD_QUEUE_PRIORITY_DEFAULT;
+        v = REG_SET_FIELD(v, CP_GFX_HQD_QUEUE_PRIORITY,
+                          PRIORITY_LEVEL, 0);
+        mqd_cpu[GfxMqdOff::cp_gfx_hqd_queue_priority] = v;
+    }
+
+    // gfx_v12_0.c:3004-3006 — quantum.
+    {
+        uint32_t v = kRegCP_GFX_HQD_QUANTUM_DEFAULT;
+        v = REG_SET_FIELD(v, CP_GFX_HQD_QUANTUM, QUANTUM_EN, 1);
+        mqd_cpu[GfxMqdOff::cp_gfx_hqd_quantum] = v;
+    }
+
+    // gfx_v12_0.c:3009-3011 — HQD base.
+    const uint64_t hqd_gpu_addr = p.hqd_base_gpu_addr >> 8;
+    mqd_cpu[GfxMqdOff::cp_gfx_hqd_base]    =
+        static_cast<uint32_t>(hqd_gpu_addr);
+    mqd_cpu[GfxMqdOff::cp_gfx_hqd_base_hi] =
+        static_cast<uint32_t>(hqd_gpu_addr >> 32);
+
+    // gfx_v12_0.c:3013-3017 — rptr_addr.
+    mqd_cpu[GfxMqdOff::cp_gfx_hqd_rptr_addr] =
+        static_cast<uint32_t>(p.rptr_gpu_addr & 0xFFFFFFFCu);
+    mqd_cpu[GfxMqdOff::cp_gfx_hqd_rptr_addr_hi] =
+        static_cast<uint32_t>(p.rptr_gpu_addr >> 32) & 0xFFFFu;
+
+    // gfx_v12_0.c:3020-3022 — wptr poll addr.
+    mqd_cpu[GfxMqdOff::cp_rb_wptr_poll_addr_lo] =
+        static_cast<uint32_t>(p.wptr_gpu_addr & 0xFFFFFFFCu);
+    mqd_cpu[GfxMqdOff::cp_rb_wptr_poll_addr_hi] =
+        static_cast<uint32_t>(p.wptr_gpu_addr >> 32) & 0xFFFFu;
+
+    // gfx_v12_0.c:3025-3036 — HQD control.
+    {
+        const uint32_t rb_bufsz =
+            order_base_2_local(p.queue_size_bytes / 4u) - 1u;
+        uint32_t v = kRegCP_GFX_HQD_CNTL_DEFAULT;
+        v = REG_SET_FIELD(v, CP_GFX_HQD_CNTL, RB_BUFSZ, rb_bufsz);
+        v = REG_SET_FIELD(v, CP_GFX_HQD_CNTL, RB_BLKSZ,
+                          (rb_bufsz >= 2) ? (rb_bufsz - 2) : 0);
+        if (!p.kernel_queue) {
+            v = REG_SET_FIELD(v, CP_GFX_HQD_CNTL, RB_NON_PRIV, 1);
+        }
+        mqd_cpu[GfxMqdOff::cp_gfx_hqd_cntl] = v;
+    }
+
+    // gfx_v12_0.c:3039-3048 — doorbell.
+    {
+        uint32_t v = kRegCP_HQD_PQ_DOORBELL_CONTROL_DEFAULT;
+        if (p.use_doorbell) {
+            v = REG_SET_FIELD(v, CP_HQD_PQ_DOORBELL_CONTROL,
+                              DOORBELL_OFFSET, p.doorbell_index);
+            v = REG_SET_FIELD(v, CP_HQD_PQ_DOORBELL_CONTROL,
+                              DOORBELL_EN, 1);
+        } else {
+            v = REG_SET_FIELD(v, CP_HQD_PQ_DOORBELL_CONTROL,
+                              DOORBELL_EN, 0);
+        }
+        mqd_cpu[GfxMqdOff::cp_rb_doorbell_control] = v;
+    }
+
+    // gfx_v12_0.c:3051 — initial rptr.
+    mqd_cpu[GfxMqdOff::cp_gfx_hqd_rptr] = kRegCP_GFX_HQD_RPTR_DEFAULT;
+
+    // gfx_v12_0.c:3054 — activate.
+    mqd_cpu[GfxMqdOff::cp_gfx_hqd_active] = 1;
+
+    return kIOReturnSuccess;
+}
+
+// (gfx_gfxhub_enable_after_rlc is declared in amdgpu_gfx.h for the
+// stage handler to depend on, but its body lives in amdgpu_init.cpp
+// where BringupContext.gmc is available. Audit-7 #10.)
 
 } // namespace amdgpu

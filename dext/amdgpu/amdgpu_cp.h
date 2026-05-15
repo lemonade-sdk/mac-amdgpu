@@ -45,24 +45,94 @@ struct GMCContext;   // forward — we ask its VRAM allocator for storage
 // GC register offsets for the CP HQD registers we touch.
 // Sourced from gc_12_0_0_offset.h. Used by cp_hqd_program / cp_enable.
 namespace CPRegs {
+    // gc_12_0_0_offset.h: regCP_RB_WPTR_DELAY  = 0x0f61
+    constexpr uint32_t CP_RB_WPTR_DELAY           = 0x0F61;
+    // gc_12_0_0_offset.h: regCP_RB0_BASE = 0x1DE0
     constexpr uint32_t CP_RB0_BASE                = 0x1DE0;
     constexpr uint32_t CP_RB0_CNTL                = 0x1DE1;
     constexpr uint32_t CP_RB0_RPTR_ADDR           = 0x1DE3;
     constexpr uint32_t CP_RB0_RPTR_ADDR_HI        = 0x1DE4;
+    // gc_12_0_0_offset.h: regCP_DEVICE_ID = 0x1deb
+    constexpr uint32_t CP_DEVICE_ID               = 0x1DEB;
     constexpr uint32_t CP_RB_VMID                 = 0x1DF1;
     constexpr uint32_t CP_RB0_WPTR                = 0x1DF4;
+    // gc_12_0_0_offset.h: regCP_RB0_WPTR_HI = 0x1df5
+    constexpr uint32_t CP_RB0_WPTR_HI             = 0x1DF5;
     constexpr uint32_t CP_RB_DOORBELL_RANGE_LOWER = 0x1DFA;
     constexpr uint32_t CP_RB_DOORBELL_RANGE_UPPER = 0x1DFB;
+    // gc_12_0_0_offset.h: regCP_MEC_DOORBELL_RANGE_{LOWER,UPPER} = 0x1dfc/0x1dfd
+    constexpr uint32_t CP_MEC_DOORBELL_RANGE_LOWER = 0x1DFC;
+    constexpr uint32_t CP_MEC_DOORBELL_RANGE_UPPER = 0x1DFD;
+    // gc_12_0_0_offset.h: regCP_MAX_CONTEXT = 0x1e4e
+    constexpr uint32_t CP_MAX_CONTEXT             = 0x1E4E;
     constexpr uint32_t CP_RB0_BASE_HI             = 0x1E51;
+    // gc_12_0_0_offset.h: regCP_RB_WPTR_POLL_ADDR_LO/_HI = 0x1e8b/0x1e8c
+    constexpr uint32_t CP_RB_WPTR_POLL_ADDR_LO    = 0x1E8B;
+    constexpr uint32_t CP_RB_WPTR_POLL_ADDR_HI    = 0x1E8C;
     constexpr uint32_t CP_RB_DOORBELL_CONTROL     = 0x1E8D;
+    // gc_12_0_0_offset.h: regCP_RB_ACTIVE = 0x1f40
+    constexpr uint32_t CP_RB_ACTIVE               = 0x1F40;
     constexpr uint32_t CP_ME_CNTL                 = 0x0803;
+    // gc_12_0_0_offset.h: regCP_MEC_RS64_CNTL = 0x2904 (BASE_IDX=1, we still
+    // use single-base-table; offset is the same since IPBaseTable.get(GC) is
+    // the BASE_IDX=0 entry's value — BASE_IDX semantics covered by
+    // amdgpu_regs.h's note).
+    constexpr uint32_t CP_MEC_RS64_CNTL           = 0x2904;
 }
 
-// CP_ME_CNTL bit positions (gfx_v12_0.c REG_SET_FIELDs imply these).
-// ME_HALT lives at bit 21 in gfx12; setting 1 halts ME0, 0 runs it.
-// PFP_HALT at bit 18, MEC_HALT at bit 22 (we don't touch those here).
-constexpr uint32_t kCP_ME_CNTL__ME_HALT__SHIFT = 21;
-constexpr uint32_t kCP_ME_CNTL__ME_HALT_MASK   = (1u << 21);
+// CP_ME_CNTL bit positions per gc_12_0_0_sh_mask.h:13868-13889.
+//   PFP_HALT__SHIFT = 0x1a (26) → MASK 0x04000000
+//   ME_HALT__SHIFT  = 0x1c (28) → MASK 0x10000000
+// (Previous values for ME_HALT in this header were WRONG — fixed per
+// upstream sh_mask. Audit-7 #1.)
+#define CP_ME_CNTL__PFP_HALT__SHIFT 0x1a
+#define CP_ME_CNTL__PFP_HALT_MASK   0x04000000
+#define CP_ME_CNTL__ME_HALT__SHIFT  0x1c
+#define CP_ME_CNTL__ME_HALT_MASK    0x10000000
+
+// CP_MEC_RS64_CNTL bit positions per gc_12_0_0_sh_mask.h:15886-15909.
+#define CP_MEC_RS64_CNTL__MEC_INVALIDATE_ICACHE__SHIFT 0x4
+#define CP_MEC_RS64_CNTL__MEC_INVALIDATE_ICACHE_MASK   0x00000010
+#define CP_MEC_RS64_CNTL__MEC_PIPE0_RESET__SHIFT       0x10
+#define CP_MEC_RS64_CNTL__MEC_PIPE0_RESET_MASK         0x00010000
+#define CP_MEC_RS64_CNTL__MEC_PIPE1_RESET__SHIFT       0x11
+#define CP_MEC_RS64_CNTL__MEC_PIPE1_RESET_MASK         0x00020000
+#define CP_MEC_RS64_CNTL__MEC_PIPE2_RESET__SHIFT       0x12
+#define CP_MEC_RS64_CNTL__MEC_PIPE2_RESET_MASK         0x00040000
+#define CP_MEC_RS64_CNTL__MEC_PIPE3_RESET__SHIFT       0x13
+#define CP_MEC_RS64_CNTL__MEC_PIPE3_RESET_MASK         0x00080000
+#define CP_MEC_RS64_CNTL__MEC_PIPE0_ACTIVE__SHIFT      0x1a
+#define CP_MEC_RS64_CNTL__MEC_PIPE0_ACTIVE_MASK        0x04000000
+#define CP_MEC_RS64_CNTL__MEC_PIPE1_ACTIVE__SHIFT      0x1b
+#define CP_MEC_RS64_CNTL__MEC_PIPE1_ACTIVE_MASK        0x08000000
+#define CP_MEC_RS64_CNTL__MEC_PIPE2_ACTIVE__SHIFT      0x1c
+#define CP_MEC_RS64_CNTL__MEC_PIPE2_ACTIVE_MASK        0x10000000
+#define CP_MEC_RS64_CNTL__MEC_PIPE3_ACTIVE__SHIFT      0x1d
+#define CP_MEC_RS64_CNTL__MEC_PIPE3_ACTIVE_MASK        0x20000000
+#define CP_MEC_RS64_CNTL__MEC_HALT__SHIFT              0x1e
+#define CP_MEC_RS64_CNTL__MEC_HALT_MASK                0x40000000
+
+// CP_RB0_CNTL fields — gfx_v12_0.c:2735 writes RB_BUFSZ and RB_BLKSZ.
+#define CP_RB0_CNTL__RB_BUFSZ__SHIFT 0x0
+#define CP_RB0_CNTL__RB_BUFSZ_MASK   0x0000003F
+#define CP_RB0_CNTL__RB_BLKSZ__SHIFT 0x8
+#define CP_RB0_CNTL__RB_BLKSZ_MASK   0x00003F00
+
+// CP_RB_DOORBELL_CONTROL field shifts (upstream gfx_v12_0.c uses
+// REG_SET_FIELD on these). DOORBELL_OFFSET[27:2], DOORBELL_EN[30].
+#define CP_RB_DOORBELL_CONTROL__DOORBELL_OFFSET__SHIFT 0x2
+#define CP_RB_DOORBELL_CONTROL__DOORBELL_OFFSET_MASK   0x0FFFFFFC
+#define CP_RB_DOORBELL_CONTROL__DOORBELL_EN__SHIFT     0x1e
+#define CP_RB_DOORBELL_CONTROL__DOORBELL_EN_MASK       0x40000000
+
+// CP_RB_DOORBELL_RANGE_LOWER.DOORBELL_RANGE_LOWER + RANGE_UPPER mask.
+#define CP_RB_DOORBELL_RANGE_LOWER__DOORBELL_RANGE_LOWER__SHIFT 0x2
+#define CP_RB_DOORBELL_RANGE_LOWER__DOORBELL_RANGE_LOWER_MASK   0x0FFFFFFC
+#define CP_RB_DOORBELL_RANGE_UPPER__DOORBELL_RANGE_UPPER_MASK   0x0FFFFFFC
+
+// CP_RB_RPTR_ADDR_HI bit mask (upstream gfx_v12_0.c:2748 uses the
+// `RB_RPTR_ADDR_HI` field mask to keep only the low 16 bits).
+#define CP_RB_RPTR_ADDR_HI__RB_RPTR_ADDR_HI_MASK 0x0000FFFF
 
 // Default ring size — 4 KB matches Linux's KIQ ring default for
 // GFX12 (one page; smaller than the upstream 16 KB only because the
@@ -157,9 +227,24 @@ uint32_t cp_emit_eop_fence(CPContext &cp);
 // first PM4 we hardcode 0 inside cp_init_full).
 kern_return_t cp_hqd_program(const DeviceContext &dev, CPContext &cp);
 
-// Toggle CP_ME_CNTL.ME_HALT. After cp_enable(true) the CP can fetch
-// + execute from the GFX ring; before, the ring is dormant.
+// Toggle CP_ME_CNTL.{ME_HALT,PFP_HALT}. After cp_enable(true) the
+// CP can fetch + execute from the GFX ring; before, the ring is
+// dormant. Mirrors upstream gfx_v12_0_cp_gfx_enable
+// (gfx_v12_0.c:2332) — both halts must drop together.
 kern_return_t cp_enable(const DeviceContext &dev, bool enable);
+
+// Toggle CP_MEC_RS64_CNTL — bring all 4 MEC pipes in/out of reset
+// and active. Mirrors upstream gfx_v12_0_cp_compute_enable
+// (gfx_v12_0.c:2778).
+kern_return_t cp_compute_enable(const DeviceContext &dev, bool enable);
+
+// Program CP_RB_DOORBELL_RANGE_{LOWER,UPPER} for GFX and
+// CP_MEC_DOORBELL_RANGE_{LOWER,UPPER} for compute. Mirrors upstream
+// gfx_v12_0_cp_set_doorbell_range (gfx_v12_0.c:2954).
+kern_return_t cp_set_doorbell_range(const DeviceContext &dev,
+                                    const CPContext &cp,
+                                    uint32_t mec_first_doorbell,
+                                    uint32_t mec_last_doorbell);
 
 // Write the GFX ring's doorbell (BAR5 + doorbell_index<<3) with the
 // current software wptr. The actual register-level write goes through

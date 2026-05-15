@@ -34,6 +34,8 @@
 #include "amdgpu_mes.h"
 #include "amdgpu_gart.h"
 #include "amdgpu_discovery.h"
+#include "amdgpu_imu.h"
+#include "amdgpu_gfx.h"
 
 namespace amdgpu {
 
@@ -69,6 +71,8 @@ struct BringupContext {
     SDMAContext   sdma;
     MESContext    mes;
     GARTContext   gart;        // GART page-table state + bindings (DMA fix)
+    IMUContext    imu;         // IMU microcode-loaded gate
+    GFXConfig     gfx;         // gfx_constants_init harvest + caps
 
     BringupStage  reached;   // highest stage that completed
 };
