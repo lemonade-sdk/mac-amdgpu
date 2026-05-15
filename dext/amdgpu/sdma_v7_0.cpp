@@ -177,12 +177,14 @@ static inline uint32_t order_base_2(uint32_t x)
 }
 
 //------------------------------------------------------------------
-// sdma_gfx_resume_instance — port of sdma_v7_0_gfx_resume_instance.
+// sdma_gfx_resume_instance — port of sdma_v7_1_gfx_resume_instance
+// (sdma_v7_1.c:456-604, restore=false branch).
 //
 // Programs all the QUEUE0 registers (RB_CNTL/BASE/WPTR/RPTR/DOORBELL),
 // unhalts the engine via MCU_CNTL, enables the ring + IB queue.
 // Skipped from upstream:
 //   • SR-IOV branches (we never run SR-IOV)
+//   • __BIG_ENDIAN swap-enable fields (Apple Silicon is LE)
 //   • amdgpu_ring_test_helper (we have our own sdma_ring_test)
 //   • nbio.funcs->sdma_doorbell_range (set elsewhere when we wire
 //     up the doorbell aperture; not needed for first NOP test)
