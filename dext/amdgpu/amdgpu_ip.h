@@ -220,9 +220,13 @@ namespace BootstrapRegs {
     constexpr uint64_t kIFWITimeoutMs     = 2000;
 }
 
-constexpr uint64_t kDiscoveryTMROffset = 0x100000;   // 1 MB
+// Upstream constants from amdgpu_discovery.h:
+//     DISCOVERY_TMR_OFFSET = (64 << 10)   = 64 KB
+//     DISCOVERY_TMR_SIZE   = (10 << 10)   = 10 KB (actual binary)
+// We allocate 64 KB to round to the AS page size (16 KB) with room.
+constexpr uint64_t kDiscoveryTMROffset = 0x10000;    // 64 KB (matches upstream)
 constexpr uint32_t kDiscoveryTMRSize   = 0x10000;    // 64 KB allocation
-                                                     // (binary itself is ~10 KB)
+                                                     // (binary itself ≈ 10 KB)
 
 // **** Apple Silicon page size is 16 KB, not 4 KB. ****
 //

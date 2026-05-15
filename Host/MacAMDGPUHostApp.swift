@@ -33,6 +33,7 @@ private let kSelInitDevice:      UInt32 = 9
 private let kSelLoadFirmware:    UInt32 = 10
 private let kSelQueryInfo:       UInt32 = 21
 private let kSelGetDiagnostics:  UInt32 = 23
+private let kSelDumpTMR:         UInt32 = 24
 
 // Firmware type tags — match MacAMDGPU.cpp enum.
 private let kFwSOS:         UInt64 = 0
@@ -156,6 +157,8 @@ struct ContentView: View {
                 Spacer()
                 Button("Diagnostics") { controller.testGetDiagnostics() }
                     .help("PCI config + PM cap + IFWI + BAR0/2/5 MMIO probes.")
+                Button("Dump TMR") { controller.testDumpTMR() }
+                    .help("Read 16 dwords from VRAM at (vram_size - 1 MB) via MM_INDEX/DATA.")
                 Button("Ping") { controller.testPing() }
                 Button("Identity") { controller.testGetIdentity() }
                 Button("BARs") { controller.testGetBARInfo() }
@@ -658,6 +661,42 @@ final class DriverController: NSObject, ObservableObject,
     private static let stageOrder: [UInt64] = [
         1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 14
     ]
+
+    func testDumpTMR() {
+        guard openUserClient() else { return }
+        let (kr, out) = callScalar(kSelDumpTMR, outCount: 16)
+        if kr != KERN_SUCCESS {
+            append(String(format: "dumpTMR: kr=%#x", kr))
+            return
+        }
+        guard out.count >= 16 else {
+            append("dumpTMR: short reply (\(out.count) words)")
+            return
+        }
+        append("tmr/vram dump @ (vram_size - 1 MB), 16 dwords:")
+        for row in 0..<4 {
+            let i = row * 4
+            append(String(format:
+                "  [+%02x] %#010x %#010x %#010x %#010x",
+                i * 4,
+                UInt32(out[i]   & 0xFFFFFFFF),
+                UInt32(out[i+1] & 0xFFFFFFFF),
+                UInt32(out[i+2] & 0xFFFFFFFF),
+                UInt32(out[i+3] & 0xFFFFFFFF)))
+        }
+        // Tell the user whether this looks like discovery (signature
+        // 0x28211407 in dw0) or zeroes (PSP didn't populate).
+        let dw0 = UInt32(out[0] & 0xFFFFFFFF)
+        if dw0 == 0x28211407 {
+            append("→ valid IP-discovery signature found in VRAM")
+        } else if dw0 == 0 && out[1] == 0 && out[2] == 0 && out[3] == 0 {
+            append("→ VRAM at TMR offset is ZEROED (PSP didn't stage discovery)")
+        } else {
+            append(String(format:
+                "→ dw0=%#010x, expected signature 0x28211407 — unexpected data",
+                dw0))
+        }
+    }
 
     func testInitDeviceUpTo(_ stage: UInt64) {
         guard openUserClient() else { return }

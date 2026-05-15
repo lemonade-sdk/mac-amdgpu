@@ -67,6 +67,7 @@ enum {
     kMacAMDGPUMethodQueryInfo         = 21,
     kMacAMDGPUMethodMESAddQueue       = 22,
     kMacAMDGPUMethodGetDiagnostics    = 23,
+    kMacAMDGPUMethodDumpTMR           = 24,
 };
 
 // QueryInfo "info type" tags — input scalarInput[0]. Output shape
@@ -1010,6 +1011,50 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             ((uint64_t)bdev.bar5MemIndex << 16) |
             ((uint64_t)bdev.bar2MemIndex << 8)  |
              (uint64_t)bdev.bar0MemIndex;
+        return kIOReturnSuccess;
+    }
+
+    case kMacAMDGPUMethodDumpTMR: {
+        // Read 16 dwords (64 bytes) from VRAM at the upstream
+        // discovery TMR location: (vram_size << 20) - 1 MB. Uses
+        // mmMM_INDEX/MM_DATA to reach offsets beyond the visible
+        // BAR0 aperture. Output goes straight to scalarOutput so the
+        // host UI can see it without depending on os_log delivery.
+        if (arguments->scalarOutput == nullptr ||
+            arguments->scalarOutputCount < 16) {
+            return kIOReturnBadArgument;
+        }
+        kern_return_t openRet = mac_amdgpu_ensure_open(this, driver, pci);
+        if (openRet != kIOReturnSuccess) return openRet;
+
+        auto &bdev = driver->ivars->bringup.device;
+
+        // Read mmRCC_CONFIG_MEMSIZE (BAR5 dword 0x0DE3) for vram size in MB.
+        uint32_t vram_mb = 0;
+        pci->MemoryRead32(bdev.bar5MemIndex,
+                          (uint64_t)0x0DE3 * 4ULL, &vram_mb);
+        uint64_t vram_bytes = (uint64_t)vram_mb << 20;
+        // DISCOVERY_TMR_OFFSET is 64 KB in upstream amdgpu_discovery.h.
+        uint64_t tmr_offset = (vram_bytes > 0x10000)
+                              ? (vram_bytes - 0x10000) : 0;
+
+        auto rd_vram = [&](uint64_t pos) -> uint32_t {
+            uint32_t idx = ((uint32_t)pos) | 0x80000000u;
+            pci->MemoryWrite32(bdev.bar5MemIndex,
+                               (uint64_t)0x0 * 4ULL, idx);  // MM_INDEX
+            pci->MemoryWrite32(bdev.bar5MemIndex,
+                               (uint64_t)0x6 * 4ULL,
+                               (uint32_t)(pos >> 31));      // MM_INDEX_HI
+            uint32_t v = 0xDEADBEEFu;
+            pci->MemoryRead32(bdev.bar5MemIndex,
+                              (uint64_t)0x1 * 4ULL, &v);    // MM_DATA
+            return v;
+        };
+
+        for (int i = 0; i < 16; i++) {
+            arguments->scalarOutput[i] =
+                rd_vram(tmr_offset + (uint64_t)i * 4ULL);
+        }
         return kIOReturnSuccess;
     }
 
