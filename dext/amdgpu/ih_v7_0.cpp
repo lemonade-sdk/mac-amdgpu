@@ -229,14 +229,25 @@ ih_enable_ring(const DeviceContext &dev, IHContext &ih)
     WREG32(dev, base_reg,   (uint32_t)((ih.ring_bus >> 8) & 0xFFFFFFFFu));
     WREG32(dev, basehi_reg, (uint32_t)((ih.ring_bus >> 40) & 0xFFu));
 
-    // RB_CNTL: enable IH_DUMMY_DATA bypass-free path.
+    // RB_CNTL: mirror ih_v7_0_rb_cntl (ih_v7_0.c:187-208) +
+    // ih_v7_0_enable_ring's RPTR_REARM line (252). Field shifts
+    // taken from osssys_7_0_0_sh_mask.h.
+    //   RB_SIZE             = log2(ring_dwords)        bits[5:1]
+    //   MC_SPACE            = 2 (bus_addr)             bits[31:28]
+    //   WPTR_OVERFLOW_CLEAR = 1                        bit[31] (self-clearing)
+    //   WPTR_OVERFLOW_ENABLE= 1                        bit[16]
+    //   WPTR_WRITEBACK_ENABLE = 1                      bit[8]
+    //   MC_SNOOP            = 1                        bit[20]
+    //   RPTR_REARM          = 1 (we use MSI)           bit[21]
+    //   MC_RO / MC_VMID     = 0
     uint32_t cntl = 0;
     cntl |= (log2u32(ih.ring_size_dwords) << kIH_RB_CNTL__RB_SIZE__SHIFT);
-    cntl |= (1u << kIH_RB_CNTL__WPTR_WRITEBACK__SHIFT);
-    cntl |= (kIH_RB_CNTL_MC_SPACE_IOMMU << kIH_RB_CNTL__MC_SPACE__SHIFT);
-    cntl |= (1u << kIH_RB_CNTL__RPTR_REARM__SHIFT);
-    cntl |= (1u << kIH_RB_CNTL__MC_SNOOP__SHIFT);
+    cntl |= (kIH_RB_CNTL_MC_SPACE_BUS_ADDR << kIH_RB_CNTL__MC_SPACE__SHIFT);
+    cntl |= (1u << kIH_RB_CNTL__WPTR_OVERFLOW_CLEAR__SHIFT);
     cntl |= (1u << kIH_RB_CNTL__WPTR_OVERFLOW_ENABLE__SHIFT);
+    cntl |= (1u << kIH_RB_CNTL__WPTR_WRITEBACK_ENABLE__SHIFT);
+    cntl |= (1u << kIH_RB_CNTL__MC_SNOOP__SHIFT);
+    cntl |= (1u << kIH_RB_CNTL__RPTR_REARM__SHIFT);
     // RB_ENABLE stays 0 here; ih_toggle(true) sets it later.
     WREG32(dev, cntl_reg, cntl);
 

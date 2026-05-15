@@ -104,34 +104,49 @@ namespace IHSourceID {
 }
 
 // Register offsets (OSSSYS IP block — IHv7).
-// From drivers/gpu/drm/amd/include/asic_reg/oss/osssys_*_offset.h.
+// From drivers/gpu/drm/amd/include/asic_reg/oss/osssys_7_0_0_offset.h.
 namespace IHRegs {
-    constexpr uint32_t IH_RB_BASE                  = 0x0083;
-    constexpr uint32_t IH_RB_BASE_HI               = 0x0084;
-    constexpr uint32_t IH_RB_CNTL                  = 0x0080;
-    constexpr uint32_t IH_RB_RPTR                  = 0x0081;
-    constexpr uint32_t IH_RB_WPTR                  = 0x0082;
-    constexpr uint32_t IH_RB_WPTR_ADDR_LO          = 0x0086;
-    constexpr uint32_t IH_RB_WPTR_ADDR_HI          = 0x0085;
-    constexpr uint32_t IH_DOORBELL_RPTR            = 0x0087;
-    constexpr uint32_t IH_STORM_CLIENT_LIST_CNTL   = 0x00AA;
-    constexpr uint32_t IH_INT_FLOOD_CNTL           = 0x00AB;
-    constexpr uint32_t IH_MSI_STORM_CTRL           = 0x00AC;
+    constexpr uint32_t IH_RB_CNTL                  = 0x0080; // line 112
+    constexpr uint32_t IH_RB_RPTR                  = 0x0081; // line 114
+    constexpr uint32_t IH_RB_WPTR                  = 0x0082; // line 116
+    constexpr uint32_t IH_RB_BASE                  = 0x0083; // line 118
+    constexpr uint32_t IH_RB_BASE_HI               = 0x0084; // line 120
+    constexpr uint32_t IH_RB_WPTR_ADDR_HI          = 0x0085; // line 122
+    constexpr uint32_t IH_RB_WPTR_ADDR_LO          = 0x0086; // line 124
+    constexpr uint32_t IH_DOORBELL_RPTR            = 0x0087; // line 126
+    constexpr uint32_t IH_STORM_CLIENT_LIST_CNTL   = 0x00aa; // line 150
+    constexpr uint32_t IH_INT_FLOOD_CNTL           = 0x00d5; // line 192
+    constexpr uint32_t IH_MSI_STORM_CTRL           = 0x00f1; // line 222
+    constexpr uint32_t IH_CHICKEN                  = 0x018a; // line 262
 }
 
-// IH_RB_CNTL bit positions (from upstream IH_RB_CNTL field defs).
-constexpr uint32_t kIH_RB_CNTL__RB_ENABLE__SHIFT       = 0;
-constexpr uint32_t kIH_RB_CNTL__RB_SIZE__SHIFT         = 1;
-constexpr uint32_t kIH_RB_CNTL__WPTR_WRITEBACK__SHIFT  = 8;
-constexpr uint32_t kIH_RB_CNTL__ENABLE_INTR__SHIFT     = 0;   // not the same; alias
-constexpr uint32_t kIH_RB_CNTL__MC_SPACE__SHIFT        = 13;
-constexpr uint32_t kIH_RB_CNTL__RPTR_REARM__SHIFT      = 4;
-constexpr uint32_t kIH_RB_CNTL__MC_SNOOP__SHIFT        = 16;
-constexpr uint32_t kIH_RB_CNTL__WPTR_OVERFLOW_ENABLE__SHIFT = 7;
-constexpr uint32_t kIH_RB_CNTL__WPTR_OVERFLOW_CLEAR__SHIFT  = 31;
+// IH_RB_CNTL bit positions per osssys_7_0_0_sh_mask.h lines 170-185.
+constexpr uint32_t kIH_RB_CNTL__RB_ENABLE__SHIFT             = 0x00; // line 170
+constexpr uint32_t kIH_RB_CNTL__RB_SIZE__SHIFT               = 0x01; // line 171
+constexpr uint32_t kIH_RB_CNTL__WPTR_WRITEBACK_ENABLE__SHIFT = 0x08; // line 172
+constexpr uint32_t kIH_RB_CNTL__RB_FULL_DRAIN_ENABLE__SHIFT  = 0x09; // line 173
+constexpr uint32_t kIH_RB_CNTL__WPTR_OVERFLOW_ENABLE__SHIFT  = 0x10; // line 177
+constexpr uint32_t kIH_RB_CNTL__ENABLE_INTR__SHIFT           = 0x11; // line 178
+constexpr uint32_t kIH_RB_CNTL__MC_SWAP__SHIFT               = 0x12; // line 179
+constexpr uint32_t kIH_RB_CNTL__MC_SNOOP__SHIFT              = 0x14; // line 180
+constexpr uint32_t kIH_RB_CNTL__RPTR_REARM__SHIFT            = 0x15; // line 181
+constexpr uint32_t kIH_RB_CNTL__MC_RO__SHIFT                 = 0x16; // line 182
+constexpr uint32_t kIH_RB_CNTL__MC_VMID__SHIFT               = 0x18; // line 183
+constexpr uint32_t kIH_RB_CNTL__MC_SPACE__SHIFT              = 0x1c; // line 184
+constexpr uint32_t kIH_RB_CNTL__WPTR_OVERFLOW_CLEAR__SHIFT   = 0x1f; // line 185
 
-// MC_SPACE values: 0 = invalid, 1 = MC, 2 = MC translated, 4 = IOMMU
-constexpr uint32_t kIH_RB_CNTL_MC_SPACE_IOMMU = 4;
+// IH_RB_WPTR fields (osssys_7_0_0_sh_mask.h:206-207). The HW puts
+// the overflow flag in bit 0 of IH_RB_WPTR — NOT bit 31 of either
+// IH_RB_WPTR or IH_RB_CNTL.
+constexpr uint32_t kIH_RB_WPTR__RB_OVERFLOW__SHIFT           = 0x00; // line 206
+constexpr uint32_t kIH_RB_WPTR__OFFSET__SHIFT                = 0x02; // line 207
+
+// MC_SPACE values (ih_v7_0.c:192): 2 = bus_addr / sysmem ring,
+// 4 = GPUVA. We always run with use_bus_addr=true on AS so the IH
+// ring is DART-mapped sysmem and the engine should treat the
+// programmed RB_BASE as a system bus address.
+constexpr uint32_t kIH_RB_CNTL_MC_SPACE_BUS_ADDR = 2;
+constexpr uint32_t kIH_RB_CNTL_MC_SPACE_GPUVA    = 4;
 
 //
 // API
