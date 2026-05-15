@@ -270,24 +270,42 @@ ih_enable_ring(const DeviceContext &dev, IHContext &ih)
 
 // ----- ih_program_msi_storm: storm/flood control -----
 //
-// Mirrors the upstream MSI storm config — throttle MSI delivery to
-// avoid VM-fault storms melting the host. Linux default DELAY=3.
+// Mirrors ih_v7_0.c:353-370 — read-modify-write each register and
+// set just one field per the upstream sequence. Field shifts come
+// from osssys_7_0_0_sh_mask.h.
 kern_return_t
 ih_program_msi_storm(const DeviceContext &dev, const IHContext &ih)
 {
     (void)ih;
     if (!dev.ip.isResolved(IPBlock::OSSSYS)) return kIOReturnNotReady;
-    // IH_MSI_STORM_CTRL: bits [1:0] = DELAY (3 = max throttle)
-    WREG32(dev, SOC15_REG_OFFSET(dev, IPBlock::OSSSYS,
-                                 IHRegs::IH_MSI_STORM_CTRL), 0x3);
-    // IH_INT_FLOOD_CNTL: leave at default (Linux writes 0; just clear it)
-    WREG32(dev, SOC15_REG_OFFSET(dev, IPBlock::OSSSYS,
-                                 IHRegs::IH_INT_FLOOD_CNTL), 0);
-    // IH_STORM_CLIENT_LIST_CNTL: enable storm protection for client 18
-    // (matches upstream default; bit-position derivation in upstream).
-    WREG32(dev, SOC15_REG_OFFSET(dev, IPBlock::OSSSYS,
-                                 IHRegs::IH_STORM_CLIENT_LIST_CNTL),
-           (1u << 18));
+
+    // IH_STORM_CLIENT_LIST_CNTL: set CLIENT18_IS_STORM_CLIENT = 1
+    // (ih_v7_0.c:353-356).
+    const uint32_t storm_reg =
+        SOC15_REG_OFFSET(dev, IPBlock::OSSSYS,
+                         IHRegs::IH_STORM_CLIENT_LIST_CNTL);
+    uint32_t storm = RREG32(dev, storm_reg);
+    storm |= (1u << kIH_STORM_CLIENT_LIST_CNTL__CLIENT18_IS_STORM_CLIENT__SHIFT);
+    WREG32(dev, storm_reg, storm);
+
+    // IH_INT_FLOOD_CNTL: FLOOD_CNTL_ENABLE = 1 (ih_v7_0.c:358-360).
+    const uint32_t flood_reg =
+        SOC15_REG_OFFSET(dev, IPBlock::OSSSYS,
+                         IHRegs::IH_INT_FLOOD_CNTL);
+    uint32_t flood = RREG32(dev, flood_reg);
+    flood |= (1u << kIH_INT_FLOOD_CNTL__FLOOD_CNTL_ENABLE__SHIFT);
+    WREG32(dev, flood_reg, flood);
+
+    // IH_MSI_STORM_CTRL: DELAY = 3 (ih_v7_0.c:367-370).
+    const uint32_t msi_reg =
+        SOC15_REG_OFFSET(dev, IPBlock::OSSSYS,
+                         IHRegs::IH_MSI_STORM_CTRL);
+    uint32_t msi = RREG32(dev, msi_reg);
+    // DELAY is a 2-bit field at [1:0] per sh_mask:
+    //   #define IH_MSI_STORM_CTRL__DELAY_MASK 0x3
+    msi = (msi & ~0x3u)
+        | (3u << kIH_MSI_STORM_CTRL__DELAY__SHIFT);
+    WREG32(dev, msi_reg, msi);
     return kIOReturnSuccess;
 }
 

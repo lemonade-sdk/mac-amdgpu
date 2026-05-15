@@ -145,6 +145,11 @@ constexpr uint32_t kIH_RB_CNTL__WPTR_OVERFLOW_CLEAR__SHIFT   = 0x1f; // line 185
 constexpr uint32_t kIH_RB_WPTR__RB_OVERFLOW__SHIFT           = 0x00; // line 206
 constexpr uint32_t kIH_RB_WPTR__OFFSET__SHIFT                = 0x02; // line 207
 
+// Storm / flood / MSI throttle field shifts.
+constexpr uint32_t kIH_STORM_CLIENT_LIST_CNTL__CLIENT18_IS_STORM_CLIENT__SHIFT = 0x12; // line 342
+constexpr uint32_t kIH_INT_FLOOD_CNTL__FLOOD_CNTL_ENABLE__SHIFT                = 0x03; // line 583
+constexpr uint32_t kIH_MSI_STORM_CTRL__DELAY__SHIFT                            = 0x00; // line 855
+
 // MC_SPACE values (ih_v7_0.c:192): 2 = bus_addr / sysmem ring,
 // 4 = GPUVA. We always run with use_bus_addr=true on AS so the IH
 // ring is DART-mapped sysmem and the engine should treat the
