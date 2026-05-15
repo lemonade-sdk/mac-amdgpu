@@ -223,15 +223,13 @@ cp_emit_eop_fence(CPContext &cp)
 
 // ----- cp_hqd_program: write CP_RB0_* registers -----
 //
-// Mirrors gfx_v12_0_cp_gfx_resume (drivers/gpu/drm/amd/amdgpu/
-// gfx_v12_0.c). On a fresh device the HQD registers are at reset
-// defaults; this routine programs them to match our ring buffer
-// location, size, and doorbell mapping so subsequent doorbell
-// rings cause the CP to fetch + execute our PM4.
-//
-// Skips per-pipe GRBM_GFX_INDEX selection — we use the default
-// pipe (RB0). Caller is responsible for taking the SRBM mutex if
-// multi-context safety is required (Phase 2 concern).
+// Mirrors gfx_v12_0_cp_gfx_resume (gfx_v12_0.c:2715) line-by-line —
+// the writes happen in upstream's exact order. Audit-7 #3 added the
+// missing fields: CP_RB_WPTR_DELAY, CP_RB0_WPTR_HI,
+// CP_RB_WPTR_POLL_ADDR_{LO,HI}, CP_RB_ACTIVE=1, CP_MAX_CONTEXT,
+// CP_DEVICE_ID=1, and the per-pipe GRBM_GFX_CNTL select that picks
+// PIPE_ID0 (cp_gfx_switch_pipe). The RB_BUFSZ encoding also follows
+// upstream: log2(ring_size_bytes/8), with RB_BLKSZ = BUFSZ - 2.
 kern_return_t
 cp_hqd_program(const DeviceContext &dev, CPContext &cp)
 {
@@ -242,69 +240,254 @@ cp_hqd_program(const DeviceContext &dev, CPContext &cp)
         return SOC15_REG_OFFSET(dev, IPBlock::GC, off);
     };
 
-    // Ring physical base — register holds bits [39:8] (256 B granularity).
-    WREG32(dev, reg(CPRegs::CP_RB0_BASE),
-           static_cast<uint32_t>(cp.ring_bus >> 8));
-    WREG32(dev, reg(CPRegs::CP_RB0_BASE_HI),
-           static_cast<uint32_t>(cp.ring_bus >> 40));
+    // gfx_v12_0.c:2723 — CP_RB_WPTR_DELAY = 0.
+    WREG32(dev, reg(CPRegs::CP_RB_WPTR_DELAY), 0);
 
-    // CP_RB0_CNTL: RB_BUFSZ = log2(ring_dwords) - 1 (per upstream
-    // order_base_2(ring_size_bytes/8) where ring_size is bytes).
-    // For 16 KB ring = 4096 dwords, BUFSZ = log2(4096/2) = 11.
-    // (Upstream encodes "log2(elements) - 1" where element = 8 bytes.)
-    uint32_t buf_log2 = 0;
-    {
-        uint32_t v = cp.ring_size_dwords / 2;  // upstream divides by 2
-        while (v >>= 1) buf_log2++;
-    }
-    uint32_t cntl = (buf_log2 & 0x3F) | ((8u & 0x3F) << 8);  // BUFSZ + BLKSZ=8
-    WREG32(dev, reg(CPRegs::CP_RB0_CNTL), cntl);
-
-    // VMID 0 — all kernel-driver submits use system VMID for now.
+    // gfx_v12_0.c:2726 — CP_RB_VMID = 0.
     WREG32(dev, reg(CPRegs::CP_RB_VMID), 0);
 
-    // Reset wptr to 0 (CP echoes; we also update software state).
-    WREG32(dev, reg(CPRegs::CP_RB0_WPTR), 0);
+    // gfx_v12_0.c:2730 — cp_gfx_switch_pipe(adev, PIPE_ID0): write
+    // GRBM_GFX_CNTL.PIPEID = 0. PIPEID field is bits [1:0]; we only
+    // change PIPEID and leave other fields at their current values.
+    // Use REG_SET_FIELD with the GRBM_GFX_CNTL field defs from
+    // amdgpu_mes.h's MES_REG block (single canonical layout for the
+    // GRBM select register).
+    {
+        const uint32_t grbm_reg = reg(GFXRegs::GRBM_GFX_CNTL);
+        uint32_t v = RREG32(dev, grbm_reg);
+        v = REG_SET_FIELD(v, GRBM_GFX_CNTL, PIPEID, 0);
+        WREG32(dev, grbm_reg, v);
+    }
+
+    // gfx_v12_0.c:2734-2737 — RB_BUFSZ = order_base_2(ring_size/8);
+    // RB_BLKSZ = BUFSZ - 2. ring_size is in BYTES upstream; ours
+    // tracked in dwords, so ring_size_bytes = ring_size_dwords * 4.
+    // order_base_2(N) = ceil(log2(N)).
+    auto order_base_2 = [](uint32_t x) -> uint32_t {
+        uint32_t r = 0;
+        while ((1u << r) < x) r++;
+        return r;
+    };
+    const uint32_t rb_bufsz = order_base_2(cp.ring_size_dwords * 4u / 8u);
+    {
+        uint32_t tmp = 0;
+        tmp = REG_SET_FIELD(tmp, CP_RB0_CNTL, RB_BUFSZ, rb_bufsz);
+        tmp = REG_SET_FIELD(tmp, CP_RB0_CNTL, RB_BLKSZ,
+                            (rb_bufsz >= 2) ? (rb_bufsz - 2) : 0);
+        WREG32(dev, reg(CPRegs::CP_RB0_CNTL), tmp);
+    }
+
+    // gfx_v12_0.c:2741-2742 — initialize wptr lo + hi to 0.
     cp.wptr = 0;
     *cp.wptr_cpu = 0;
     *cp.rptr_cpu = 0;
     *cp.fence_cpu = 0;
+    WREG32(dev, reg(CPRegs::CP_RB0_WPTR),    0);
+    WREG32(dev, reg(CPRegs::CP_RB0_WPTR_HI), 0);
 
-    // RPTR write-back address — GPU writes its current read pointer
-    // into our WB page at this offset so the CPU can poll it without
-    // hitting MMIO.
+    // gfx_v12_0.c:2746-2748 — RPTR write-back address. The HI write
+    // upstream masks to RB_RPTR_ADDR_HI_MASK.
     WREG32(dev, reg(CPRegs::CP_RB0_RPTR_ADDR),
            static_cast<uint32_t>(cp.rptr_gpu_addr & 0xFFFFFFFCu));
     WREG32(dev, reg(CPRegs::CP_RB0_RPTR_ADDR_HI),
-           static_cast<uint32_t>(cp.rptr_gpu_addr >> 32));
+           static_cast<uint32_t>(cp.rptr_gpu_addr >> 32) &
+           CP_RB_RPTR_ADDR_HI__RB_RPTR_ADDR_HI_MASK);
 
-    // Doorbell control — index << 2 per upstream encoding, plus
-    // doorbell-enable bit (we set bit 30 to enable the doorbell).
-    constexpr uint32_t kDoorbellEnable = (1u << 30);
-    WREG32(dev, reg(CPRegs::CP_RB_DOORBELL_CONTROL),
-           kDoorbellEnable | ((cp.doorbell_index & 0xFFFFFF) << 2));
-    WREG32(dev, reg(CPRegs::CP_RB_DOORBELL_RANGE_LOWER),
-           (cp.doorbell_index & 0xFFFFFF) << 2);
-    WREG32(dev, reg(CPRegs::CP_RB_DOORBELL_RANGE_UPPER),
-           ((cp.doorbell_index + 1) & 0xFFFFFF) << 2);
+    // gfx_v12_0.c:2751-2754 — WPTR poll address pair. Required for
+    // wptr-poll-driven CP rings; missing in our previous implementation.
+    // Audit-7 #3.
+    WREG32(dev, reg(CPRegs::CP_RB_WPTR_POLL_ADDR_LO),
+           static_cast<uint32_t>(cp.wptr_gpu_addr));
+    WREG32(dev, reg(CPRegs::CP_RB_WPTR_POLL_ADDR_HI),
+           static_cast<uint32_t>(cp.wptr_gpu_addr >> 32));
+
+    // gfx_v12_0.c:2756 — mdelay(1) before re-writing CP_RB0_CNTL.
+    // Upstream literally writes the same value twice with a 1 ms gap
+    // — there's a CP-internal latch that requires the redundant write.
+    IOSleep(1);
+    {
+        uint32_t tmp = 0;
+        tmp = REG_SET_FIELD(tmp, CP_RB0_CNTL, RB_BUFSZ, rb_bufsz);
+        tmp = REG_SET_FIELD(tmp, CP_RB0_CNTL, RB_BLKSZ,
+                            (rb_bufsz >= 2) ? (rb_bufsz - 2) : 0);
+        WREG32(dev, reg(CPRegs::CP_RB0_CNTL), tmp);
+    }
+
+    // gfx_v12_0.c:2759-2761 — ring base, low + high.
+    {
+        const uint64_t rb_addr = cp.ring_bus >> 8;
+        WREG32(dev, reg(CPRegs::CP_RB0_BASE),
+               static_cast<uint32_t>(rb_addr));
+        WREG32(dev, reg(CPRegs::CP_RB0_BASE_HI),
+               static_cast<uint32_t>(rb_addr >> 32));
+    }
+
+    // gfx_v12_0.c:2763 — CP_RB_ACTIVE = 1.  Audit-7 #3.
+    WREG32(dev, reg(CPRegs::CP_RB_ACTIVE), 1);
+
+    // gfx_v12_0.c:2690-2712 — cp_gfx_set_doorbell. Doorbell control +
+    // range registers. Mirrors upstream's REG_SET_FIELD pattern.
+    {
+        const uint32_t db_reg = reg(CPRegs::CP_RB_DOORBELL_CONTROL);
+        uint32_t v = RREG32(dev, db_reg);
+        v = REG_SET_FIELD(v, CP_RB_DOORBELL_CONTROL, DOORBELL_OFFSET,
+                          cp.doorbell_index);
+        v = REG_SET_FIELD(v, CP_RB_DOORBELL_CONTROL, DOORBELL_EN, 1);
+        WREG32(dev, db_reg, v);
+
+        uint32_t lower = 0;
+        lower = REG_SET_FIELD(lower, CP_RB_DOORBELL_RANGE_LOWER,
+                              DOORBELL_RANGE_LOWER, cp.doorbell_index);
+        WREG32(dev, reg(CPRegs::CP_RB_DOORBELL_RANGE_LOWER), lower);
+        // Upstream writes the full mask to RANGE_UPPER — accept any
+        // doorbell index in our window.
+        WREG32(dev, reg(CPRegs::CP_RB_DOORBELL_RANGE_UPPER),
+               CP_RB_DOORBELL_RANGE_UPPER__DOORBELL_RANGE_UPPER_MASK);
+    }
+
+    // gfx_v12_0.c:2770 — switch to PIPE_ID0 (second switch — the
+    // start/stop pattern; upstream brackets cp_gfx_start with two
+    // switches even though they're idempotent for PIPE_ID0).
+    {
+        const uint32_t grbm_reg = reg(GFXRegs::GRBM_GFX_CNTL);
+        uint32_t v = RREG32(dev, grbm_reg);
+        v = REG_SET_FIELD(v, GRBM_GFX_CNTL, PIPEID, 0);
+        WREG32(dev, grbm_reg, v);
+    }
+
+    // gfx_v12_0.c:2669-2671 — cp_gfx_start. CP_MAX_CONTEXT and
+    // CP_DEVICE_ID. Upstream uses adev->gfx.config.max_hw_contexts - 1;
+    // GFX12 hardcodes max_hw_contexts = 8 in gfx_v12_0_gpu_early_init,
+    // so the field value is 7. CP_DEVICE_ID = 1 per upstream.
+    // Audit-7 #3.
+    WREG32(dev, reg(CPRegs::CP_MAX_CONTEXT), 8u - 1u);
+    WREG32(dev, reg(CPRegs::CP_DEVICE_ID),  1);
 
     CP_LOG("HQD programmed: ring_bus=%#llx bufsz=%u doorbell=%u",
-           cp.ring_bus, buf_log2, cp.doorbell_index);
+           cp.ring_bus, rb_bufsz, cp.doorbell_index);
     return kIOReturnSuccess;
 }
 
-// ----- cp_enable: toggle CP_ME_CNTL.ME_HALT -----
+// ----- cp_compute_enable: program CP_MEC_RS64_CNTL -----
+//
+// Direct port of gfx_v12_0_cp_compute_enable (gfx_v12_0.c:2778).
+// Brings the MEC out of reset by clearing PIPE{0..3}_RESET and
+// MEC_INVALIDATE_ICACHE, then sets PIPE{0..3}_ACTIVE and clears
+// MEC_HALT. Disable path inverts all bits.
+//
+// Audit-7 #2 — without this, MEC pipes stay in reset and any compute
+// queue (KCQ / KIQ if not MES-driven) goes nowhere.
+kern_return_t
+cp_compute_enable(const DeviceContext &dev, bool enable)
+{
+    if (!dev.ip.isResolved(IPBlock::GC)) return kIOReturnNotReady;
+    const uint32_t r =
+        SOC15_REG_OFFSET(dev, IPBlock::GC, CPRegs::CP_MEC_RS64_CNTL);
+
+    // gfx_v12_0.c:2782-2803 — full RMW for every field.
+    uint32_t data = RREG32(dev, r);
+    data = REG_SET_FIELD(data, CP_MEC_RS64_CNTL, MEC_INVALIDATE_ICACHE,
+                         enable ? 0 : 1);
+    data = REG_SET_FIELD(data, CP_MEC_RS64_CNTL, MEC_PIPE0_RESET,
+                         enable ? 0 : 1);
+    data = REG_SET_FIELD(data, CP_MEC_RS64_CNTL, MEC_PIPE1_RESET,
+                         enable ? 0 : 1);
+    data = REG_SET_FIELD(data, CP_MEC_RS64_CNTL, MEC_PIPE2_RESET,
+                         enable ? 0 : 1);
+    data = REG_SET_FIELD(data, CP_MEC_RS64_CNTL, MEC_PIPE3_RESET,
+                         enable ? 0 : 1);
+    data = REG_SET_FIELD(data, CP_MEC_RS64_CNTL, MEC_PIPE0_ACTIVE,
+                         enable ? 1 : 0);
+    data = REG_SET_FIELD(data, CP_MEC_RS64_CNTL, MEC_PIPE1_ACTIVE,
+                         enable ? 1 : 0);
+    data = REG_SET_FIELD(data, CP_MEC_RS64_CNTL, MEC_PIPE2_ACTIVE,
+                         enable ? 1 : 0);
+    data = REG_SET_FIELD(data, CP_MEC_RS64_CNTL, MEC_PIPE3_ACTIVE,
+                         enable ? 1 : 0);
+    data = REG_SET_FIELD(data, CP_MEC_RS64_CNTL, MEC_HALT,
+                         enable ? 0 : 1);
+    WREG32(dev, r, data);
+
+    // gfx_v12_0.c:2807 — short settling delay so MEC sees the
+    // write before any queue programming follows.
+    IOSleep(1);  // upstream uses udelay(50); IOSleep(1) is the
+                 // coarsest granularity available in DriverKit.
+
+    CP_LOG("CP_MEC_RS64_CNTL %s: value=%#010x",
+           enable ? "enabled (MEC running)" : "disabled (MEC halted)",
+           data);
+    return kIOReturnSuccess;
+}
+
+// ----- cp_set_doorbell_range: program GFX + MEC doorbell windows -----
+//
+// Direct port of gfx_v12_0_cp_set_doorbell_range (gfx_v12_0.c:2954).
+// Both ranges accept any in-window doorbell. We pick conservative
+// caller-set bounds: GFX gets [cp.doorbell_index, cp.doorbell_index+1)
+// (one slot); MEC (compute) gets the full 0..0xFFFFFFFC window so
+// MES-assigned compute doorbells fall inside it.
+//
+// Audit-7 #4 — without CP_MEC_DOORBELL_RANGE_*, compute queues built
+// via MES SET_HW_RESOURCES (or KIQ MAP_QUEUES) will be rejected by
+// the CP doorbell aperture filter and never wake up the MEC.
+kern_return_t
+cp_set_doorbell_range(const DeviceContext &dev, const CPContext &cp,
+                      uint32_t mec_first_doorbell,
+                      uint32_t mec_last_doorbell)
+{
+    if (!dev.ip.isResolved(IPBlock::GC)) return kIOReturnNotReady;
+    auto reg = [&](uint32_t off) {
+        return SOC15_REG_OFFSET(dev, IPBlock::GC, off);
+    };
+
+    // gfx_v12_0.c:2957-2960 — GFX ring window. Upstream encodes the
+    // doorbell index as `(idx * 2) << 2` (GFX12 8-byte doorbell
+    // stride × shift-into-DOORBELL_RANGE_LOWER field). Total
+    // multiplier: × 8 (byte offset). Same formula for the MEC.
+    WREG32(dev, reg(CPRegs::CP_RB_DOORBELL_RANGE_LOWER),
+           (cp.doorbell_index * 2u) << 2);
+    WREG32(dev, reg(CPRegs::CP_RB_DOORBELL_RANGE_UPPER),
+           ((cp.doorbell_index + 1u) * 2u) << 2);
+
+    // gfx_v12_0.c:2963-2966 — MEC window. Same encoding as GFX
+    // (× 8 byte offset).  Audit-7 #4.
+    WREG32(dev, reg(CPRegs::CP_MEC_DOORBELL_RANGE_LOWER),
+           (mec_first_doorbell * 2u) << 2);
+    WREG32(dev, reg(CPRegs::CP_MEC_DOORBELL_RANGE_UPPER),
+           (mec_last_doorbell  * 2u) << 2);
+
+    CP_LOG("doorbell ranges: GFX=[%u..%u] MEC=[%u..%u]",
+           cp.doorbell_index, cp.doorbell_index + 1u,
+           mec_first_doorbell, mec_last_doorbell);
+    return kIOReturnSuccess;
+}
+
+// ----- cp_enable: toggle CP_ME_CNTL.{ME_HALT,PFP_HALT} -----
+//
+// Direct port of gfx_v12_0_cp_gfx_enable (gfx_v12_0.c:2332).
+// Both PFP and ME halts must drop together — clearing only ME_HALT
+// leaves PFP_HALT set, so the PFP never fetches packets into the ME's
+// queue and ME_HALT=0 looks active but the ring is dead.
+//
+// Audit-7 #1 — previously this routine cleared only ME_HALT_MASK,
+// which is also at the wrong bit position. Now matches upstream
+// REG_SET_FIELD pattern, with bit positions sourced from
+// gc_12_0_0_sh_mask.h: PFP_HALT=0x1a, ME_HALT=0x1c.
 kern_return_t
 cp_enable(const DeviceContext &dev, bool enable)
 {
     if (!dev.ip.isResolved(IPBlock::GC)) return kIOReturnNotReady;
     const uint32_t r = SOC15_REG_OFFSET(dev, IPBlock::GC, CPRegs::CP_ME_CNTL);
-    uint32_t v = RREG32(dev, r);
-    if (enable) v &= ~kCP_ME_CNTL__ME_HALT_MASK;   // halt=0 → running
-    else        v |=  kCP_ME_CNTL__ME_HALT_MASK;
-    WREG32(dev, r, v);
-    CP_LOG("CP ME_HALT %s (CP_ME_CNTL=%#010x)",
-           enable ? "cleared (CP running)" : "set (CP halted)", v);
+
+    // gfx_v12_0.c:2335-2339 — RMW.
+    uint32_t tmp = RREG32(dev, r);
+    tmp = REG_SET_FIELD(tmp, CP_ME_CNTL, ME_HALT,  enable ? 0 : 1);
+    tmp = REG_SET_FIELD(tmp, CP_ME_CNTL, PFP_HALT, enable ? 0 : 1);
+    WREG32(dev, r, tmp);
+
+    CP_LOG("CP_ME_CNTL %s (ME_HALT=%u PFP_HALT=%u, value=%#010x)",
+           enable ? "running" : "halted",
+           enable ? 0u : 1u, enable ? 0u : 1u, tmp);
     return kIOReturnSuccess;
 }
 
@@ -358,6 +541,10 @@ cp_submit_eop_test(const DeviceContext &dev, CPContext &cp,
 }
 
 // ----- cp_init_full: BringupStage::CPInit entry -----
+//
+// Mirrors gfx_v12_0_cp_resume (gfx_v12_0.c:3484) for the PSP-load
+// path, with the legacy-direct-load branches stripped (PSP autoload
+// chains the firmware itself).
 kern_return_t
 cp_init_full(DeviceContext &dev, GMCContext &gmc, CPContext &cp)
 {
@@ -376,22 +563,47 @@ cp_init_full(DeviceContext &dev, GMCContext &gmc, CPContext &cp)
         return kIOReturnSuccess;
     }
 
-    // Halt CP while we reprogram registers (safety, matches upstream).
+    // gfx_v12_0_cp_resume:3490 — halt + halt-compute first. Matches
+    // upstream's idle-before-program pattern (audit-7 #1 and #2).
     cp_enable(dev, false);
+    cp_compute_enable(dev, false);
 
     // GFX top-level constants (GRBM_CNTL.READ_TIMEOUT, SH_MEM_CONFIG)
     // must be programmed before the CP starts fetching from the ring.
+    // Upstream calls gfx_v12_0_constants_init in hw_init before
+    // cp_resume; we still call it here to keep CPInit self-contained.
     r = gfx_constants_init(dev);
     if (r != kIOReturnSuccess) {
         CP_LOG("gfx_constants_init failed: %#x", r);
         return r;
     }
 
+    // gfx_v12_0_cp_resume:3503 — cp_set_doorbell_range BEFORE
+    // KIQ/KCQ/MES resume. We default MEC window to [0x10, 0x100) to
+    // cover the MES SCHED + KIQ + KFD-style compute doorbells we
+    // hand out later. (cp_v12_0 only owns RB0; MES code owns the
+    // compute slots so picks the actual mec doorbell map.)
+    r = cp_set_doorbell_range(dev, cp,
+                              /*mec_first_doorbell=*/0x10,
+                              /*mec_last_doorbell =*/0x100);
+    if (r != kIOReturnSuccess) {
+        CP_LOG("cp_set_doorbell_range failed: %#x", r);
+        return r;
+    }
+
+    // Program the GFX HQD (cp_gfx_resume) — upstream gfx_v12_0.c:3522.
     r = cp_hqd_program(dev, cp);
     if (r != kIOReturnSuccess) return r;
-    cp_enable(dev, true);
 
-    CP_LOG("CP ready: GFX ring active at doorbell %u", cp.doorbell_index);
+    // gfx_v12_0_cp_resume implicitly enables CP via cp_gfx_start
+    // (gfx_v12_0.c:2674) which calls cp_gfx_enable. We do the same
+    // here: bring ME + PFP out of halt, plus the compute MEC pipes
+    // (audit-7 #2).
+    cp_enable(dev, true);
+    cp_compute_enable(dev, true);
+
+    CP_LOG("CP ready: GFX ring active at doorbell %u, MEC pipes active",
+           cp.doorbell_index);
     return kIOReturnSuccess;
 }
 

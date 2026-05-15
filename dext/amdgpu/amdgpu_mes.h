@@ -95,13 +95,41 @@ namespace MESRegs {
     constexpr uint32_t CP_MQD_CONTROL               = 0x1fcb;
     // Aggregated doorbell + GFX gate registers.
     constexpr uint32_t CP_HQD_GFX_CONTROL           = 0x1e9f;
+    // gc_12_0_0_offset.h: regCP_UNMAPPED_DOORBELL = 0x0880 (BASE_IDX=1).
+    // mes_v12_0.c:867 reads/writes this to enable unmapped doorbell
+    // handling so MES sees doorbell writes to queues it hasn't yet
+    // mapped (the KFD-style "any process can ring any doorbell" model).
     constexpr uint32_t CP_UNMAPPED_DOORBELL         = 0x0880;
     constexpr uint32_t CP_MES_DOORBELL_CONTROL1     = 0x283c;
     constexpr uint32_t CP_MES_DOORBELL_CONTROL2     = 0x283d;
     constexpr uint32_t CP_MES_DOORBELL_CONTROL3     = 0x283e;
     constexpr uint32_t CP_MES_DOORBELL_CONTROL4     = 0x283f;
     constexpr uint32_t CP_MES_DOORBELL_CONTROL5     = 0x2840;
+    // gc_12_0_0_offset.h: regRLC_CP_SCHEDULERS = 0x098a.
+    // Written by mes_v12_0_kiq_setting (mes_v12_0.c:1728) to tell RLC
+    // which CP queue is the KIQ — required before MES can serve as
+    // the kernel-interface queue manager.
+    constexpr uint32_t RLC_CP_SCHEDULERS            = 0x098A;
+    // gc_12_0_0_offset.h: regCP_MES_MSCRATCH_HI/_LO = 0x2814/0x2815.
+    // Written by mes_v12_0_enable (mes_v12_0.c:1100) when MES event
+    // logging is on — provides MES with a buffer for its scratch
+    // ring. Optional but harmless if event_log_size is 0; we wire it
+    // up to a static pair of zero values so the registers aren't left
+    // at reset garbage.
+    constexpr uint32_t CP_MES_MSCRATCH_LO_OFFSET    = 0x2815;
+    constexpr uint32_t CP_MES_MSCRATCH_HI_OFFSET    = 0x2814;
+    // gc_12_0_0_offset.h: regCP_MES_GP3_LO = 0x2849.  MES copies its
+    // version into this register at queue-init time; mes_v12_0.c:1506
+    // reads it from CP_MES_GP3_LO into adev->mes.sched_version after
+    // mes_v12_0_queue_init.
+    constexpr uint32_t CP_MES_GP3_LO                = 0x2849;
 }
+
+// CP_UNMAPPED_DOORBELL fields per gc_12_0_0_sh_mask.h:14084-14093.
+#define CP_UNMAPPED_DOORBELL__ENABLE__SHIFT          0x0
+#define CP_UNMAPPED_DOORBELL__ENABLE_MASK            0x00000001
+#define CP_UNMAPPED_DOORBELL__PROC_LSB__SHIFT        0x8
+#define CP_UNMAPPED_DOORBELL__PROC_LSB_MASK          0x00001F00
 
 // CP_MES_DOORBELL_CONTROL1..5 share the same field layout —
 // DOORBELL_OFFSET[27:2], DOORBELL_EN[30], DOORBELL_HIT[31].
@@ -169,6 +197,9 @@ constexpr uint32_t kCP_HQD_EOP_CONTROL_DEFAULT     = 0x00000006u;
 #define CP_MES_CNTL__MES_HALT_MASK                0x40000000
 
 // GRBM_GFX_CNTL — selects (ME, PIPE, QUEUE, VMID) for HQD writes.
+// Also defined in amdgpu_gfx.h; guard so headers can be included in
+// either order.
+#ifndef GRBM_GFX_CNTL__PIPEID__SHIFT
 #define GRBM_GFX_CNTL__PIPEID__SHIFT  0x0
 #define GRBM_GFX_CNTL__PIPEID_MASK    0x00000003
 #define GRBM_GFX_CNTL__MEID__SHIFT    0x2
@@ -177,6 +208,7 @@ constexpr uint32_t kCP_HQD_EOP_CONTROL_DEFAULT     = 0x00000006u;
 #define GRBM_GFX_CNTL__VMID_MASK      0x000000F0
 #define GRBM_GFX_CNTL__QUEUEID__SHIFT 0x8
 #define GRBM_GFX_CNTL__QUEUEID_MASK   0x00000700
+#endif
 
 //------------------------------------------------------------------
 // Per-pipe state.
@@ -224,6 +256,23 @@ struct MESContext {
     bool        kiq_ucode_loaded;     // RS64_KIQ  (78) seen — N/A for uni
     bool        uni_mes_active;
 
+    // MES scheduler firmware version. Read from CP_MES_GP3_LO after
+    // mes_v12_0_queue_init by upstream (mes_v12_0.c:1506). Only the
+    // low 16 bits matter (AMDGPU_MES_VERSION_MASK = 0xffff). Used to
+    // gate SET_HW_RESOURCES_1: upstream sends that frame only when
+    // sched_version >= 0x4b (mes_v12_0_hw_init:1859).
+    uint32_t  sched_version;
+    uint32_t  kiq_version;
+
+    // SET_HW_RESOURCES_1 cleaner-shader fence buffer. Allocated lazily
+    // by mes_set_hw_resources_1.  Matches mes->resource_1_gpu_addr in
+    // upstream (mes_v12_0.c:721).
+#ifdef __APPLE__
+    IOBufferMemoryDescriptor *resource_1_buf;
+    IODMACommand             *resource_1_dma;
+#endif
+    uint64_t  resource_1_bus;
+
     // Lazy-allocated by mes_set_hw_resources on first call. Lifetime
     // is tied to the MESContext (i.e. the driver instance).
 #ifdef __APPLE__
@@ -235,6 +284,10 @@ struct MESContext {
     uint64_t  sch_ctx_bus;
     uint64_t  status_fence_bus;
 };
+
+constexpr uint32_t kMES_VERSION_MASK     = 0x0000FFFFu;
+constexpr uint32_t kMES_Resource1Bytes   = 4096;
+constexpr uint32_t kMES_HwResources1MinSchedVersion = 0x4b;
 
 //------------------------------------------------------------------
 // Helper — GRBM_GFX_CNTL select. Mirrors soc21_grbm_select(adev,
@@ -396,12 +449,37 @@ struct MES_SetHwResources {
 static_assert(sizeof(MES_SetHwResources) == 64 * 4,
               "MES_SetHwResources must be 64 dwords");
 
-// SET_HW_RESOURCES flag bit positions (mirrors upstream bitfield).
+// SET_HW_RESOURCES flag bit positions (mirrors upstream packed
+// bitfield in mes_v12_api_def.h:275-298). Layout (LSB→MSB):
+//   bit  0  : disable_reset
+//   bit  1  : use_different_vmid_compute
+//   bit  2  : disable_mes_log
+//   bit  3  : apply_mmhub_pgvm_invalidate_ack_loss_wa
+//   bit  4  : apply_grbm_remote_register_dummy_read_wa
+//   bit  5  : second_gfx_pipe_enabled
+//   bit  6  : enable_level_process_quantum_check
+//   bit  7  : legacy_sch_mode
+//   bit  8  : disable_add_queue_wptr_mc_addr
+//   bit  9  : enable_mes_event_int_logging
+//   bit 10  : enable_reg_active_poll
+//   bit 11  : use_disable_queue_in_legacy_uq_preemption
+//   bit 12  : send_write_data
+//   bit 13  : os_tdr_timeout_override
+//   bit 14  : use_rs64mem_for_proc_gang_ctx
+//   bit 15  : halt_on_misaligned_access
+//   bit 16  : use_add_queue_unmap_flag_addr
+//   bit 17  : enable_mes_sch_stb_log
+//   bit 18  : limit_single_process
+//   bit 19..20 : unmapped_doorbell_handling (2 bits) — upstream
+//                writes value 1 (basic version) per mes_v12_0.c:792
+//   bit 21  : enable_mes_fence_int
+//   bit 22  : enable_lr_compute_wa
 constexpr uint32_t kSetHwRsrcFlag_disable_reset                      = 1u <<  0;
 constexpr uint32_t kSetHwRsrcFlag_use_different_vmid_compute         = 1u <<  1;
 constexpr uint32_t kSetHwRsrcFlag_disable_mes_log                    = 1u <<  2;
 constexpr uint32_t kSetHwRsrcFlag_enable_level_process_quantum_check = 1u <<  6;
 constexpr uint32_t kSetHwRsrcFlag_enable_reg_active_poll             = 1u << 10;
+constexpr uint32_t kSetHwRsrcFlag_unmapped_doorbell_handling_BASIC   = 1u << 19;
 
 struct MES_AddQueue {
     MES_Header_Wire header;
@@ -422,14 +500,20 @@ struct MES_AddQueue {
     uint64_t h_context;
     uint64_t h_queue;
     uint32_t queue_type;
+    uint32_t gds_base;          // mes_v12_api_def.h:357 — was MISSING.
     uint32_t gds_size;          // union with kfd_queue_size
     uint32_t gws_base;
     uint32_t gws_size;
     uint32_t oa_mask;
-    uint32_t _pad1;             // align trap_handler_addr to 8
+    // Natural u64 alignment pads to 144 here. trap_handler_addr at
+    // offset 144 (dw 36) — matches upstream's offset (compiler also
+    // inserts the same 4-byte pad after `oa_mask` upstream).
     uint64_t trap_handler_addr;
     uint32_t vm_context_cntl;
     uint32_t flags;             // packed bitfield
+    // api_status (u64 first field) is naturally aligned — vm_context_cntl
+    // + flags = 8 bytes; sum-since-trap_handler_addr u64 = 16 bytes; the
+    // running offset is 8-aligned.
     MES_API_Status api_status;
     uint64_t tma_addr;
     uint32_t sch_id;
@@ -441,19 +525,40 @@ struct MES_AddQueue {
     uint32_t queue_id;
     uint32_t alignment_mode_setting;
     uint32_t full_sh_mem_config_data;
-    uint32_t pad[10];           // round to 64 dw
+    uint32_t pad[8];            // round to 64 dw
 };
 static_assert(sizeof(MES_AddQueue) == 64 * 4,
               "MES_AddQueue must be 64 dwords");
 
 // MES_AddQueue flags bitfield encoding (bit position).
+// Mirrors mes_v12_api_def.h:369-385 packed bitfield order:
+//   bit  0    : paging
+//   bits 1..4 : debug_vmid (4 bits)
+//   bit  5    : program_gds
+//   bit  6    : is_gang_suspended
+//   bit  7    : is_tmz_queue
+//   bit  8    : map_kiq_utility_queue
+//   bit  9    : is_kfd_process
+//   bit 10    : trap_en
+//   bit 11    : is_aql_queue
+//   bit 12    : skip_process_ctx_clear
+//   bit 13    : map_legacy_kq
+//   bit 14    : exclusively_scheduled
+//   bit 15    : is_long_running
+//   bit 16    : is_dwm_queue
 constexpr uint32_t kAddQueueFlag_paging                = 1u <<  0;
 constexpr uint32_t kAddQueueFlag_program_gds           = 1u <<  5;
-constexpr uint32_t kAddQueueFlag_is_kfd_process        = 1u <<  8;
-constexpr uint32_t kAddQueueFlag_trap_en               = 1u <<  9;
-constexpr uint32_t kAddQueueFlag_is_aql_queue          = 1u << 10;
-constexpr uint32_t kAddQueueFlag_skip_process_ctx_clear= 1u << 11;
-constexpr uint32_t kAddQueueFlag_map_legacy_kq         = 1u << 12;
+constexpr uint32_t kAddQueueFlag_is_gang_suspended     = 1u <<  6;
+constexpr uint32_t kAddQueueFlag_is_tmz_queue          = 1u <<  7;
+constexpr uint32_t kAddQueueFlag_map_kiq_utility_queue = 1u <<  8;
+constexpr uint32_t kAddQueueFlag_is_kfd_process        = 1u <<  9;
+constexpr uint32_t kAddQueueFlag_trap_en               = 1u << 10;
+constexpr uint32_t kAddQueueFlag_is_aql_queue          = 1u << 11;
+constexpr uint32_t kAddQueueFlag_skip_process_ctx_clear= 1u << 12;
+constexpr uint32_t kAddQueueFlag_map_legacy_kq         = 1u << 13;
+constexpr uint32_t kAddQueueFlag_exclusively_scheduled = 1u << 14;
+constexpr uint32_t kAddQueueFlag_is_long_running       = 1u << 15;
+constexpr uint32_t kAddQueueFlag_is_dwm_queue          = 1u << 16;
 
 // MES queue types (mirrors enum MES_QUEUE_TYPE).
 constexpr uint32_t kMESQueueType_GFX     = 0;
@@ -504,6 +609,28 @@ kern_return_t mes_add_hw_queue(const DeviceContext &dev, MESContext &mes,
 // Doorbell offsets are bytes (already shifted via OFFSET field write).
 kern_return_t mes_init_aggregated_doorbell(const DeviceContext &dev,
                                            const uint32_t doorbells[5]);
+
+// Port of mes_v12_0_kiq_setting (mes_v12_0.c:1728). Writes RLC_CP_SCHEDULERS
+// with the (me, pipe, queue) encoding for the KIQ ring + scheduler-active
+// bit so RLC routes IRQs to the correct queue.
+kern_return_t mes_kiq_setting(const DeviceContext &dev,
+                              uint32_t me, uint32_t pipe, uint32_t queue);
+
+// Port of mes_v12_0_enable_unmapped_doorbell_handling (mes_v12_0.c:863).
+// Sets CP_UNMAPPED_DOORBELL.PROC_LSB = 0xd + ENABLE = 1 so the CP
+// forwards doorbell writes to queues MES hasn't yet mapped.
+kern_return_t mes_enable_unmapped_doorbell_handling(const DeviceContext &dev,
+                                                    bool enable);
+
+// Port of mes_v12_0_set_hw_resources_1 (mes_v12_0.c:711). Sent
+// AFTER set_hw_resources, gated on sched_version >= 0x4b. Lazily
+// allocates the cleaner_shader_fence buffer.
+kern_return_t mes_set_hw_resources_1(DeviceContext &dev, MESContext &mes);
+
+// Read MES scheduler version from CP_MES_GP3_LO after mes_enable
+// (mes_v12_0.c:1505). Stashed on mes.sched_version.
+kern_return_t mes_read_sched_version(const DeviceContext &dev,
+                                     MESContext &mes, MESPipe pipe);
 
 // Program the MES SCHED pipe's HQD registers. Mirrors upstream's
 // mes_v12_0_queue_init_register + the field defaults from

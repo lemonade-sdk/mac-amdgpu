@@ -191,11 +191,48 @@ run_stage(BringupContext &ctx, BringupStage s)
         return sdma_init_full(ctx.device, ctx.psp, ctx.gmc, ctx.sdma);
     case BringupStage::MESInit:
         return mes_init_full(ctx.device, ctx.psp, ctx.gmc, ctx.mes);
-    // Still-stubs — return Unsupported until ported.
     case BringupStage::IMUInit:
-    case BringupStage::GFXInit:
-        INIT_LOG("stage %{public}s: NOT YET IMPLEMENTED", stage_name(s));
-        return kIOReturnUnsupported;
+        // Audit-7 #11. PSP-load path: imu microcode comes via PSP
+        // LOAD_IP_FW(IMU_I) + LOAD_IP_FW(IMU_D); the firmware
+        // extractor (separate agent) sets imu.microcode_loaded.
+        // This handler only validates that gate, no MMIO.
+        return imu_init_full(ctx.device, ctx.imu);
+    case BringupStage::GFXInit: {
+        // Audit-7 #8 + #10. Run gfx_constants_init (still nominally
+        // a CPInit prerequisite — but here we re-arm GFXHUB so it
+        // survives RLC autoload's register reset).
+        //
+        // Upstream sequence (gfx_v12_0_hw_init:3697):
+        //     gfx_v12_0_gfxhub_enable(adev);     // gart_enable + hdp_flush + tlb_flush
+        //     gfx_v12_0_constants_init(adev);
+        //     gfx_v12_0_rlc_resume(adev);        // not driver-side on PSP path
+        //     gfx_v12_0_cp_resume(adev);         // already done in CPInit
+        //
+        // We delegate the gart_enable re-run to gmc_gfxhub_gart_enable
+        // (which has the full upstream port), then HDP flush, then
+        // gfx_constants_init.
+        if (!ctx.device.ip.isResolved(IPBlock::GC)) {
+            INIT_LOG("stage GFXInit: GC IP base not resolved");
+            return kIOReturnNotReady;
+        }
+        // Re-arm GFXHUB after RLC autoload may have stomped on some
+        // of the per-VMID context regs (gfx_v12_0_hw_init does this).
+        if (ctx.device.ip.isResolved(IPBlock::GMC)) {
+            kern_return_t r = gmc_gfxhub_gart_enable(ctx.device, ctx.gmc);
+            if (r != kIOReturnSuccess) {
+                INIT_LOG("GFXInit: gfxhub_gart_enable failed: %#x", r);
+                return r;
+            }
+            // Drain NBIO write buffers + invalidate TLBs implicitly
+            // (gmc_gfxhub_gart_enable arms invalidation engines).
+            gmc_hdp_flush(ctx.device);
+        } else {
+            INIT_LOG("GFXInit: skipping gfxhub re-run (GMC IP base unresolved)");
+        }
+        // Run gfx_v12_0_constants_init now (idempotent — CPInit's
+        // cp_init_full also calls the legacy convenience overload).
+        return gfx_constants_init(ctx.device, ctx.gfx);
+    }
     }
     return kIOReturnUnsupported;
 }
