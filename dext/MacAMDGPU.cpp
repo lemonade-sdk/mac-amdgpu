@@ -36,6 +36,7 @@
 #include "amdgpu/amdgpu_cp.h"
 #include "amdgpu/amdgpu_sdma.h"
 #include "amdgpu/amdgpu_mes.h"
+#include "amdgpu/amdgpu_ucode_extract.h"
 
 #define MACAMDGPU_LOG(fmt, ...) \
     os_log(OS_LOG_DEFAULT, "mac.amdgpu: " fmt, ##__VA_ARGS__)
@@ -113,6 +114,17 @@ enum {
     kMacAMDGPUFwTypeIP_RS64_MES_STACK   = 0x100 + 77,
     kMacAMDGPUFwTypeIP_RS64_KIQ         = 0x100 + 78,
     kMacAMDGPUFwTypeIP_RS64_KIQ_STACK   = 0x100 + 79,
+    // 0x200+ — multi-payload .bin files. Each value names a SOURCE
+    // FILE; the dext expands it into N LOAD_IP_FW frames via
+    // amdgpu_ucode_extract. Keep in sync with constants in
+    // amdgpu_ucode_extract.cpp.
+    kMacAMDGPUFwTypeFile_SDMA       = 0x200 + 0,
+    kMacAMDGPUFwTypeFile_RLC        = 0x200 + 1,
+    kMacAMDGPUFwTypeFile_IMU        = 0x200 + 2,
+    kMacAMDGPUFwTypeFile_MES_UNI    = 0x200 + 3,
+    kMacAMDGPUFwTypeFile_CP_PFP     = 0x200 + 4,
+    kMacAMDGPUFwTypeFile_CP_ME      = 0x200 + 5,
+    kMacAMDGPUFwTypeFile_CP_MEC     = 0x200 + 6,
 };
 
 enum {
@@ -1401,42 +1413,47 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             return amdgpu::psp_bootloader_load_component(
                 dev, psp, bin, fwSize, amdgpu::PSPBootloaderCmd::LoadIPKeyMgrDrv);
         default:
-            // Post-SOS IP firmware path: fwType encoded as 0x100 + psp_gfx_fw_type.
-            if (fwType >= 0x100 && fwType < 0x200) {
-                uint32_t gfxFwType = static_cast<uint32_t>(fwType - 0x100);
+            // Post-SOS IP firmware path. Two host fwType encodings:
+            //   0x100..0x1FF  single-payload IP firmware (legacy);
+            //                 psp_fw_type = hostFwType - 0x100.
+            //   0x200..0x2FF  per-file multi-payload (e.g. rlc.bin emits
+            //                 up to 13 LOAD_IP_FW frames). The extractor
+            //                 (`amdgpu_ucode_extract`) decodes the file
+            //                 header version and emits all required
+            //                 (fw_type, offset, size) tuples for us to
+            //                 loop over.
+            //
+            // Mirrors upstream amdgpu_ucode_init_single_fw +
+            // psp_get_fw_type + psp_execute_ip_fw_load, called per-IP
+            // from psp_load_non_psp_fw.
+            if ((fwType >= 0x100 && fwType < 0x200) ||
+                (fwType >= 0x200 && fwType < 0x300)) {
+
                 if (ivars->dmaSegmentsCount < 1) return kIOReturnNotReady;
                 auto &gart = driver->ivars->bringup.gart;
                 if (!gart.enabled) {
                     return kIOReturnNotReady;
                 }
 
-                // The host streams the WHOLE .bin file (including header)
-                // into the DMA buffer; PSP wants only the ucode payload
-                // bytes, located at `header.ucode_array_offset_bytes` of
-                // size `header.ucode_size_bytes`. Mirrors upstream
-                // `amdgpu_ucode_init_single_fw` / `psp_prep_load_ip_fw_cmd_buf`
-                // which both work off (start + ucode_array_offset_bytes,
-                // ucode_size_bytes). Without this, PSP reads the 32-byte
-                // common_firmware_header as if it were ucode → bogus.
-                uint32_t ucodeOff = 0;
-                uint32_t ucodeSize = static_cast<uint32_t>(fwSize);
-                if (fwSize >= sizeof(amdgpu::common_firmware_header)) {
-                    auto *hdr = reinterpret_cast<
-                        const amdgpu::common_firmware_header *>(bin);
-                    if (hdr->ucode_array_offset_bytes < fwSize &&
-                        hdr->ucode_size_bytes > 0 &&
-                        hdr->ucode_array_offset_bytes + hdr->ucode_size_bytes
-                            <= fwSize) {
-                        ucodeOff  = hdr->ucode_array_offset_bytes;
-                        ucodeSize = hdr->ucode_size_bytes;
-                    }
+                // Decode the .bin into one-or-more LOAD_IP_FW payloads.
+                amdgpu::UcodePayload payloads[amdgpu::kMaxUcodePayloadsPerFile];
+                uint32_t count = amdgpu::amdgpu_ucode_extract(
+                    fwType, bin, fwSize, payloads);
+                if (count == 0) {
+                    MACAMDGPU_LOG("LoadFirmware: extractor returned 0 payloads "
+                                  "for fwType=%#llx size=%llu",
+                                  fwType, fwSize);
+                    return kIOReturnUnsupported;
                 }
 
                 // Bind the DMA buffer's bus addr range into GART once
                 // (slot is reused across submits since the busAddr is
-                // stable for the lifetime of the DMA buffer) and pass
-                // the GART MC address (plus the in-file ucode offset)
-                // to PSP. Mirrors upstream's GTT-domain-BO flow.
+                // stable for the lifetime of the DMA buffer). The
+                // per-payload GPU bus address = gartMCAddr + payload
+                // offset_bytes.  Mirrors upstream's GTT-domain-BO flow:
+                // amdgpu_ucode_init_bo allocates ONE big BO, copies all
+                // payloads into it, and each (info->mc_addr, info->ucode_size)
+                // points into that single BO.
                 kern_return_t br = amdgpu::gart_bind_existing(
                     dev, gart,
                     ivars->dmaSegments[0].address,
@@ -1445,45 +1462,72 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                 if (br != kIOReturnSuccess) {
                     return br;
                 }
-                uint64_t fwBusAddr =
-                    ivars->dmaGartBinding.gartMCAddr + ucodeOff;
-                kern_return_t r = amdgpu::psp_load_ip_fw(dev, psp, fwBusAddr,
-                                              ucodeSize, gfxFwType);
-                if (r == kIOReturnSuccess) {
-                    // Flip per-IP microcode flags so the corresponding
-                    // BringupStage knows it can proceed with HQD program.
-                    if (gfxFwType == amdgpu::PSPGfxFwType::SDMA0 ||
-                        gfxFwType == amdgpu::PSPGfxFwType::SDMA1 ||
-                        gfxFwType == amdgpu::PSPGfxFwType::SDMA_UCODE_TH0) {
-                        driver->ivars->bringup.sdma.microcode_loaded = true;
-                    }
-                    // For MES, parse the firmware header to extract
-                    // mes_uc_start_addr_lo/hi and stash on the right pipe.
-                    // mes_firmware_header_v1_0 layout (amdgpu_ucode.h):
-                    //   common_firmware_header = 8 dwords (32 bytes), then
-                    //   6 mes-specific dwords (ucode_version,
-                    //   ucode_size_bytes, ucode_offset_bytes,
-                    //   data_version, data_size_bytes, data_offset_bytes),
-                    //   then start_addr_lo (dw 14), start_addr_hi (dw 15).
-                    if (gfxFwType == amdgpu::PSPGfxFwType::RS64_MES ||
-                        gfxFwType == amdgpu::PSPGfxFwType::RS64_KIQ) {
-                        if (fwSize >= 16 * 4) {
-                            const uint32_t *hdr32 =
-                                reinterpret_cast<const uint32_t *>(bin);
-                            const uint32_t off_dw = 8 + 6;
-                            uint64_t uc_lo = hdr32[off_dw + 0];
-                            uint64_t uc_hi = hdr32[off_dw + 1];
-                            uint64_t uc_addr = uc_lo | (uc_hi << 32);
-                            amdgpu::MESPipe pipe =
-                                (gfxFwType == amdgpu::PSPGfxFwType::RS64_MES)
-                                ? amdgpu::MESPipe::Sched
-                                : amdgpu::MESPipe::KIQ;
-                            amdgpu::mes_set_uc_start_addr(
-                                driver->ivars->bringup.mes, pipe, uc_addr);
-                        }
+
+                // Side-effect bookkeeping that used to live in the
+                // single-payload path. Captures MES start addresses
+                // from the MES file header (independent of any
+                // particular payload), and flips sdma microcode_loaded
+                // when the SDMA payload submits successfully.
+                bool sdma_loaded_this_call = false;
+
+                // MES start address extraction — pre-loop because it's
+                // a property of the .bin file, not a per-payload value.
+                // Upstream: amdgpu_mes.c:708-713 stashes
+                // adev->mes.uc_start_addr[pipe] from the header before
+                // PSP load. The KIQ pipe is not exposed on R9700 yet —
+                // mes_v12_0 uses one file per pipe so we only see the
+                // SCHED pipe via uni_mes/mes.bin.
+                //
+                // We trigger on the FILE-typed path (0x200+3 = MES_UNI)
+                // and on the legacy CP_MES (0x100+33) single-payload
+                // path that also loads a uni_mes-format file.
+                if (fwType == kMacAMDGPUFwTypeFile_MES_UNI ||
+                    fwType == 0x100ULL + amdgpu::PSPGfxFwType::CP_MES) {
+                    if (fwSize >= sizeof(amdgpu::mes_firmware_header_v1_0)) {
+                        auto *mhdr = reinterpret_cast<
+                            const amdgpu::mes_firmware_header_v1_0 *>(bin);
+                        uint64_t uc_addr =
+                            static_cast<uint64_t>(mhdr->mes_uc_start_addr_lo) |
+                            (static_cast<uint64_t>(mhdr->mes_uc_start_addr_hi) << 32);
+                        amdgpu::mes_set_uc_start_addr(
+                            driver->ivars->bringup.mes,
+                            amdgpu::MESPipe::Sched, uc_addr);
                     }
                 }
-                return r;
+
+                // Submit each (fw_type, offset, size) as a separate
+                // LOAD_IP_FW frame. Bail on first error — upstream
+                // psp_load_non_psp_fw does the same (a failing IP fw
+                // load aborts the whole bringup; we mirror that here
+                // so subsequent failing loads don't mask the first).
+                MACAMDGPU_LOG("LoadFirmware(fwType=%#llx): extractor produced "
+                              "%u payload(s)", fwType, count);
+                for (uint32_t i = 0; i < count; i++) {
+                    uint64_t fwBusAddr =
+                        ivars->dmaGartBinding.gartMCAddr + payloads[i].offset_bytes;
+                    MACAMDGPU_LOG("  payload[%u]: fw_type=%u offset=%u size=%u",
+                                  i, payloads[i].fw_type,
+                                  payloads[i].offset_bytes,
+                                  payloads[i].size_bytes);
+                    kern_return_t r = amdgpu::psp_load_ip_fw(
+                        dev, psp, fwBusAddr,
+                        payloads[i].size_bytes, payloads[i].fw_type);
+                    if (r != kIOReturnSuccess) {
+                        MACAMDGPU_LOG("LoadFirmware(fwType=%#llx) payload[%u] "
+                                      "(fw_type=%u) FAILED kr=%#x",
+                                      fwType, i, payloads[i].fw_type, r);
+                        return r;
+                    }
+                    if (payloads[i].fw_type == amdgpu::PSPGfxFwType::SDMA0 ||
+                        payloads[i].fw_type == amdgpu::PSPGfxFwType::SDMA1 ||
+                        payloads[i].fw_type == amdgpu::PSPGfxFwType::SDMA_UCODE_TH0) {
+                        sdma_loaded_this_call = true;
+                    }
+                }
+                if (sdma_loaded_this_call) {
+                    driver->ivars->bringup.sdma.microcode_loaded = true;
+                }
+                return kIOReturnSuccess;
             }
             MACAMDGPU_LOG("LoadFirmware: fw type %llu not yet implemented",
                           fwType);
