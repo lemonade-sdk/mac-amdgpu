@@ -249,15 +249,26 @@ psp_wait_for_bootloader(const DeviceContext &dev)
     if (!dev.ip.isResolved(IPBlock::MP0)) return false;
     const uint32_t reg = SOC15_REG_OFFSET(dev, IPBlock::MP0,
                                           MP0Regs::C2PMSG_35);
-    // Linux retries up to 10 times against psp->adev->usec_timeout
-    // (default ~100ms each). We do a single 1-second budget.
-    const uint64_t kBudgetUs = 1000000;
+    // Upstream Linux psp_v14_0_wait_for_bootloader loops 10x against
+    // psp_wait_for (each call uses adev->usec_timeout, default 100 ms;
+    // bumped 10x for emulation/passthrough modes). Total budget on
+    // bare-metal is ~1 second; with the 10x emulation bump it's ~10 s.
+    //
+    // TB5 hotplug effectively counts as "passthrough" — the PSP
+    // bootloader takes longer to come up than on PCIe-attached cards.
+    // Use a 10-second budget to match upstream's worst case.
+    PSP_LOG("wait_for_bootloader: polling C2PMSG_35 (reg=%#x) for "
+            "bit 31 set, up to 10 sec", reg);
+    const uint64_t kBudgetUs = 10ULL * 1000000;
     uint32_t v = 0;
     bool ok = poll_reg(dev, reg,
                        kPSPBootloaderReadyBit, kPSPBootloaderReadyBit,
                        kBudgetUs, &v);
     if (!ok) {
-        PSP_LOG("bootloader wait timeout — C2PMSG_35=%#010x", v);
+        PSP_LOG("bootloader wait timeout — C2PMSG_35=%#010x "
+                "(expected bit 31 set)", v);
+    } else {
+        PSP_LOG("bootloader ready — C2PMSG_35=%#010x", v);
     }
     return ok;
 }

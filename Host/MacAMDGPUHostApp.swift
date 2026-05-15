@@ -34,6 +34,7 @@ private let kSelLoadFirmware:    UInt32 = 10
 private let kSelQueryInfo:       UInt32 = 21
 private let kSelGetDiagnostics:  UInt32 = 23
 private let kSelDumpTMR:         UInt32 = 24
+private let kSelDumpPSP:         UInt32 = 25
 
 // Firmware type tags — match MacAMDGPU.cpp enum.
 private let kFwSOS:         UInt64 = 0
@@ -158,7 +159,9 @@ struct ContentView: View {
                 Button("Diagnostics") { controller.testGetDiagnostics() }
                     .help("PCI config + PM cap + IFWI + BAR0/2/5 MMIO probes.")
                 Button("Dump TMR") { controller.testDumpTMR() }
-                    .help("Read 16 dwords from VRAM at (vram_size - 1 MB) via MM_INDEX/DATA.")
+                    .help("Read 16 dwords from VRAM at (vram_size - 64 KB) via MM_INDEX/DATA.")
+                Button("Dump PSP") { controller.testDumpPSP() }
+                    .help("Read SOC15-resolved MP0 C2PMSG_33/35/36/64/81 registers.")
                 Button("Ping") { controller.testPing() }
                 Button("Identity") { controller.testGetIdentity() }
                 Button("BARs") { controller.testGetBARInfo() }
@@ -696,6 +699,47 @@ final class DriverController: NSObject, ObservableObject,
                 "→ dw0=%#010x, expected signature 0x28211407 — unexpected data",
                 dw0))
         }
+    }
+
+    func testDumpPSP() {
+        guard openUserClient() else { return }
+        let (kr, out) = callScalar(kSelDumpPSP, outCount: 7)
+        if kr != KERN_SUCCESS {
+            append(String(format: "dumpPSP: kr=%#x", kr))
+            return
+        }
+        guard out.count >= 7 else {
+            append("dumpPSP: short reply (\(out.count) words)")
+            return
+        }
+        let mp0Base = UInt32(out[0] & 0xFFFFFFFF)
+        if mp0Base == 0xFFFFFFFF {
+            append("psp: MP0 base UNRESOLVED — run Initialize GPU first")
+            return
+        }
+        let c33 = UInt32(out[1] & 0xFFFFFFFF)
+        let c35 = UInt32(out[2] & 0xFFFFFFFF)
+        let c36 = UInt32(out[3] & 0xFFFFFFFF)
+        let c64 = UInt32(out[4] & 0xFFFFFFFF)
+        let c81 = UInt32(out[5] & 0xFFFFFFFF)
+        let ringCreated = out[6] != 0
+        append(String(format: "psp/mp0_base: %#010x", mp0Base))
+        append(String(format:
+            "psp/C2PMSG_33 (IFWI ready, bit 31): %#010x %@",
+            c33, (c33 & 0x80000000) != 0 ? "✓ READY" : "✗ NOT READY"))
+        append(String(format:
+            "psp/C2PMSG_35 (bootloader, bit 31): %#010x %@",
+            c35, (c35 & 0x80000000) != 0 ? "✓ READY" : "✗ NOT READY"))
+        append(String(format:
+            "psp/C2PMSG_36 (fw buf addr [>>20]):  %#010x",
+            c36))
+        append(String(format:
+            "psp/C2PMSG_64 (ring base low):       %#010x",
+            c64))
+        append(String(format:
+            "psp/C2PMSG_81 (sOS sign-of-life, bit 31): %#010x %@",
+            c81, (c81 & 0x80000000) != 0 ? "✓ ALIVE" : "✗ NOT ALIVE"))
+        append("psp/ring created: \(ringCreated)")
     }
 
     func testInitDeviceUpTo(_ stage: UInt64) {

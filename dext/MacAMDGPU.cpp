@@ -68,6 +68,7 @@ enum {
     kMacAMDGPUMethodMESAddQueue       = 22,
     kMacAMDGPUMethodGetDiagnostics    = 23,
     kMacAMDGPUMethodDumpTMR           = 24,
+    kMacAMDGPUMethodDumpPSP           = 25,
 };
 
 // QueryInfo "info type" tags — input scalarInput[0]. Output shape
@@ -1055,6 +1056,41 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             arguments->scalarOutput[i] =
                 rd_vram(tmr_offset + (uint64_t)i * 4ULL);
         }
+        return kIOReturnSuccess;
+    }
+
+    case kMacAMDGPUMethodDumpPSP: {
+        // Returns SOC15-resolved PSP register reads. Requires IP
+        // discovery to have populated MP0's base — call after at
+        // least one successful IP discovery / Initialize GPU run.
+        // Outputs:
+        //   [0] MP0 IP base (or 0xFFFFFFFF if unresolved)
+        //   [1] C2PMSG_33 (IFWI ready, bit 31 = 1 when ready)
+        //   [2] C2PMSG_35 (bootloader ready, bit 31 = 1 when ready)
+        //   [3] C2PMSG_36 (firmware buffer address — host-written)
+        //   [4] C2PMSG_64 (PSP ring base low — host-written)
+        //   [5] C2PMSG_81 (sOS sign-of-life, bit 31 set when alive)
+        //   [6] PSP ring create state (0=not created, 1=created)
+        if (arguments->scalarOutput == nullptr ||
+            arguments->scalarOutputCount < 7) {
+            return kIOReturnBadArgument;
+        }
+        kern_return_t openRet = mac_amdgpu_ensure_open(this, driver, pci);
+        if (openRet != kIOReturnSuccess) return openRet;
+        auto &dev = driver->ivars->bringup.device;
+        if (!dev.ip.isResolved(amdgpu::IPBlock::MP0)) {
+            arguments->scalarOutput[0] = 0xFFFFFFFFu;
+            for (int i = 1; i < 7; i++) arguments->scalarOutput[i] = 0;
+            return kIOReturnSuccess;
+        }
+        uint32_t mp0_base = dev.ip.get(amdgpu::IPBlock::MP0);
+        arguments->scalarOutput[0] = mp0_base;
+        arguments->scalarOutput[1] = amdgpu::RREG32(dev, mp0_base + 0x0061);
+        arguments->scalarOutput[2] = amdgpu::RREG32(dev, mp0_base + 0x0063);
+        arguments->scalarOutput[3] = amdgpu::RREG32(dev, mp0_base + 0x0064);
+        arguments->scalarOutput[4] = amdgpu::RREG32(dev, mp0_base + 0x0080);
+        arguments->scalarOutput[5] = amdgpu::RREG32(dev, mp0_base + 0x0091);
+        arguments->scalarOutput[6] = (uint64_t)driver->ivars->bringup.psp.ringCreated;
         return kIOReturnSuccess;
     }
 
