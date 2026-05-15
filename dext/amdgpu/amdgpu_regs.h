@@ -149,30 +149,73 @@ WBAR0_32(const DeviceContext &ctx, uint64_t byte_offset, uint32_t value)
     ctx.pci->MemoryWrite32(ctx.bar0MemIndex, byte_offset, value);
 }
 
-// memcpy-equivalent for staging a buffer into VRAM via BAR0. Writes
-// 32-bit dwords; src must be 4-byte aligned in length (rounded up if
-// not). Slow (each dword is an MMIO write — ~10x slower on AS than
-// native PCIe) but correct.
+// memcpy-equivalent for staging a buffer into VRAM via BAR0. Uses
+// MemoryWrite64 in the aligned-8-byte-stride region for ~2× fewer
+// MMIO calls vs all-32-bit writes (DMA-1 in docs/DMA_FIX_PLAN.md).
+//
+// Still ~10× slower than native PCIe per call on AS — the real fix is
+// DMA-3 (CreateMapping for CPU-pointer memcpy). This is a stopgap.
 static inline void
 bar0_memcpy_to_vram(const DeviceContext &ctx, uint64_t vram_byte_offset,
                     const void *src, uint64_t size_bytes)
 {
-    const uint32_t *p = static_cast<const uint32_t *>(src);
-    uint64_t dwords = (size_bytes + 3) >> 2;
-    for (uint64_t i = 0; i < dwords; i++) {
-        WBAR0_32(ctx, vram_byte_offset + i * 4ULL, p[i]);
+    const uint8_t *bytes  = static_cast<const uint8_t *>(src);
+    uint64_t off = 0;
+
+    // Lead-in: align to 8 bytes via 32-bit writes if the start isn't
+    // 8-byte-aligned. (Our PSP buffers are 16 KB-aligned so this is
+    // usually a no-op, but be safe.)
+    while ((vram_byte_offset + off) % 8 != 0 && off + 4 <= size_bytes) {
+        uint32_t v;
+        memcpy(&v, bytes + off, 4);
+        WBAR0_32(ctx, vram_byte_offset + off, v);
+        off += 4;
+    }
+
+    // Bulk: 64-bit writes — half the MMIO calls.
+    while (off + 8 <= size_bytes) {
+        uint64_t v;
+        memcpy(&v, bytes + off, 8);
+        ctx.pci->MemoryWrite64(ctx.bar0MemIndex,
+                               vram_byte_offset + off, v);
+        off += 8;
+    }
+
+    // Trailing partial dwords.
+    while (off + 4 <= size_bytes) {
+        uint32_t v;
+        memcpy(&v, bytes + off, 4);
+        WBAR0_32(ctx, vram_byte_offset + off, v);
+        off += 4;
+    }
+    if (off < size_bytes) {
+        uint32_t v = 0;
+        memcpy(&v, bytes + off, size_bytes - off);
+        WBAR0_32(ctx, vram_byte_offset + off, v);
     }
 }
 
-// memset-equivalent for the BAR0 aperture — zero-fills size_bytes of
-// VRAM starting at the given offset.
+// memset-equivalent for the BAR0 aperture. Same 64-bit-stride
+// optimisation as bar0_memcpy_to_vram.
 static inline void
 bar0_memset_vram(const DeviceContext &ctx, uint64_t vram_byte_offset,
                  uint32_t pattern, uint64_t size_bytes)
 {
-    uint64_t dwords = (size_bytes + 3) >> 2;
-    for (uint64_t i = 0; i < dwords; i++) {
-        WBAR0_32(ctx, vram_byte_offset + i * 4ULL, pattern);
+    uint64_t pattern64 = ((uint64_t)pattern << 32) | pattern;
+    uint64_t off = 0;
+
+    while ((vram_byte_offset + off) % 8 != 0 && off + 4 <= size_bytes) {
+        WBAR0_32(ctx, vram_byte_offset + off, pattern);
+        off += 4;
+    }
+    while (off + 8 <= size_bytes) {
+        ctx.pci->MemoryWrite64(ctx.bar0MemIndex,
+                               vram_byte_offset + off, pattern64);
+        off += 8;
+    }
+    while (off + 4 <= size_bytes) {
+        WBAR0_32(ctx, vram_byte_offset + off, pattern);
+        off += 4;
     }
 }
 

@@ -35,6 +35,7 @@ private let kSelQueryInfo:       UInt32 = 21
 private let kSelGetDiagnostics:  UInt32 = 23
 private let kSelDumpTMR:         UInt32 = 24
 private let kSelDumpPSP:         UInt32 = 25
+private let kSelDumpCmdBuf:      UInt32 = 26
 
 // Firmware type tags — match MacAMDGPU.cpp enum.
 private let kFwSOS:         UInt64 = 0
@@ -162,6 +163,8 @@ struct ContentView: View {
                     .help("Read 16 dwords from VRAM at (vram_size - 64 KB) via MM_INDEX/DATA.")
                 Button("Dump PSP") { controller.testDumpPSP() }
                     .help("Read SOC15-resolved MP0 C2PMSG_33/35/36/64/81 registers.")
+                Button("Dump Cmd") { controller.testDumpCmdBuf() }
+                    .help("Read VRAM cmd_buf + fence + ring after a submit attempt.")
                 Button("Ping") { controller.testPing() }
                 Button("Identity") { controller.testGetIdentity() }
                 Button("BARs") { controller.testGetBARInfo() }
@@ -776,6 +779,38 @@ final class DriverController: NSObject, ObservableObject,
                 "psp/vram_start (MC addr): %#018llx  → expected C2PMSG_36 = %#x",
                 vramStart, UInt32(vramStart >> 20) & 0xFFFFFFFF))
         }
+    }
+
+    func testDumpCmdBuf() {
+        guard openUserClient() else { return }
+        let (kr, out) = callScalar(kSelDumpCmdBuf, outCount: 16)
+        if kr != KERN_SUCCESS {
+            append(String(format: "dumpCmdBuf: kr=%#x", kr))
+            return
+        }
+        guard out.count >= 16 else {
+            append("dumpCmdBuf: short reply (\(out.count) words)")
+            return
+        }
+        append("cmd_buf header [+0..+15]:")
+        append(String(format: "  buf_size=%#x  buf_version=%#x  cmd_id=%#x  resp_lo=%#x",
+            UInt32(out[0] & 0xFFFFFFFF), UInt32(out[1] & 0xFFFFFFFF),
+            UInt32(out[2] & 0xFFFFFFFF), UInt32(out[3] & 0xFFFFFFFF)))
+        append(String(format: "cmd_buf payload [+64..+79]: %#010x %#010x %#010x %#010x",
+            UInt32(out[4] & 0xFFFFFFFF), UInt32(out[5] & 0xFFFFFFFF),
+            UInt32(out[6] & 0xFFFFFFFF), UInt32(out[7] & 0xFFFFFFFF)))
+        append(String(format: "cmd_buf resp status [+864..+879]: %#010x %#010x %#010x %#010x",
+            UInt32(out[8] & 0xFFFFFFFF), UInt32(out[9] & 0xFFFFFFFF),
+            UInt32(out[10] & 0xFFFFFFFF), UInt32(out[11] & 0xFFFFFFFF)))
+        let fence = UInt32(out[12] & 0xFFFFFFFF)
+        append(String(format:
+            "fence_buf[0]: %#010x %@",
+            fence,
+            fence == 0 ? "(PSP never wrote — submit failed silently)" :
+                         "(PSP wrote this fence value)"))
+        append(String(format: "ring_mem [+0..+11]: %#010x %#010x %#010x",
+            UInt32(out[13] & 0xFFFFFFFF), UInt32(out[14] & 0xFFFFFFFF),
+            UInt32(out[15] & 0xFFFFFFFF)))
     }
 
     func testInitDeviceUpTo(_ stage: UInt64) {

@@ -49,10 +49,18 @@ psp_read_vram_start(const DeviceContext &dev)
            << MMHUBRegs::kFBBaseShift;
 }
 
-// VRAM offset for fw_pri. Picking 0 keeps PSP's MC-address math simple
-// (mc = vram_start + 0 = vram_start). The visible BAR0 aperture is
-// 256 MB, well larger than PSP_1_MEG (1 MB).
-static constexpr uint64_t kFwPriVRAMOffset = 0;
+// VRAM layout for PSP-accessed buffers. All four live within the first
+// few MB of VRAM (well inside the 256 MB visible BAR0 aperture). PSP
+// reads via internal GMC route — the MC address it sees is
+// `vram_start + offset`.
+//
+// We hardcode offsets for simplicity; later phases will manage VRAM
+// allocation through a proper bump-or-buddy allocator.
+static constexpr uint64_t kFwPriVRAMOffset = 0;          // [0, 1MB)
+static constexpr uint64_t kRingVRAMOffset  = 0x100000;   // 1 MB
+static constexpr uint64_t kCmdBufVRAMOffset = 0x104000;  // 1 MB + 16 KB
+static constexpr uint64_t kFenceVRAMOffset = 0x108000;   // 1 MB + 32 KB
+static constexpr uint64_t kTMRVRAMOffset   = 0x200000;   // 2 MB (size 4 MB)
 
 kern_return_t
 psp_init(DeviceContext &dev, PSPContext &psp)
@@ -409,51 +417,23 @@ psp_ring_create(DeviceContext &dev, PSPContext &psp)
         return kIOReturnNotReady;
     }
 
-    // PSP wants a 4 KB ring per its protocol; DART on AS needs a
-    // 16 KB-aligned + sized backing buffer. Allocate 16 KB, tell PSP
-    // the usable area is 4 KB via C2PMSG_71. Trailing 12 KB unused.
-    IOBufferMemoryDescriptor *buf = nullptr;
-    kern_return_t ret = IOBufferMemoryDescriptor::Create(
-        kIOMemoryDirectionOutIn, kPSPKMRingBufSize, kASPageSize, &buf);
-    if (ret != kIOReturnSuccess || buf == nullptr) {
-        return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
-    }
-    ret = buf->SetLength(kPSPKMRingBufSize);
-    if (ret != kIOReturnSuccess) {
-        buf->release();
-        return ret;
+    // VRAM-backed ring (same reason as fw_pri — PSP reads via GMC,
+    // needs an MC address, not a DART bus address). 16 KB allocation
+    // sized to AS page granularity; PSP uses only the first 4 KB.
+    uint64_t vram_start = psp_read_vram_start(dev);
+    if (vram_start == 0) {
+        PSP_LOG("ring_create: vram_start = 0; MMHUB not ready");
+        return kIOReturnNotReady;
     }
 
-    IODMACommandSpecification spec = {};
-    spec.options        = kIODMACommandSpecificationNoOptions;
-    spec.maxAddressBits = 64;
-
-    IODMACommand *cmd = nullptr;
-    ret = IODMACommand::Create(dev.pci, kIODMACommandCreateNoOptions,
-                               &spec, &cmd);
-    if (ret != kIOReturnSuccess || cmd == nullptr) {
-        buf->release();
-        return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
-    }
-    uint64_t flags = 0;
-    uint32_t segCount = 1;
-    IOAddressSegment seg = {};
-    ret = cmd->PrepareForDMA(kIODMACommandPrepareForDMANoOptions,
-                             buf, 0, kPSPKMRingBufSize,
-                             &flags, &segCount, &seg);
-    if (ret != kIOReturnSuccess || segCount != 1) {
-        cmd->release();
-        buf->release();
-        return ret != kIOReturnSuccess ? ret : kIOReturnNotAligned;
-    }
-    IOAddressSegment cpuSeg = {};
-    buf->GetAddressRange(&cpuSeg);
-
-    psp.ringBuffer      = buf;
-    psp.ringDMACommand  = cmd;
-    psp.ringBusAddr     = seg.address;
-    psp.ringCPUAddr     = reinterpret_cast<void *>(cpuSeg.address);
+    psp.ringBuffer      = nullptr;  // no sysmem buffer
+    psp.ringDMACommand  = nullptr;
+    psp.ringBusAddr     = vram_start + kRingVRAMOffset;
+    psp.ringCPUAddr     = nullptr;
     psp.ringSize        = kPSPKMRingSize;
+
+    // Zero the ring memory in VRAM (small — 16 KB = 4096 dwords).
+    bar0_memset_vram(dev, kRingVRAMOffset, 0, kPSPKMRingBufSize);
 
     const uint32_t reg64 = SOC15_REG_OFFSET(dev, IPBlock::MP0,
                                             MP0Regs::C2PMSG_64);
@@ -513,64 +493,27 @@ psp_ring_create(DeviceContext &dev, PSPContext &psp)
     }
 
     psp.ringCreated = true;
-    PSP_LOG("ring_created bus=%#llx size=%llu (response=%#010x)",
+    PSP_LOG("ring_created mc=%#llx size=%llu (response=%#010x)",
             psp.ringBusAddr, psp.ringSize, v);
 
-    // Allocate cmd + fence buffers — both DART-mapped, 16 KB aligned.
-    // The fence is just a 4 B word that PSP writes when a command
-    // completes; the cmd buffer holds one psp_gfx_cmd_resp at a time.
-    {
-        IOBufferMemoryDescriptor *cb = nullptr;
-        ret = IOBufferMemoryDescriptor::Create(
-            kIOMemoryDirectionOutIn, kPSPCmdBufSize, kASPageSize, &cb);
-        if (ret != kIOReturnSuccess || cb == nullptr) {
-            PSP_LOG("cmd buffer alloc failed: %#x", ret);
-            return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
-        }
-        cb->SetLength(kPSPCmdBufSize);
-        IODMACommand *cdma = nullptr;
-        IODMACommand::Create(dev.pci, kIODMACommandCreateNoOptions,
-                             &spec, &cdma);
-        IOAddressSegment cseg = {};
-        uint64_t cflags = 0;
-        uint32_t csegc = 1;
-        cdma->PrepareForDMA(kIODMACommandPrepareForDMANoOptions, cb, 0,
-                            kPSPCmdBufSize, &cflags, &csegc, &cseg);
-        IOAddressSegment cpu = {};
-        cb->GetAddressRange(&cpu);
-        psp.cmdBuffer     = cb;
-        psp.cmdDMACommand = cdma;
-        psp.cmdBusAddr    = cseg.address;
-        psp.cmdCPUAddr    = reinterpret_cast<void *>(cpu.address);
-    }
-    {
-        IOBufferMemoryDescriptor *fb = nullptr;
-        ret = IOBufferMemoryDescriptor::Create(
-            kIOMemoryDirectionOutIn, kPSPFenceBufSize, kASPageSize, &fb);
-        if (ret != kIOReturnSuccess || fb == nullptr) {
-            PSP_LOG("fence buffer alloc failed: %#x", ret);
-            return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
-        }
-        fb->SetLength(kPSPFenceBufSize);
-        IODMACommand *fdma = nullptr;
-        IODMACommand::Create(dev.pci, kIODMACommandCreateNoOptions,
-                             &spec, &fdma);
-        IOAddressSegment fseg = {};
-        uint64_t fflags = 0;
-        uint32_t fsegc = 1;
-        fdma->PrepareForDMA(kIODMACommandPrepareForDMANoOptions, fb, 0,
-                            kPSPFenceBufSize, &fflags, &fsegc, &fseg);
-        IOAddressSegment cpu = {};
-        fb->GetAddressRange(&cpu);
-        psp.fenceBuffer     = fb;
-        psp.fenceDMACommand = fdma;
-        psp.fenceBusAddr    = fseg.address;
-        psp.fenceCPUAddr    = reinterpret_cast<void *>(cpu.address);
-        psp.fenceCounter    = 0;
-        // Clear so the first fence value comparison doesn't false-match.
-        *reinterpret_cast<volatile uint32_t *>(psp.fenceCPUAddr) = 0;
-    }
-    PSP_LOG("cmd_buf bus=%#llx fence_buf bus=%#llx",
+    // VRAM-backed cmd + fence buffers. Same reasoning as ring/fw_pri:
+    // PSP needs an MC address it can route via GMC.
+    psp.cmdBuffer       = nullptr;
+    psp.cmdDMACommand   = nullptr;
+    psp.cmdBusAddr      = vram_start + kCmdBufVRAMOffset;
+    psp.cmdCPUAddr      = nullptr;
+
+    psp.fenceBuffer     = nullptr;
+    psp.fenceDMACommand = nullptr;
+    psp.fenceBusAddr    = vram_start + kFenceVRAMOffset;
+    psp.fenceCPUAddr    = nullptr;
+    psp.fenceCounter    = 0;
+
+    // Zero both regions in VRAM.
+    bar0_memset_vram(dev, kCmdBufVRAMOffset, 0, kPSPCmdBufSize);
+    bar0_memset_vram(dev, kFenceVRAMOffset,  0, kPSPFenceBufSize);
+
+    PSP_LOG("cmd_buf mc=%#llx fence_buf mc=%#llx",
             psp.cmdBusAddr, psp.fenceBusAddr);
     return kIOReturnSuccess;
 }
@@ -596,8 +539,7 @@ psp_ring_cmd_submit(DeviceContext &dev, PSPContext &psp,
                     const void *cmd, uint32_t cmdSize,
                     uint32_t *outRespStatus)
 {
-    if (!psp.ringCreated || psp.cmdCPUAddr == nullptr ||
-        psp.fenceCPUAddr == nullptr) {
+    if (!psp.ringCreated) {
         return kIOReturnNotReady;
     }
     if (cmd == nullptr || cmdSize != kPSPGfxCmdRespSize) {
@@ -616,64 +558,63 @@ psp_ring_cmd_submit(DeviceContext &dev, PSPContext &psp,
     // 1. Get current wptr.
     uint32_t wptr_dw = RREG32(dev, regWptr);
 
-    // 2. Locate the frame slot in ring memory.
-    PSPGfxRBFrame *ring_start =
-        reinterpret_cast<PSPGfxRBFrame *>(psp.ringCPUAddr);
-    PSPGfxRBFrame *ring_end =
-        ring_start + (ringSizeBytes / sizeof(PSPGfxRBFrame)) - 1;
-    PSPGfxRBFrame *frame;
+    // 2. Locate the frame slot offset within the ring (VRAM-relative).
+    uint32_t frame_slot;
     if ((wptr_dw % ringSizeDw) == 0) {
-        frame = ring_start;
+        frame_slot = 0;
     } else {
-        frame = ring_start + (wptr_dw / frameSizeDw);
+        frame_slot = wptr_dw / frameSizeDw;
     }
-    if (frame < ring_start || frame > ring_end) {
+    uint32_t max_slot = ringSizeBytes / sizeof(PSPGfxRBFrame);
+    if (frame_slot >= max_slot) {
         PSP_LOG("ring_cmd_submit: wptr %u out of range", wptr_dw);
         return kIOReturnInternalError;
     }
+    uint64_t frame_vram_off = kRingVRAMOffset
+                            + (uint64_t)frame_slot * sizeof(PSPGfxRBFrame);
 
-    // 3. Stage the command buffer.
-    memset(psp.cmdCPUAddr, 0, kPSPCmdBufSize);
-    memcpy(psp.cmdCPUAddr, cmd, cmdSize);
+    // 3. Stage the command buffer in VRAM via BAR0.
+    bar0_memcpy_to_vram(dev, kCmdBufVRAMOffset, cmd, cmdSize);
 
-    // 4. Bump fence counter and build the frame.
+    // 4. Bump fence counter, zero the fence dword, build the frame.
     uint32_t fence_index = ++psp.fenceCounter;
-    *reinterpret_cast<volatile uint32_t *>(psp.fenceCPUAddr) = 0;
+    WBAR0_32(dev, kFenceVRAMOffset, 0);
 
-    memset(frame, 0, sizeof(*frame));
-    frame->cmd_buf_addr_lo = static_cast<uint32_t>(psp.cmdBusAddr & 0xFFFFFFFFu);
-    frame->cmd_buf_addr_hi = static_cast<uint32_t>(psp.cmdBusAddr >> 32);
-    frame->cmd_buf_size    = kPSPGfxCmdRespSize;
-    frame->fence_addr_lo   = static_cast<uint32_t>(psp.fenceBusAddr & 0xFFFFFFFFu);
-    frame->fence_addr_hi   = static_cast<uint32_t>(psp.fenceBusAddr >> 32);
-    frame->fence_value     = fence_index;
+    PSPGfxRBFrame frame;
+    memset(&frame, 0, sizeof(frame));
+    frame.cmd_buf_addr_lo = static_cast<uint32_t>(psp.cmdBusAddr & 0xFFFFFFFFu);
+    frame.cmd_buf_addr_hi = static_cast<uint32_t>(psp.cmdBusAddr >> 32);
+    frame.cmd_buf_size    = kPSPGfxCmdRespSize;
+    frame.fence_addr_lo   = static_cast<uint32_t>(psp.fenceBusAddr & 0xFFFFFFFFu);
+    frame.fence_addr_hi   = static_cast<uint32_t>(psp.fenceBusAddr >> 32);
+    frame.fence_value     = fence_index;
+    bar0_memcpy_to_vram(dev, frame_vram_off, &frame, sizeof(frame));
 
     // 5. Advance and publish wptr (in dwords).
     wptr_dw = (wptr_dw + frameSizeDw) % ringSizeDw;
     WREG32(dev, regWptr, wptr_dw);
 
-    // 6. Wait for PSP to write the fence value.
-    auto *fence_ptr = reinterpret_cast<volatile uint32_t *>(psp.fenceCPUAddr);
-    const uint64_t kBudgetUs = 10 * 1000000;  // 10 s — same order as Linux
+    // 6. Wait for PSP to write the fence value in VRAM (read via BAR0).
+    const uint64_t kBudgetUs = 10 * 1000000;  // 10 s
     uint64_t elapsed = 0;
-    const uint64_t kStep = 100;
+    uint32_t observed = 0;
     while (elapsed < kBudgetUs) {
-        if (*fence_ptr == fence_index) break;
+        observed = RBAR2_32(dev, kFenceVRAMOffset);
+        if (observed == fence_index) break;
         IOSleep(1);
         elapsed += 1000;
-        (void)kStep;
     }
-    if (*fence_ptr != fence_index) {
+    if (observed != fence_index) {
         PSP_LOG("ring_cmd_submit: fence timeout (expected %u, got %u)",
-                fence_index, *fence_ptr);
+                fence_index, observed);
         return kIOReturnTimeout;
     }
 
-    // 7. Read response status from the cmd buffer.
-    // Upstream psp_gfx_cmd_resp.resp lives at offset 864 (see psp_gfx_if.h).
+    // 7. Read response status from cmd buffer in VRAM.
+    // Upstream psp_gfx_cmd_resp.resp lives at offset 864 (psp_gfx_if.h).
     const uint32_t kRespStatusOffset = 864;
-    uint32_t resp_status = *reinterpret_cast<const uint32_t *>(
-        static_cast<const uint8_t *>(psp.cmdCPUAddr) + kRespStatusOffset);
+    uint32_t resp_status = RBAR2_32(dev,
+        kCmdBufVRAMOffset + kRespStatusOffset);
     if (outRespStatus) *outRespStatus = resp_status;
     if (resp_status != 0) {
         PSP_LOG("ring_cmd_submit: PSP returned status %#x", resp_status);
@@ -693,49 +634,26 @@ kern_return_t
 psp_setup_tmr(DeviceContext &dev, PSPContext &psp)
 {
     if (psp.tmrSetUp) return kIOReturnSuccess;
-    if (!psp.ringCreated || psp.cmdCPUAddr == nullptr) {
+    if (!psp.ringCreated) {
         return kIOReturnNotReady;
     }
 
-    // Allocate TMR backing buffer (system memory, DART-mapped).
-    IOBufferMemoryDescriptor *buf = nullptr;
-    kern_return_t ret = IOBufferMemoryDescriptor::Create(
-        kIOMemoryDirectionOutIn, kPSPTMRDefaultSize, kASPageSize, &buf);
-    if (ret != kIOReturnSuccess || buf == nullptr) {
-        PSP_LOG("tmr buffer alloc failed: %#x", ret);
-        return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
+    // VRAM-backed TMR — pass PSP an MC address. We don't need to
+    // CPU-touch the TMR; PSP and IP firmwares own it.
+    uint64_t vram_start = psp_read_vram_start(dev);
+    if (vram_start == 0) {
+        PSP_LOG("setup_tmr: vram_start=0; MMHUB not ready");
+        return kIOReturnNotReady;
     }
-    buf->SetLength(kPSPTMRDefaultSize);
-
-    IODMACommandSpecification spec = {};
-    spec.options        = kIODMACommandSpecificationNoOptions;
-    spec.maxAddressBits = 64;
-    IODMACommand *dma = nullptr;
-    ret = IODMACommand::Create(dev.pci, kIODMACommandCreateNoOptions,
-                               &spec, &dma);
-    if (ret != kIOReturnSuccess || dma == nullptr) {
-        buf->release();
-        return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
-    }
-    uint64_t flags = 0;
-    uint32_t segCount = 1;
-    IOAddressSegment seg = {};
-    ret = dma->PrepareForDMA(kIODMACommandPrepareForDMANoOptions, buf, 0,
-                             kPSPTMRDefaultSize, &flags, &segCount, &seg);
-    if (ret != kIOReturnSuccess || segCount != 1) {
-        dma->release();
-        buf->release();
-        return ret != kIOReturnSuccess ? ret : kIOReturnNotAligned;
-    }
-    IOAddressSegment cpu = {};
-    buf->GetAddressRange(&cpu);
-    psp.tmrBuffer     = buf;
-    psp.tmrDMACommand = dma;
-    psp.tmrBusAddr    = seg.address;
-    psp.tmrCPUAddr    = reinterpret_cast<void *>(cpu.address);
+    psp.tmrBuffer     = nullptr;
+    psp.tmrDMACommand = nullptr;
+    psp.tmrBusAddr    = vram_start + kTMRVRAMOffset;
+    psp.tmrCPUAddr    = nullptr;
     psp.tmrSize       = kPSPTMRDefaultSize;
 
     // Build SETUP_TMR command in a scratch cmd_resp-sized buffer.
+    // We construct this on the dext stack and rely on the ring submit
+    // path to BAR0-copy it into the VRAM cmd_buf.
     uint8_t cmd_buf[kPSPGfxCmdRespSize];
     memset(cmd_buf, 0, sizeof(cmd_buf));
     auto *hdr = reinterpret_cast<PSPGfxCmdRespHeader *>(cmd_buf);
@@ -747,19 +665,20 @@ psp_setup_tmr(DeviceContext &dev, PSPContext &psp)
     tmr->buf_phy_addr_lo    = static_cast<uint32_t>(psp.tmrBusAddr & 0xFFFFFFFFu);
     tmr->buf_phy_addr_hi    = static_cast<uint32_t>(psp.tmrBusAddr >> 32);
     tmr->buf_size           = static_cast<uint32_t>(psp.tmrSize);
-    tmr->tmr_flags          = 0x2;  // virt_phy_addr=1 — DART buffer is its own phys
-    tmr->system_phy_addr_lo = tmr->buf_phy_addr_lo;
-    tmr->system_phy_addr_hi = tmr->buf_phy_addr_hi;
+    tmr->tmr_flags          = 0;  // VRAM-backed, not virt_phy
+    tmr->system_phy_addr_lo = 0;
+    tmr->system_phy_addr_hi = 0;
 
     uint32_t resp = 0;
-    ret = psp_ring_cmd_submit(dev, psp, cmd_buf, kPSPGfxCmdRespSize, &resp);
+    kern_return_t ret = psp_ring_cmd_submit(dev, psp, cmd_buf,
+                                            kPSPGfxCmdRespSize, &resp);
     if (ret != kIOReturnSuccess) {
         PSP_LOG("SETUP_TMR submit failed: %#x (resp=%#x)", ret, resp);
         return ret;
     }
     psp.tmrSetUp = true;
-    PSP_LOG("SETUP_TMR ok — TMR at bus=%#llx size=%llu",
-            psp.tmrBusAddr, psp.tmrSize);
+    PSP_LOG("SETUP_TMR ok — TMR at mc=%#llx (vram_off=%#llx) size=%llu",
+            psp.tmrBusAddr, (uint64_t)kTMRVRAMOffset, psp.tmrSize);
     return kIOReturnSuccess;
 }
 

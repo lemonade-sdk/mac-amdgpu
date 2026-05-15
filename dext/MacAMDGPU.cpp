@@ -69,6 +69,7 @@ enum {
     kMacAMDGPUMethodGetDiagnostics    = 23,
     kMacAMDGPUMethodDumpTMR           = 24,
     kMacAMDGPUMethodDumpPSP           = 25,
+    kMacAMDGPUMethodDumpCmdBuf        = 26,
 };
 
 // QueryInfo "info type" tags — input scalarInput[0]. Output shape
@@ -1112,6 +1113,50 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             arguments->scalarOutput[9]  = 0;
             arguments->scalarOutput[10] = 0;
         }
+        return kIOReturnSuccess;
+    }
+
+    case kMacAMDGPUMethodDumpCmdBuf: {
+        // Read 16 dwords from each of the VRAM-backed PSP control
+        // regions so we can see what PSP wrote (or didn't) after a
+        // ring submission attempt.
+        //   [0..3]  cmd_buf[0..3]     (header: buf_size, version, cmd_id, ...)
+        //   [4..7]  cmd_buf[16..19]   (cmd-specific payload start, byte 64)
+        //   [8..11] cmd_buf[216..219] (status region near upstream resp offset)
+        //   [12]    fence_buf[0]      (PSP-written fence value, or 0 if PSP
+        //                              never wrote — i.e. ring submit failed)
+        //   [13..15] ring_mem[0..2]   (first dwords of the ring frame layout)
+        if (arguments->scalarOutput == nullptr ||
+            arguments->scalarOutputCount < 16) {
+            return kIOReturnBadArgument;
+        }
+        kern_return_t openRet = mac_amdgpu_ensure_open(this, driver, pci);
+        if (openRet != kIOReturnSuccess) return openRet;
+        auto &dev = driver->ivars->bringup.device;
+        const uint64_t kCmd   = 0x104000;  // matches kCmdBufVRAMOffset
+        const uint64_t kFence = 0x108000;  // matches kFenceVRAMOffset
+        const uint64_t kRing  = 0x100000;  // matches kRingVRAMOffset
+        auto rd = [&](uint64_t off) -> uint32_t {
+            uint32_t v = 0xDEADBEEFu;
+            pci->MemoryRead32(dev.bar0MemIndex, off, &v);
+            return v;
+        };
+        arguments->scalarOutput[0]  = rd(kCmd + 0);
+        arguments->scalarOutput[1]  = rd(kCmd + 4);
+        arguments->scalarOutput[2]  = rd(kCmd + 8);
+        arguments->scalarOutput[3]  = rd(kCmd + 12);
+        arguments->scalarOutput[4]  = rd(kCmd + 64);
+        arguments->scalarOutput[5]  = rd(kCmd + 68);
+        arguments->scalarOutput[6]  = rd(kCmd + 72);
+        arguments->scalarOutput[7]  = rd(kCmd + 76);
+        arguments->scalarOutput[8]  = rd(kCmd + 864);   // resp.status @ 864
+        arguments->scalarOutput[9]  = rd(kCmd + 868);
+        arguments->scalarOutput[10] = rd(kCmd + 872);
+        arguments->scalarOutput[11] = rd(kCmd + 876);
+        arguments->scalarOutput[12] = rd(kFence + 0);
+        arguments->scalarOutput[13] = rd(kRing + 0);
+        arguments->scalarOutput[14] = rd(kRing + 4);
+        arguments->scalarOutput[15] = rd(kRing + 8);
         return kIOReturnSuccess;
     }
 
