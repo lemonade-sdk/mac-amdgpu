@@ -310,6 +310,26 @@ namespace PSPGfxFwType {
     // uni_mes packaging: ucode + data loaded as two LOAD_IP_FW frames.
     constexpr uint32_t CP_MES          = 33;
     constexpr uint32_t CP_MES_DATA     = 34;
+    // Note: upstream `enum psp_gfx_fw_type` calls this MES_STACK (=34);
+    // we use CP_MES_DATA as a clearer name for the uni_mes data half.
+    constexpr uint32_t MES_STACK       = 34;   // alias of CP_MES_DATA
+
+    // RLC sub-firmwares (v2.1+). All emitted from a single rlc.bin
+    // file when the relevant rlc_firmware_header_v2_x has non-zero
+    // size for that sub-bin. From psp_gfx_if.h.
+    constexpr uint32_t RLC_RESTORE_LIST_GPM_MEM  = 20;
+    constexpr uint32_t RLC_RESTORE_LIST_SRM_MEM  = 21;
+    constexpr uint32_t RLC_RESTORE_LIST_SRM_CNTL = 22;
+    constexpr uint32_t RLC_V                     = 7;   // psp_gfx_if.h:216
+    constexpr uint32_t RLC_P                     = 25;
+    constexpr uint32_t RLC_IRAM                  = 26;
+    constexpr uint32_t RLC_DRAM_BOOT             = 48;
+    // RLC v2.4 tap delays.
+    constexpr uint32_t GLOBAL_TAP_DELAYS         = 27;
+    constexpr uint32_t SE0_TAP_DELAYS            = 28;
+    constexpr uint32_t SE1_TAP_DELAYS            = 29;
+    constexpr uint32_t SE2_TAP_DELAYS            = 65;
+    constexpr uint32_t SE3_TAP_DELAYS            = 66;
 }
 
 // GFX command IDs (subset). Full list in upstream psp_gfx_if.h.

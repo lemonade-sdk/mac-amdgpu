@@ -125,6 +125,205 @@ struct psp_firmware_header_v2_1 {
     psp_fw_bin_desc            psp_fw_bin[];
 } __attribute__((packed));
 
+// =======================================================================
+// Per-IP firmware headers — vendored verbatim from upstream amdgpu_ucode.h
+// =======================================================================
+//
+// These are the secondary headers that follow `common_firmware_header`
+// inside a per-IP `.bin` file. The dext's per-IP extractor reads them
+// to pick out (ucode_offset, ucode_size) tuples for each LOAD_IP_FW
+// frame. Layouts MUST match upstream byte-for-byte — they're the file
+// format AMD ships, not an in-driver convention.
+
+// version_major=1, version_minor=0
+// Upstream: drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.h:181
+struct gfx_firmware_header_v1_0 {
+    common_firmware_header header;
+    uint32_t ucode_feature_version;
+    uint32_t jt_offset;
+    uint32_t jt_size;
+} __attribute__((packed));
+static_assert(sizeof(gfx_firmware_header_v1_0) == 32 + 12,
+              "gfx_firmware_header_v1_0 must be 44 bytes");
+
+// version_major=2, version_minor=0
+// Upstream: drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.h:189-198
+//
+// Used for RS64 CP firmwares (PFP/ME/MEC on RDNA4/gfx12). The single
+// .bin file contains both ucode + data; PSP gets fed:
+//   - ucode payload at (header.ucode_array_offset_bytes,
+//                       cpv2_hdr->ucode_size_bytes)
+//   - 1..N stack payloads ALL at (cpv2_hdr->data_offset_bytes,
+//                                 cpv2_hdr->data_size_bytes) — same
+//     bytes, just submitted multiple times with different fw_types
+//     (P0_STACK, P1_STACK, …). See amdgpu_ucode.c:1032-1085.
+struct gfx_firmware_header_v2_0 {
+    common_firmware_header header;
+    uint32_t ucode_feature_version;
+    uint32_t ucode_size_bytes;
+    uint32_t ucode_offset_bytes;
+    uint32_t data_size_bytes;
+    uint32_t data_offset_bytes;
+    uint32_t ucode_start_addr_lo;
+    uint32_t ucode_start_addr_hi;
+} __attribute__((packed));
+static_assert(sizeof(gfx_firmware_header_v2_0) == 32 + 28,
+              "gfx_firmware_header_v2_0 must be 60 bytes");
+
+// version_major=1, version_minor=0
+// Upstream: drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.h:201-213
+//
+// Used for both legacy mes ("amdgpu/<prefix>_mes.bin") and unified mes
+// ("amdgpu/<prefix>_uni_mes.bin") packaging. ucode and data both live
+// in the same .bin and are submitted as separate LOAD_IP_FW frames.
+struct mes_firmware_header_v1_0 {
+    common_firmware_header header;
+    uint32_t mes_ucode_version;
+    uint32_t mes_ucode_size_bytes;
+    uint32_t mes_ucode_offset_bytes;
+    uint32_t mes_ucode_data_version;
+    uint32_t mes_ucode_data_size_bytes;
+    uint32_t mes_ucode_data_offset_bytes;
+    uint32_t mes_uc_start_addr_lo;
+    uint32_t mes_uc_start_addr_hi;
+    uint32_t mes_data_start_addr_lo;
+    uint32_t mes_data_start_addr_hi;
+} __attribute__((packed));
+static_assert(sizeof(mes_firmware_header_v1_0) == 32 + 40,
+              "mes_firmware_header_v1_0 must be 72 bytes");
+
+// version_major=2, version_minor=0
+// Upstream: drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.h:226-246
+struct rlc_firmware_header_v2_0 {
+    common_firmware_header header;
+    uint32_t ucode_feature_version;
+    uint32_t jt_offset;
+    uint32_t jt_size;
+    uint32_t save_and_restore_offset;
+    uint32_t clear_state_descriptor_offset;
+    uint32_t avail_scratch_ram_locations;
+    uint32_t reg_restore_list_size;
+    uint32_t reg_list_format_start;
+    uint32_t reg_list_format_separate_start;
+    uint32_t starting_offsets_start;
+    uint32_t reg_list_format_size_bytes;
+    uint32_t reg_list_format_array_offset_bytes;
+    uint32_t reg_list_size_bytes;
+    uint32_t reg_list_array_offset_bytes;
+    uint32_t reg_list_format_separate_size_bytes;
+    uint32_t reg_list_format_separate_array_offset_bytes;
+    uint32_t reg_list_separate_size_bytes;
+    uint32_t reg_list_separate_array_offset_bytes;
+} __attribute__((packed));
+static_assert(sizeof(rlc_firmware_header_v2_0) == 32 + 18 * 4,
+              "rlc_firmware_header_v2_0 must be 104 bytes");
+
+// version_major=2, version_minor=1
+// Upstream: drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.h:249-264
+struct rlc_firmware_header_v2_1 {
+    rlc_firmware_header_v2_0 v2_0;
+    uint32_t reg_list_format_direct_reg_list_length;
+    uint32_t save_restore_list_cntl_ucode_ver;
+    uint32_t save_restore_list_cntl_feature_ver;
+    uint32_t save_restore_list_cntl_size_bytes;
+    uint32_t save_restore_list_cntl_offset_bytes;
+    uint32_t save_restore_list_gpm_ucode_ver;
+    uint32_t save_restore_list_gpm_feature_ver;
+    uint32_t save_restore_list_gpm_size_bytes;
+    uint32_t save_restore_list_gpm_offset_bytes;
+    uint32_t save_restore_list_srm_ucode_ver;
+    uint32_t save_restore_list_srm_feature_ver;
+    uint32_t save_restore_list_srm_size_bytes;
+    uint32_t save_restore_list_srm_offset_bytes;
+} __attribute__((packed));
+static_assert(sizeof(rlc_firmware_header_v2_1) ==
+                  sizeof(rlc_firmware_header_v2_0) + 13 * 4,
+              "rlc_firmware_header_v2_1 must be v2_0 + 52 bytes");
+
+// version_major=2, version_minor=2
+// Upstream: drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.h:267-273
+struct rlc_firmware_header_v2_2 {
+    rlc_firmware_header_v2_1 v2_1;
+    uint32_t rlc_iram_ucode_size_bytes;
+    uint32_t rlc_iram_ucode_offset_bytes;
+    uint32_t rlc_dram_ucode_size_bytes;
+    uint32_t rlc_dram_ucode_offset_bytes;
+} __attribute__((packed));
+static_assert(sizeof(rlc_firmware_header_v2_2) ==
+                  sizeof(rlc_firmware_header_v2_1) + 16,
+              "rlc_firmware_header_v2_2 must be v2_1 + 16 bytes");
+
+// version_major=2, version_minor=3
+// Upstream: drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.h:276-286
+struct rlc_firmware_header_v2_3 {
+    rlc_firmware_header_v2_2 v2_2;
+    uint32_t rlcp_ucode_version;
+    uint32_t rlcp_ucode_feature_version;
+    uint32_t rlcp_ucode_size_bytes;
+    uint32_t rlcp_ucode_offset_bytes;
+    uint32_t rlcv_ucode_version;
+    uint32_t rlcv_ucode_feature_version;
+    uint32_t rlcv_ucode_size_bytes;
+    uint32_t rlcv_ucode_offset_bytes;
+} __attribute__((packed));
+static_assert(sizeof(rlc_firmware_header_v2_3) ==
+                  sizeof(rlc_firmware_header_v2_2) + 8 * 4,
+              "rlc_firmware_header_v2_3 must be v2_2 + 32 bytes");
+
+// version_major=2, version_minor=4
+// Upstream: drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.h:289-301
+struct rlc_firmware_header_v2_4 {
+    rlc_firmware_header_v2_3 v2_3;
+    uint32_t global_tap_delays_ucode_size_bytes;
+    uint32_t global_tap_delays_ucode_offset_bytes;
+    uint32_t se0_tap_delays_ucode_size_bytes;
+    uint32_t se0_tap_delays_ucode_offset_bytes;
+    uint32_t se1_tap_delays_ucode_size_bytes;
+    uint32_t se1_tap_delays_ucode_offset_bytes;
+    uint32_t se2_tap_delays_ucode_size_bytes;
+    uint32_t se2_tap_delays_ucode_offset_bytes;
+    uint32_t se3_tap_delays_ucode_size_bytes;
+    uint32_t se3_tap_delays_ucode_offset_bytes;
+} __attribute__((packed));
+static_assert(sizeof(rlc_firmware_header_v2_4) ==
+                  sizeof(rlc_firmware_header_v2_3) + 10 * 4,
+              "rlc_firmware_header_v2_4 must be v2_3 + 40 bytes");
+
+// version_major=3, version_minor=0
+// Upstream: drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.h:371-376
+//
+// Used by sdma_v7_x (RDNA4 / gfx12). Single payload, but the
+// payload offset is `header.ucode_array_offset_bytes` and the
+// size is `ucode_size_bytes` (a v3-specific field, NOT the
+// common header's ucode_size_bytes — the common one for a v3
+// .bin is the total file size). See amdgpu_ucode.c:901-905
+// (AMDGPU_UCODE_ID_SDMA_RS64 case).
+struct sdma_firmware_header_v3_0 {
+    common_firmware_header header;
+    uint32_t ucode_feature_version;
+    uint32_t ucode_offset_bytes;
+    uint32_t ucode_size_bytes;
+} __attribute__((packed));
+static_assert(sizeof(sdma_firmware_header_v3_0) == 32 + 12,
+              "sdma_firmware_header_v3_0 must be 44 bytes");
+
+// version_major=1, version_minor=0
+// Upstream: drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.h:432-438
+//
+// One .bin contains both iram + dram ucode. PSP gets two LOAD_IP_FW
+// frames (IMU_I=68 and IMU_D=69). Per amdgpu_ucode.c:1021-1031, the
+// IMU_D payload sits IMMEDIATELY AFTER the iram payload (no
+// independent offset field for dram — it's iram_offset + iram_size).
+struct imu_firmware_header_v1_0 {
+    common_firmware_header header;
+    uint32_t imu_iram_ucode_size_bytes;
+    uint32_t imu_iram_ucode_offset_bytes;
+    uint32_t imu_dram_ucode_size_bytes;
+    uint32_t imu_dram_ucode_offset_bytes;
+} __attribute__((packed));
+static_assert(sizeof(imu_firmware_header_v1_0) == 32 + 16,
+              "imu_firmware_header_v1_0 must be 48 bytes");
+
 // ---- Bootloader command codes ------------------------------------------
 //
 // Written to MP0_C2PMSG_35 to tell the PSP bootloader which sub-firmware
