@@ -129,7 +129,10 @@ ih_init(DeviceContext &dev, IHContext &ih)
     ih.ring_cpu         = reinterpret_cast<void *>(ring_cpu.address);
     ih.ring_size_bytes  = ring_size;
     ih.ring_size_dwords = ring_size / 4;
-    ih.ptr_mask         = ih.ring_size_dwords - 1;
+    // ptr_mask is byte-granular per upstream amdgpu_ih_ring_init
+    // (amdgpu_ih.c:52). rptr/wptr in this driver are both byte
+    // offsets into the ring.
+    ih.ptr_mask         = ring_size - 1;
     ih.wptr_shadow_buf  = wbuf;
     ih.wptr_shadow_dma  = wdma;
     ih.wptr_shadow_bus  = wseg.address;
@@ -229,14 +232,25 @@ ih_enable_ring(const DeviceContext &dev, IHContext &ih)
     WREG32(dev, base_reg,   (uint32_t)((ih.ring_bus >> 8) & 0xFFFFFFFFu));
     WREG32(dev, basehi_reg, (uint32_t)((ih.ring_bus >> 40) & 0xFFu));
 
-    // RB_CNTL: enable IH_DUMMY_DATA bypass-free path.
+    // RB_CNTL: mirror ih_v7_0_rb_cntl (ih_v7_0.c:187-208) +
+    // ih_v7_0_enable_ring's RPTR_REARM line (252). Field shifts
+    // taken from osssys_7_0_0_sh_mask.h.
+    //   RB_SIZE             = log2(ring_dwords)        bits[5:1]
+    //   MC_SPACE            = 2 (bus_addr)             bits[31:28]
+    //   WPTR_OVERFLOW_CLEAR = 1                        bit[31] (self-clearing)
+    //   WPTR_OVERFLOW_ENABLE= 1                        bit[16]
+    //   WPTR_WRITEBACK_ENABLE = 1                      bit[8]
+    //   MC_SNOOP            = 1                        bit[20]
+    //   RPTR_REARM          = 1 (we use MSI)           bit[21]
+    //   MC_RO / MC_VMID     = 0
     uint32_t cntl = 0;
     cntl |= (log2u32(ih.ring_size_dwords) << kIH_RB_CNTL__RB_SIZE__SHIFT);
-    cntl |= (1u << kIH_RB_CNTL__WPTR_WRITEBACK__SHIFT);
-    cntl |= (kIH_RB_CNTL_MC_SPACE_IOMMU << kIH_RB_CNTL__MC_SPACE__SHIFT);
-    cntl |= (1u << kIH_RB_CNTL__RPTR_REARM__SHIFT);
-    cntl |= (1u << kIH_RB_CNTL__MC_SNOOP__SHIFT);
+    cntl |= (kIH_RB_CNTL_MC_SPACE_BUS_ADDR << kIH_RB_CNTL__MC_SPACE__SHIFT);
+    cntl |= (1u << kIH_RB_CNTL__WPTR_OVERFLOW_CLEAR__SHIFT);
     cntl |= (1u << kIH_RB_CNTL__WPTR_OVERFLOW_ENABLE__SHIFT);
+    cntl |= (1u << kIH_RB_CNTL__WPTR_WRITEBACK_ENABLE__SHIFT);
+    cntl |= (1u << kIH_RB_CNTL__MC_SNOOP__SHIFT);
+    cntl |= (1u << kIH_RB_CNTL__RPTR_REARM__SHIFT);
     // RB_ENABLE stays 0 here; ih_toggle(true) sets it later.
     WREG32(dev, cntl_reg, cntl);
 
@@ -256,24 +270,42 @@ ih_enable_ring(const DeviceContext &dev, IHContext &ih)
 
 // ----- ih_program_msi_storm: storm/flood control -----
 //
-// Mirrors the upstream MSI storm config — throttle MSI delivery to
-// avoid VM-fault storms melting the host. Linux default DELAY=3.
+// Mirrors ih_v7_0.c:353-370 — read-modify-write each register and
+// set just one field per the upstream sequence. Field shifts come
+// from osssys_7_0_0_sh_mask.h.
 kern_return_t
 ih_program_msi_storm(const DeviceContext &dev, const IHContext &ih)
 {
     (void)ih;
     if (!dev.ip.isResolved(IPBlock::OSSSYS)) return kIOReturnNotReady;
-    // IH_MSI_STORM_CTRL: bits [1:0] = DELAY (3 = max throttle)
-    WREG32(dev, SOC15_REG_OFFSET(dev, IPBlock::OSSSYS,
-                                 IHRegs::IH_MSI_STORM_CTRL), 0x3);
-    // IH_INT_FLOOD_CNTL: leave at default (Linux writes 0; just clear it)
-    WREG32(dev, SOC15_REG_OFFSET(dev, IPBlock::OSSSYS,
-                                 IHRegs::IH_INT_FLOOD_CNTL), 0);
-    // IH_STORM_CLIENT_LIST_CNTL: enable storm protection for client 18
-    // (matches upstream default; bit-position derivation in upstream).
-    WREG32(dev, SOC15_REG_OFFSET(dev, IPBlock::OSSSYS,
-                                 IHRegs::IH_STORM_CLIENT_LIST_CNTL),
-           (1u << 18));
+
+    // IH_STORM_CLIENT_LIST_CNTL: set CLIENT18_IS_STORM_CLIENT = 1
+    // (ih_v7_0.c:353-356).
+    const uint32_t storm_reg =
+        SOC15_REG_OFFSET(dev, IPBlock::OSSSYS,
+                         IHRegs::IH_STORM_CLIENT_LIST_CNTL);
+    uint32_t storm = RREG32(dev, storm_reg);
+    storm |= (1u << kIH_STORM_CLIENT_LIST_CNTL__CLIENT18_IS_STORM_CLIENT__SHIFT);
+    WREG32(dev, storm_reg, storm);
+
+    // IH_INT_FLOOD_CNTL: FLOOD_CNTL_ENABLE = 1 (ih_v7_0.c:358-360).
+    const uint32_t flood_reg =
+        SOC15_REG_OFFSET(dev, IPBlock::OSSSYS,
+                         IHRegs::IH_INT_FLOOD_CNTL);
+    uint32_t flood = RREG32(dev, flood_reg);
+    flood |= (1u << kIH_INT_FLOOD_CNTL__FLOOD_CNTL_ENABLE__SHIFT);
+    WREG32(dev, flood_reg, flood);
+
+    // IH_MSI_STORM_CTRL: DELAY = 3 (ih_v7_0.c:367-370).
+    const uint32_t msi_reg =
+        SOC15_REG_OFFSET(dev, IPBlock::OSSSYS,
+                         IHRegs::IH_MSI_STORM_CTRL);
+    uint32_t msi = RREG32(dev, msi_reg);
+    // DELAY is a 2-bit field at [1:0] per sh_mask:
+    //   #define IH_MSI_STORM_CTRL__DELAY_MASK 0x3
+    msi = (msi & ~0x3u)
+        | (3u << kIH_MSI_STORM_CTRL__DELAY__SHIFT);
+    WREG32(dev, msi_reg, msi);
     return kIOReturnSuccess;
 }
 
@@ -297,26 +329,45 @@ ih_drain(const DeviceContext &dev, IHContext &ih,
         : RREG32(dev,
                  SOC15_REG_OFFSET(dev, IPBlock::OSSSYS,
                                   IHRegs::IH_RB_WPTR));
-    // Overflow bit: bit 31 of wptr indicates the GPU's write pointer
-    // wrapped past rptr. Linux logs + clears.
-    if (wptr & (1u << 31)) {
+    // Overflow flag lives in IH_RB_WPTR.RB_OVERFLOW (bit 0) per
+    // osssys_7_0_0_sh_mask.h:206 and ih_v7_0_get_wptr (ih_v7_0.c:462).
+    // The earlier "bit 31" check was bogus.
+    if (wptr & (1u << kIH_RB_WPTR__RB_OVERFLOW__SHIFT)) {
         ih.overflows_seen++;
-        // Clear overflow in IH_RB_CNTL bit 31.
+        // Re-read from MMIO to make sure the overflow latched (the
+        // shadow can race with the engine on the same line) — mirrors
+        // ih_v7_0_get_wptr's second RREG32_NO_KIQ.
+        wptr = RREG32(dev,
+                      SOC15_REG_OFFSET(dev, IPBlock::OSSSYS,
+                                       IHRegs::IH_RB_WPTR));
+        // Recovery per upstream: skip ahead to wptr+32 (drop oldest)
+        // and assert + de-assert IH_RB_CNTL.WPTR_OVERFLOW_CLEAR so a
+        // new overflow can be latched.
         uint32_t cntl_reg = SOC15_REG_OFFSET(dev, IPBlock::OSSSYS,
                                              IHRegs::IH_RB_CNTL);
         uint32_t cntl = RREG32(dev, cntl_reg);
         cntl |= (1u << kIH_RB_CNTL__WPTR_OVERFLOW_CLEAR__SHIFT);
         WREG32(dev, cntl_reg, cntl);
-        IH_LOG("ring overflow seen (count=%llu)", ih.overflows_seen);
-        wptr &= ~(1u << 31);
+        cntl &= ~(1u << kIH_RB_CNTL__WPTR_OVERFLOW_CLEAR__SHIFT);
+        WREG32(dev, cntl_reg, cntl);
+
+        // Clear the overflow bit out of wptr before masking, and
+        // advance rptr to wptr+32 so we start from the oldest entry
+        // still in the ring (ih_v7_0.c:474).
+        wptr &= ~(1u << kIH_RB_WPTR__RB_OVERFLOW__SHIFT);
+        ih.rptr = (wptr + 32) & ih.ptr_mask;
+        IH_LOG("ring overflow seen (count=%llu) — rptr advanced to %#x",
+               ih.overflows_seen, ih.rptr);
     }
 
     wptr &= ih.ptr_mask;
     uint32_t count = 0;
     auto *ring = static_cast<const uint32_t *>(ih.ring_cpu);
     while (ih.rptr != wptr) {
-        // 8 dwords per entry.
-        const uint32_t *e = &ring[ih.rptr];
+        // rptr / wptr are byte offsets; the ring base is dword-typed
+        // so divide by 4 to index. Each IH entry is 8 dwords = 32 B
+        // (amdgpu_ih.c:295: `ih->rptr += 32`).
+        const uint32_t *e = &ring[ih.rptr >> 2];
         IHEntry decoded{};
         decoded.client_id  =  e[0]        & 0xFF;
         decoded.src_id     = (e[0] >> 8)  & 0xFF;
@@ -333,12 +384,12 @@ ih_drain(const DeviceContext &dev, IHContext &ih,
 
         if (dispatch != nullptr) dispatch(decoded, user);
 
-        ih.rptr = (ih.rptr + kIHEntryDwords) & ih.ptr_mask;
+        ih.rptr = (ih.rptr + kIHEntryBytes) & ih.ptr_mask;
         count++;
     }
 
     if (count > 0) {
-        // Advance hardware rptr.
+        // Advance hardware rptr — register also takes bytes.
         WREG32(dev, SOC15_REG_OFFSET(dev, IPBlock::OSSSYS,
                                      IHRegs::IH_RB_RPTR),
                ih.rptr);
