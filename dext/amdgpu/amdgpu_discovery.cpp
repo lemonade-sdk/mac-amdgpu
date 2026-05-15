@@ -49,7 +49,7 @@ IPBlock hwid_to_block(uint16_t hwid) {
     case HWID::MP0:    return IPBlock::MP0;
     case HWID::MP1:    return IPBlock::MP1;
     case HWID::GC:     return IPBlock::GC;
-    case HWID::MMHUB:  return IPBlock::GMC;
+    case HWID::MMHUB:  return IPBlock::MMHUB;
     case HWID::HDP:    return IPBlock::HDP;
     case HWID::OSSSYS: return IPBlock::OSSSYS;
     case HWID::SDMA0:  return IPBlock::SDMA0;
@@ -70,6 +70,7 @@ const char *block_name(IPBlock b) {
     case IPBlock::SDMA0:  return "SDMA0";
     case IPBlock::SDMA1:  return "SDMA1";
     case IPBlock::NBIO:   return "NBIO";
+    case IPBlock::MMHUB:  return "MMHUB";
     default:              return "?";
     }
 }

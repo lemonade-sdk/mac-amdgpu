@@ -65,6 +65,7 @@ enum class IPBlock : uint8_t {
     NBIO,
     OSSSYS,    // IH lives here
     GMC,
+    MMHUB,     // owns regMMMC_VM_FB_LOCATION_BASE — needed to find vram_start
     Count,
 };
 
@@ -137,6 +138,23 @@ namespace MP1Regs {
     constexpr uint32_t C2PMSG_66 = 0x0082;  // message id (host → SMU)
     constexpr uint32_t C2PMSG_82 = 0x0092;  // parameter / return value
     constexpr uint32_t C2PMSG_90 = 0x009A;  // response (SMU → host)
+}
+
+// MMHUB registers — owns the VRAM/framebuffer location in MC space.
+// Used to compute the GPU-MC address of any VRAM offset so PSP /
+// other firmware can DMA-read from it via the GMC internal path.
+//
+// Offsets from upstream asic_reg/mmhub/mmhub_4_1_0_offset.h (RDNA4).
+// Older NBIO families (4_1_0, etc) use the same offset but different
+// IP BASE_IDX — we use BASE_IDX 0 which is what discovery reports.
+//
+// `regMMMC_VM_FB_LOCATION_BASE & 0x00FFFFFF` << 24 = vram_start MC addr.
+namespace MMHUBRegs {
+    constexpr uint32_t MMMC_VM_FB_LOCATION_BASE = 0x0554;
+    constexpr uint32_t MMMC_VM_FB_LOCATION_TOP  = 0x0555;
+    constexpr uint32_t MMMC_VM_FB_OFFSET        = 0x0556;
+    constexpr uint32_t kFBBaseMask = 0x00FFFFFFu;  // low 24 bits
+    constexpr uint32_t kFBBaseShift = 24;          // <<24 to get MC addr
 }
 
 // PPSMC messages — drivers/gpu/drm/amd/pm/swsmu/inc/pmfw_if/

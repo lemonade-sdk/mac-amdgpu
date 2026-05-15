@@ -725,12 +725,12 @@ final class DriverController: NSObject, ObservableObject,
 
     func testDumpPSP() {
         guard openUserClient() else { return }
-        let (kr, out) = callScalar(kSelDumpPSP, outCount: 7)
+        let (kr, out) = callScalar(kSelDumpPSP, outCount: 11)
         if kr != KERN_SUCCESS {
             append(String(format: "dumpPSP: kr=%#x", kr))
             return
         }
-        guard out.count >= 7 else {
+        guard out.count >= 11 else {
             append("dumpPSP: short reply (\(out.count) words)")
             return
         }
@@ -762,6 +762,20 @@ final class DriverController: NSObject, ObservableObject,
             "psp/C2PMSG_81 (sOS sign-of-life, bit 31): %#010x %@",
             c81, (c81 & 0x80000000) != 0 ? "✓ ALIVE" : "✗ NOT ALIVE"))
         append("psp/ring created: \(ringCreated)")
+        let mmhubBase = UInt32(out[7] & 0xFFFFFFFF)
+        if mmhubBase == 0xFFFFFFFF {
+            append("psp/mmhub: UNRESOLVED — MMHUB IP base not discovered")
+        } else {
+            let fbBase = UInt32(out[8] & 0xFFFFFFFF)
+            let fbTop  = UInt32(out[9] & 0xFFFFFFFF)
+            let vramStart = out[10]
+            append(String(format:
+                "psp/mmhub_base: %#010x  FB_LOCATION_BASE=%#010x  FB_LOCATION_TOP=%#010x",
+                mmhubBase, fbBase, fbTop))
+            append(String(format:
+                "psp/vram_start (MC addr): %#018llx  → expected C2PMSG_36 = %#x",
+                vramStart, UInt32(vramStart >> 20) & 0xFFFFFFFF))
+        }
     }
 
     func testInitDeviceUpTo(_ stage: UInt64) {

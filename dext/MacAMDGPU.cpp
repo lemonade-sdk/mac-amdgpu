@@ -1059,9 +1059,7 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
     }
 
     case kMacAMDGPUMethodDumpPSP: {
-        // Returns SOC15-resolved PSP register reads. Requires IP
-        // discovery to have populated MP0's base — call after at
-        // least one successful IP discovery / Initialize GPU run.
+        // Returns SOC15-resolved PSP register reads + MMHUB vram_start.
         // Outputs:
         //   [0] MP0 IP base (or 0xFFFFFFFF if unresolved)
         //   [1] C2PMSG_33 (IFWI ready, bit 31 = 1 when ready)
@@ -1070,8 +1068,12 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         //   [4] C2PMSG_64 (PSP ring base low — host-written)
         //   [5] C2PMSG_81 (sOS sign-of-life, bit 31 set when alive)
         //   [6] PSP ring create state (0=not created, 1=created)
+        //   [7] MMHUB IP base (or 0xFFFFFFFF if unresolved)
+        //   [8] regMMMC_VM_FB_LOCATION_BASE raw value
+        //   [9] regMMMC_VM_FB_LOCATION_TOP raw value
+        //   [10] computed vram_start (FB_LOCATION_BASE.FB_BASE << 24)
         if (arguments->scalarOutput == nullptr ||
-            arguments->scalarOutputCount < 7) {
+            arguments->scalarOutputCount < 11) {
             return kIOReturnBadArgument;
         }
         kern_return_t openRet = mac_amdgpu_ensure_open(this, driver, pci);
@@ -1079,7 +1081,7 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         auto &dev = driver->ivars->bringup.device;
         if (!dev.ip.isResolved(amdgpu::IPBlock::MP0)) {
             arguments->scalarOutput[0] = 0xFFFFFFFFu;
-            for (int i = 1; i < 7; i++) arguments->scalarOutput[i] = 0;
+            for (int i = 1; i < 11; i++) arguments->scalarOutput[i] = 0;
             return kIOReturnSuccess;
         }
         uint32_t mp0_base = dev.ip.get(amdgpu::IPBlock::MP0);
@@ -1090,6 +1092,26 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         arguments->scalarOutput[4] = amdgpu::RREG32(dev, mp0_base + 0x0080);
         arguments->scalarOutput[5] = amdgpu::RREG32(dev, mp0_base + 0x0091);
         arguments->scalarOutput[6] = (uint64_t)driver->ivars->bringup.psp.ringCreated;
+
+        if (dev.ip.isResolved(amdgpu::IPBlock::MMHUB)) {
+            uint32_t mmhub_base = dev.ip.get(amdgpu::IPBlock::MMHUB);
+            uint32_t fb_base_raw = amdgpu::RREG32(dev,
+                mmhub_base + amdgpu::MMHUBRegs::MMMC_VM_FB_LOCATION_BASE);
+            uint32_t fb_top_raw  = amdgpu::RREG32(dev,
+                mmhub_base + amdgpu::MMHUBRegs::MMMC_VM_FB_LOCATION_TOP);
+            uint64_t vram_start =
+                ((uint64_t)(fb_base_raw & amdgpu::MMHUBRegs::kFBBaseMask))
+                << amdgpu::MMHUBRegs::kFBBaseShift;
+            arguments->scalarOutput[7]  = mmhub_base;
+            arguments->scalarOutput[8]  = fb_base_raw;
+            arguments->scalarOutput[9]  = fb_top_raw;
+            arguments->scalarOutput[10] = vram_start;
+        } else {
+            arguments->scalarOutput[7]  = 0xFFFFFFFFu;
+            arguments->scalarOutput[8]  = 0;
+            arguments->scalarOutput[9]  = 0;
+            arguments->scalarOutput[10] = 0;
+        }
         return kIOReturnSuccess;
     }
 
