@@ -1,10 +1,15 @@
 //
-//  sdma_v7_0.cpp — SDMA v7_0 ring bringup for RDNA4 / gfx1201.
+//  sdma_v7_0.cpp — SDMA v7_1 ring bringup for RDNA4 R9700 / gfx12.1.0.
+//
+//  File name kept as sdma_v7_0.cpp for git history; the implementation
+//  actually mirrors sdma_v7_1.c (IP_VERSION(7,0,1)). All register
+//  offsets and field shifts come from gc_12_1_0_offset.h /
+//  gc_12_1_0_sh_mask.h via amdgpu_sdma.h.
 //
 //  Sources:
-//      drivers/gpu/drm/amd/amdgpu/sdma_v7_0.c
-//          (sdma_v7_0_gfx_resume_instance, sdma_v7_0_enable,
-//           sdma_v7_0_gfx_stop, sdma_v7_0_get_reg_offset)
+//      drivers/gpu/drm/amd/amdgpu/sdma_v7_1.c
+//          (sdma_v7_1_gfx_resume_instance, sdma_v7_1_inst_enable,
+//           sdma_v7_1_inst_gfx_stop, sdma_v7_1_get_reg_offset)
 //
 
 #include <os/log.h>
@@ -120,7 +125,7 @@ sdma_alloc_storage(DeviceContext &dev, SDMAInstance &inst)
 }
 
 //------------------------------------------------------------------
-// sdma_engine_halt — write SDMA0_MCU_CNTL.HALT.
+// sdma_engine_halt — write SDMA0_SDMA_MCU_CNTL.HALT.
 //------------------------------------------------------------------
 kern_return_t
 sdma_engine_halt(const DeviceContext &dev, uint32_t instance, bool halt)
@@ -131,8 +136,8 @@ sdma_engine_halt(const DeviceContext &dev, uint32_t instance, bool halt)
     }
     const uint32_t reg = sdma_reg_offset(dev, instance, SDMARegs::MCU_CNTL);
     uint32_t v = RREG32(dev, reg);
-    v = REG_SET_FIELD(v, SDMA0_MCU_CNTL, HALT, halt ? 1u : 0u);
-    v = REG_SET_FIELD(v, SDMA0_MCU_CNTL, RESET, 0u);
+    v = REG_SET_FIELD(v, SDMA0_SDMA_MCU_CNTL, HALT, halt ? 1u : 0u);
+    v = REG_SET_FIELD(v, SDMA0_SDMA_MCU_CNTL, RESET, 0u);
     WREG32(dev, reg, v);
     return kIOReturnSuccess;
 }
@@ -151,11 +156,11 @@ sdma_gfx_stop_instance(const DeviceContext &dev, uint32_t instance)
         sdma_reg_offset(dev, instance, SDMARegs::QUEUE0_IB_CNTL);
 
     uint32_t rb_cntl = RREG32(dev, rb_cntl_reg);
-    rb_cntl = REG_SET_FIELD(rb_cntl, SDMA0_QUEUE0_RB_CNTL, RB_ENABLE, 0);
+    rb_cntl = REG_SET_FIELD(rb_cntl, SDMA0_SDMA_QUEUE0_RB_CNTL, RB_ENABLE, 0);
     WREG32(dev, rb_cntl_reg, rb_cntl);
 
     uint32_t ib_cntl = RREG32(dev, ib_cntl_reg);
-    ib_cntl = REG_SET_FIELD(ib_cntl, SDMA0_QUEUE0_IB_CNTL, IB_ENABLE, 0);
+    ib_cntl = REG_SET_FIELD(ib_cntl, SDMA0_SDMA_QUEUE0_IB_CNTL, IB_ENABLE, 0);
     WREG32(dev, ib_cntl_reg, ib_cntl);
     return kIOReturnSuccess;
 }
@@ -194,8 +199,8 @@ sdma_gfx_resume_instance(const DeviceContext &dev, SDMAInstance &inst)
     // 1) Initial RB_CNTL — set RB_SIZE, set RB_PRIV.
     uint32_t rb_bufsz = order_base_2(inst.ring_size_dwords);
     uint32_t rb_cntl = RREG32(dev, reg(SDMARegs::QUEUE0_RB_CNTL));
-    rb_cntl = REG_SET_FIELD(rb_cntl, SDMA0_QUEUE0_RB_CNTL, RB_SIZE, rb_bufsz);
-    rb_cntl = REG_SET_FIELD(rb_cntl, SDMA0_QUEUE0_RB_CNTL, RB_PRIV, 1);
+    rb_cntl = REG_SET_FIELD(rb_cntl, SDMA0_SDMA_QUEUE0_RB_CNTL, RB_SIZE, rb_bufsz);
+    rb_cntl = REG_SET_FIELD(rb_cntl, SDMA0_SDMA_QUEUE0_RB_CNTL, RB_PRIV, 1);
     WREG32(dev, reg(SDMARegs::QUEUE0_RB_CNTL), rb_cntl);
 
     // 2) Reset RPTR/WPTR.
@@ -219,11 +224,11 @@ sdma_gfx_resume_instance(const DeviceContext &dev, SDMAInstance &inst)
 
     // 5) Enable RPTR writeback. MCU_WPTR_POLL_ENABLE on per upstream
     //    bare-metal path; WPTR_POLL_ENABLE off (driver kicks doorbell).
-    rb_cntl = REG_SET_FIELD(rb_cntl, SDMA0_QUEUE0_RB_CNTL,
+    rb_cntl = REG_SET_FIELD(rb_cntl, SDMA0_SDMA_QUEUE0_RB_CNTL,
                             RPTR_WRITEBACK_ENABLE, 1);
-    rb_cntl = REG_SET_FIELD(rb_cntl, SDMA0_QUEUE0_RB_CNTL,
+    rb_cntl = REG_SET_FIELD(rb_cntl, SDMA0_SDMA_QUEUE0_RB_CNTL,
                             WPTR_POLL_ENABLE, 0);
-    rb_cntl = REG_SET_FIELD(rb_cntl, SDMA0_QUEUE0_RB_CNTL,
+    rb_cntl = REG_SET_FIELD(rb_cntl, SDMA0_SDMA_QUEUE0_RB_CNTL,
                             MCU_WPTR_POLL_ENABLE, 1);
 
     // 6) Ring base — RB_BASE is bus_addr >> 8, BASE_HI is >> 40.
@@ -244,9 +249,9 @@ sdma_gfx_resume_instance(const DeviceContext &dev, SDMAInstance &inst)
     uint32_t doorbell        = RREG32(dev, reg(SDMARegs::QUEUE0_DOORBELL));
     uint32_t doorbell_offset = RREG32(dev, reg(SDMARegs::QUEUE0_DOORBELL_OFFSET));
     doorbell        = REG_SET_FIELD(doorbell,
-                                    SDMA0_QUEUE0_DOORBELL, ENABLE, 1);
+                                    SDMA0_SDMA_QUEUE0_DOORBELL, ENABLE, 1);
     doorbell_offset = REG_SET_FIELD(doorbell_offset,
-                                    SDMA0_QUEUE0_DOORBELL_OFFSET, OFFSET,
+                                    SDMA0_SDMA_QUEUE0_DOORBELL_OFFSET, OFFSET,
                                     inst.doorbell_index);
     WREG32(dev, reg(SDMARegs::QUEUE0_DOORBELL),        doorbell);
     WREG32(dev, reg(SDMARegs::QUEUE0_DOORBELL_OFFSET), doorbell_offset);
@@ -258,15 +263,15 @@ sdma_gfx_resume_instance(const DeviceContext &dev, SDMAInstance &inst)
     //     For now we just write 1 (we don't carry a usec_timeout var).
     {
         uint32_t v = RREG32(dev, reg(SDMARegs::WATCHDOG_CNTL));
-        v = REG_SET_FIELD(v, SDMA0_WATCHDOG_CNTL, QUEUE_HANG_COUNT, 1);
+        v = REG_SET_FIELD(v, SDMA0_SDMA_WATCHDOG_CNTL, QUEUE_HANG_COUNT, 1);
         WREG32(dev, reg(SDMARegs::WATCHDOG_CNTL), v);
     }
 
     // 11) UTCL1 RESP_MODE=3, REDO_DELAY=9.
     {
         uint32_t v = RREG32(dev, reg(SDMARegs::UTCL1_CNTL));
-        v = REG_SET_FIELD(v, SDMA0_UTCL1_CNTL, RESP_MODE,  3);
-        v = REG_SET_FIELD(v, SDMA0_UTCL1_CNTL, REDO_DELAY, 9);
+        v = REG_SET_FIELD(v, SDMA0_SDMA_UTCL1_CNTL, RESP_MODE,  3);
+        v = REG_SET_FIELD(v, SDMA0_SDMA_UTCL1_CNTL, REDO_DELAY, 9);
         WREG32(dev, reg(SDMARegs::UTCL1_CNTL), v);
     }
 
@@ -283,11 +288,11 @@ sdma_gfx_resume_instance(const DeviceContext &dev, SDMAInstance &inst)
     sdma_engine_halt(dev, i, false);
 
     // 14) Enable the ring + IB.
-    rb_cntl = REG_SET_FIELD(rb_cntl, SDMA0_QUEUE0_RB_CNTL, RB_ENABLE, 1);
+    rb_cntl = REG_SET_FIELD(rb_cntl, SDMA0_SDMA_QUEUE0_RB_CNTL, RB_ENABLE, 1);
     WREG32(dev, reg(SDMARegs::QUEUE0_RB_CNTL), rb_cntl);
 
     uint32_t ib_cntl = RREG32(dev, reg(SDMARegs::QUEUE0_IB_CNTL));
-    ib_cntl = REG_SET_FIELD(ib_cntl, SDMA0_QUEUE0_IB_CNTL, IB_ENABLE, 1);
+    ib_cntl = REG_SET_FIELD(ib_cntl, SDMA0_SDMA_QUEUE0_IB_CNTL, IB_ENABLE, 1);
     WREG32(dev, reg(SDMARegs::QUEUE0_IB_CNTL), ib_cntl);
 
     inst.enabled = true;
