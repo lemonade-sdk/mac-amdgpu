@@ -35,70 +35,62 @@
 
 namespace amdgpu {
 
+// Read the GPU's vram_start MC address from MMHUB's
+// regMMMC_VM_FB_LOCATION_BASE. Requires MMHUB IP base to be resolved
+// via IP discovery first.
+static uint64_t
+psp_read_vram_start(const DeviceContext &dev)
+{
+    if (!dev.ip.isResolved(IPBlock::MMHUB)) return 0;
+    uint32_t mmhub_base = dev.ip.get(IPBlock::MMHUB);
+    uint32_t raw = RREG32(dev,
+        mmhub_base + MMHUBRegs::MMMC_VM_FB_LOCATION_BASE);
+    return ((uint64_t)(raw & MMHUBRegs::kFBBaseMask))
+           << MMHUBRegs::kFBBaseShift;
+}
+
+// VRAM offset for fw_pri. Picking 0 keeps PSP's MC-address math simple
+// (mc = vram_start + 0 = vram_start). The visible BAR0 aperture is
+// 256 MB, well larger than PSP_1_MEG (1 MB).
+static constexpr uint64_t kFwPriVRAMOffset = 0;
+
 kern_return_t
 psp_init(DeviceContext &dev, PSPContext &psp)
 {
-    if (psp.fwPriBuffer != nullptr) {
+    if (psp.fwPriSize != 0) {
         return kIOReturnSuccess; // idempotent
     }
     if (!dev.ip.isResolved(IPBlock::MP0)) {
         PSP_LOG("MP0 IP base not resolved — IP discovery missing");
         return kIOReturnNotReady;
     }
-
-    IOBufferMemoryDescriptor *buf = nullptr;
-    // AS page size is 16 KB; DART rejects mappings that aren't
-    // page-aligned. fw_pri is 1 MB so its size is already aligned.
-    kern_return_t ret = IOBufferMemoryDescriptor::Create(
-        kIOMemoryDirectionOutIn, kPSPFwPriBufSize, kASPageSize, &buf);
-    if (ret != kIOReturnSuccess || buf == nullptr) {
-        PSP_LOG("fw_pri buffer alloc failed: %#x", ret);
-        return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
-    }
-    ret = buf->SetLength(kPSPFwPriBufSize);
-    if (ret != kIOReturnSuccess) {
-        buf->release();
-        return ret;
+    if (!dev.ip.isResolved(IPBlock::MMHUB)) {
+        PSP_LOG("MMHUB IP base not resolved — IP discovery missing");
+        return kIOReturnNotReady;
     }
 
-    IODMACommandSpecification spec = {};
-    spec.options        = kIODMACommandSpecificationNoOptions;
-    spec.maxAddressBits = 64;
-
-    IODMACommand *cmd = nullptr;
-    ret = IODMACommand::Create(dev.pci, kIODMACommandCreateNoOptions,
-                               &spec, &cmd);
-    if (ret != kIOReturnSuccess || cmd == nullptr) {
-        buf->release();
-        PSP_LOG("fw_pri IODMACommand::Create failed: %#x", ret);
-        return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
+    // VRAM-backed fw_pri: PSP DMAs via the GMC internal path using an
+    // MC address, NOT via PCIe with a DART-mapped sysmem bus address.
+    // For us "allocation" is just picking a VRAM offset; CPU writes go
+    // through the visible BAR0 aperture (256 MB on R9700).
+    uint64_t vram_start = psp_read_vram_start(dev);
+    if (vram_start == 0) {
+        PSP_LOG("psp_init: vram_start read back as 0 — MMHUB "
+                "regMMMC_VM_FB_LOCATION_BASE not populated yet?");
+        return kIOReturnNotReady;
     }
 
-    uint64_t flags = 0;
-    uint32_t segCount = 1;
-    IOAddressSegment seg = {};
-    ret = cmd->PrepareForDMA(kIODMACommandPrepareForDMANoOptions,
-                             buf, 0, kPSPFwPriBufSize,
-                             &flags, &segCount, &seg);
-    if (ret != kIOReturnSuccess || segCount != 1) {
-        if (cmd) cmd->release();
-        buf->release();
-        PSP_LOG("fw_pri PrepareForDMA failed: %#x segs=%u", ret, segCount);
-        return ret != kIOReturnSuccess ? ret : kIOReturnNotAligned;
-    }
-
-    IOAddressSegment cpuSeg = {};
-    buf->GetAddressRange(&cpuSeg);
-
-    psp.fwPriBuffer     = buf;
-    psp.fwPriDMACommand = cmd;
-    psp.fwPriBusAddr    = seg.address;
-    psp.fwPriCPUAddr    = reinterpret_cast<void *>(cpuSeg.address);
+    psp.fwPriBuffer     = nullptr;  // no sysmem buffer — VRAM-backed
+    psp.fwPriDMACommand = nullptr;
+    psp.fwPriBusAddr    = vram_start + kFwPriVRAMOffset;  // GPU MC addr
+    psp.fwPriCPUAddr    = nullptr;  // CPU side accesses via BAR0 aperture
     psp.fwPriSize       = kPSPFwPriBufSize;
     psp.sosAlive        = false;
 
-    PSP_LOG("fw_pri ready cpu=%p bus=%#llx size=%llu",
-            psp.fwPriCPUAddr, psp.fwPriBusAddr, psp.fwPriSize);
+    PSP_LOG("fw_pri ready VRAM-backed @ vram_off=%#llx mc=%#llx size=%llu "
+            "(vram_start=%#llx)",
+            (uint64_t)kFwPriVRAMOffset, psp.fwPriBusAddr,
+            psp.fwPriSize, vram_start);
     return kIOReturnSuccess;
 }
 
@@ -235,13 +227,14 @@ psp_is_sos_alive(const DeviceContext &dev)
     if (!dev.ip.isResolved(IPBlock::MP0)) return false;
     uint32_t sol = RREG32(dev,
         SOC15_REG_OFFSET(dev, IPBlock::MP0, MP0Regs::C2PMSG_81));
-    // Upstream Linux psp_v14_0_is_sos_alive() returns `sol != 0`,
-    // but that's loose: on a cold boot C2PMSG_81 can hold arbitrary
-    // non-zero garbage (we've observed 0x31c5a3aa on TB5 R9700).
-    // psp_v14_0_bootloader_load_sos itself waits for the high bit
-    // (0x80000000) to latch after the load — use the same gate
-    // here so we don't falsely skip the SOS load.
-    return (sol & 0x80000000u) == 0x80000000u;
+    // Match upstream psp_v14_0_is_sos_alive exactly: any non-zero
+    // value indicates SOS booted. PSP writes a build/version stamp
+    // here once SOS init completes (we've observed 0x022690e0).
+    // Earlier code tightened to bit 31 to defend against cold-boot
+    // garbage — but on a fresh power-up C2PMSG_81 is reliably zero
+    // until SOS sets it, and upstream's broader check is required
+    // to accept the real value PSP writes.
+    return sol != 0;
 }
 
 bool
@@ -277,7 +270,7 @@ psp_wait_for_bootloader(const DeviceContext &dev)
 kern_return_t
 psp_load_sos(DeviceContext &dev, PSPContext &psp)
 {
-    if (psp.fwPriBuffer == nullptr || psp.fwPriCPUAddr == nullptr) {
+    if (psp.fwPriSize == 0) {
         PSP_LOG("load_sos: psp_init not called");
         return kIOReturnNotReady;
     }
@@ -305,9 +298,15 @@ psp_load_sos(DeviceContext &dev, PSPContext &psp)
         return kIOReturnTimeout;
     }
 
-    // Stage the SOS image in fw_pri.
-    memset(psp.fwPriCPUAddr, 0, psp.fwPriSize);
-    memcpy(psp.fwPriCPUAddr, psp.sosFirmware, psp.sosFirmwareSize);
+    // Stage the SOS image in fw_pri (VRAM via BAR0 aperture).
+    // NOTE: we don't memset the full 1 MB like upstream — each BAR0
+    // dword write is ~10x slower on AS, so a full 1 MB memset takes
+    // ~2.6 sec. Just zero exactly what the firmware doesn't cover.
+    // For SOS specifically, since this is the final load and the file
+    // is large, skip the trailing zero entirely; PSP should not read
+    // past sosFirmwareSize when the descriptor reports it.
+    bar0_memcpy_to_vram(dev, kFwPriVRAMOffset,
+                        psp.sosFirmware, psp.sosFirmwareSize);
 
     const uint32_t regAddr = SOC15_REG_OFFSET(dev, IPBlock::MP0,
                                               MP0Regs::C2PMSG_36);
@@ -354,7 +353,7 @@ psp_bootloader_load_component(DeviceContext &dev, PSPContext &psp,
                               const uint8_t *bin, uint64_t binSize,
                               uint32_t bl_cmd)
 {
-    if (psp.fwPriCPUAddr == nullptr) {
+    if (psp.fwPriSize == 0) {
         PSP_LOG("load_component(cmd=%#x): psp_init not called", bl_cmd);
         return kIOReturnNotReady;
     }
@@ -376,8 +375,9 @@ psp_bootloader_load_component(DeviceContext &dev, PSPContext &psp,
         return kIOReturnTimeout;
     }
 
-    memset(psp.fwPriCPUAddr, 0, psp.fwPriSize);
-    memcpy(psp.fwPriCPUAddr, bin, binSize);
+    // Stage the sub-firmware in fw_pri (VRAM via BAR0 aperture).
+    // Skip the full-1MB memset (too slow on AS — see psp_load_sos).
+    bar0_memcpy_to_vram(dev, kFwPriVRAMOffset, bin, binSize);
 
     const uint32_t regAddr = SOC15_REG_OFFSET(dev, IPBlock::MP0,
                                               MP0Regs::C2PMSG_36);

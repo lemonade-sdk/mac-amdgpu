@@ -139,6 +139,43 @@ RBAR2_32(const DeviceContext &ctx, uint64_t byte_offset)
     return value;
 }
 
+// 32-bit write to BAR0 at the given **byte** offset. BAR0 is the
+// visible-VRAM aperture, so this writes to VRAM at the corresponding
+// VRAM offset. Used for staging firmware buffers PSP will read via
+// its internal GMC path.
+static inline void
+WBAR0_32(const DeviceContext &ctx, uint64_t byte_offset, uint32_t value)
+{
+    ctx.pci->MemoryWrite32(ctx.bar0MemIndex, byte_offset, value);
+}
+
+// memcpy-equivalent for staging a buffer into VRAM via BAR0. Writes
+// 32-bit dwords; src must be 4-byte aligned in length (rounded up if
+// not). Slow (each dword is an MMIO write — ~10x slower on AS than
+// native PCIe) but correct.
+static inline void
+bar0_memcpy_to_vram(const DeviceContext &ctx, uint64_t vram_byte_offset,
+                    const void *src, uint64_t size_bytes)
+{
+    const uint32_t *p = static_cast<const uint32_t *>(src);
+    uint64_t dwords = (size_bytes + 3) >> 2;
+    for (uint64_t i = 0; i < dwords; i++) {
+        WBAR0_32(ctx, vram_byte_offset + i * 4ULL, p[i]);
+    }
+}
+
+// memset-equivalent for the BAR0 aperture — zero-fills size_bytes of
+// VRAM starting at the given offset.
+static inline void
+bar0_memset_vram(const DeviceContext &ctx, uint64_t vram_byte_offset,
+                 uint32_t pattern, uint64_t size_bytes)
+{
+    uint64_t dwords = (size_bytes + 3) >> 2;
+    for (uint64_t i = 0; i < dwords; i++) {
+        WBAR0_32(ctx, vram_byte_offset + i * 4ULL, pattern);
+    }
+}
+
 // Read a single dword from anywhere in VRAM via the
 // mmMM_INDEX / mmMM_INDEX_HI / mmMM_DATA register pair.
 //
