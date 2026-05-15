@@ -4,7 +4,7 @@ Granular tasks. Status legend: `[ ]` open · `[~]` in progress · `[x]` done · 
 
 Phase numbers match `ROADMAP.md`. Target hardware fixed: Apple Silicon M5 Pro/Max/Ultra + TB5 + AMD Radeon AI PRO R9700 (gfx1201, RDNA4).
 
-Last sync against `git log`: chunk 28 (MES SET_HW_RESOURCES + ADD_QUEUE + aggregated_doorbell, item 186 + 290 + 604 closed, item 153 narrowed).
+Last sync against `git log`: PSP bring-up landed on real R9700 hardware — IP discovery from VRAM, BAR5 register window confirmed, `psp_init_sos_microcode` ported, upstream firmware structs vendored, `psp_14_0_3_sos.bin` loads, PSP ring created (stage 4 reached). GART bootstrap is the next critical-path blocker — `dext/amdgpu/amdgpu_gart.h` landed; tracked in `docs/GART_PORT_PLAN.md` + `docs/DMA_FIX_PLAN.md`.
 
 ---
 
@@ -46,9 +46,9 @@ Last sync against `git log`: chunk 28 (MES SET_HW_RESOURCES + ADD_QUEUE + aggreg
 - [x] 105  Build empty dext bundle → bundle ID `com.geramyloveless.MacAMDGPUHost.MacAMDGPU` registered
 - [ ] 106  **Submit entitlement request** in Apple Developer portal — *user action, not yet done*
 - [x] 107  `Start()` opens IOPCIDevice, logs VID/DID/class/cmd/status/header
-- [x] 108  Map BAR0 (registers) via _CopyDeviceMemoryWithIndex
-- [x] 109  Map BAR2 (visible VRAM aperture) — exposed via CopyClientMemoryForType
-- [x] 110  Map BAR5 (doorbells)
+- [x] 108  Map BAR0 (visible VRAM aperture) via _CopyDeviceMemoryWithIndex — used for VRAM read/write via MM_INDEX/MM_DATA at runtime
+- [x] 109  Map BAR2 (VRAM doorbell/aperture) — exposed via CopyClientMemoryForType
+- [x] 110  Map BAR5 (**register window — Bonaire+ AMD layout**, confirmed on R9700; not BAR0)
 - [x] 111  Enable PCI bus master + Memory Space (lazy on first BAR map)
 - [x] 112  Allocate up to 256 MSI-X vectors via IOInterruptDispatchSource
 - [x] 113  DART/DMA path — `IODMACommand::PrepareForDMA` with 16 KB alignment
@@ -73,18 +73,38 @@ Cite Linux source file in commit messages.
 ### 1B.0 IP discovery
 - [x] 150  Port IP discovery parser (`amdgpu_discovery.c` header + IPDS walker) → `dext/amdgpu/amdgpu_discovery.cpp`
 - [x] 151  LoadDiscoveryBinary selector — host uploads a captured binary via DMABuffer, dext parses
-- [x] 152  On-die discovery read — RREG32(mmRCC_CONFIG_MEMSIZE) → BAR2 read of binary at `(vram_size_MB << 20) - 0x100000` — chunk 18; IP bases now populated automatically by `InitDevice(IPDiscovery)`.
+- [x] 152  On-die discovery read — RREG32(mmRCC_CONFIG_MEMSIZE) → VRAM read of binary at `(vram_size_MB << 20) - 0x10000` (64 KB TMR offset, **was 1 MB — upstream uses 64 KB**, fixed in commit `8fcc609`) via MM_INDEX/MM_DATA. Confirmed on R9700 hardware: parser auto-detects gfx1201 + `psp_v14_0_3` + `smu_v14_0_3` + `sdma_v7_0_1`. IP bases populated automatically by `InitDevice(IPDiscovery)`.
 - [~] 153  Cross-validate parser against `docs/reference/gfx1151_discovery.bin` — exercised via `kMacAMDGPUMethodLoadDiscoveryBin` (selector 13) and `scripts/macamdgpu_ping.swift --load-discovery docs/reference/gfx1151_discovery.bin` (which then calls `showIPBases` to dump every populated IP base). Standalone host-only parser test would need the dext code compiled for macOS instead of DriverKit — deferred until we add a unit-test harness.
 
-### 1B.1 PSP v14 — done
-- [x] 160  Port PSP v14 bootloader wait (`psp_v14_0_wait_for_bootloader`)
-- [x] 161  Port `psp_v14_0_is_sos_alive` (C2PMSG_81 check)
-- [x] 162  Port `psp_v14_0_bootloader_load_sos` — `psp_14_0_3_sos.bin` via C2PMSG_35/36 protocol
+### 1B.1 PSP v14 — bootloader + SOS + ring all confirmed on R9700
+- [x] 160  Port PSP v14 bootloader wait (`psp_v14_0_wait_for_bootloader`) — confirmed on hw
+- [x] 161  Port `psp_v14_0_is_sos_alive` (C2PMSG_81 check; bit 31 must be set per commit `0cfed7f`) — confirmed on hw
+- [x] 162  Port `psp_v14_0_bootloader_load_sos` — `psp_14_0_3_sos.bin` via C2PMSG_35/36 protocol — **loads + runs on R9700** (commit `d53c775`)
 - [x] 163  Port `psp_v14_0_bootloader_load_component` (generic) — KDB/SPL/SysDrv/SocDrv/IntfDrv/HADDrv/RASDrv/IPKeyMgrDrv wrappers exposed via LoadFirmware selector
-- [x] 164  Port `psp_v14_0_ring_create` — 4 KB km_ring inside 16 KB DART-aligned buffer; non-SR-IOV path
-- [x] 165  Port `psp_ring_cmd_submit` — gfx_rb_frame builder + cmd_buf + fence_buf + wptr (C2PMSG_67) + poll fence
-- [x] 166  Port `psp_setup_tmr` — 4 MB DART-mapped TMR with `virt_phy_addr=1` flag
+- [x] 164  Port `psp_v14_0_ring_create` — 4 KB km_ring inside 16 KB DART-aligned buffer; non-SR-IOV path — **ring created on R9700** (PSPRingCreate stage 4 reached)
+- [~] 165  Port `psp_ring_cmd_submit` — gfx_rb_frame builder + cmd_buf + fence_buf + wptr (C2PMSG_67) + poll fence. wptr writes land cleanly (verified via DumpPSP — advances by 0x10 per submit), but PSP doesn't process frames whose cmd_buf is VRAM-backed. **Blocked on GART** — see 1B.0a + `docs/GART_PORT_PLAN.md`.
+- [!] 166  Port `psp_setup_tmr` — 4 MB TMR with `virt_phy_addr=1` flag — **blocked on GART** (first ring submit; needs GART-routable MC for cmd_buf)
 - [x] 167  Port `psp_load_ip_fw` — generic LOAD_IP_FW for SMU/SDMA/RLC/CP/IMU/MES firmware
+- [x] 168  Port `psp_init_sos_microcode` — v1 + v2 header autodetect + sub-firmware extraction (KDB/SPL/SYS/SOC/INTF/DBG/RAS/IPKEYMGR/SOS) — commit `d53c775`
+- [x] 169  Vendor upstream firmware structs — `common_firmware_header`, `psp_firmware_header_v1/v2`, `psp_fw_bin_desc` — commit `d53c775`
+- [x] 169a Port `amdgpu_is_kicker_fw` + `kicker_device_list`; expose PCI revision in Identity — commit `3694bd3`
+
+### 1B.0a GART bootstrap — current critical-path blocker
+
+See `docs/GART_PORT_PLAN.md` (GART-1 .. GART-7) and `docs/DMA_FIX_PLAN.md` (DMA-4 .. DMA-10). PSP ring DMA needs GART-routable MC addresses for cmd/fence/ring; raw VRAM-backed buffers are silently dropped. Inserts `BringupStage::GARTEnable` between `PSPRingCreate` and `TMRSetup`.
+
+- [ ] 140  GART-1: read upstream `amdgpu_gart.c` + `gmc_v12_0_gart_enable`; document PTE format + register pokes
+- [~] 141  GART-2: `dext/amdgpu/amdgpu_gart.h` + GC IP registers (`GCMC_VM_FB_LOCATION_BASE`, `GCVM_CONTEXT0_*`, etc.) — **header landed; .cpp next**
+- [ ] 142  GART-3: allocate page table in VRAM (4 KB at `kGARTPageTableVRAMOffset` after TMR); zero-fill via `bar0_memset_vram`
+- [ ] 143  GART-4: `gart_bind(IOBufferMemoryDescriptor*) → GART MC addr` — PTE write via `bar0_memcpy_to_vram`
+- [ ] 144  GART-5: `gmc_v12_0_gart_enable` port — register pokes + readback validation
+- [ ] 145  GART-6: wire `BringupStage::GARTEnable` into `amdgpu_init.cpp`; refactor `psp_ring_create` / `psp_setup_tmr` to sysmem + GART
+- [ ] 146  GART-7: validate on hw — TMRSetup should clear; fence_buf[0] should reflect fence_value
+- [x] 147  DMA-1: `MemoryWrite64` instead of per-dword `MemoryWrite32` for BAR-aperture VRAM writes (commit `9fcdef1`)
+- [x] 147a DMA-1b: drop PSP fence-wait timeout 10 s → 1 s + bail-on-first-stage-failure — cuts a failed Initialize GPU from 95 s to 4 s (commit `6c51672`)
+- [x] 147b DMA-2: DumpCmdBuf + DumpPSP selectors for ring debugging (commits `9fcdef1`, `f13512c`)
+- [ ] 148  DMA-3: probe `IOMemoryDescriptor::CreateMapping` on BAR0 aperture for 10–50× CPU-side speedup (optional once GART removes the hot path)
+- [ ] 149  SQ-2: investigate write-combined mapping on BAR0 as a fallback to CreateMapping
 
 ### 1B.2 SMU v14_0_3 — primitives done, depends on PMFW
 - [x] 170  Port `smu_cmn_send_smc_msg_with_param` (MP1 C2PMSG_66/82/90)

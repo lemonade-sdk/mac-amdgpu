@@ -155,7 +155,54 @@ namespace MMHUBRegs {
     constexpr uint32_t MMMC_VM_FB_OFFSET        = 0x0556;
     constexpr uint32_t kFBBaseMask = 0x00FFFFFFu;  // low 24 bits
     constexpr uint32_t kFBBaseShift = 24;          // <<24 to get MC addr
+
+    // GART setup registers from mmhub_4_1_0_offset.h (RDNA4 NBIO 7_11
+    // family). All BASE_IDX 0 — same IP base as MMMC_VM_FB_LOCATION_BASE.
+    // Used by gart_enable to point the GPU's GMC at our page table and
+    // define the GART aperture in MC space.
+    constexpr uint32_t MMVM_CONTEXT0_CNTL                       = 0x0564;
+    constexpr uint32_t MMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32  = 0x05cf;
+    constexpr uint32_t MMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32  = 0x05d0;
+    constexpr uint32_t MMVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32 = 0x05ef;
+    constexpr uint32_t MMVM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32 = 0x05f0;
+    constexpr uint32_t MMVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32   = 0x060f;
+    constexpr uint32_t MMVM_CONTEXT0_PAGE_TABLE_END_ADDR_HI32   = 0x0610;
+    constexpr uint32_t MMMC_VM_AGP_BASE                         = 0x055c;
+    constexpr uint32_t MMMC_VM_AGP_BOT                          = 0x055d;
+    constexpr uint32_t MMMC_VM_AGP_TOP                          = 0x055e;
+    constexpr uint32_t MMMC_VM_SYSTEM_APERTURE_LOW_ADDR         = 0x0559;
+    constexpr uint32_t MMMC_VM_SYSTEM_APERTURE_HIGH_ADDR        = 0x055a;
+    constexpr uint32_t MMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_LSB = 0x055f;
+    constexpr uint32_t MMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_MSB = 0x0560;
+    constexpr uint32_t MMMC_VM_MX_L1_TLB_CNTL                   = 0x055b;
+    constexpr uint32_t MMVM_L2_CNTL                             = 0x04e4;
+    constexpr uint32_t MMVM_L2_CNTL2                            = 0x04e5;
+    constexpr uint32_t MMVM_L2_CNTL3                            = 0x04e6;
+    constexpr uint32_t MMVM_L2_CNTL4                            = 0x04e7;
+    constexpr uint32_t MMVM_L2_CNTL5                            = 0x04e8;
 }
+
+// PTE flag bits — drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h.
+// PTEs are 64-bit: high bits = host physical address (page-aligned),
+// low bits = flags. For GART-mapped sysmem we use VALID|SYSTEM|R|W.
+namespace PTEFlags {
+    constexpr uint64_t VALID     = (1ULL << 0);
+    constexpr uint64_t SYSTEM    = (1ULL << 1);  // sysmem (not VRAM)
+    constexpr uint64_t SNOOPED   = (1ULL << 2);
+    constexpr uint64_t TMZ       = (1ULL << 3);
+    constexpr uint64_t EXECUTABLE = (1ULL << 4);
+    constexpr uint64_t READABLE  = (1ULL << 5);
+    constexpr uint64_t WRITEABLE = (1ULL << 6);
+    constexpr uint64_t FRAG_4K   = 0;
+    // Standard sysmem mapping for PSP-readable buffers.
+    constexpr uint64_t SYSMEM_RW = VALID | SYSTEM | SNOOPED |
+                                   READABLE | WRITEABLE;
+}
+
+// AMDGPU GPU page size is fixed at 4 KB regardless of CPU page size.
+// Apple Silicon CPU is 16 KB pages so each CPU page maps 4 GPU PTEs.
+constexpr uint32_t kAMDGPUGPUPageSize  = 4096;
+constexpr uint32_t kAMDGPUGPUPageShift = 12;
 
 // PPSMC messages — drivers/gpu/drm/amd/pm/swsmu/inc/pmfw_if/
 // smu_v14_0_2_ppsmc.h. Tiny subset; expand as we wire up features.

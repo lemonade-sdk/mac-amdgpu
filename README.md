@@ -1,19 +1,22 @@
 # STATUS
 
-The driver loads and talks to a real AMD GPU on a Mac. It can't render
-anything yet.
+The driver loads, talks to a real AMD GPU on a Mac, and now runs PSP
+firmware on it. It can't render anything yet.
 
 What works: the card is detected, the driver attaches over Thunderbolt 5,
 identity reads back correctly (VID=0x1002 DID=0x7551), MMIO register
-reads return real values, the IP discovery binary is read directly from
-VRAM and parsed (auto-detecting that this is a gfx1201 / RDNA4 / R9700
-with `psp_v14_0_3`, `smu_v14_0_3`, `sdma_v7_0_1`), and PSP initialization
-runs.
+reads work (BAR5 is the register window on Bonaire+, not BAR0), the IP
+discovery binary is read directly from VRAM via MM_INDEX/MM_DATA and
+parsed (auto-detecting gfx1201 / RDNA4 / R9700 with `psp_v14_0_3`,
+`smu_v14_0_3`, `sdma_v7_0_1`). **PSP SOS firmware uploads and runs**, and
+the **PSP ring is created** (bring-up reaches stage 4, PSPRingCreate).
 
-What's next: the PSP "SOS" firmware upload (the first real firmware load
-the GPU needs) currently times out on the mailbox handshake. Once that
-goes through, the remaining init stages (SMU, GMC, RLC, CP, MES, SDMA,
-IH) and the first GFX12 PM4 packet submission should follow.
+What's next: GART bootstrap. The first PSP ring submission (TMRSetup)
+fails because PSP needs GART-routable MC addresses for its
+ring/cmd/fence buffers — VRAM-backed buffers work for the bootloader
+handshake but not for ring DMA. Once GART is up, TMRSetup, SMUInit, GMC,
+IMU, RLC, CP, MES, SDMA, IH and the first GFX12 PM4 packet should
+follow. Tracked in `docs/GART_PORT_PLAN.md`.
 
 To use it: install the host app, click **Initialize GPU** in the test UI,
 and watch each bring-up stage print as it runs.

@@ -119,7 +119,7 @@ Build the Xcode bundle first so the entitlement request has a target. Apple's re
 - 1A.3 Build, codesign with team identity → bundle ID registered on Apple Developer portal.
 - 1A.4 **Submit entitlement request** for `com.apple.developer.driverkit.transport.pci` against bundle ID — parallel to 1A.5+.
 - 1A.5 `Start()` — open `IOPCIDevice` over TB5, log VID/DID/config space; compare against `qemu-vfio-apple/traces/linux-pre-driver-init.txt`.
-- 1A.6 Map BARs — BAR0 (registers, MMIO), BAR2 (VRAM aperture), BAR5 (doorbells). Cross-check sizes against config space reads from the captured traces.
+- 1A.6 Map BARs — BAR0 (visible VRAM aperture), BAR2 (VRAM doorbell/aperture), **BAR5 (register window — Bonaire+ AMD layout, confirmed on R9700)**. Cross-check sizes against config space reads from the captured traces.
 - 1A.7 Enable bus master + MSI-X; allocate N vectors via `IOInterruptDispatchSource`.
 - 1A.8 DART/DMA validation — `IODMACommand` allocate, write, GPU SDMA-copy back, bit-compare. Pattern after `VFIOUserPCIDriver.cpp` DMA paths.
 - 1A.9 `IOUserClient` subclass + stub method table.
@@ -131,25 +131,39 @@ Build the Xcode bundle first so the entitlement request has a target. Apple's re
 
 Port from `upstream/linux/drivers/gpu/drm/amd/amdgpu/` against the gfx1201/v12_1/v7/v14 versioned files. Cite Linux source files in commit messages. Cross-check every register write against the ftrace captures in `qemu-vfio-apple/traces/` (those are the exact RREG32/WREG32 sequences amdgpu emits when bringing up our R9700 on our actual hardware).
 
-The bringup orchestrator (`dext/amdgpu/amdgpu_init.{h,cpp}`) drives a 14-stage ladder via the `InitDevice(target_stage)` selector. As of commit `413b539`, stages 0–4 + the LoadFirmware mechanism are in main; stages 5–14 are stubs returning `NotReady`/`Unsupported` until each subsystem lands.
+The bringup orchestrator (`dext/amdgpu/amdgpu_init.{h,cpp}`) drives a 14-stage ladder via the `InitDevice(target_stage)` selector. On real R9700 hardware, stages 0–4 are confirmed; PSP SOS firmware loads + runs and the PSP ring is created. Stage 5 (TMRSetup) is blocked on GART bootstrap (see sub-phase 1B.0a below). Stages 6–14 codebases exist but are gated on TMRSetup landing.
 
-| # | Stage              | Source                            | Status |
+| #  | Stage              | Source                            | Status (on R9700) |
 |---|---|---|---|
-| 0 | None               | —                                 | ✅ |
-| 1 | IPDiscovery        | parser ported; userspace uploads binary via `LoadDiscoveryBin` | ✅ (parser); on-die read pending |
-| 2 | PSPInit            | `psp_init` fw_pri buffer alloc    | ✅ |
-| 3 | PSPLoadSOS         | `psp_v14_0_bootloader_load_sos`   | ✅ |
-| 4 | PSPRingCreate      | `psp_v14_0_ring_create`           | ✅ |
-| 5 | TMRSetup           | `psp_setup_tmr` (4 MB DART-mapped TMR) | ✅ |
-| 6 | SMUInit            | `smu_send_msg_with_param` + TestMessage | mailbox ✅; PMFW load via LoadFirmware(0x112) pending |
-| 7 | GMCInit            | `gmc_v12_0_*` + `mmhub_v4_1_0_*` + `gfxhub_v12_0_*` | port plan written, no code yet |
-| 8 | IMUInit            | `gfx_v12_0_imu_*` (via PSP LOAD_IP_FW) | pending |
-| 9 | RLCInit            | `gfx_v12_0_rlc_init` + `_resume`  | pending |
-|10 | CPInit             | `gfx_v12_0_cp_gfx_resume`         | pending |
-|11 | MESInit            | `mes_v12_1_*` (port plan written) | pending |
-|12 | IHInit             | `ih_v7_0_*` (port plan written)   | pending |
-|13 | GFXInit            | First-PM4 path (port plan written) | pending |
-|14 | SDMAInit           | `sdma_v7_0_*` / `sdma_v7_1_*`     | pending |
+| 0  | None               | —                                 | ✅ |
+| 1  | IPDiscovery        | on-die VRAM read via MM_INDEX/MM_DATA (TMR offset 64 KB); parser ported | ✅ (confirmed; auto-detects gfx1201) |
+| 2  | PSPInit            | `psp_init` fw_pri buffer alloc    | ✅ |
+| 3  | PSPLoadSOS         | `psp_v14_0_bootloader_load_sos`; `psp_init_sos_microcode` v1+v2 header autodetect + sub-firmware extraction (KDB/SPL/SYS/SOC/INTF/DBG/RAS/IPKEYMGR/SOS); `psp_14_0_3_sos.bin` confirmed loaded | ✅ (confirmed) |
+| 4  | PSPRingCreate      | `psp_v14_0_ring_create`           | ✅ (confirmed; ring created on hw) |
+| 5  | TMRSetup           | `psp_setup_tmr` (4 MB GART-mapped TMR) | ⛔ blocked on GART — first ring submit, see 1B.0a |
+| 6  | SMUInit            | `smu_send_msg_with_param` + TestMessage | mailbox ✅; PMFW load via LoadFirmware(0x112) pending |
+| 7  | GMCInit            | `gmc_v12_0_*` + `mmhub_v4_1_0_*` + `gfxhub_v12_0_*` | code ported; untested |
+| 8  | IMUInit            | `gfx_v12_0_imu_*` (via PSP LOAD_IP_FW) | pending |
+| 9  | RLCInit            | `gfx_v12_0_rlc_init` + `_resume`  | code ported; untested |
+| 10 | CPInit             | `gfx_v12_0_cp_gfx_resume`         | code ported; untested |
+| 11 | MESInit            | `mes_v12_1_*`                     | code ported; untested |
+| 12 | IHInit             | `ih_v7_0_*`                       | code ported; untested |
+| 13 | GFXInit            | First-PM4 path                    | code ported; untested |
+| 14 | SDMAInit           | `sdma_v7_0_*` / `sdma_v7_1_*`     | code ported; untested |
+
+### Phase 1B.0a — GART bootstrap (current critical-path blocker)
+
+PSP's ring DMA on RDNA4 requires GART-routable MC addresses for
+`cmd_buf`/`fence_buf`/`ring_mem`. VRAM-backed buffers work for the
+bootloader handshake (`fw_pri` via C2PMSG_36) but PSP silently drops
+ring frames whose payloads sit in raw VRAM — matches Linux's
+GTT-domain design for these buffers. Until GART is up, `TMRSetup` and
+every subsequent stage that issues a PSP ring command stalls.
+
+Plan: `docs/GART_PORT_PLAN.md` (GART-1 .. GART-7). In-progress —
+`dext/amdgpu/amdgpu_gart.h` landed; `.cpp` next. The new
+`BringupStage::GARTEnable` slots between `PSPRingCreate` and
+`TMRSetup`.
 
 **Pre-SOS bootloader components** (KDB/SPL/SysDrv/SocDrv/IntfDrv/HADDrv/RASDrv/IPKeyMgrDrv) all load via `psp_bootloader_load_component` exposed through `LoadFirmware(type=1..8, size)`. Post-SOS IP firmware (PMFW, RLC, CP, IMU, MES, SDMA) loads via `psp_load_ip_fw` exposed through `LoadFirmware(type=0x100+psp_gfx_fw_type, size)`.
 
