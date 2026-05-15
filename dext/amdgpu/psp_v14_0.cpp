@@ -503,15 +503,19 @@ psp_ring_create(DeviceContext &dev, PSPContext &psp)
 
     IOSleep(20);
 
-    // 3. Wait for response flag.
-    if (!poll_reg(dev, reg64, kPSPMboxRespMask, kPSPMboxRespFlag,
-                  5 * 1000000, &v)) {
-        uint32_t now64 = RREG32(dev, reg64);
+    // 3. Wait for response flag. poll_psp_response surfaces PSP-side
+    // error statuses (bit 31 set + non-zero low 16) as kIOReturnIOError
+    // instead of letting us spin until timeout.
+    kern_return_t pr = poll_psp_response(dev, reg64,
+                                         kPSPMboxRespMask, kPSPMboxRespFlag,
+                                         5 * 1000000, &v);
+    if (pr != kIOReturnSuccess) {
         uint32_t now81 = RREG32(dev, reg81);
-        PSP_LOG("ring_create: response wait timed out — "
-                "final C2PMSG_64=%#010x C2PMSG_81=%#010x",
-                now64, now81);
-        return kIOReturnTimeout;
+        const char *why = (pr == kIOReturnIOError) ? "ERROR" : "TIMEOUT";
+        PSP_LOG("ring_create: response wait %{public}s — "
+                "final C2PMSG_64=%#010x (status=%#x) C2PMSG_81=%#010x",
+                why, v, v & 0xFFFFu, now81);
+        return pr;
     }
 
     psp.ringCreated = true;

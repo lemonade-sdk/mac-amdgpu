@@ -212,11 +212,20 @@ gart_unbind(GARTContext &gart, GARTBinding *binding)
 static void
 gart_setup_vm_pt_regs(const DeviceContext &dev, uint64_t pt_base_mc)
 {
+    // Upstream amdgpu_gmc_pd_addr ORs in AMDGPU_PTE_VALID before
+    // writing the page-table base. Without VALID, GMC treats the
+    // page table itself as invalid and every GART access faults —
+    // PSP then rejects ring_create with status 0x0a.
+    //
+    // For RDNA4 the PDE format also wants the FRAG field cleared and
+    // (for VRAM-backed page tables) SYSTEM=0; we satisfy both by only
+    // setting VALID.
+    uint64_t pte_base = pt_base_mc | PTEFlags::VALID;
     uint32_t base = dev.ip.get(IPBlock::MMHUB);
     WREG32(dev, base + MMHUBRegs::MMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32,
-           static_cast<uint32_t>(pt_base_mc & 0xFFFFFFFFu));
+           static_cast<uint32_t>(pte_base & 0xFFFFFFFFu));
     WREG32(dev, base + MMHUBRegs::MMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32,
-           static_cast<uint32_t>(pt_base_mc >> 32));
+           static_cast<uint32_t>(pte_base >> 32));
 }
 
 static void

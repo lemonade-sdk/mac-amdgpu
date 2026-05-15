@@ -244,6 +244,50 @@ RVRAM32_via_mm(const DeviceContext &ctx, uint64_t pos)
 #endif
 
 //============================================================
+// poll_psp_response — port of upstream psp_wait_for. Polls a PSP
+// mailbox register until either:
+//   (a) (val & mask) == expected  → returns kIOReturnSuccess
+//   (b) (val & GFX_CMD_STATUS_MASK) != 0  → PSP responded with an
+//       error status; returns kIOReturnIOError with *outValue set
+//       (mirrors Linux's -EIO).
+//
+// Without (b), a PSP error response with status bits set looks the
+// same as no-response — both eventually time out — and we waste the
+// full budget waiting for a reply that already came.
+//============================================================
+#ifdef __APPLE__
+static inline kern_return_t
+poll_psp_response(const DeviceContext &ctx, uint32_t reg,
+                  uint32_t mask, uint32_t expected,
+                  uint64_t timeout_us, uint32_t *outValue)
+{
+    constexpr uint32_t kPSPStatusMask = 0x0000FFFFu;
+    const uint64_t kStepMs = 1;
+    uint64_t elapsed_us = 0;
+    uint32_t v = 0;
+    while (true) {
+        v = RREG32(ctx, reg);
+        if ((v & mask) == expected) {
+            if (outValue) *outValue = v;
+            return kIOReturnSuccess;
+        }
+        // PSP responded with non-zero status — surface the error
+        // immediately instead of timing out.
+        if ((v & 0x80000000u) && (v & kPSPStatusMask) != 0) {
+            if (outValue) *outValue = v;
+            return kIOReturnIOError;
+        }
+        if (elapsed_us >= timeout_us) {
+            if (outValue) *outValue = v;
+            return kIOReturnTimeout;
+        }
+        IOSleep(kStepMs);
+        elapsed_us += kStepMs * 1000;
+    }
+}
+#endif
+
+//============================================================
 // poll_reg — read a register until (value & mask) == expected,
 // or timeout_us microseconds elapse. Returns the last value
 // observed regardless of success.
