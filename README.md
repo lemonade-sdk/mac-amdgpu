@@ -1,8 +1,22 @@
 # STATUS
 
-The driver loads and talks to a real AMD GPU on a Mac. It can't render anything yet. 
-The card is detected, the driver attaches over Thunderbolt 5, identity reads back correctly (VID=0x1002 DID=0x7551), and the first two hardware init steps (IP discovery and PSP setup) work. 
-We haven't run a graphics command yet, which needs the rest of the firmware loading + a handful more init steps that are written but not yet tested on the physical card.
+The driver loads and talks to a real AMD GPU on a Mac. It can't render
+anything yet.
+
+What works: the card is detected, the driver attaches over Thunderbolt 5,
+identity reads back correctly (VID=0x1002 DID=0x7551), MMIO register
+reads return real values, the IP discovery binary is read directly from
+VRAM and parsed (auto-detecting that this is a gfx1201 / RDNA4 / R9700
+with `psp_v14_0_3`, `smu_v14_0_3`, `sdma_v7_0_1`), and PSP initialization
+runs.
+
+What's next: the PSP "SOS" firmware upload (the first real firmware load
+the GPU needs) currently times out on the mailbox handshake. Once that
+goes through, the remaining init stages (SMU, GMC, RLC, CP, MES, SDMA,
+IH) and the first GFX12 PM4 packet submission should follow.
+
+To use it: install the host app, click **Initialize GPU** in the test UI,
+and watch each bring-up stage print as it runs.
 
   
 # mac_amdgpu
