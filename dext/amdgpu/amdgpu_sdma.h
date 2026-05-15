@@ -185,7 +185,10 @@ struct SDMAInstance {
     volatile uint32_t *rptr_cpu;
 
     uint32_t  wptr;             // software wptr (dword index)
-    uint32_t  doorbell_index;   // BAR5 doorbell slot
+    // DWORD offset into the doorbell BAR (BAR2). Programmed into
+    // SDMA_QUEUE0_DOORBELL_OFFSET. SOC21 default: 0x200 for SDMA0,
+    // 0x214 for SDMA1 (= sdma_engine[i] << 1).
+    uint32_t  doorbell_index;
 };
 
 struct SDMAContext {
@@ -234,8 +237,9 @@ kern_return_t sdma_gfx_resume_instance(const DeviceContext &dev,
                                        SDMAInstance &inst);
 
 // Kick QUEUE0's doorbell with the current software wptr (byte
-// offset, so wptr_dword << 2). Writes to BAR5 dev.bar5MemIndex at
-// (doorbell_index * 8).
+// offset, so wptr_dword << 2). Writes to BAR2 dev.bar2MemIndex at
+// (doorbell_index * 4) — see amdgpu_mm_wdoorbell @
+// amdgpu_doorbell_mgr.c:59 for the upstream byte-stride.
 kern_return_t sdma_kick_doorbell(const DeviceContext &dev,
                                  const SDMAInstance &inst);
 

@@ -109,10 +109,15 @@ sdma_alloc_storage(DeviceContext &dev, SDMAInstance &inst)
     inst.wptr_poll_gpu_addr = inst.wb_bus + 0x40;
 
     inst.wptr           = 0;
-    // Doorbell index — first PM4 hardcodes per-instance slots in the
-    // user's doorbell page. SDMA0 = slot 0x10, SDMA1 = slot 0x12
-    // (matches upstream doorbell_index.sdma_engine[0/1] for SOC21).
-    inst.doorbell_index = (inst.instance == 0) ? 0x10 : 0x12;
+    // Doorbell index — DWORD offset into the doorbell BAR (BAR2).
+    // SOC21 layout (nv.c:580-583, amdgpu_doorbell.h:210-211):
+    //     adev->doorbell_index.sdma_engine[0] = AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0 = 0x100
+    //     adev->doorbell_index.sdma_engine[1] = AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE1 = 0x10A
+    // sdma_v7_1.c:1329-1330 assigns
+    //     ring->doorbell_index = adev->doorbell_index.sdma_engine[i] << 1;
+    // which is the DWORD offset written into the SDMA_QUEUE0_DOORBELL_OFFSET
+    // register and consumed by the engine to filter doorbell traffic.
+    inst.doorbell_index = (inst.instance == 0) ? 0x200u : 0x214u;
     inst.inited         = true;
 
     SDMA_LOG("instance %u: ring %u dwords @ bus %#llx, "
@@ -320,16 +325,26 @@ sdma_ring_write(SDMAInstance &inst, const uint32_t *src, uint32_t dwords)
 }
 
 //------------------------------------------------------------------
-// sdma_kick_doorbell — BAR5 write at (doorbell_index * 8).
-// Wptr is the byte offset (dword wptr << 2).
+// sdma_kick_doorbell — write into the doorbell aperture (BAR2).
+//
+// Upstream amdgpu_mm_wdoorbell (amdgpu_doorbell_mgr.c:59-68) is
+// effectively `writel(v, doorbell.cpu_addr + index)` where cpu_addr
+// is `u32 *` mapped onto BAR2; that is a stride of sizeof(u32) = 4
+// bytes per index. doorbell_index here is the per-engine DWORD
+// offset programmed into SDMA_QUEUE0_DOORBELL_OFFSET (e.g. 0x200
+// for SDMA0, 0x214 for SDMA1).
+//
+// The value written is the new wptr in bytes (sdma_v7_1_ring_set_wptr
+// writes ring->wptr << 2 i.e. dword_wptr * 4).
 //------------------------------------------------------------------
 kern_return_t
 sdma_kick_doorbell(const DeviceContext &dev, const SDMAInstance &inst)
 {
     if (!inst.inited) return kIOReturnNotReady;
-    const uint64_t offs = static_cast<uint64_t>(inst.doorbell_index) * 8ull;
+    const uint64_t offs =
+        static_cast<uint64_t>(inst.doorbell_index) * 4ull;
     const uint32_t v = inst.wptr << 2;
-    dev.pci->MemoryWrite32(dev.bar5MemIndex, offs, v);
+    dev.pci->MemoryWrite32(dev.bar2MemIndex, offs, v);
     return kIOReturnSuccess;
 }
 
