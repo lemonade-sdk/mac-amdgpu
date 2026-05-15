@@ -1077,8 +1077,12 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         //   [9] regMMMC_VM_FB_LOCATION_TOP raw value
         //   [10] computed vram_start (FB_LOCATION_BASE.FB_BASE << 24)
         //   [11] C2PMSG_67 (PSP ring wptr — dwords; non-zero ⇒ PSP saw our kick)
+        //   [12] MMMC_VM_FB_OFFSET raw value (controls GMC vram_base_offset)
+        //   [13] MMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32 read-back (after gart_enable)
+        //   [14] MMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32 read-back
+        //   [15] MMVM_CONTEXT0_CNTL read-back (bit 0 = ENABLE_CONTEXT)
         if (arguments->scalarOutput == nullptr ||
-            arguments->scalarOutputCount < 12) {
+            arguments->scalarOutputCount < 16) {
             return kIOReturnBadArgument;
         }
         kern_return_t openRet = mac_amdgpu_ensure_open(this, driver, pci);
@@ -1104,18 +1108,34 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                 mmhub_base + amdgpu::MMHUBRegs::MMMC_VM_FB_LOCATION_BASE);
             uint32_t fb_top_raw  = amdgpu::RREG32(dev,
                 mmhub_base + amdgpu::MMHUBRegs::MMMC_VM_FB_LOCATION_TOP);
+            uint32_t fb_off_raw  = amdgpu::RREG32(dev,
+                mmhub_base + amdgpu::MMHUBRegs::MMMC_VM_FB_OFFSET);
             uint64_t vram_start =
                 ((uint64_t)(fb_base_raw & amdgpu::MMHUBRegs::kFBBaseMask))
                 << amdgpu::MMHUBRegs::kFBBaseShift;
+            uint32_t pt_lo = amdgpu::RREG32(dev,
+                mmhub_base + amdgpu::MMHUBRegs::MMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32);
+            uint32_t pt_hi = amdgpu::RREG32(dev,
+                mmhub_base + amdgpu::MMHUBRegs::MMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32);
+            uint32_t ctx0_cntl = amdgpu::RREG32(dev,
+                mmhub_base + amdgpu::MMHUBRegs::MMVM_CONTEXT0_CNTL);
             arguments->scalarOutput[7]  = mmhub_base;
             arguments->scalarOutput[8]  = fb_base_raw;
             arguments->scalarOutput[9]  = fb_top_raw;
             arguments->scalarOutput[10] = vram_start;
+            arguments->scalarOutput[12] = fb_off_raw;
+            arguments->scalarOutput[13] = pt_lo;
+            arguments->scalarOutput[14] = pt_hi;
+            arguments->scalarOutput[15] = ctx0_cntl;
         } else {
             arguments->scalarOutput[7]  = 0xFFFFFFFFu;
             arguments->scalarOutput[8]  = 0;
             arguments->scalarOutput[9]  = 0;
             arguments->scalarOutput[10] = 0;
+            arguments->scalarOutput[12] = 0;
+            arguments->scalarOutput[13] = 0;
+            arguments->scalarOutput[14] = 0;
+            arguments->scalarOutput[15] = 0;
         }
         // C2PMSG_67 lives at dword offset 0x0083 — the "_67" is the
         // register's logical name in PSP's spec, not its register-file

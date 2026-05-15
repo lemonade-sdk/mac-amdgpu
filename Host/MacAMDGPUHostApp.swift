@@ -728,12 +728,12 @@ final class DriverController: NSObject, ObservableObject,
 
     func testDumpPSP() {
         guard openUserClient() else { return }
-        let (kr, out) = callScalar(kSelDumpPSP, outCount: 12)
+        let (kr, out) = callScalar(kSelDumpPSP, outCount: 16)
         if kr != KERN_SUCCESS {
             append(String(format: "dumpPSP: kr=%#x", kr))
             return
         }
-        guard out.count >= 12 else {
+        guard out.count >= 16 else {
             append("dumpPSP: short reply (\(out.count) words)")
             return
         }
@@ -780,6 +780,15 @@ final class DriverController: NSObject, ObservableObject,
             append(String(format:
                 "psp/vram_start (MC addr): %#018llx  → expected C2PMSG_36 = %#x",
                 vramStart, UInt32(vramStart >> 20) & 0xFFFFFFFF))
+            let fbOff   = UInt32(out[12] & 0xFFFFFFFF)
+            let ptLo    = UInt32(out[13] & 0xFFFFFFFF)
+            let ptHi    = UInt32(out[14] & 0xFFFFFFFF)
+            let ctxCntl = UInt32(out[15] & 0xFFFFFFFF)
+            let ptFull = (UInt64(ptHi) << 32) | UInt64(ptLo)
+            append(String(format:
+                "psp/gart: FB_OFFSET=%#010x  PT_BASE=%#010x:%#010x (%#018llx)  CTX0_CNTL=%#010x  ENABLE=%@",
+                fbOff, ptHi, ptLo, ptFull, ctxCntl,
+                (ctxCntl & 1) != 0 ? "yes" : "NO"))
         }
     }
 
