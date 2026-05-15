@@ -129,7 +129,10 @@ ih_init(DeviceContext &dev, IHContext &ih)
     ih.ring_cpu         = reinterpret_cast<void *>(ring_cpu.address);
     ih.ring_size_bytes  = ring_size;
     ih.ring_size_dwords = ring_size / 4;
-    ih.ptr_mask         = ih.ring_size_dwords - 1;
+    // ptr_mask is byte-granular per upstream amdgpu_ih_ring_init
+    // (amdgpu_ih.c:52). rptr/wptr in this driver are both byte
+    // offsets into the ring.
+    ih.ptr_mask         = ring_size - 1;
     ih.wptr_shadow_buf  = wbuf;
     ih.wptr_shadow_dma  = wdma;
     ih.wptr_shadow_bus  = wseg.address;

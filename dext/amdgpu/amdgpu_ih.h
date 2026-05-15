@@ -74,10 +74,14 @@ struct IHContext {
     void     *ring_cpu;
     uint32_t  ring_size_bytes;  // power of two
     uint32_t  ring_size_dwords;
-    uint32_t  ptr_mask;         // (ring_size_dwords - 1)
+    // ptr_mask is in BYTES — (ring_size_bytes - 1). Matches upstream
+    // amdgpu_ih.c:52 (`ih->ptr_mask = ih->ring_size - 1`). rptr is a
+    // byte offset; the HW wptr from the shadow is also bytes.
+    uint32_t  ptr_mask;
     uint64_t  wptr_shadow_bus;
     volatile uint32_t *wptr_shadow_cpu;  // GPU writes wptr here
-    uint32_t  rptr;              // host's read pointer (dword index)
+    // host read pointer, in BYTES — advances 32 per dispatched entry.
+    uint32_t  rptr;
 
     // Counters
     uint64_t  entries_processed;
