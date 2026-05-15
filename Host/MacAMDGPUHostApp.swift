@@ -204,6 +204,12 @@ final class DriverController: NSObject, ObservableObject,
     @Published var installedVersion: String = "—"
     @Published var versionMatch: Bool = false
 
+    // Cached PCI identity, populated by the first testGetIdentity().
+    // Used to pick the kicker firmware variant where required (R9700
+    // rev 0xC8 needs psp_14_0_3_sos_kicker.bin etc).
+    var pciDeviceId: UInt16 = 0
+    var pciRevision: UInt8 = 0
+
     private var didAutoActivate = false
 
     // MARK: Startup flow
@@ -525,20 +531,36 @@ final class DriverController: NSObject, ObservableObject,
         }
     }
 
+    // Mirrors upstream amdgpu_ucode.c kicker_device_list[]: cards that
+    // need the `_kicker` firmware variant instead of the plain one.
+    private static let kickerDeviceList: [(device: UInt16, revision: UInt8)] = [
+        (0x744B, 0x00),
+        (0x7551, 0xC8),
+    ]
+
+    static func amdgpuIsKickerFw(deviceId: UInt16, revision: UInt8) -> Bool {
+        return kickerDeviceList.contains { $0.device == deviceId && $0.revision == revision }
+    }
+
     func testGetIdentity() {
         guard openUserClient() else { return }
-        let (kr, out) = callScalar(kSelGetIdentity, outCount: 6)
-        if kr == KERN_SUCCESS && out.count >= 6 {
-            // dext returns [bus, dev, fn, vid, did, classRev]
+        let (kr, out) = callScalar(kSelGetIdentity, outCount: 7)
+        if kr == KERN_SUCCESS && out.count >= 7 {
+            // dext returns [bus, dev, fn, vid, did, class+progif, revision]
             let bus      = UInt8(out[0] & 0xFF)
             let dev      = UInt8(out[1] & 0xFF)
             let fn       = UInt8(out[2] & 0xFF)
             let vid      = UInt16(out[3] & 0xFFFF)
             let did      = UInt16(out[4] & 0xFFFF)
-            let classRev = UInt32(out[5] & 0xFFFFFF)
+            let classProg = UInt32(out[5] & 0xFFFFFF)
+            let rev      = UInt8(out[6] & 0xFF)
+            self.pciDeviceId = did
+            self.pciRevision = rev
+            let kicker = DriverController.amdgpuIsKickerFw(deviceId: did, revision: rev)
             append(String(format:
-                "identity: %02x:%02x.%x VID=%04x DID=%04x class+rev=%06x",
-                bus, dev, fn, vid, did, classRev))
+                "identity: %02x:%02x.%x VID=%04x DID=%04x class+progif=%06x rev=%02x%@",
+                bus, dev, fn, vid, did, classProg, rev,
+                kicker ? " [KICKER fw variant]" : ""))
         } else {
             append(String(format: "identity: failed kr=%#x", kr))
         }
@@ -963,6 +985,9 @@ final class DriverController: NSObject, ObservableObject,
             append("initializeGPU: aborted — no user client; stop here")
             return
         }
+        // 1b. Read identity (PCI device id + revision) so we can pick
+        // the kicker firmware variant where applicable.
+        await MainActor.run { self.testGetIdentity() }
         // 2. DMA buffer.
         let dma = step("alloc DMA buffer") { self.ensureDMABuffer() }
         if !dma {
@@ -1003,11 +1028,21 @@ final class DriverController: NSObject, ObservableObject,
         // 4. PSPInit (no firmware yet).
         testInitDeviceUpTo(2)
 
-        // 5. PSP SOS firmware load.
-        if loadFirmware(kFwSOS, "psp_\(psp)_sos.bin") {
-            append("psp_\(psp)_sos.bin → loaded")
+        // 5. PSP SOS firmware load. Mirror upstream amdgpu_psp.c
+        // psp_init_sos_microcode line 3700:
+        //     if (amdgpu_is_kicker_fw(adev))
+        //         "amdgpu/%s_sos_kicker.bin"
+        //     else
+        //         "amdgpu/%s_sos.bin"
+        let isKicker = DriverController.amdgpuIsKickerFw(
+            deviceId: pciDeviceId, revision: pciRevision)
+        let sosName = isKicker ? "psp_\(psp)_sos_kicker.bin"
+                               : "psp_\(psp)_sos.bin"
+        append("PSP SOS firmware selection: device=0x\(String(format: "%04x", pciDeviceId)) rev=0x\(String(format: "%02x", pciRevision)) → \(sosName)")
+        if loadFirmware(kFwSOS, sosName) {
+            append("\(sosName) → loaded")
         } else {
-            append("psp_\(psp)_sos.bin → FAILED to load")
+            append("\(sosName) → FAILED to load")
         }
 
         // 6-8. Each remaining stage prints its own ok/FAILED via

@@ -892,12 +892,10 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
 
     case kMacAMDGPUMethodGetIdentity: {
         if (arguments->scalarOutput == nullptr ||
-            arguments->scalarOutputCount < 6) {
+            arguments->scalarOutputCount < 7) {
             return kIOReturnBadArgument;
         }
         // Config-space reads need the PCI device to be Open()'d.
-        // Force lazy open + populate DeviceContext so subsequent
-        // InitDevice / SubmitTestPM4 / etc. paths see a ready ctx.
         kern_return_t openRet = mac_amdgpu_ensure_open(this, driver, pci);
         if (openRet != kIOReturnSuccess) return openRet;
         uint8_t  bus = 0, dev = 0, fn = 0;
@@ -913,7 +911,8 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         arguments->scalarOutput[2] = fn;
         arguments->scalarOutput[3] = vid;
         arguments->scalarOutput[4] = did;
-        arguments->scalarOutput[5] = (classRev >> 8) & 0xFFFFFFu;
+        arguments->scalarOutput[5] = (classRev >> 8) & 0xFFFFFFu;  // class+prog_if
+        arguments->scalarOutput[6] = classRev & 0xFFu;             // revision
         return kIOReturnSuccess;
     }
 
