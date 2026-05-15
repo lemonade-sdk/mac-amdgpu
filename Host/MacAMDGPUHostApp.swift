@@ -28,9 +28,11 @@ private let kSelPing:            UInt32 = 0
 private let kSelGetIdentity:     UInt32 = 1
 private let kSelGetBARInfo:      UInt32 = 2
 private let kSelAllocateDMA:     UInt32 = 6
+private let kSelResetDevice:     UInt32 = 8
 private let kSelInitDevice:      UInt32 = 9
 private let kSelLoadFirmware:    UInt32 = 10
 private let kSelQueryInfo:       UInt32 = 21
+private let kSelGetDiagnostics:  UInt32 = 23
 
 // Firmware type tags — match MacAMDGPU.cpp enum.
 private let kFwSOS:         UInt64 = 0
@@ -147,40 +149,19 @@ struct ContentView: View {
             // makes external clients work too once Apple grants the
             // matching capability to a separate tool.
             HStack(spacing: 6) {
+                Button("Initialize GPU") {
+                    controller.initializeGPU()
+                }
+                .help("Run every bringup stage in order, printing each as it completes.")
+                Spacer()
+                Button("Diagnostics") { controller.testGetDiagnostics() }
+                    .help("PCI config + PM cap + IFWI + BAR0/2/5 MMIO probes.")
                 Button("Ping") { controller.testPing() }
                 Button("Identity") { controller.testGetIdentity() }
                 Button("BARs") { controller.testGetBARInfo() }
                 Button("Query") { controller.testQueryInfo() }
-                Spacer()
-                Button("Run Full Bringup") {
-                    controller.runFullBringup()
-                }
-                .help("Loads PSP firmware then runs every InitDevice stage.")
             }
             .font(.caption)
-
-            // Bring-up stage ladder. Click each in order; each runs
-            // every stage up to and including the requested target.
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Bringup stages").font(.caption2).foregroundStyle(.secondary)
-                HStack(spacing: 4) {
-                    Button("1. IPDiscovery")   { controller.testInitDeviceUpTo(1) }
-                    Button("2. PSPInit")       { controller.testInitDeviceUpTo(2) }
-                    Button("3. LoadSOS+...")   { controller.runFullBringup() }
-                    Button("4. PSPRingCreate") { controller.testInitDeviceUpTo(4) }
-                    Button("5. TMRSetup")      { controller.testInitDeviceUpTo(5) }
-                }
-                .font(.caption)
-                HStack(spacing: 4) {
-                    Button("6. SMUInit")  { controller.testInitDeviceUpTo(6) }
-                    Button("7. GMCInit")  { controller.testInitDeviceUpTo(7) }
-                    Button("9. RLCInit")  { controller.testInitDeviceUpTo(9) }
-                    Button("10. CPInit")  { controller.testInitDeviceUpTo(10) }
-                    Button("12. IHInit")  { controller.testInitDeviceUpTo(12) }
-                    Button("14. SDMA")    { controller.testInitDeviceUpTo(14) }
-                }
-                .font(.caption)
-            }
             .padding(.vertical, 4)
 
             ScrollView {
@@ -601,16 +582,95 @@ final class DriverController: NSObject, ObservableObject,
         }
     }
 
+    func testGetDiagnostics() {
+        guard openUserClient() else { return }
+        let (kr, out) = callScalar(kSelGetDiagnostics, outCount: 16)
+        if kr != KERN_SUCCESS {
+            append(String(format: "diagnostics: kr=%#x", kr))
+            return
+        }
+        guard out.count >= 16 else {
+            append("diagnostics: short reply (\(out.count) words)")
+            return
+        }
+        let cmd       = UInt16(out[0] & 0xFFFF)
+        let status    = UInt16((out[0] >> 16) & 0xFFFF)
+        let bar0Lo    = UInt32(out[1] & 0xFFFFFFFF)
+        let bar0Hi    = UInt32(out[2] & 0xFFFFFFFF)
+        let bar2Lo    = UInt32(out[3] & 0xFFFFFFFF)
+        let bar2Hi    = UInt32(out[4] & 0xFFFFFFFF)
+        let bar5Cfg   = UInt32(out[5] & 0xFFFFFFFF)
+        let pmcsr     = UInt16(out[6] & 0xFFFF)
+        let pmCapOff  = UInt8((out[6] >> 16) & 0xFF)
+        let pmState   = pmcsr & 0x3
+        let memEnable = (cmd & 0x2) != 0
+        let busMaster = (cmd & 0x4) != 0
+        let bar0Full  = (UInt64(bar0Hi) << 32) | UInt64(bar0Lo & ~UInt32(0xF))
+        let bar2Full  = (UInt64(bar2Hi) << 32) | UInt64(bar2Lo & ~UInt32(0xF))
+
+        append(String(format:
+            "diag/config: cmd=%#06x (MEM=%@ BM=%@) status=%#06x",
+            cmd, memEnable ? "1" : "0",
+            busMaster ? "1" : "0", status))
+        let memIdxBar0 = UInt8(out[15] & 0xFF)
+        let memIdxBar2 = UInt8((out[15] >> 8) & 0xFF)
+        let memIdxBar5 = UInt8((out[15] >> 16) & 0xFF)
+        append(String(format:
+            "diag/bar0: cfg=%#010x:%#010x base=%#018llx size=%llu memIdx=%u",
+            bar0Hi, bar0Lo, bar0Full, out[7], memIdxBar0))
+        append(String(format:
+            "diag/bar2: cfg=%#010x:%#010x base=%#018llx size=%llu memIdx=%u",
+            bar2Hi, bar2Lo, bar2Full, out[8], memIdxBar2))
+        append(String(format:
+            "diag/bar5: cfg=%#010x memIdx=%u",
+            bar5Cfg, memIdxBar5))
+        if pmCapOff != 0 {
+            append(String(format:
+                "diag/pm: cap@%#x PMCSR=%#06x state=D%u",
+                pmCapOff, pmcsr, pmState))
+        } else {
+            append("diag/pm: no PM capability found")
+        }
+        append(String(format:
+            "diag/mmio bar5 (REGISTERS): [0x000]=%#x [0x004]=%#x [0xDE3*4]=%#x",
+            UInt32(out[9]  & 0xFFFFFFFF),
+            UInt32(out[10] & 0xFFFFFFFF),
+            UInt32(out[11] & 0xFFFFFFFF)))
+        append(String(format:
+            "diag/mmio bar0 (FRAMEBUFFER): [0x000]=%#x [0x004]=%#x",
+            UInt32(out[12] & 0xFFFFFFFF),
+            UInt32(out[13] & 0xFFFFFFFF)))
+        let ifwi = UInt32(out[14] & 0xFFFFFFFF)
+        let ifwiReady = (ifwi & 0x80000000) == 0x80000000
+        append(String(format:
+            "diag/ifwi: MP0_C2PMSG_33=%#010x %@",
+            ifwi, ifwiReady ? "(ready)" : "(NOT READY — waiting for IFWI)"))
+    }
+
+    // Stage labels mirror BringupStage in dext/amdgpu/amdgpu_init.h.
+    private static let stageNames: [UInt64: String] = [
+        1: "IPDiscovery", 2: "PSPInit", 3: "PSPLoadSOS",
+        4: "PSPRingCreate", 5: "TMRSetup", 6: "SMUInit",
+        7: "GMCInit", 8: "IMUInit", 9: "RLCInit",
+        10: "CPInit", 11: "MESInit", 12: "IHInit",
+        13: "GFXInit", 14: "SDMAInit"
+    ]
+    private static let stageOrder: [UInt64] = [
+        1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 14
+    ]
+
     func testInitDeviceUpTo(_ stage: UInt64) {
         guard openUserClient() else { return }
         let (kr, out) = callScalar(kSelInitDevice,
                                    input: [stage],
                                    outCount: 1)
+        let name = DriverController.stageNames[stage] ?? "stage\(stage)"
         if kr == KERN_SUCCESS, let reached = out.first {
-            append("InitDevice(stage=\(stage)): ok, reached=\(reached)")
+            let reachedName = DriverController.stageNames[reached] ?? "stage\(reached)"
+            append("\(name): ok (reached \(reachedName))")
         } else {
             append(String(format:
-                "InitDevice(stage=\(stage)): kr=%#x", kr))
+                "\(name): FAILED kr=%#x", kr))
         }
     }
 
@@ -780,6 +840,111 @@ final class DriverController: NSObject, ObservableObject,
                 self?.statusColor = .green
             }
         }
+    }
+
+    // initializeGPU: one-button bring-up that logs EVERY step it
+    // attempts with a "→ start" line and a result line, and continues
+    // past failures so the user sees the full ladder.
+    func initializeGPU() {
+        guard !isWorking else {
+            append("initializeGPU: already running")
+            return
+        }
+        isWorking = true
+        status = "initializing GPU…"
+        statusColor = .orange
+        Task.detached(priority: .userInitiated) { [weak self] in
+            await self?.initializeGPUBlocking()
+            await MainActor.run {
+                self?.isWorking = false
+                self?.status = "initializeGPU finished"
+                self?.statusColor = .green
+            }
+        }
+    }
+
+    private func initializeGPUBlocking() async {
+        append("──── initializeGPU starting ────")
+
+        // Helper to log "step → start" then "step → result".
+        func step(_ name: String, _ body: () -> Bool) -> Bool {
+            append("\(name) → start")
+            let ok = body()
+            append(ok ? "\(name) → ok" : "\(name) → FAILED")
+            return ok
+        }
+
+        // 1. Open user client.
+        let uc = step("open user client") { self.openUserClient() }
+        if !uc {
+            append("initializeGPU: aborted — no user client; stop here")
+            return
+        }
+        // 2. DMA buffer.
+        let dma = step("alloc DMA buffer") { self.ensureDMABuffer() }
+        if !dma {
+            append("initializeGPU: aborted — no DMA buffer; stop here")
+            return
+        }
+        // 3. Function-Level Reset — kicks off IFWI on cold-hotplugged
+        // cards. qemu-vfio-apple does this before MMIO; we were
+        // skipping it which is why C2PMSG_33 stays 0.
+        _ = step("PCIe Function-Level Reset (kicks IFWI)") {
+            let (kr, _) = self.callScalar(kSelResetDevice, outCount: 0)
+            return kr == KERN_SUCCESS
+        }
+        // Give IFWI ~150 ms to start the watchdog after reset before
+        // we begin polling its status. Linux waits the same way.
+        try? await Task.sleep(nanoseconds: 150_000_000)
+
+        // 4. IP discovery (polls IFWI internally, up to 2 sec).
+        let disc = step("IP discovery (IFWI wait + RCC_CONFIG_MEMSIZE)") {
+            self.discoverIPs()
+        }
+        if !disc {
+            append("initializeGPU: discovery failed — without IP versions we")
+            append("  can't construct firmware filenames. Click Diagnostics")
+            append("  to inspect IFWI / BAR state.")
+            return
+        }
+
+        guard let psp  = self.ipPSP?.path,
+              let smu  = self.ipSMU?.path,
+              let sdma = self.ipSDMA?.path,
+              let gfx  = self.ipGFX?.path
+        else {
+            append("initializeGPU: discovery didn't fill IP versions")
+            return
+        }
+
+        // 4. PSPInit (no firmware yet).
+        testInitDeviceUpTo(2)
+
+        // 5. PSP SOS firmware load.
+        if loadFirmware(kFwSOS, "psp_\(psp)_sos.bin") {
+            append("psp_\(psp)_sos.bin → loaded")
+        } else {
+            append("psp_\(psp)_sos.bin → FAILED to load")
+        }
+
+        // 6-8. Each remaining stage prints its own ok/FAILED via
+        // testInitDeviceUpTo's log line.
+        for s: UInt64 in [3, 4, 5, 6, 7, 9, 10, 11, 12, 14] {
+            testInitDeviceUpTo(s)
+        }
+
+        // Per-IP firmware loads sprinkled in for SMU / SDMA / RLC / MES.
+        if loadFirmware(kFwIP_SMU, "smu_\(smu).bin") {
+            append("smu_\(smu).bin → loaded")
+        }
+        if loadFirmware(kFwIP_SDMA0, "sdma_\(sdma).bin") {
+            append("sdma_\(sdma).bin → loaded (SDMA0)")
+            _ = loadFirmware(kFwIP_SDMA1, "sdma_\(sdma).bin")
+        }
+        _ = loadFirmware(kFwIP_RLC_G, "gc_\(gfx)_rlc.bin")
+        _ = loadFirmware(kFwIP_RS64_MES, "gc_\(gfx)_uni_mes.bin")
+
+        append("──── initializeGPU done ────")
     }
 
     private func runFullBringupBlocking() async {

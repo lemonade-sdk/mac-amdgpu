@@ -78,18 +78,30 @@ SOC15_REG_OFFSET(const DeviceContext &ctx, IPBlock block, uint32_t reg)
 }
 
 //============================================================
-// RREG32 / WREG32 — 32-bit MMIO over BAR0.
+// RREG32 / WREG32 — 32-bit MMIO over the register BAR.
 //
-// `reg` is the absolute BAR0-relative dword offset (post-SOC15
-// resolution). PCIDriverKit's MemoryRead32/Write32 take a byte
-// offset, so we shift left by 2.
+// IMPORTANT: For all AMD GPUs >= CHIP_BONAIRE (gfx7 and later —
+// every modern card including RDNA3/3.5/4), the MMIO register
+// window is in BAR5, NOT BAR0. See upstream amdgpu_device.c
+// amdgpu_device_init():
+//     if (asic_type >= CHIP_BONAIRE) {
+//         adev->rmmio_base = pci_resource_start(pdev, 5);  // BAR5
+//     } else {
+//         adev->rmmio_base = pci_resource_start(pdev, 2);
+//     }
+// BAR0 on these chips is the framebuffer/VRAM aperture and
+// returns 0 for all reads until PSP sets up VRAM backing.
+//
+// `reg` is the BAR5-relative dword offset (post-SOC15 resolution).
+// PCIDriverKit's MemoryRead/Write32 take a byte offset, so we
+// shift left by 2.
 //============================================================
 #ifdef __APPLE__
 static inline uint32_t
 RREG32(const DeviceContext &ctx, uint32_t reg)
 {
     uint32_t value = 0xFFFFFFFFu;
-    ctx.pci->MemoryRead32(ctx.bar0MemIndex,
+    ctx.pci->MemoryRead32(ctx.bar5MemIndex,
                           static_cast<uint64_t>(reg) * 4ULL, &value);
     return value;
 }
@@ -97,33 +109,57 @@ RREG32(const DeviceContext &ctx, uint32_t reg)
 static inline void
 WREG32(const DeviceContext &ctx, uint32_t reg, uint32_t value)
 {
-    ctx.pci->MemoryWrite32(ctx.bar0MemIndex,
+    ctx.pci->MemoryWrite32(ctx.bar5MemIndex,
                            static_cast<uint64_t>(reg) * 4ULL, value);
 }
 
-// Absolute BAR0 read — bypasses SOC15 indirection. Used by the
+// Absolute register read — bypasses SOC15 indirection. Used by the
 // bootstrap path (IP discovery) to read mmRCC_CONFIG_MEMSIZE +
-// mmDRIVER_SCRATCH_{0,1,2} before any IP bases are resolved.
+// mmDRIVER_SCRATCH_{0,1,2} + mmMP0_C2PMSG_33 before any IP bases
+// are resolved. Same BAR as RREG32 (BAR5 register window).
 static inline uint32_t
 RREG32_abs(const DeviceContext &ctx, uint32_t reg_dword_offset)
 {
     uint32_t value = 0xFFFFFFFFu;
-    ctx.pci->MemoryRead32(ctx.bar0MemIndex,
+    ctx.pci->MemoryRead32(ctx.bar5MemIndex,
                           static_cast<uint64_t>(reg_dword_offset) * 4ULL,
                           &value);
     return value;
 }
 
-// 32-bit read from BAR2 at the given **byte** offset. BAR2 maps the
-// visible VRAM aperture; offsets larger than ctx.bar2VisibleVRAMSize
-// are not valid (the IP discovery TMR must live in the visible
-// window or the on-die path bails — see amdgpu_discovery::discover_ips_on_die).
+// 32-bit read from BAR0 at the given **byte** offset. BAR0 maps the
+// visible VRAM aperture (it's the framebuffer BAR on Bonaire+); the
+// IP discovery TMR lives in this window when not in sysmem AND when
+// the total VRAM fits inside the visible aperture.
 static inline uint32_t
 RBAR2_32(const DeviceContext &ctx, uint64_t byte_offset)
 {
     uint32_t value = 0;
-    ctx.pci->MemoryRead32(ctx.bar2MemIndex, byte_offset, &value);
+    ctx.pci->MemoryRead32(ctx.bar0MemIndex, byte_offset, &value);
     return value;
+}
+
+// Read a single dword from anywhere in VRAM via the
+// mmMM_INDEX / mmMM_INDEX_HI / mmMM_DATA register pair.
+//
+// Mirrors upstream amdgpu_device_mm_access():
+//     WREG32(mmMM_INDEX, (pos & 0xffffffff) | 0x80000000);
+//     WREG32(mmMM_INDEX_HI, pos >> 31);
+//     return RREG32(mmMM_DATA);
+//
+// Required to reach VRAM offsets above the visible BAR0 aperture —
+// e.g. the IP discovery TMR sits at (vram_size - 1 MB), which is at
+// ~30 GB for a 32 GB card with only 256 MB visible. Same register
+// layout on all chips since bif_3_0 — see asic_reg/bif/bif_5_1_d.h.
+static inline uint32_t
+RVRAM32_via_mm(const DeviceContext &ctx, uint64_t pos)
+{
+    constexpr uint32_t mmMM_INDEX     = 0x0;
+    constexpr uint32_t mmMM_DATA      = 0x1;
+    constexpr uint32_t mmMM_INDEX_HI  = 0x6;
+    WREG32(ctx, mmMM_INDEX, ((uint32_t)pos) | 0x80000000u);
+    WREG32(ctx, mmMM_INDEX_HI, (uint32_t)(pos >> 31));
+    return RREG32(ctx, mmMM_DATA);
 }
 #endif
 

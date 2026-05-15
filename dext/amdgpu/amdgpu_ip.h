@@ -199,10 +199,25 @@ constexpr uint32_t kPSPFwPriBufSize       = 1024u * 1024u;  // PSP_1_MEG
 //       size   = DISCOVERY_TMR_SIZE
 // ============================================================
 namespace BootstrapRegs {
+    // BAR0-absolute dword offsets — these are the upstream "legacy
+    // aliases" that work pre-IP-discovery. Same offset across NBIO
+    // 6_1 / 7_0 / 7_4 / 7_11. They become valid only AFTER IFWI
+    // init completes (poll MP0_C2PMSG_33 bit 31).
     constexpr uint32_t RCC_CONFIG_MEMSIZE = 0x0DE3;
     constexpr uint32_t DRIVER_SCRATCH_0   = 0x0094;
     constexpr uint32_t DRIVER_SCRATCH_1   = 0x0095;
     constexpr uint32_t DRIVER_SCRATCH_2   = 0x0096;
+
+    // MP0 IFWI handshake register. Upstream amdgpu_discovery.c
+    // amdgpu_discovery_get_tmr_info() polls this for bit 31 set for
+    // up to 2 seconds before reading MEMSIZE — required on USB4/TB
+    // hotplug because IFWI init isn't complete when the OS sees the
+    // device. Offset matches mp_11_5_0 / mp_12_0_0 / mp_14_0_2
+    // ASIC headers: dword 0x0061 (byte 0x184).
+    constexpr uint32_t MP0_C2PMSG_33      = 0x0061;
+    constexpr uint32_t kIFWIReadyMask     = 0x80000000u;
+    constexpr uint32_t kIFWIReadyValue    = 0x80000000u;
+    constexpr uint64_t kIFWITimeoutMs     = 2000;
 }
 
 constexpr uint64_t kDiscoveryTMROffset = 0x100000;   // 1 MB

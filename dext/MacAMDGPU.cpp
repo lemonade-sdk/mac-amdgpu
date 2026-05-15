@@ -66,6 +66,7 @@ enum {
     kMacAMDGPUMethodWaitFence         = 20,
     kMacAMDGPUMethodQueryInfo         = 21,
     kMacAMDGPUMethodMESAddQueue       = 22,
+    kMacAMDGPUMethodGetDiagnostics    = 23,
 };
 
 // QueryInfo "info type" tags — input scalarInput[0]. Output shape
@@ -304,15 +305,21 @@ mac_amdgpu_ensure_open(IOService *opener, MacAMDGPU *driver,
         uint8_t  ty = 0;
         if (pci->GetBARInfo(bar, &mi, &sz, &ty) != kIOReturnSuccess) continue;
         switch (bar) {
-        case 0: bdev.bar0MemIndex = mi; bdev.bar0Size = sz; break;
-        case 2: bdev.bar2MemIndex = mi; bdev.bar2VisibleVRAMSize = sz; break;
-        case 5: bdev.bar5MemIndex = mi; break;
+        case 0:
+            // BAR0 is the visible-VRAM/framebuffer aperture on Bonaire+.
+            bdev.bar0MemIndex         = mi;
+            bdev.bar0Size             = sz;
+            bdev.bar2VisibleVRAMSize  = sz;  // visible VRAM window size
+            break;
+        case 2: bdev.bar2MemIndex = mi; break;       // doorbell BAR
+        case 5: bdev.bar5MemIndex = mi; break;       // MMIO register window
         default: break;
         }
     }
-    MACAMDGPU_LOG("ensure_open: PCI opened, cmd=%#x, BAR0=%llu B, "
-                  "BAR2(visible VRAM)=%llu B",
-                  (unsigned)cmd, bdev.bar0Size, bdev.bar2VisibleVRAMSize);
+    MACAMDGPU_LOG("ensure_open: PCI opened, cmd=%#x, "
+                  "BAR0(visible VRAM)=%llu B, BAR2(doorbell)=2MB, "
+                  "BAR5(registers)=512KB",
+                  (unsigned)cmd, bdev.bar0Size);
 
     // Read PCI config space + try to wake device to D0.
     uint32_t bar0_cfg = 0, bar2_cfg = 0, bar5_cfg = 0;
@@ -930,6 +937,79 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         arguments->scalarOutput[0] = memoryIndex;
         arguments->scalarOutput[1] = barSize;
         arguments->scalarOutput[2] = barType;
+        return kIOReturnSuccess;
+    }
+
+    case kMacAMDGPUMethodGetDiagnostics: {
+        // Returns: cfg (cmd/status, BAR0..5 low+high), PM cap, BAR0/2/5
+        // MMIO probes so the host can see exactly what each BAR reads.
+        if (arguments->scalarOutput == nullptr ||
+            arguments->scalarOutputCount < 16) {
+            return kIOReturnBadArgument;
+        }
+        kern_return_t openRet = mac_amdgpu_ensure_open(this, driver, pci);
+        if (openRet != kIOReturnSuccess) return openRet;
+
+        uint16_t cmd = 0, status = 0;
+        uint32_t bar0_lo = 0, bar0_hi = 0;
+        uint32_t bar2_lo = 0, bar2_hi = 0, bar5_cfg = 0;
+        pci->ConfigurationRead16(0x04, &cmd);
+        pci->ConfigurationRead16(0x06, &status);
+        pci->ConfigurationRead32(0x10, &bar0_lo);
+        pci->ConfigurationRead32(0x14, &bar0_hi);  // 64-bit BAR0 high dword
+        pci->ConfigurationRead32(0x18, &bar2_lo);
+        pci->ConfigurationRead32(0x1C, &bar2_hi);  // 64-bit BAR2 high dword
+        pci->ConfigurationRead32(0x24, &bar5_cfg);
+
+        uint8_t  pm_cap_ptr = 0;
+        uint16_t pmcsr      = 0xFFFFu;
+        {
+            uint8_t cp = 0;
+            pci->ConfigurationRead8(0x34, &cp);
+            while (cp != 0 && cp != 0xFF) {
+                uint16_t hdr = 0;
+                pci->ConfigurationRead16(cp, &hdr);
+                if ((hdr & 0xFF) == 0x01) {
+                    pm_cap_ptr = cp;
+                    pci->ConfigurationRead16(cp + 4, &pmcsr);
+                    break;
+                }
+                cp = (hdr >> 8) & 0xFF;
+            }
+        }
+
+        auto rdBar = [&](uint8_t memIdx, uint64_t byteOff) -> uint32_t {
+            uint32_t v = 0xDEADBEEFu;  // distinct from 0 and 0xFFFFFFFF
+            pci->MemoryRead32(memIdx, byteOff, &v);
+            return v;
+        };
+        auto &bdev = driver->ivars->bringup.device;
+        arguments->scalarOutput[0]  = ((uint64_t)status << 16) | cmd;
+        arguments->scalarOutput[1]  = bar0_lo;
+        arguments->scalarOutput[2]  = bar0_hi;
+        arguments->scalarOutput[3]  = bar2_lo;
+        arguments->scalarOutput[4]  = bar2_hi;
+        arguments->scalarOutput[5]  = bar5_cfg;
+        arguments->scalarOutput[6]  = ((uint64_t)pm_cap_ptr << 16) | pmcsr;
+        arguments->scalarOutput[7]  = bdev.bar0Size;
+        arguments->scalarOutput[8]  = bdev.bar2VisibleVRAMSize;
+        // BAR5 is the MMIO register window on Bonaire+ AMDGPUs.
+        // BAR0 is the framebuffer aperture (returns 0 pre-VRAM-setup).
+        arguments->scalarOutput[9]  = rdBar(bdev.bar5MemIndex, 0x0000);
+        arguments->scalarOutput[10] = rdBar(bdev.bar5MemIndex, 0x0004);
+        arguments->scalarOutput[11] = rdBar(bdev.bar5MemIndex, 0x0DE3 * 4);
+        arguments->scalarOutput[12] = rdBar(bdev.bar0MemIndex, 0x0000);
+        arguments->scalarOutput[13] = rdBar(bdev.bar0MemIndex, 0x0004);
+        // MP0_C2PMSG_33 (IFWI status) — read from BAR5 (the register
+        // window), dword 0x0061 = byte 0x184. Bit 31 set = IFWI complete.
+        arguments->scalarOutput[14] =
+            rdBar(bdev.bar5MemIndex, (uint64_t)0x0061 * 4ULL);
+        // memIdx values packed in case PCIDriverKit numbered them
+        // differently from the BAR numbers (compacted indices).
+        arguments->scalarOutput[15] =
+            ((uint64_t)bdev.bar5MemIndex << 16) |
+            ((uint64_t)bdev.bar2MemIndex << 8)  |
+             (uint64_t)bdev.bar0MemIndex;
         return kIOReturnSuccess;
     }
 
