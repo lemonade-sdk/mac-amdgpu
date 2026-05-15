@@ -184,17 +184,25 @@ discovery_parse(const uint8_t *binary, uint64_t binarySize,
                 break;
             }
 
-            // First base address only — that's what SOC15 uses (BASE_IDX=0).
-            uint32_t base32 = 0;
-            if (ip->num_base_address > 0) {
+            // Read ALL base addresses (up to kMaxBaseSegments). Upstream
+            // registers declare their BASE_IDX alongside the offset; each
+            // BASE_IDX picks a different slot in this array.
+            uint32_t bases[IPBaseTable::kMaxBaseSegments] = {0};
+            uint8_t numBases = ip->num_base_address;
+            if (numBases > IPBaseTable::kMaxBaseSegments) {
+                numBases = IPBaseTable::kMaxBaseSegments;
+            }
+            for (uint8_t b = 0; b < numBases; b++) {
                 if (base_addr_64) {
                     auto *p = reinterpret_cast<const uint64_t *>(
-                        reinterpret_cast<const uint8_t *>(ip) + sizeof(DiscoveryIPv4));
-                    base32 = static_cast<uint32_t>(*p);  // low 32 bits
+                        reinterpret_cast<const uint8_t *>(ip) +
+                        sizeof(DiscoveryIPv4));
+                    bases[b] = static_cast<uint32_t>(p[b]);
                 } else {
                     auto *p = reinterpret_cast<const uint32_t *>(
-                        reinterpret_cast<const uint8_t *>(ip) + sizeof(DiscoveryIPv4));
-                    base32 = *p;
+                        reinterpret_cast<const uint8_t *>(ip) +
+                        sizeof(DiscoveryIPv4));
+                    bases[b] = p[b];
                 }
             }
 
@@ -202,12 +210,16 @@ discovery_parse(const uint8_t *binary, uint64_t binarySize,
             if (blk != IPBlock::Count && ip->instance_number == 0) {
                 // Only first instance — multi-instance for things like SDMA
                 // already has its own HWID per instance (SDMA0 vs SDMA1).
-                dev.ip.set(blk, base32);
+                for (uint8_t b = 0; b < numBases; b++) {
+                    dev.ip.setBase(blk, b, bases[b]);
+                }
                 ips_recognised++;
                 DISC_LOG("  ip[%u] hw_id=%u %{public}s v%u.%u.%u "
-                         "base=%#010x",
+                         "bases=[%#010x %#010x %#010x %#010x %#010x] (n=%u)",
                          i, ip->hw_id, block_name(blk),
-                         ip->major, ip->minor, ip->revision, base32);
+                         ip->major, ip->minor, ip->revision,
+                         bases[0], bases[1], bases[2], bases[3], bases[4],
+                         numBases);
 
                 // First time we see GC, capture its version too for
                 // user-visible reporting.

@@ -30,6 +30,7 @@
 #include "MacAMDGPUUserClient.h"
 
 #include "amdgpu/amdgpu_init.h"
+#include "amdgpu/amdgpu_ucode_psp.h"
 #include "amdgpu/amdgpu_discovery.h"
 #include "amdgpu/amdgpu_ih.h"
 #include "amdgpu/amdgpu_cp.h"
@@ -213,6 +214,13 @@ struct MacAMDGPUUserClient_IVars {
     BOEntry   bos[MACAMDGPU_MAX_BO];
     uint64_t  boBumpOffset;
     uint32_t  boGenCounter;
+
+    // GART binding for the DMA buffer. Lazily populated on the first
+    // LOAD_IP_FW submit; reused across subsequent submits (the host
+    // streams different firmware bytes into the same DART-mapped
+    // buffer, so the busAddr is stable). Reset on EnsureDMABuffer
+    // when the buffer is reallocated.
+    amdgpu::GARTBinding dmaGartBinding;
 };
 
 //
@@ -401,6 +409,11 @@ mac_amdgpu_release_dma_buffer(MacAMDGPUUserClient *client)
     client->ivars->dmaSegmentsCount = 0;
     memset(client->ivars->dmaSegments, 0,
            sizeof(client->ivars->dmaSegments));
+    // The bus address goes away with the buffer; the GART slot stays
+    // mapped to a stale address until something rewrites it. Clear the
+    // binding's MC addr so the next LOAD_IP_FW path rebinds afresh.
+    memset(&client->ivars->dmaGartBinding, 0,
+           sizeof(client->ivars->dmaGartBinding));
 }
 
 static kern_return_t
@@ -1145,13 +1158,15 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
     }
 
     case kMacAMDGPUMethodDumpCmdBuf: {
-        // Read 16 dwords from the GART-backed sysmem PSP control
-        // buffers (ring/cmd/fence are sysmem now, not VRAM).
+        // Read 16 dwords from the VRAM-backed PSP control buffers via
+        // the BAR0 aperture. ring/cmd/fence live at fixed VRAM offsets
+        // (kRingVRAMOffset / kCmdBufVRAMOffset / kFenceVRAMOffset from
+        // psp_v14_0.cpp — kept in sync with the constants there).
         //   [0..3]  cmd_buf[0..3]     (header: buf_size, version, cmd_id, ...)
-        //   [4..7]  cmd_buf[16..19]   (cmd-specific payload start, byte 64)
-        //   [8..11] cmd_buf[216..219] (status region near upstream resp offset)
+        //   [4..7]  cmd_buf[64..76]   (cmd-specific payload start)
+        //   [8..11] cmd_buf[864..876] (response status region)
         //   [12]    fence_buf[0]      (PSP-written fence value)
-        //   [13..15] ring_mem[0..2]   (first dwords of the ring frame layout)
+        //   [13..15] ring_mem[0..8]   (first dwords of the ring frame)
         if (arguments->scalarOutput == nullptr ||
             arguments->scalarOutputCount < 16) {
             return kIOReturnBadArgument;
@@ -1159,22 +1174,23 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         kern_return_t openRet = mac_amdgpu_ensure_open(this, driver, pci);
         if (openRet != kIOReturnSuccess) return openRet;
         auto &psp = driver->ivars->bringup.psp;
-        if (psp.cmdCPUAddr == nullptr || psp.fenceCPUAddr == nullptr ||
-            psp.ringCPUAddr == nullptr) {
+        if (!psp.ringCreated) {
             for (int i = 0; i < 16; i++) arguments->scalarOutput[i] = 0;
             return kIOReturnSuccess;  // ring not created yet
         }
-        auto cmdU32 = [&](uint32_t off) -> uint32_t {
-            return *reinterpret_cast<volatile uint32_t *>(
-                static_cast<uint8_t *>(psp.cmdCPUAddr) + off);
+        // VRAM offsets must match psp_v14_0.cpp constants.
+        constexpr uint64_t kRingVRAMOff   = 0x100000;
+        constexpr uint64_t kCmdBufVRAMOff = 0x104000;
+        constexpr uint64_t kFenceVRAMOff  = 0x108000;
+        auto &devCtx = driver->ivars->bringup.device;
+        auto cmdU32   = [&](uint64_t off) -> uint32_t {
+            return amdgpu::RBAR2_32(devCtx, kCmdBufVRAMOff + off);
         };
-        auto fenceU32 = [&](uint32_t off) -> uint32_t {
-            return *reinterpret_cast<volatile uint32_t *>(
-                static_cast<uint8_t *>(psp.fenceCPUAddr) + off);
+        auto fenceU32 = [&](uint64_t off) -> uint32_t {
+            return amdgpu::RBAR2_32(devCtx, kFenceVRAMOff + off);
         };
-        auto ringU32 = [&](uint32_t off) -> uint32_t {
-            return *reinterpret_cast<volatile uint32_t *>(
-                static_cast<uint8_t *>(psp.ringCPUAddr) + off);
+        auto ringU32  = [&](uint64_t off) -> uint32_t {
+            return amdgpu::RBAR2_32(devCtx, kRingVRAMOff + off);
         };
         arguments->scalarOutput[0]  = cmdU32(0);
         arguments->scalarOutput[1]  = cmdU32(4);
@@ -1388,38 +1404,73 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             // Post-SOS IP firmware path: fwType encoded as 0x100 + psp_gfx_fw_type.
             if (fwType >= 0x100 && fwType < 0x200) {
                 uint32_t gfxFwType = static_cast<uint32_t>(fwType - 0x100);
-                // The PSP LOAD_IP_FW path reads the firmware bytes directly
-                // from a DART-mapped buffer at a stable bus address. We use
-                // the client's DMABuffer for this; the bus address is the
-                // first segment's bus addr (we've already enforced
-                // single-segment mappings).
                 if (ivars->dmaSegmentsCount < 1) return kIOReturnNotReady;
-                uint64_t fwBusAddr = ivars->dmaSegments[0].address;
+                auto &gart = driver->ivars->bringup.gart;
+                if (!gart.enabled) {
+                    return kIOReturnNotReady;
+                }
+
+                // The host streams the WHOLE .bin file (including header)
+                // into the DMA buffer; PSP wants only the ucode payload
+                // bytes, located at `header.ucode_array_offset_bytes` of
+                // size `header.ucode_size_bytes`. Mirrors upstream
+                // `amdgpu_ucode_init_single_fw` / `psp_prep_load_ip_fw_cmd_buf`
+                // which both work off (start + ucode_array_offset_bytes,
+                // ucode_size_bytes). Without this, PSP reads the 32-byte
+                // common_firmware_header as if it were ucode → bogus.
+                uint32_t ucodeOff = 0;
+                uint32_t ucodeSize = static_cast<uint32_t>(fwSize);
+                if (fwSize >= sizeof(amdgpu::common_firmware_header)) {
+                    auto *hdr = reinterpret_cast<
+                        const amdgpu::common_firmware_header *>(bin);
+                    if (hdr->ucode_array_offset_bytes < fwSize &&
+                        hdr->ucode_size_bytes > 0 &&
+                        hdr->ucode_array_offset_bytes + hdr->ucode_size_bytes
+                            <= fwSize) {
+                        ucodeOff  = hdr->ucode_array_offset_bytes;
+                        ucodeSize = hdr->ucode_size_bytes;
+                    }
+                }
+
+                // Bind the DMA buffer's bus addr range into GART once
+                // (slot is reused across submits since the busAddr is
+                // stable for the lifetime of the DMA buffer) and pass
+                // the GART MC address (plus the in-file ucode offset)
+                // to PSP. Mirrors upstream's GTT-domain-BO flow.
+                kern_return_t br = amdgpu::gart_bind_existing(
+                    dev, gart,
+                    ivars->dmaSegments[0].address,
+                    ivars->dmaBufferSize,
+                    &ivars->dmaGartBinding);
+                if (br != kIOReturnSuccess) {
+                    return br;
+                }
+                uint64_t fwBusAddr =
+                    ivars->dmaGartBinding.gartMCAddr + ucodeOff;
                 kern_return_t r = amdgpu::psp_load_ip_fw(dev, psp, fwBusAddr,
-                                              static_cast<uint32_t>(fwSize),
-                                              gfxFwType);
+                                              ucodeSize, gfxFwType);
                 if (r == kIOReturnSuccess) {
                     // Flip per-IP microcode flags so the corresponding
                     // BringupStage knows it can proceed with HQD program.
                     if (gfxFwType == amdgpu::PSPGfxFwType::SDMA0 ||
-                        gfxFwType == amdgpu::PSPGfxFwType::SDMA1) {
+                        gfxFwType == amdgpu::PSPGfxFwType::SDMA1 ||
+                        gfxFwType == amdgpu::PSPGfxFwType::SDMA_UCODE_TH0) {
                         driver->ivars->bringup.sdma.microcode_loaded = true;
                     }
                     // For MES, parse the firmware header to extract
                     // mes_uc_start_addr_lo/hi and stash on the right pipe.
                     // mes_firmware_header_v1_0 layout (amdgpu_ucode.h):
-                    //   common_firmware_header (10 dwords, 40 bytes)
-                    //   then: ucode_version (4), ucode_size_bytes (4),
-                    //         ucode_offset_bytes (4), data_version (4),
-                    //         data_size_bytes (4), data_offset_bytes (4),
-                    //         mes_uc_start_addr_lo (4), mes_uc_start_addr_hi (4)
+                    //   common_firmware_header = 8 dwords (32 bytes), then
+                    //   6 mes-specific dwords (ucode_version,
+                    //   ucode_size_bytes, ucode_offset_bytes,
+                    //   data_version, data_size_bytes, data_offset_bytes),
+                    //   then start_addr_lo (dw 14), start_addr_hi (dw 15).
                     if (gfxFwType == amdgpu::PSPGfxFwType::RS64_MES ||
                         gfxFwType == amdgpu::PSPGfxFwType::RS64_KIQ) {
-                        if (fwSize >= 0x40 + 8) {
-                            const uint32_t *hdr32 = reinterpret_cast<const uint32_t *>(bin);
-                            // common header = 10 dwords; mes header adds
-                            // 6 dwords before the start_addr_lo/hi pair.
-                            const uint32_t off_dw = 10 + 6;
+                        if (fwSize >= 16 * 4) {
+                            const uint32_t *hdr32 =
+                                reinterpret_cast<const uint32_t *>(bin);
+                            const uint32_t off_dw = 8 + 6;
                             uint64_t uc_lo = hdr32[off_dw + 0];
                             uint64_t uc_hi = hdr32[off_dw + 1];
                             uint64_t uc_addr = uc_lo | (uc_hi << 32);

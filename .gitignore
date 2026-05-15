@@ -4,6 +4,9 @@ upstream/linux-firmware/
 upstream/mesa/
 upstream/
 
+# Internal porting notes / audit reports — not for public view.
+docs/
+
 # Firmware blobs — vendored under firmware/. Sourced from
 # linux-firmware (license headers in firmware/LICENSE.* preserved).
 

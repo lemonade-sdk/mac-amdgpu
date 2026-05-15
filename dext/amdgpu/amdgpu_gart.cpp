@@ -36,7 +36,11 @@ namespace amdgpu {
 // allocate 4 KB for now — enough for ring/cmd/fence + headroom.
 //============================================================
 constexpr uint64_t kGARTPageTableVRAMOffset = 0x700000;   // 7 MB
-constexpr uint32_t kGARTPageTableBytes      = 4096;       // one 4 KB page
+// 64 KB page table = 8192 PTEs × 4 KB GPU page = 32 MB of GART space.
+// Sized to cover the user-client's 32 MB DMA staging buffer + future
+// runtime BO bindings without needing to grow at runtime. Each PTE is
+// 8 bytes so the table itself only costs 64 KB of VRAM.
+constexpr uint32_t kGARTPageTableBytes      = 64 * 1024;  // 64 KB
 
 // GART aperture in MC space. Picked LOW (4 GB MC offset) — safely
 // below vram_start (= 512 GB for our R9700) and well within the
@@ -177,6 +181,76 @@ gart_bind_sysmem(DeviceContext &dev, GARTContext &gart,
     GART_LOG("bind: %llu bytes @ bus=%#llx → gart_mc=%#llx "
              "(%u PTEs at PT idx %llu)",
              roundedSize, seg.address, outBinding->gartMCAddr,
+             numPTEs, pteStartIndex);
+    return kIOReturnSuccess;
+}
+
+//============================================================
+// gart_bind_existing — write PTEs for a pre-existing DART-mapped
+// bus address range. No buffer/DMA-command alloc. Caller owns the
+// underlying IOBuffer; this only programs the page table.
+//
+// Reuse semantics: pass a binding with non-zero gartMCAddr to RE-USE
+// the previously assigned slot (avoids burning bump-allocator space
+// when the host swaps the buffer's contents but the busAddr/size are
+// stable). Pass a zero-initialised binding to allocate fresh.
+//============================================================
+kern_return_t
+gart_bind_existing(DeviceContext &dev, GARTContext &gart,
+                   uint64_t busAddr, uint64_t sizeBytes,
+                   GARTBinding *binding)
+{
+    if (binding == nullptr) return kIOReturnBadArgument;
+    if (gart.numPTEs == 0) {
+        GART_LOG("bind_existing: GART not initialised");
+        return kIOReturnNotReady;
+    }
+    if ((busAddr & (kAMDGPUGPUPageSize - 1)) != 0) {
+        GART_LOG("bind_existing: busAddr %#llx not 4 KB aligned", busAddr);
+        return kIOReturnNotAligned;
+    }
+    uint64_t rounded = (sizeBytes + kAMDGPUGPUPageSize - 1) &
+                      ~((uint64_t)kAMDGPUGPUPageSize - 1);
+    uint32_t numPTEs = static_cast<uint32_t>(rounded / kAMDGPUGPUPageSize);
+
+    // Choose GART slot: reuse if binding already has one, else bump.
+    uint64_t gartOff;
+    if (binding->gartMCAddr != 0 && binding->numGPUPages >= numPTEs) {
+        gartOff = binding->gartOffset;
+    } else {
+        if (gart.nextFreeOffset + rounded > gart.gartSize) {
+            GART_LOG("bind_existing: out of GART (need %llu, free %llu)",
+                     rounded, gart.gartSize - gart.nextFreeOffset);
+            return kIOReturnNoSpace;
+        }
+        gartOff = gart.nextFreeOffset;
+        gart.nextFreeOffset += rounded;
+    }
+
+    uint64_t pteStartIndex = gartOff / kAMDGPUGPUPageSize;
+    for (uint32_t i = 0; i < numPTEs; i++) {
+        uint64_t physAddr = busAddr + (uint64_t)i * kAMDGPUGPUPageSize;
+        uint64_t pte = (physAddr & ~((uint64_t)0xFFFULL)) |
+                       PTEFlags::SYSMEM_RW;
+        uint64_t pteOffsetInPT = (pteStartIndex + i) * 8ULL;
+        bar0_memcpy_to_vram(dev,
+                            gart.pageTableVRAMOffset + pteOffsetInPT,
+                            &pte, sizeof(pte));
+    }
+    amdgpu_hdp_flush(dev);
+
+    binding->sysmemBuffer = nullptr;   // caller owns
+    binding->dmaCommand   = nullptr;
+    binding->busAddr      = busAddr;
+    binding->cpuAddr      = nullptr;   // caller has the CPU pointer
+    binding->sizeBytes    = rounded;
+    binding->gartOffset   = gartOff;
+    binding->gartMCAddr   = gart.gartStart + gartOff;
+    binding->numGPUPages  = numPTEs;
+
+    GART_LOG("bind_existing: %llu bytes @ bus=%#llx → gart_mc=%#llx "
+             "(%u PTEs at PT idx %llu)",
+             rounded, busAddr, binding->gartMCAddr,
              numPTEs, pteStartIndex);
     return kIOReturnSuccess;
 }

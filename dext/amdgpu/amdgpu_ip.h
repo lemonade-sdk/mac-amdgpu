@@ -69,32 +69,58 @@ enum class IPBlock : uint8_t {
     Count,
 };
 
-// IP base addresses in BAR0-relative dword offsets. Each entry is
-// the SOC15 "instance 0" base; SOC15 register references are added
-// on top.
+// IP base addresses in BAR0/BAR5-relative dword offsets. Each IP
+// block has UP TO kMaxBaseSegments (5) base addresses — one per
+// SOC15 BASE_IDX. Upstream registers declare their BASE_IDX
+// alongside their offset (e.g. `regMP1_SMN_C2PMSG_*_BASE_IDX 1`),
+// so the correct address is `base[BLK][BASE_IDX] + reg_offset`.
 //
-// Sentinel: 0xFFFFFFFFu means "not yet read from discovery — must
-// fill in before using this IP block."
+// Practical examples on R9700:
+//   MP0  / regMPASP_SMN_C2PMSG_*   BASE_IDX 0
+//   MP1  / regMP1_SMN_C2PMSG_*     BASE_IDX 1   (SMU mailbox)
+//   NBIO / regBIF_BX0_REMAP_HDP_*  BASE_IDX 5   (HDP flush remap)
+//
+// Sentinel: 0xFFFFFFFFu means "not yet read from discovery". A real
+// IP base is never 0 on a PCIDriverKit-mapped BAR (SMN registers
+// start in the 0x40000+ range after the SMUIO front-end block).
 struct IPBaseTable {
-    uint32_t base[(int)IPBlock::Count];
+    static constexpr int kMaxBaseSegments = 5;
+    uint32_t base[(int)IPBlock::Count][kMaxBaseSegments];
 
     constexpr IPBaseTable() : base{} {
         for (int i = 0; i < (int)IPBlock::Count; i++) {
-            base[i] = 0xFFFFFFFFu;
+            for (int j = 0; j < kMaxBaseSegments; j++) {
+                base[i][j] = 0xFFFFFFFFu;
+            }
         }
     }
 
     // IIG's IONewZero zero-fills the parent struct without running
     // C++ ctors, so base[] arrives as 0 instead of 0xFFFFFFFFu.
-    // Treat *both* as "unresolved". A real IP base is never 0 on a
-    // PCIDriverKit-mapped BAR0 (SMN registers start in the 0x40000+
-    // range after the front-end SMUIO block).
+    // Treat both as "unresolved".
     bool isResolved(IPBlock block) const {
-        uint32_t b = base[(int)block];
+        uint32_t b = base[(int)block][0];
         return b != 0xFFFFFFFFu && b != 0u;
     }
-    uint32_t get(IPBlock block) const { return base[(int)block]; }
-    void set(IPBlock block, uint32_t b) { base[(int)block] = b; }
+    bool isResolved(IPBlock block, int baseIdx) const {
+        if (baseIdx < 0 || baseIdx >= kMaxBaseSegments) return false;
+        uint32_t b = base[(int)block][baseIdx];
+        return b != 0xFFFFFFFFu && b != 0u;
+    }
+    // Default BASE_IDX = 0 for backward compatibility with code that
+    // hasn't been threaded with a baseIdx yet.
+    uint32_t get(IPBlock block) const { return base[(int)block][0]; }
+    void set(IPBlock block, uint32_t b) { base[(int)block][0] = b; }
+    // Explicit BASE_IDX accessors for new code (NBIO HDP remap, SMU
+    // MP1 mailbox, etc.). idx clamped to [0, kMaxBaseSegments).
+    uint32_t getBase(IPBlock block, int baseIdx) const {
+        if (baseIdx < 0 || baseIdx >= kMaxBaseSegments) return 0xFFFFFFFFu;
+        return base[(int)block][baseIdx];
+    }
+    void setBase(IPBlock block, int baseIdx, uint32_t b) {
+        if (baseIdx < 0 || baseIdx >= kMaxBaseSegments) return;
+        base[(int)block][baseIdx] = b;
+    }
 };
 
 // SOC15 register offsets from upstream Linux —
@@ -152,7 +178,10 @@ namespace MP1Regs {
 namespace MMHUBRegs {
     constexpr uint32_t MMMC_VM_FB_LOCATION_BASE = 0x0554;
     constexpr uint32_t MMMC_VM_FB_LOCATION_TOP  = 0x0555;
-    constexpr uint32_t MMMC_VM_FB_OFFSET        = 0x0556;
+    // FB_OFFSET is in the LOW MMHUB-cfg block at 0x04c7, NOT colocated
+    // with FB_LOCATION. We previously had 0x0556 which is actually
+    // regMMMC_VM_AGP_TOP — a different register entirely.
+    constexpr uint32_t MMMC_VM_FB_OFFSET        = 0x04c7;
     constexpr uint32_t kFBBaseMask = 0x00FFFFFFu;  // low 24 bits
     constexpr uint32_t kFBBaseShift = 24;          // <<24 to get MC addr
 
@@ -167,19 +196,25 @@ namespace MMHUBRegs {
     constexpr uint32_t MMVM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32 = 0x05f0;
     constexpr uint32_t MMVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32   = 0x060f;
     constexpr uint32_t MMVM_CONTEXT0_PAGE_TABLE_END_ADDR_HI32   = 0x0610;
-    constexpr uint32_t MMMC_VM_AGP_BASE                         = 0x055c;
-    constexpr uint32_t MMMC_VM_AGP_BOT                          = 0x055d;
-    constexpr uint32_t MMMC_VM_AGP_TOP                          = 0x055e;
+    // AGP/system-aperture/L2 register offsets — all per
+    // mmhub_4_1_0_offset.h. Previous values for AGP_BASE/BOT/TOP were
+    // wrong (had them at 0x055c/0x055d/0x055e); upstream is
+    // 0x0558/0x0557/0x0556 — note the BOT/TOP/BASE non-sequential
+    // ordering. SYSTEM_APERTURE_DEFAULT_{LSB,MSB} are in the LOW
+    // MMHUB-cfg block, NOT colocated with the rest.
+    constexpr uint32_t MMMC_VM_AGP_TOP                          = 0x0556;
+    constexpr uint32_t MMMC_VM_AGP_BOT                          = 0x0557;
+    constexpr uint32_t MMMC_VM_AGP_BASE                         = 0x0558;
     constexpr uint32_t MMMC_VM_SYSTEM_APERTURE_LOW_ADDR         = 0x0559;
     constexpr uint32_t MMMC_VM_SYSTEM_APERTURE_HIGH_ADDR        = 0x055a;
-    constexpr uint32_t MMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_LSB = 0x055f;
-    constexpr uint32_t MMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_MSB = 0x0560;
+    constexpr uint32_t MMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_LSB = 0x04c8;
+    constexpr uint32_t MMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_MSB = 0x04c9;
     constexpr uint32_t MMMC_VM_MX_L1_TLB_CNTL                   = 0x055b;
     constexpr uint32_t MMVM_L2_CNTL                             = 0x04e4;
     constexpr uint32_t MMVM_L2_CNTL2                            = 0x04e5;
     constexpr uint32_t MMVM_L2_CNTL3                            = 0x04e6;
-    constexpr uint32_t MMVM_L2_CNTL4                            = 0x04e7;
-    constexpr uint32_t MMVM_L2_CNTL5                            = 0x04e8;
+    constexpr uint32_t MMVM_L2_CNTL4                            = 0x04fd;
+    constexpr uint32_t MMVM_L2_CNTL5                            = 0x0503;
 
     // Registers needed for the rest of mmhub_v4_1_0_gart_enable.
     constexpr uint32_t MMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_LSB_AT_4C8 = 0x04c8;
@@ -207,8 +242,15 @@ namespace MMHUBRegs {
     constexpr uint32_t MMVM_CONTEXT1_PAGE_TABLE_START_ADDR_HI32 = 0x05f2;
     constexpr uint32_t MMVM_CONTEXT1_PAGE_TABLE_END_ADDR_LO32   = 0x0611;
     constexpr uint32_t MMVM_CONTEXT1_PAGE_TABLE_END_ADDR_HI32   = 0x0612;
-    constexpr uint32_t MMVM_INVALIDATE_ENG0_ADDR_RANGE_LO32     = 0x062a;
-    constexpr uint32_t MMVM_INVALIDATE_ENG0_ADDR_RANGE_HI32     = 0x062b;
+    // Invalidate engine 0 (the only engine we use for CONTEXT0).
+    // Upstream eng_distance = 1 (REQ/ACK/SEM are stride-1 dwords),
+    // eng_addr_distance = 2 (ADDR_RANGE_LO/HI are 2 dwords apart per
+    // engine). REQ/ACK/SEM offsets per mmhub_4_1_0_offset.h:
+    constexpr uint32_t MMVM_INVALIDATE_ENG0_SEM                 = 0x0575;
+    constexpr uint32_t MMVM_INVALIDATE_ENG0_REQ                 = 0x0587;
+    constexpr uint32_t MMVM_INVALIDATE_ENG0_ACK                 = 0x0599;
+    constexpr uint32_t MMVM_INVALIDATE_ENG0_ADDR_RANGE_LO32     = 0x05ab;
+    constexpr uint32_t MMVM_INVALIDATE_ENG0_ADDR_RANGE_HI32     = 0x05ac;
 }
 
 // PTE flag bits — drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h.
@@ -223,12 +265,19 @@ namespace PTEFlags {
     constexpr uint64_t READABLE  = (1ULL << 5);
     constexpr uint64_t WRITEABLE = (1ULL << 6);
     constexpr uint64_t FRAG_4K   = 0;
-    // Standard sysmem mapping for PSP-readable buffers. Adds the
-    // EXECUTABLE bit to match upstream gart_pte_flags defaults; MTYPE
-    // bits 54-55 are left as 0 = MTYPE_NC (Non-Coherent) which matches
-    // gmc_v12_0_get_vm_pte's default for GTT sysmem PTEs.
+    // GFX12 / RDNA4 PTE bit. With PAGE_TABLE_DEPTH=0 (single-level
+    // page table), GMC distinguishes PTEs from sub-PDE pointers by
+    // bit 63. Every PTE we write MUST have this set, otherwise GMC
+    // walks the entry as if it points to another PDE level and faults
+    // on the resulting garbage address. amdgpu_vm.h:133.
+    constexpr uint64_t IS_PTE    = (1ULL << 63);
+    // Standard sysmem mapping for PSP-readable buffers. Adds IS_PTE
+    // (mandatory on GFX12) + EXECUTABLE to match upstream gart_pte_flags
+    // defaults; MTYPE bits 54-55 left at 0 = MTYPE_NC (Non-Coherent)
+    // which matches gmc_v12_0_get_vm_pte's default for GTT sysmem PTEs.
     constexpr uint64_t SYSMEM_RW = VALID | SYSTEM | SNOOPED |
-                                   EXECUTABLE | READABLE | WRITEABLE;
+                                   EXECUTABLE | READABLE | WRITEABLE |
+                                   IS_PTE;
 }
 
 // AMDGPU GPU page size is fixed at 4 KB regardless of CPU page size.
@@ -263,7 +312,7 @@ namespace PSPBootloaderCmd {
     constexpr uint32_t LoadIntfDrv      = 0xD0000;
     constexpr uint32_t LoadHADDrv       = 0xC0000;
     constexpr uint32_t LoadRASDrv       = 0xE0000;
-    constexpr uint32_t LoadIPKeyMgrDrv  = 0x110000;
+    constexpr uint32_t LoadIPKeyMgrDrv  = 0x0F0000;  // upstream PSP_BL__LOAD_IPKEYMGRDRV
     constexpr uint32_t LoadSOSDrv       = 0x20000;
 }
 
@@ -349,7 +398,16 @@ constexpr uint32_t kPSPMboxRespMask = kPSPGfxCmdResponseMask
                                     | kPSPGfxCmdStatusMask;
 
 // psp_ring_type — only KM is used outside SR-IOV.
-constexpr uint32_t kPSPRingTypeKM = 1;
+// PSP_RING_TYPE__KM = 2 per upstream amdgpu_psp.h:116. Kernel-mode
+// (formerly GPCOM) ring. When shifted by 16 and written to C2PMSG_64
+// it produces GFX_CTRL_CMD_ID_INIT_GPCOM_RING = 0x20000. *DO NOT* set
+// this to 1 — that's PSP_RING_TYPE__UM (user-mode / SR-IOV RBI ring),
+// which when shifted by 16 maps to GFX_CTRL_CMD_ID_INIT_RBI_RING
+// (0x10000). PSP accepts the RBI init and responds OK, but never
+// honors C2PMSG_67 wptr doorbells for it — every subsequent ring
+// submit is silently dropped. Burned 6 days chasing this with KM=1.
+constexpr uint32_t kPSPRingTypeKM = 2;
+constexpr uint32_t kPSPRingTypeUM = 1;
 
 // PSP's protocol uses a 4 KB ring (matches Linux psp_ring_init).
 // On AS we still allocate the underlying buffer at 16 KB alignment

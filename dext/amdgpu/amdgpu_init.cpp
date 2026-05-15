@@ -52,7 +52,39 @@ bringup_ip_discovery(BringupContext &ctx)
     // Until step 3 is done, anything that depends on MP0/GC/SDMA0
     // base addresses returns kIOReturnNotReady.
 
-    (void)ctx; // currently a no-op (versions are compile-time consts)
+    // Program NBIO's remap-HDP registers so that subsequent writes to
+    // BAR5 byte 0x44000 actually trigger HDP_MEM_FLUSH on the GPU side.
+    // Without this, our `amdgpu_hdp_flush` is a no-op — host→VRAM BAR0
+    // writes never drain before PSP fetches the ring frame and PSP
+    // silently drops every submit.
+    //
+    // Direct port of upstream `nbio_v7_11_remap_hdp_registers`
+    // (nbio_v7_11.c:30). Both target registers live at NBIO BASE_IDX 5
+    // (per nbio/nbio_7_11_0_offset.h: regBIF_BX0_REMAP_HDP_*_FLUSH_CNTL
+    // = 0x8e4d / 0x8e4e). The value we write is the BAR5 byte offset of
+    // the eventual flush register — `MMIO_REG_HOLE_OFFSET (= 0x44000) +
+    // KFD_MMIO_REMAP_HDP_{MEM,REG}_FLUSH_CNTL (= 0 / 4)`.
+    if (ctx.device.ip.isResolved(IPBlock::NBIO, /*baseIdx=*/5)) {
+        constexpr uint32_t kRegBIF_BX0_REMAP_HDP_MEM_FLUSH_CNTL = 0x8e4d;
+        constexpr uint32_t kRegBIF_BX0_REMAP_HDP_REG_FLUSH_CNTL = 0x8e4e;
+        constexpr uint32_t kRMMIORemap = 0x44000;
+        uint32_t regMem = SOC15_REG_OFFSET_BIDX(
+            ctx.device, IPBlock::NBIO, 5,
+            kRegBIF_BX0_REMAP_HDP_MEM_FLUSH_CNTL);
+        uint32_t regReg = SOC15_REG_OFFSET_BIDX(
+            ctx.device, IPBlock::NBIO, 5,
+            kRegBIF_BX0_REMAP_HDP_REG_FLUSH_CNTL);
+        WREG32(ctx.device, regMem, kRMMIORemap + 0);
+        WREG32(ctx.device, regReg, kRMMIORemap + 4);
+        INIT_LOG("nbio: remap_hdp programmed — "
+                 "BIF_BX0_REMAP_HDP_MEM_FLUSH @%#x = %#x, "
+                 "BIF_BX0_REMAP_HDP_REG_FLUSH @%#x = %#x",
+                 regMem, kRMMIORemap + 0, regReg, kRMMIORemap + 4);
+    } else {
+        INIT_LOG("nbio: BASE_IDX 5 unresolved — HDP flush will be a no-op "
+                 "until NBIO discovery fills it in (PSP silent-drop risk)");
+    }
+
     return kIOReturnSuccess;
 }
 
@@ -116,8 +148,17 @@ run_stage(BringupContext &ctx, BringupStage s)
         return psp_init(ctx.device, ctx.psp);
     case BringupStage::PSPLoadSOS:
         return psp_load_sos(ctx.device, ctx.psp);
-    case BringupStage::PSPRingCreate:
-        return psp_ring_create(ctx.device, ctx.psp);
+    case BringupStage::PSPRingCreate: {
+        // psp_v14_0_3 with recent SOS expects FB_FW_RESERV queries
+        // immediately after ring_create. Per amdgpu_psp.c:2594-2600
+        // (psp_update_fw_reservation), gated on SOS fw_version
+        // >= 0x3a0e14 for IP_VERSION(14, 0, 3). We always send the
+        // pair — PSP_ERR_UNKNOWN_COMMAND from older SOS is treated
+        // as success per upstream.
+        kern_return_t r = psp_ring_create(ctx.device, ctx.psp);
+        if (r != kIOReturnSuccess) return r;
+        return psp_query_fw_reservation(ctx.device, ctx.psp);
+    }
     case BringupStage::TMRSetup:
         return psp_setup_tmr(ctx.device, ctx.psp);
     case BringupStage::SMUInit: {

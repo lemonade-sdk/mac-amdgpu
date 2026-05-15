@@ -1,25 +1,51 @@
 # STATUS
 
-The driver loads, talks to a real AMD GPU on a Mac, and now runs PSP
-firmware on it. It can't render anything yet.
+The driver loads, talks to a real AMD GPU on a Mac, brings PSP up,
+loads SMU PMFW via PSP's ring, and gets the SMU mailbox responding.
+It still can't render anything — the GFX/RLC/MES/SDMA microcode load
+path is the next chunk of work.
 
-What works: the card is detected, the driver attaches over Thunderbolt 5,
-identity reads back correctly (VID=0x1002 DID=0x7551), MMIO register
-reads work (BAR5 is the register window on Bonaire+, not BAR0), the IP
-discovery binary is read directly from VRAM via MM_INDEX/MM_DATA and
-parsed (auto-detecting gfx1201 / RDNA4 / R9700 with `psp_v14_0_3`,
-`smu_v14_0_3`, `sdma_v7_0_1`). **PSP SOS firmware uploads and runs**, and
-the **PSP ring is created** (bring-up reaches stage 4, PSPRingCreate).
+**What works (v0.0.58 on real R9700 over Thunderbolt 5):**
 
-What's next: GART bootstrap. The first PSP ring submission (TMRSetup)
-fails because PSP needs GART-routable MC addresses for its
-ring/cmd/fence buffers — VRAM-backed buffers work for the bootloader
-handshake but not for ring DMA. Once GART is up, TMRSetup, SMUInit, GMC,
-IMU, RLC, CP, MES, SDMA, IH and the first GFX12 PM4 packet should
-follow. Tracked in `docs/GART_PORT_PLAN.md`.
+- Card detection + dext attach over TB5
+- Identity reads (VID=`0x1002`, DID=`0x7551`, rev `0xC0`)
+- MMIO via BAR5 (registers) + BAR0 (framebuffer aperture)
+- IP discovery binary read from VRAM via MM_INDEX/MM_DATA, parsed
+  with full multi-`BASE_IDX` support — auto-detected
+  `gfx_12_0_1` / `psp_14_0_3` / `smu_14_0_3` / `sdma_7_0_1` /
+  `mes_12_0_1` / `nbio_7_11` on a live R9700
+- PSP SOS firmware upload + run (kicker / non-kicker selection
+  matches upstream `kicker_device_list`)
+- PSP ring (KM / GPCOM) create + first-frame submit, FB_FW_RESERV
+  queries return real responses (fence increments correctly)
+- LOAD_IP_FW for SMU PMFW returns success — PSP TEE accepts it
+- SMU mailbox responsive (`TestMessage` echoes, `GetVersion` works)
+- GMC + MMHUB bringup (gart_enable with full
+  `mmhub_v4_1_0_gart_enable` register sequence, GFX12 PTE format
+  with `IS_PTE` bit, NBIO HDP `remap_hdp_registers` programmed)
+- DART-mapped sysmem buffers bound into GART for LOAD_IP_FW payloads
 
-To use it: install the host app, click **Initialize GPU** in the test UI,
-and watch each bring-up stage print as it runs.
+**What's next:**
+
+- **Multi-component firmware parsing.** SDMA (sdma_v3 header),
+  RLC (sub-binaries for `RLC_G` / `RLC_IRAM` / `RLC_DRAM` / etc.)
+  and uni_mes (split into `CP_MES` + `CP_MES_DATA`) all currently
+  bounce off PSP with `0xFFFF0006 = TEE_ERROR_BAD_PARAMETERS`
+  because our simple "skip the 32-byte common header" extractor
+  doesn't match their layouts. Each needs the per-IP header
+  parser from upstream `amdgpu_ucode_init_single_fw`.
+- IMU_I / IMU_D loading (currently `IMUInit` is a stub).
+- RLC autoload start, CP RS64 PFP/ME/MEC load with P0..P3 stack
+  variants, MES queue init reorder vs `mes_enable`.
+- GFXHUB gart_enable re-run after RLC autoload.
+- First PM4 packet on a GFX12 compute queue.
+
+**To use it:** install the host app, click **Initialize GPU** in the
+test UI, and watch each bring-up stage print as it runs. Expected
+output today: stages 1-7 (`IPDiscovery → PSPInit → PSPLoadSOS →
+PSPRingCreate → TMRSetup → SMUInit → GMCInit`) green, stage 9
+(`RLCInit`) hits `kIOReturnUnsupported` because RLC microcode isn't
+loaded yet.
 
   
 # mac_amdgpu
@@ -32,10 +58,6 @@ slices of the Linux `amdgpu` kernel driver into a DriverKit system extension.
 Primary target hardware is the **AMD Radeon AI PRO R9700** (RDNA4, gfx1201,
 PCI `0x1002:0x7551`) connected via Thunderbolt 5 to an Apple Silicon Mac.
 Other RDNA4 / gfx1201 cards should work with the same firmware images.
-
-See [`docs/PORTING_NOTES.md`](docs/PORTING_NOTES.md) for the summary of how
-this project diverges from upstream Linux `amdgpu` (memory model, IRQ model,
-firmware loading, DART constraints, etc.).
 
 ## Hardware requirements
 
@@ -203,11 +225,23 @@ Driver Extensions** — toggle MacAMDGPU on. Afterwards,
 
 ## Run the bring-up
 
-The host app window has a row of test buttons
-(**Ping** / **Identity** / **BARs** / **Query**) plus a
-"**Bringup stages**" ladder. Click them in order. The log pane shows
-results. Before the `LoadSOS+...` step, click "**Pick Firmware Folder…**"
-and choose the directory containing the firmware blobs above.
+The host app window has a row of diagnostic buttons
+(**Identity** / **BARs** / **Diagnostics** / **Dump PSP** /
+**Dump TMR** / **Dump CmdBuf**) and a single **Initialize GPU**
+button that runs every bring-up stage in order, prints the result
+of each stage, and bails out the moment any stage fails.
+
+Firmware is auto-loaded from `Contents/Resources/firmware/` inside
+the host app bundle — `xcodegen` adds the repo's `firmware/`
+directory there. The **Pick Firmware Folder…** button exists only
+to override that for testing.
+
+A successful run today gets through `IPDiscovery → PSPInit →
+PSPLoadSOS → PSPRingCreate → TMRSetup` plus an interleaved
+LoadFirmware of `smu_<v>.bin` via the PSP ring, then `SMUInit →
+GMCInit`. The next blocker is `RLCInit`, which returns
+`kIOReturnUnsupported` until SDMA / RLC / uni_mes microcode parsing
+is finished (see `docs/audit/00_SUMMARY.md`).
 
 ## Entitlement reference
 

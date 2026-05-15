@@ -29,14 +29,14 @@ namespace amdgpu {
 static bool
 smu_wait_for_response(const DeviceContext &dev, uint32_t *outResp)
 {
-    if (!dev.ip.isResolved(IPBlock::MP1)) {
+    if (!dev.ip.isResolved(IPBlock::MP1, /*baseIdx=*/1)) {
         if (outResp) *outResp = 0;
         return false;
     }
-    const uint32_t reg = SOC15_REG_OFFSET(dev, IPBlock::MP1,
-                                          MP1Regs::C2PMSG_90);
-    // Linux uses adev->usec_timeout, default ~1 second.
-    const uint64_t kBudgetUs = 1 * 1000000;
+    const uint32_t reg = SOC15_REG_OFFSET_BIDX(dev, IPBlock::MP1, 1,
+                                               MP1Regs::C2PMSG_90);
+    // Upstream uses `adev->usec_timeout * 20 = 100 ms * 20 = 2 s` here.
+    const uint64_t kBudgetUs = 2 * 1000000;
     uint32_t v = 0;
     bool ok = poll_reg(dev, reg, 0xFFFFFFFFu, 0u, /*invert below*/
                        0, &v);
@@ -64,17 +64,22 @@ smu_send_msg_with_param(const DeviceContext &dev,
                         uint32_t msgId, uint32_t param,
                         uint32_t *outReturn)
 {
-    if (!dev.ip.isResolved(IPBlock::MP1)) {
-        SMU_LOG("MP1 IP base not resolved");
+    // SMU mailbox registers `regMP1_SMN_C2PMSG_*` declare BASE_IDX 1 in
+    // upstream mp_14_0_2_offset.h — NOT BASE_IDX 0. Using base[0] (the
+    // historical default) routes the writes to a completely different
+    // physical register and SMU never responds. Confirmed against
+    // upstream `smu_v14_0_send_msg_with_param`.
+    if (!dev.ip.isResolved(IPBlock::MP1, /*baseIdx=*/1)) {
+        SMU_LOG("MP1 BASE_IDX 1 not resolved — SMU mailbox unreachable");
         return kIOReturnNotReady;
     }
 
-    const uint32_t regMsg   = SOC15_REG_OFFSET(dev, IPBlock::MP1,
-                                               MP1Regs::C2PMSG_66);
-    const uint32_t regParam = SOC15_REG_OFFSET(dev, IPBlock::MP1,
-                                               MP1Regs::C2PMSG_82);
-    const uint32_t regResp  = SOC15_REG_OFFSET(dev, IPBlock::MP1,
-                                               MP1Regs::C2PMSG_90);
+    const uint32_t regMsg   = SOC15_REG_OFFSET_BIDX(dev, IPBlock::MP1, 1,
+                                                    MP1Regs::C2PMSG_66);
+    const uint32_t regParam = SOC15_REG_OFFSET_BIDX(dev, IPBlock::MP1, 1,
+                                                    MP1Regs::C2PMSG_82);
+    const uint32_t regResp  = SOC15_REG_OFFSET_BIDX(dev, IPBlock::MP1, 1,
+                                                    MP1Regs::C2PMSG_90);
 
     // 1. Clear any stale response.
     WREG32(dev, regResp, 0);

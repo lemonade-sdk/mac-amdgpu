@@ -68,13 +68,29 @@ struct DeviceContext {
 //============================================================
 // SOC15_REG_OFFSET — combine IP base + reg offset.
 //
-// Linux's macro takes a HW IP enum + instance + reg name and
-// expands to a full register absolute offset. We do the same.
+// Linux's macro takes (HW_IP, instance, reg_name) and expands to
+// `base_address[BASE_IDX][instance] + reg_offset`. Each register
+// declares its own BASE_IDX in the offset header (e.g.
+// `regMP1_SMN_C2PMSG_66_BASE_IDX = 1`). For instance==0 (our only
+// case so far) and BASE_IDX==0, it collapses to `base[0] + reg`.
+//
+// `SOC15_REG_OFFSET` keeps the BASE_IDX=0 default for backward
+// compatibility with code that hasn't been audited yet (PSP / MP0
+// registers all live at BASE_IDX 0). Use `SOC15_REG_OFFSET_BIDX`
+// for registers that explicitly declare a non-zero BASE_IDX (NBIO
+// HDP remap, MP1 SMU mailbox, …).
 //============================================================
 static inline uint32_t
 SOC15_REG_OFFSET(const DeviceContext &ctx, IPBlock block, uint32_t reg)
 {
     return ctx.ip.get(block) + reg;
+}
+
+static inline uint32_t
+SOC15_REG_OFFSET_BIDX(const DeviceContext &ctx, IPBlock block,
+                     int baseIdx, uint32_t reg)
+{
+    return ctx.ip.getBase(block, baseIdx) + reg;
 }
 
 //============================================================
@@ -164,7 +180,27 @@ WBAR0_32(const DeviceContext &ctx, uint64_t byte_offset, uint32_t value)
 static inline void
 amdgpu_hdp_flush(const DeviceContext &ctx)
 {
+    // Step 1: write 0 to HDP_MEM_FLUSH_CNTL — drains NBIO write buffers.
     ctx.pci->MemoryWrite32(ctx.bar5MemIndex, 0x44000, 0);
+    // Step 2: read back a NBIO register to force preceding BAR0 writes
+    // to actually complete on the GPU side. PCIe writes are posted —
+    // without this readback, PSP can observe the wptr update before
+    // our ring-frame / cmd_buf writes have hit VRAM, leading to it
+    // reading stale (zero) frames and silently dropping submits.
+    //
+    // Mirrors upstream amdgpu_hdp_generic_flush in amdgpu_hdp.c:51:
+    //   WREG32(... HDP_MEM_FLUSH_CNTL ..., 0);
+    //   if (adev->nbio.funcs->get_memsize) get_memsize(adev);
+    //
+    // get_memsize on NBIO 7.11 = RREG32(mmRCC_CONFIG_MEMSIZE), an
+    // absolute BAR5 dword at 0xDE3 (== byte offset 0x36AC). The value
+    // read is discarded — we only care about the read transaction
+    // forcing prior writes to drain.
+    uint32_t scratch = 0;
+    ctx.pci->MemoryRead32(ctx.bar5MemIndex,
+                          static_cast<uint64_t>(0x0DE3) * 4ULL,
+                          &scratch);
+    (void)scratch;
 }
 #endif
 

@@ -108,4 +108,25 @@ kern_return_t gart_bind_sysmem(DeviceContext &dev, GARTContext &gart,
 //
 void gart_unbind(GARTContext &gart, GARTBinding *binding);
 
+//
+// gart_bind_existing — bind an EXISTING bus address range into GART.
+// Used when the host's DMA buffer is already DART-mapped (e.g. the
+// shared firmware-staging buffer the user client owns) and we just
+// need PSP to be able to read it via a GMC MC address.
+//
+// Writes PTEs at the next free GART slot. The caller retains ownership
+// of the underlying IOBufferMemoryDescriptor / IODMACommand — this
+// function doesn't take a reference. PTEs stay live until the GART is
+// reset (`gart_init` re-zero's the page table) or the binding is
+// overwritten by another bind at the same offset.
+//
+// Idempotent across re-binds of the same buffer: if the same busAddr/
+// size is re-bound, you can pass the previous binding back in to reuse
+// its `gartOffset` (avoids bumping the allocator); pass a zero-init
+// binding to allocate a fresh slot.
+//
+kern_return_t gart_bind_existing(DeviceContext &dev, GARTContext &gart,
+                                 uint64_t busAddr, uint64_t sizeBytes,
+                                 GARTBinding *binding);
+
 } // namespace amdgpu

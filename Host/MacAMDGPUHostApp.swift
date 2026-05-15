@@ -48,13 +48,35 @@ private let kFwDbgDrv:      UInt64 = 6
 private let kFwRASDrv:      UInt64 = 7
 private let kFwIPKeyMgrDrv: UInt64 = 8
 private let kFwIP_SMU:      UInt64 = 0x100 + 18
-private let kFwIP_SDMA0:    UInt64 = 0x100 + 9
-private let kFwIP_SDMA1:    UInt64 = 0x100 + 10
+// SDMA on RDNA4 / gfx12 = sdma_v7_1 = RS64 SDMA, packaged as a single
+// firmware. Upstream `amdgpu_sdma_init_microcode` for v3.0 headers
+// loads it ONCE as GFX_FW_TYPE_SDMA_UCODE_TH0 (= 71). The legacy
+// SDMA0=9 / SDMA1=10 fw_types are for older sdma_v4-style headers
+// where the two instances each had a separate ucode blob.
+private let kFwIP_SDMA_TH0: UInt64 = 0x100 + 71
 private let kFwIP_RLC_G:    UInt64 = 0x100 + 8
-private let kFwIP_CP_ME:    UInt64 = 0x100 + 1
-private let kFwIP_CP_PFP:   UInt64 = 0x100 + 2
-private let kFwIP_CP_MEC:   UInt64 = 0x100 + 4
-private let kFwIP_RS64_MES: UInt64 = 0x100 + 76
+// GFX12 / RDNA4 uses RS64 CP firmwares (separate from legacy ME/PFP/MEC).
+// Per upstream `amdgpu_psp_get_fw_type` mapping for AMDGPU_UCODE_ID_CP_RS64_*:
+//   RS64_PFP=87, RS64_ME=88, RS64_MEC=89,
+//   RS64_PFP_P0_STACK=90, _P1=91, ME_P0=92, ME_P1=93,
+//   MEC_P0=94, MEC_P1=95, MEC_P2=96, MEC_P3=97.
+private let kFwIP_CP_RS64_PFP:     UInt64 = 0x100 + 87
+private let kFwIP_CP_RS64_ME:      UInt64 = 0x100 + 88
+private let kFwIP_CP_RS64_MEC:     UInt64 = 0x100 + 89
+private let kFwIP_CP_RS64_PFP_P0:  UInt64 = 0x100 + 90
+private let kFwIP_CP_RS64_PFP_P1:  UInt64 = 0x100 + 91
+private let kFwIP_CP_RS64_ME_P0:   UInt64 = 0x100 + 92
+private let kFwIP_CP_RS64_ME_P1:   UInt64 = 0x100 + 93
+private let kFwIP_CP_RS64_MEC_P0:  UInt64 = 0x100 + 94
+private let kFwIP_CP_RS64_MEC_P1:  UInt64 = 0x100 + 95
+private let kFwIP_CP_RS64_MEC_P2:  UInt64 = 0x100 + 96
+private let kFwIP_CP_RS64_MEC_P3:  UInt64 = 0x100 + 97
+// uni_mes ships both code and data; upstream emits two LOAD_IP_FW
+// frames per uni_mes file — CP_MES (=33) for the ucode portion, then
+// MES_STACK (=34) for the data portion. 76 (RS64_MES) was the standalone
+// MES ucode fw_type — wrong for the uni_mes packaging on RDNA4.
+private let kFwIP_CP_MES:      UInt64 = 0x100 + 33
+private let kFwIP_CP_MES_DATA: UInt64 = 0x100 + 34
 
 // Bringup stages — match amdgpu_init.h.
 private let kStageIPDiscovery:   UInt64 = 1
@@ -1110,28 +1132,49 @@ final class DriverController: NSObject, ObservableObject,
             append("\(sosName) → FAILED to load")
         }
 
-        // 6-8. Each remaining stage prints its own ok/FAILED.
-        // Bail out at the FIRST failure — downstream stages depend on
-        // the earlier ones (e.g. SMU/GMC need TMR), so once one stage
-        // times out the rest will too. No point burning 80 seconds on
-        // 8 stages that will all fail the same way.
-        for s: UInt64 in [3, 4, 5, 6, 7, 9, 10, 11, 12, 14] {
+        // Stages 3-5: PSPLoadSOS → PSPRingCreate → TMRSetup. These don't
+        // depend on per-IP microcode.
+        for s: UInt64 in [3, 4, 5] {
+            if !testInitDeviceUpTo(s) {
+                append("initializeGPU: stopping early — stage \(s) failed; downstream stages depend on it")
+                return
+            }
+        }
+
+        // SMU PMFW MUST be loaded via PSP ring BEFORE SMUInit's mailbox
+        // test — otherwise MP1 stays in reset and TestMessage just
+        // times out. Mirror upstream psp_load_non_psp_fw ordering: SMU
+        // first (because 14_0_3 has autoload_supported=true and
+        // pmfw_centralized_cstate_management=false).
+        if loadFirmware(kFwIP_SMU, "smu_\(smu).bin") {
+            append("smu_\(smu).bin → loaded")
+        } else {
+            append("initializeGPU: SMU PMFW load failed; SMUInit will fail")
+        }
+
+        // Stage 6: SMUInit (smu_test_message — works once PMFW is up).
+        if !testInitDeviceUpTo(6) {
+            append("initializeGPU: stopping early — SMUInit failed even after PMFW load")
+            // Don't return; the per-IP loads below still exercise the PSP ring.
+        }
+
+        // Stages 7, 9-12, 14: GMC / IH / RLC / CP / MES / SDMA bringup.
+        for s: UInt64 in [7, 9, 10, 11, 12, 14] {
             if !testInitDeviceUpTo(s) {
                 append("initializeGPU: stopping early — stage \(s) failed; downstream stages depend on it")
                 break
             }
         }
 
-        // Per-IP firmware loads sprinkled in for SMU / SDMA / RLC / MES.
-        if loadFirmware(kFwIP_SMU, "smu_\(smu).bin") {
-            append("smu_\(smu).bin → loaded")
-        }
-        if loadFirmware(kFwIP_SDMA0, "sdma_\(sdma).bin") {
-            append("sdma_\(sdma).bin → loaded (SDMA0)")
-            _ = loadFirmware(kFwIP_SDMA1, "sdma_\(sdma).bin")
-        }
-        _ = loadFirmware(kFwIP_RLC_G, "gc_\(gfx)_rlc.bin")
-        _ = loadFirmware(kFwIP_RS64_MES, "gc_\(gfx)_uni_mes.bin")
+        // Per-IP firmware loads for SDMA / RLC / MES (post-SMU). These
+        // currently return TEE_ERROR_BAD_PARAMETERS (0xFFFF0006) — our
+        // simple "skip the common header" payload extraction doesn't
+        // match the multi-component sdma_v7_1 / rlc / uni_mes layouts.
+        // Tracked in audit #8 + audit #7 follow-ups; tolerated here so
+        // the rest of the run still exercises the PSP ring.
+        _ = loadFirmware(kFwIP_SDMA_TH0, "sdma_\(sdma).bin")
+        _ = loadFirmware(kFwIP_RLC_G,    "gc_\(gfx)_rlc.bin")
+        _ = loadFirmware(kFwIP_CP_MES,   "gc_\(gfx)_uni_mes.bin")
 
         append("──── initializeGPU done ────")
     }
@@ -1170,15 +1213,14 @@ final class DriverController: NSObject, ObservableObject,
         // Stages 7/12/9: GMCInit, IHInit, RLCInit — no firmware.
         for s: UInt64 in [7, 12, 9] { testInitDeviceUpTo(s) }
 
-        // SDMA microcode (per-instance, same IP version on RDNA4).
-        if loadFirmware(kFwIP_SDMA0, "sdma_\(sdma).bin") {
-            _ = loadFirmware(kFwIP_SDMA1, "sdma_\(sdma).bin")
+        // SDMA microcode — RDNA4 sdma_v7_1 is a single RS64 load (TH0=71).
+        if loadFirmware(kFwIP_SDMA_TH0, "sdma_\(sdma).bin") {
             testInitDeviceUpTo(14)  // SDMAInit
         }
 
         // GFX microcode: RLC + uni-MES — then MES + CP init.
-        _ = loadFirmware(kFwIP_RLC_G,    "gc_\(gfx)_rlc.bin")
-        _ = loadFirmware(kFwIP_RS64_MES, "gc_\(gfx)_uni_mes.bin")
+        _ = loadFirmware(kFwIP_RLC_G, "gc_\(gfx)_rlc.bin")
+        _ = loadFirmware(kFwIP_CP_MES, "gc_\(gfx)_uni_mes.bin")
         testInitDeviceUpTo(11)  // MESInit
         testInitDeviceUpTo(10)  // CPInit
 

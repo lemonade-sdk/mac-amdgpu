@@ -277,24 +277,67 @@ kern_return_t psp_load_ip_fw(DeviceContext &dev, PSPContext &psp,
 // drivers/gpu/drm/amd/amdgpu/psp_gfx_if.h (208).
 namespace PSPGfxFwType {
     constexpr uint32_t SMU       = 18;   // PMFW
+    // Legacy SDMA instances (sdma_v4-style packaging). RDNA4 uses
+    // SDMA_UCODE_TH0 instead — see below.
     constexpr uint32_t SDMA0     = 9;
     constexpr uint32_t SDMA1     = 10;
+    // RDNA4 (sdma_v7_1) packs both engines into one RS64 firmware that
+    // PSP loads ONCE with TH0=71. Per upstream amdgpu_sdma_init_microcode.
+    constexpr uint32_t SDMA_UCODE_TH0 = 71;
     constexpr uint32_t RLC_G     = 8;
     constexpr uint32_t CP_ME     = 1;
     constexpr uint32_t CP_PFP    = 2;
     constexpr uint32_t CP_MEC    = 4;
+    // GFX12 / RDNA4 RS64 CP firmwares.
+    constexpr uint32_t RS64_PFP      = 87;
+    constexpr uint32_t RS64_ME       = 88;
+    constexpr uint32_t RS64_MEC      = 89;
+    constexpr uint32_t RS64_PFP_P0   = 90;
+    constexpr uint32_t RS64_PFP_P1   = 91;
+    constexpr uint32_t RS64_ME_P0    = 92;
+    constexpr uint32_t RS64_ME_P1    = 93;
+    constexpr uint32_t RS64_MEC_P0   = 94;
+    constexpr uint32_t RS64_MEC_P1   = 95;
+    constexpr uint32_t RS64_MEC_P2   = 96;
+    constexpr uint32_t RS64_MEC_P3   = 97;
     constexpr uint32_t IMU_I     = 68;
     constexpr uint32_t IMU_D     = 69;
+    // Standalone MES (legacy / non-uni packaging).
     constexpr uint32_t RS64_MES        = 76;
     constexpr uint32_t RS64_MES_STACK  = 77;
     constexpr uint32_t RS64_KIQ        = 78;
     constexpr uint32_t RS64_KIQ_STACK  = 79;
+    // uni_mes packaging: ucode + data loaded as two LOAD_IP_FW frames.
+    constexpr uint32_t CP_MES          = 33;
+    constexpr uint32_t CP_MES_DATA     = 34;
 }
 
 // GFX command IDs (subset). Full list in upstream psp_gfx_if.h.
 namespace PSPGfxCmd {
-    constexpr uint32_t SETUP_TMR   = 5;
-    constexpr uint32_t LOAD_IP_FW  = 6;
+    constexpr uint32_t SETUP_TMR             = 5;
+    constexpr uint32_t LOAD_IP_FW            = 6;
+    constexpr uint32_t FB_FW_RESERV_ADDR     = 0x50;
+    constexpr uint32_t FB_FW_RESERV_EXT_ADDR = 0x51;
 }
+
+//
+// psp_query_fw_reservation — port of upstream `psp_update_fw_reservation`
+// (amdgpu_psp.c:1040). For psp_v14_0_2/3 with SOS firmware
+// >= 0x3a0e14, upstream sends GFX_CMD_ID_FB_FW_RESERV_ADDR +
+// _EXT_ADDR via the ring right after ring_create and BEFORE any
+// LOAD_IP_FW. Skipping this pair MAY leave PSP in a half-handshake
+// state where it accepts wptr changes but discards every subsequent
+// submit (one of three audit theories for the silent-drop bug we hit
+// in v0.0.47..0.0.52).
+//
+// Each is a cmd_id-only frame (no payload). Response carries
+// reserve_base_address + reserve_size which we don't actually use
+// (the host doesn't manage VRAM allocation yet). PSP responds with
+// PSP_ERR_UNKNOWN_COMMAND on older SOS, which we silently swallow.
+//
+// Returns kIOReturnSuccess if the ring submits go through (regardless
+// of PSP's resp.status, since UNKNOWN_COMMAND is acceptable).
+//
+kern_return_t psp_query_fw_reservation(DeviceContext &dev, PSPContext &psp);
 
 } // namespace amdgpu

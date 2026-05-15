@@ -200,20 +200,16 @@ psp_release(PSPContext &psp)
     psp.cmdCPUAddr = nullptr;
     psp.cmdBusAddr = 0;
 
-    // GART-bound ring/cmd/fence — release via gart_unbind.
-    if (psp.gart != nullptr) {
-        gart_unbind(*psp.gart, &psp.ringBinding);
-        gart_unbind(*psp.gart, &psp.cmdBinding);
-        gart_unbind(*psp.gart, &psp.fenceBinding);
-    }
-    psp.ringCPUAddr = nullptr;
-    psp.ringBusAddr = 0;
-    psp.ringSize    = 0;
-    psp.cmdCPUAddr = nullptr;
-    psp.cmdBusAddr = 0;
+    // VRAM-backed ring/cmd/fence — nothing to free on the CPU side;
+    // VRAM allocator (when we have one) will reclaim the offsets.
+    psp.ringCPUAddr  = nullptr;
+    psp.ringBusAddr  = 0;
+    psp.ringSize     = 0;
+    psp.cmdCPUAddr   = nullptr;
+    psp.cmdBusAddr   = 0;
     psp.fenceCPUAddr = nullptr;
     psp.fenceBusAddr = 0;
-    psp.ringCreated = false;
+    psp.ringCreated  = false;
 
     if (psp.fwPriDMACommand != nullptr) {
         psp.fwPriDMACommand->CompleteDMA(kIODMACommandCompleteDMANoOptions);
@@ -307,6 +303,10 @@ psp_load_sos(DeviceContext &dev, PSPContext &psp)
     // GMC.hw_init (which calls gart_enable) BEFORE PSP.hw_init. If we
     // enable GART after SOS is running, our TLB/L2 writes stomp on
     // state SOS set up for itself and PSP drops subsequent requests.
+    //
+    // (v0.0.55 isolation test confirmed GART is NOT the silent-drop
+    //  cause — PSP dropped frames just as badly with GART disabled.
+    //  Re-enabled because LOAD_IP_FW needs GART for sysmem fw buffers.)
     if (psp.gart != nullptr && !psp.gart->enabled) {
         kern_return_t gi = gart_init(dev, *psp.gart);
         if (gi != kIOReturnSuccess) {
@@ -437,27 +437,24 @@ psp_ring_create(DeviceContext &dev, PSPContext &psp)
         return kIOReturnNotReady;
     }
 
-    // GART must already be up — psp_load_sos bootstraps it before
-    // loading SOS so SOS comes up with the right TLB/L2 state.
-    if (psp.gart == nullptr || !psp.gart->enabled) {
-        PSP_LOG("ring_create: GART not enabled (load SOS first)");
+    // PSP ring/cmd/fence live in VRAM addressed via the FB aperture
+    // (MC = vram_start + vram_offset) — NOT via GART. PSP's internal
+    // fetch path for RB frames bypasses MMHUB/GFXHUB and dereferences
+    // the address as a raw VRAM physical offset. Confirmed by upstream
+    // amdgpu_bo_fb_aper_addr() at amdgpu_object.c:1493 + psp_update_
+    // gpu_addresses() at amdgpu_psp.c:2475-2486. GART remains up — it's
+    // still needed for future runtime GTT-domain BOs.
+    uint64_t vram_start = psp_read_vram_start(dev);
+    if (vram_start == 0) {
+        PSP_LOG("ring_create: vram_start=0 — MMHUB not ready");
         return kIOReturnNotReady;
     }
 
-    // Allocate ring as a GART-bound sysmem buffer. 16 KB sized to AS
-    // page granularity; PSP uses only the first 4 KB but the backing
-    // buffer needs to be 16 KB-aligned for DART.
-    kern_return_t br = gart_bind_sysmem(dev, *psp.gart,
-                                        kPSPKMRingBufSize, kASPageSize,
-                                        &psp.ringBinding);
-    if (br != kIOReturnSuccess) {
-        PSP_LOG("ring_create: gart_bind ring failed: %#x", br);
-        return br;
-    }
-    psp.ringBusAddr = psp.ringBinding.gartMCAddr;
-    psp.ringCPUAddr = psp.ringBinding.cpuAddr;
+    psp.ringBusAddr = vram_start + kRingVRAMOffset;
+    psp.ringCPUAddr = nullptr;  // VRAM-backed; CPU access via BAR0
     psp.ringSize    = kPSPKMRingSize;
-    memset(psp.ringCPUAddr, 0, kPSPKMRingBufSize);
+    // Zero the full ring buffer in VRAM via BAR0.
+    bar0_memset_vram(dev, kRingVRAMOffset, 0, kPSPKMRingBufSize);
 
     const uint32_t reg64 = SOC15_REG_OFFSET(dev, IPBlock::MP0,
                                             MP0Regs::C2PMSG_64);
@@ -485,9 +482,6 @@ psp_ring_create(DeviceContext &dev, PSPContext &psp)
         PSP_LOG("ring_create: SOS not ready — C2PMSG_64=%#010x "
                 "(masked=%#010x, want %#010x)",
                 v, v & kPSPMboxRespMask, kPSPMboxRespFlag);
-        if (psp.gart != nullptr) {
-            gart_unbind(*psp.gart, &psp.ringBinding);
-        }
         return kIOReturnTimeout;
     }
     PSP_LOG("ring_create: SOS ready, C2PMSG_64=%#010x", v);
@@ -522,32 +516,18 @@ psp_ring_create(DeviceContext &dev, PSPContext &psp)
     PSP_LOG("ring_created mc=%#llx size=%llu (response=%#010x)",
             psp.ringBusAddr, psp.ringSize, v);
 
-    // GART-bound cmd + fence buffers (sysmem, routed via GMC).
-    kern_return_t bc = gart_bind_sysmem(dev, *psp.gart,
-                                        kPSPCmdBufSize, kASPageSize,
-                                        &psp.cmdBinding);
-    if (bc != kIOReturnSuccess) {
-        PSP_LOG("ring_create: gart_bind cmd_buf failed: %#x", bc);
-        return bc;
-    }
-    psp.cmdBusAddr = psp.cmdBinding.gartMCAddr;
-    psp.cmdCPUAddr = psp.cmdBinding.cpuAddr;
-    memset(psp.cmdCPUAddr, 0, kPSPCmdBufSize);
-
-    kern_return_t bf = gart_bind_sysmem(dev, *psp.gart,
-                                        kPSPFenceBufSize, kASPageSize,
-                                        &psp.fenceBinding);
-    if (bf != kIOReturnSuccess) {
-        PSP_LOG("ring_create: gart_bind fence_buf failed: %#x", bf);
-        return bf;
-    }
-    psp.fenceBusAddr = psp.fenceBinding.gartMCAddr;
-    psp.fenceCPUAddr = psp.fenceBinding.cpuAddr;
+    // VRAM-backed cmd + fence buffers (FB-aperture MC addresses).
+    psp.cmdBusAddr   = vram_start + kCmdBufVRAMOffset;
+    psp.cmdCPUAddr   = nullptr;  // VRAM-backed; CPU access via BAR0
+    psp.fenceBusAddr = vram_start + kFenceVRAMOffset;
+    psp.fenceCPUAddr = nullptr;
     psp.fenceCounter = 0;
-    memset(psp.fenceCPUAddr, 0, kPSPFenceBufSize);
+    bar0_memset_vram(dev, kCmdBufVRAMOffset,  0, kPSPCmdBufSize);
+    bar0_memset_vram(dev, kFenceVRAMOffset, 0, kPSPFenceBufSize);
 
-    PSP_LOG("cmd_buf mc=%#llx fence_buf mc=%#llx",
-            psp.cmdBusAddr, psp.fenceBusAddr);
+    PSP_LOG("cmd_buf mc=%#llx (vram_off=%#llx) fence_buf mc=%#llx (vram_off=%#llx)",
+            psp.cmdBusAddr, (uint64_t)kCmdBufVRAMOffset,
+            psp.fenceBusAddr, (uint64_t)kFenceVRAMOffset);
     return kIOReturnSuccess;
 }
 
@@ -591,7 +571,7 @@ psp_ring_cmd_submit(DeviceContext &dev, PSPContext &psp,
     // 1. Get current wptr.
     uint32_t wptr_dw = RREG32(dev, regWptr);
 
-    // 2. Locate the frame slot via the CPU pointer (sysmem now).
+    // 2. Locate the frame slot by VRAM byte offset (ring is in VRAM).
     uint32_t frame_slot;
     if ((wptr_dw % ringSizeDw) == 0) {
         frame_slot = 0;
@@ -603,40 +583,48 @@ psp_ring_cmd_submit(DeviceContext &dev, PSPContext &psp,
         PSP_LOG("ring_cmd_submit: wptr %u out of range", wptr_dw);
         return kIOReturnInternalError;
     }
-    PSPGfxRBFrame *frame =
-        reinterpret_cast<PSPGfxRBFrame *>(psp.ringCPUAddr) + frame_slot;
+    const uint64_t frameVRAMOff = kRingVRAMOffset +
+        (uint64_t)frame_slot * sizeof(PSPGfxRBFrame);
 
-    // 3. Stage the command buffer (sysmem memcpy — fast).
-    memcpy(psp.cmdCPUAddr, cmd, cmdSize);
+    // 3. Stage the command buffer in VRAM via BAR0.
+    bar0_memcpy_to_vram(dev, kCmdBufVRAMOffset, cmd, cmdSize);
 
-    // 4. Bump fence counter, zero the fence dword, build the frame.
+    // 4. Bump fence counter, zero the fence dword in VRAM, build the
+    //    frame in a stack buffer and copy it into the ring slot.
     uint32_t fence_index = ++psp.fenceCounter;
-    *static_cast<volatile uint32_t *>(psp.fenceCPUAddr) = 0;
+    WBAR0_32(dev, kFenceVRAMOffset, 0);
 
-    memset(frame, 0, sizeof(*frame));
-    frame->cmd_buf_addr_lo = static_cast<uint32_t>(psp.cmdBusAddr & 0xFFFFFFFFu);
-    frame->cmd_buf_addr_hi = static_cast<uint32_t>(psp.cmdBusAddr >> 32);
-    frame->cmd_buf_size    = kPSPGfxCmdRespSize;
-    frame->fence_addr_lo   = static_cast<uint32_t>(psp.fenceBusAddr & 0xFFFFFFFFu);
-    frame->fence_addr_hi   = static_cast<uint32_t>(psp.fenceBusAddr >> 32);
-    frame->fence_value     = fence_index;
+    // Upstream amdgpu_psp.c:3485-3492 — memset frame to zero, then set
+    // ONLY these 5 fields. cmd_buf_size, sid, vmid, frame_type, all
+    // reserved fields stay zero. Setting cmd_buf_size to a non-zero
+    // value (we used to write 0x400) makes PSP silently drop the
+    // frame — match upstream exactly.
+    PSPGfxRBFrame frame;
+    memset(&frame, 0, sizeof(frame));
+    frame.cmd_buf_addr_hi = static_cast<uint32_t>(psp.cmdBusAddr >> 32);
+    frame.cmd_buf_addr_lo = static_cast<uint32_t>(psp.cmdBusAddr & 0xFFFFFFFFu);
+    frame.fence_addr_hi   = static_cast<uint32_t>(psp.fenceBusAddr >> 32);
+    frame.fence_addr_lo   = static_cast<uint32_t>(psp.fenceBusAddr & 0xFFFFFFFFu);
+    frame.fence_value     = fence_index;
+    bar0_memcpy_to_vram(dev, frameVRAMOff, &frame, sizeof(frame));
 
-    // 5a. HDP flush — drain any host-side write buffers in the GPU's
-    // NBIO so PSP sees our ring frame + cmd_buf when it reads them.
-    // Upstream amdgpu_psp.c calls amdgpu_device_flush_hdp here.
+    // 5a. HDP flush — drain host-side write buffers so PSP sees our
+    //     ring frame + cmd_buf. Upstream calls amdgpu_device_flush_hdp
+    //     here in psp_ring_cmd_submit.
     amdgpu_hdp_flush(dev);
 
     // 5b. Advance and publish wptr (in dwords).
     wptr_dw = (wptr_dw + frameSizeDw) % ringSizeDw;
     WREG32(dev, regWptr, wptr_dw);
 
-    // 6. Wait for PSP to write the fence value (sysmem volatile read).
-    auto *fencePtr = static_cast<volatile uint32_t *>(psp.fenceCPUAddr);
+    // 6. Wait for PSP to write the fence value into VRAM. Read it back
+    //    via the BAR0 aperture — BAR0 reads bypass any CPU cache and go
+    //    straight to PCIe / VRAM, so we always see the latest value.
     const uint64_t kBudgetUs = 1 * 1000000;
     uint64_t elapsed = 0;
     uint32_t observed = 0;
     while (elapsed < kBudgetUs) {
-        observed = *fencePtr;
+        observed = RBAR2_32(dev, kFenceVRAMOffset);
         if (observed == fence_index) break;
         IOSleep(1);
         elapsed += 1000;
@@ -647,11 +635,12 @@ psp_ring_cmd_submit(DeviceContext &dev, PSPContext &psp,
         return kIOReturnTimeout;
     }
 
-    // 7. Read response status from cmd buffer (sysmem read).
-    // Upstream psp_gfx_cmd_resp.resp lives at offset 864 (psp_gfx_if.h).
+    // 7. Read response status from cmd buffer in VRAM via BAR0.
+    //    Upstream psp_gfx_cmd_resp.resp.status lives at offset 864
+    //    (psp_gfx_if.h struct layout).
     const uint32_t kRespStatusOffset = 864;
-    uint32_t resp_status = *reinterpret_cast<volatile uint32_t *>(
-        static_cast<uint8_t *>(psp.cmdCPUAddr) + kRespStatusOffset);
+    uint32_t resp_status = RBAR2_32(dev,
+        kCmdBufVRAMOffset + kRespStatusOffset);
     if (outRespStatus) *outRespStatus = resp_status;
     if (resp_status != 0) {
         PSP_LOG("ring_cmd_submit: PSP returned status %#x", resp_status);
@@ -662,10 +651,20 @@ psp_ring_cmd_submit(DeviceContext &dev, PSPContext &psp,
 }
 
 //
-// psp_setup_tmr — allocates a DART-backed system-memory buffer for
-// the TMR and submits GFX_CMD_ID_SETUP_TMR via the PSP ring.
-// Idempotent. Linux normally puts the TMR in VRAM; we use system
-// memory + the `virt_phy_addr` flag until we have a VRAM allocator.
+// psp_setup_tmr — port of upstream psp_tmr_load (amdgpu_psp.c:916).
+//
+// IMPORTANT — on psp_v14_0 IP_VERSION(14,0,2) and (14,0,3) (R9700 and
+// related), upstream's `psp_skip_tmr` returns true because the chip
+// defaults both `boot_time_tmr = true` and `autoload_supported = true`
+// (amdgpu_psp.c:173-174, no override for 14,0,2/3 at lines 257-261).
+// PSP's SOS sets up TMR itself during boot, before the driver's ring
+// is even created. Sending SETUP_TMR after SOS boot is silently
+// dropped by PSP (the symptom we hit on v0.0.47/48: ring submit lands
+// in C2PMSG_67 but fence_buf never gets written).
+//
+// So for v14_0_2/3 we skip the submit entirely. Tracked state still
+// flips to tmrSetUp = true so downstream LOAD_IP_FW commands are
+// allowed to proceed — PSP knows where its TMR is, we don't need to.
 //
 kern_return_t
 psp_setup_tmr(DeviceContext &dev, PSPContext &psp)
@@ -675,8 +674,23 @@ psp_setup_tmr(DeviceContext &dev, PSPContext &psp)
         return kIOReturnNotReady;
     }
 
-    // VRAM-backed TMR — pass PSP an MC address. We don't need to
-    // CPU-touch the TMR; PSP and IP firmwares own it.
+    // psp_v14_0_x: boot_time_tmr + autoload → skip the cmd. SOS owns
+    // the TMR. Mark "set up" so psp_load_ip_fw isn't blocked.
+    if (kIP_PSP.major == 14) {
+        psp.tmrBusAddr = 0;  // SOS-managed; we have no MC address
+        psp.tmrCPUAddr = nullptr;
+        psp.tmrSize    = 0;
+        psp.tmrSetUp   = true;
+        PSP_LOG("setup_tmr: SKIP (psp_v14_0_%u — boot_time_tmr by SOS, "
+                "see psp_skip_tmr in upstream amdgpu_psp.c:906)",
+                (unsigned)kIP_PSP.rev);
+        return kIOReturnSuccess;
+    }
+
+    // Legacy / other PSP families that DO accept SETUP_TMR from the
+    // driver — port of upstream psp_setup_tmr (amdgpu_psp.c:825 sets
+    // virt_phy_addr = 1 unconditionally; system_phy_addr is the
+    // CPU-visible BAR phys address of the TMR BO).
     uint64_t vram_start = psp_read_vram_start(dev);
     if (vram_start == 0) {
         PSP_LOG("setup_tmr: vram_start=0; MMHUB not ready");
@@ -688,9 +702,6 @@ psp_setup_tmr(DeviceContext &dev, PSPContext &psp)
     psp.tmrCPUAddr    = nullptr;
     psp.tmrSize       = kPSPTMRDefaultSize;
 
-    // Build SETUP_TMR command in a scratch cmd_resp-sized buffer.
-    // We construct this on the dext stack and rely on the ring submit
-    // path to BAR0-copy it into the VRAM cmd_buf.
     uint8_t cmd_buf[kPSPGfxCmdRespSize];
     memset(cmd_buf, 0, sizeof(cmd_buf));
     auto *hdr = reinterpret_cast<PSPGfxCmdRespHeader *>(cmd_buf);
@@ -702,9 +713,9 @@ psp_setup_tmr(DeviceContext &dev, PSPContext &psp)
     tmr->buf_phy_addr_lo    = static_cast<uint32_t>(psp.tmrBusAddr & 0xFFFFFFFFu);
     tmr->buf_phy_addr_hi    = static_cast<uint32_t>(psp.tmrBusAddr >> 32);
     tmr->buf_size           = static_cast<uint32_t>(psp.tmrSize);
-    tmr->tmr_flags          = 0;  // VRAM-backed, not virt_phy
-    tmr->system_phy_addr_lo = 0;
-    tmr->system_phy_addr_hi = 0;
+    tmr->tmr_flags          = 0x2;  // bit 1 = virt_phy_addr per upstream
+    tmr->system_phy_addr_lo = static_cast<uint32_t>(psp.tmrBusAddr & 0xFFFFFFFFu);
+    tmr->system_phy_addr_hi = static_cast<uint32_t>(psp.tmrBusAddr >> 32);
 
     uint32_t resp = 0;
     kern_return_t ret = psp_ring_cmd_submit(dev, psp, cmd_buf,
@@ -738,10 +749,15 @@ psp_load_ip_fw(DeviceContext &dev, PSPContext &psp,
     if (fwBusAddr == 0 || fwSize == 0) {
         return kIOReturnBadArgument;
     }
-    // 4 KB alignment is the PSP protocol requirement (independent of
-    // AS 16 KB DART pages — we satisfy both because all our DART-mapped
-    // buffers come in at 16 KB-aligned bus addresses).
-    if (fwBusAddr & 0xFFF) {
+    // Upstream `psp_prep_load_ip_fw_cmd_buf` does NOT enforce 4 KB
+    // alignment on fw_phy_addr — it just stuffs whatever address came
+    // out of `amdgpu_bo_gpu_offset(bo) + ucode_array_offset_bytes`.
+    // The BO is page-aligned, but ucode_array_offset_bytes is typically
+    // 32 (= sizeof(common_firmware_header)), so the resulting address
+    // is dword-aligned, not 4 KB. PSP accepts that. Our previous 4 KB
+    // alignment check rejected every real LOAD_IP_FW call with
+    // kIOReturnNotAligned. Keep only the minimal dword-alignment check.
+    if (fwBusAddr & 0x3) {
         return kIOReturnNotAligned;
     }
 
@@ -768,6 +784,48 @@ psp_load_ip_fw(DeviceContext &dev, PSPContext &psp,
     }
     PSP_LOG("LOAD_IP_FW(type=%u, size=%u) ok", fwType, fwSize);
     return kIOReturnSuccess;
+}
+
+kern_return_t
+psp_query_fw_reservation(DeviceContext &dev, PSPContext &psp)
+{
+    if (!psp.ringCreated) {
+        return kIOReturnNotReady;
+    }
+    auto submit_one = [&](uint32_t cmd_id, const char *name) -> kern_return_t {
+        uint8_t cmd_buf[kPSPGfxCmdRespSize];
+        memset(cmd_buf, 0, sizeof(cmd_buf));
+        auto *hdr = reinterpret_cast<PSPGfxCmdRespHeader *>(cmd_buf);
+        hdr->buf_size    = sizeof(cmd_buf);
+        hdr->buf_version = kPSPGfxCmdBufVersion;
+        hdr->cmd_id      = cmd_id;
+        uint32_t resp = 0;
+        kern_return_t r = psp_ring_cmd_submit(dev, psp, cmd_buf,
+                                              kPSPGfxCmdRespSize, &resp);
+        if (r == kIOReturnSuccess) {
+            PSP_LOG("query_fw_reservation: %{public}s ok (resp=%#x)",
+                    name, resp);
+            return kIOReturnSuccess;
+        }
+        // PSP_ERR_UNKNOWN_COMMAND (0x100) means SOS too old to know this
+        // cmd — upstream treats it as success+(addr=0,size=0). For us,
+        // the ring submit itself was processed; only the chip's response
+        // says "I don't know this command", which is fine.
+        if (r == kIOReturnError && (resp & 0xFFFFu) == 0x100) {
+            PSP_LOG("query_fw_reservation: %{public}s — SOS doesn't "
+                    "implement (resp=%#x); ignoring", name, resp);
+            return kIOReturnSuccess;
+        }
+        PSP_LOG("query_fw_reservation: %{public}s FAILED kr=%#x resp=%#x",
+                name, r, resp);
+        return r;
+    };
+    kern_return_t r1 = submit_one(PSPGfxCmd::FB_FW_RESERV_ADDR,
+                                  "FB_FW_RESERV_ADDR");
+    if (r1 != kIOReturnSuccess) return r1;
+    kern_return_t r2 = submit_one(PSPGfxCmd::FB_FW_RESERV_EXT_ADDR,
+                                  "FB_FW_RESERV_EXT_ADDR");
+    return r2;
 }
 
 //============================================================
