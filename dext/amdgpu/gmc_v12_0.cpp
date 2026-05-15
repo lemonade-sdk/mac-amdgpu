@@ -663,23 +663,20 @@ gmc_init(DeviceContext &dev, GMCContext &gmc)
 }
 
 // ============================================================
-// HDP flush — invalidates the HDP cache so reads from VRAM via the
-// BAR aperture see fresh data. Linux's amdgpu_device_flush_hdp
-// dispatches per-IP version; for v7 (gfx1201) it's a simple write
-// to regHDP_MEM_COHERENCY_FLUSH_CNTL.
+// HDP flush — delegates to amdgpu_hdp_flush in amdgpu_regs.h, which
+// is the proper port of upstream amdgpu_hdp_generic_flush
+// (amdgpu_hdp.c:48-54): write 0 to remap-HDP register + readback
+// NBIO's get_memsize. hdp_v7_0_funcs (hdp_v7_0.c:128-132) only
+// hooks .flush_hdp = amdgpu_hdp_generic_flush; there is no
+// invalidate_hdp on this asic, and the prior implementation here
+// wrote to a bogus regHDP_MEM_COHERENCY_FLUSH_CNTL=0x230C that does
+// not exist in gc_12_0_0_offset.h or hdp_7_0_0_offset.h. Audit #6
+// step 8.
 // ============================================================
 kern_return_t
 gmc_hdp_flush(DeviceContext &dev)
 {
-    if (!dev.ip.isResolved(IPBlock::HDP)) return kIOReturnNotReady;
-    // regHDP_MEM_COHERENCY_FLUSH_CNTL is a single dword at offset
-    // 0x230C in the HDP register window per gc_12_0_0_offset.h
-    // (HDP shares the same offset across v7.x in practice). Writing
-    // 1 to bit 0 triggers the flush.
-    constexpr uint32_t kHDP_MEM_COHERENCY_FLUSH_CNTL = 0x230C;
-    WREG32(dev,
-           SOC15_REG_OFFSET(dev, IPBlock::HDP, kHDP_MEM_COHERENCY_FLUSH_CNTL),
-           1);
+    amdgpu_hdp_flush(dev);
     return kIOReturnSuccess;
 }
 
