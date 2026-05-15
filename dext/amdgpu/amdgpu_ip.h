@@ -180,6 +180,35 @@ namespace MMHUBRegs {
     constexpr uint32_t MMVM_L2_CNTL3                            = 0x04e6;
     constexpr uint32_t MMVM_L2_CNTL4                            = 0x04e7;
     constexpr uint32_t MMVM_L2_CNTL5                            = 0x04e8;
+
+    // Registers needed for the rest of mmhub_v4_1_0_gart_enable.
+    constexpr uint32_t MMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_LSB_AT_4C8 = 0x04c8;
+    constexpr uint32_t MMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_MSB_AT_4C9 = 0x04c9;
+    constexpr uint32_t MMVM_L2_PROTECTION_FAULT_CNTL2           = 0x04ed;
+    constexpr uint32_t MMVM_L2_PROTECTION_FAULT_DEFAULT_ADDR_LO32 = 0x04f4;
+    constexpr uint32_t MMVM_L2_PROTECTION_FAULT_DEFAULT_ADDR_HI32 = 0x04f5;
+    constexpr uint32_t MMVM_L2_CONTEXT1_IDENTITY_APERTURE_LOW_ADDR_LO32  = 0x04f7;
+    constexpr uint32_t MMVM_L2_CONTEXT1_IDENTITY_APERTURE_LOW_ADDR_HI32  = 0x04f8;
+    constexpr uint32_t MMVM_L2_CONTEXT1_IDENTITY_APERTURE_HIGH_ADDR_LO32 = 0x04f9;
+    constexpr uint32_t MMVM_L2_CONTEXT1_IDENTITY_APERTURE_HIGH_ADDR_HI32 = 0x04fa;
+    constexpr uint32_t MMVM_L2_CONTEXT_IDENTITY_PHYSICAL_OFFSET_LO32     = 0x04fb;
+    constexpr uint32_t MMVM_L2_CONTEXT_IDENTITY_PHYSICAL_OFFSET_HI32     = 0x04fc;
+    // Note: MMMC_VM_SYSTEM_APERTURE_{LOW,HIGH,DEFAULT_ADDR_*} have two
+    // different offset locations in the header. The ones used by
+    // mmhub_v4_1_0_init_system_aperture_regs are AT_4C8/AT_4C9. The
+    // similar-named regs at 0x559/0x55a/0x55f/0x560 are for a different
+    // context and not touched by init_system_aperture_regs.
+    //
+    // VMID config + invalidation engine — per-context regs accessed
+    // via base + i * ctx_distance. Upstream uses ctx_distance =
+    // MMVM_CONTEXT1_CNTL - MMVM_CONTEXT0_CNTL.
+    constexpr uint32_t MMVM_CONTEXT1_CNTL                       = 0x0565;
+    constexpr uint32_t MMVM_CONTEXT1_PAGE_TABLE_START_ADDR_LO32 = 0x05f1;
+    constexpr uint32_t MMVM_CONTEXT1_PAGE_TABLE_START_ADDR_HI32 = 0x05f2;
+    constexpr uint32_t MMVM_CONTEXT1_PAGE_TABLE_END_ADDR_LO32   = 0x0611;
+    constexpr uint32_t MMVM_CONTEXT1_PAGE_TABLE_END_ADDR_HI32   = 0x0612;
+    constexpr uint32_t MMVM_INVALIDATE_ENG0_ADDR_RANGE_LO32     = 0x062a;
+    constexpr uint32_t MMVM_INVALIDATE_ENG0_ADDR_RANGE_HI32     = 0x062b;
 }
 
 // PTE flag bits — drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h.

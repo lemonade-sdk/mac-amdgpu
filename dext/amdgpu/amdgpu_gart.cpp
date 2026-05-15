@@ -223,6 +223,8 @@ static void
 gart_init_aperture_regs(const DeviceContext &dev, const GARTContext &gart,
                         uint64_t pt_base_mc)
 {
+    GART_LOG("init_gart_aperture_regs: pt_base=%#llx start=%#llx end=%#llx",
+             pt_base_mc, gart.gartStart, gart.gartEnd);
     uint32_t base = dev.ip.get(IPBlock::MMHUB);
     gart_setup_vm_pt_regs(dev, pt_base_mc);
     // start/end addresses are in 4 KB units (low 32 = bits 12-43,
@@ -237,9 +239,161 @@ gart_init_aperture_regs(const DeviceContext &dev, const GARTContext &gart,
            static_cast<uint32_t>(gart.gartEnd >> 44));
 }
 
+// Port of mmhub_v4_1_0_init_system_aperture_regs. Programs AGP +
+// system aperture window + default addr + L2 protection-fault
+// default addr. We don't use AGP, so disable it (BOT > TOP). The
+// "system aperture" defines the MC range that maps to the
+// framebuffer (covers vram_start..vram_end). The default + fault
+// addrs need a small sysmem scratch; we point both at the first
+// page of our PT table (it's already VRAM-backed and writable).
+static void
+gart_init_system_aperture_regs(const DeviceContext &dev,
+                               uint64_t vramStart, uint64_t vramEnd)
+{
+    GART_LOG("init_system_aperture_regs: vram=[%#llx,%#llx]",
+             vramStart, vramEnd);
+    uint32_t base = dev.ip.get(IPBlock::MMHUB);
+
+    // Disable AGP — BOT > TOP signals "no AGP aperture."
+    WREG32(dev, base + MMHUBRegs::MMMC_VM_AGP_BASE, 0);
+    WREG32(dev, base + MMHUBRegs::MMMC_VM_AGP_BOT, 0xFFFFFFu);
+    WREG32(dev, base + MMHUBRegs::MMMC_VM_AGP_TOP, 0);
+
+    // System aperture covers the framebuffer (VRAM range). Addresses
+    // are in 256 KB units (>> 18).
+    WREG32(dev, base + MMHUBRegs::MMMC_VM_SYSTEM_APERTURE_LOW_ADDR,
+           static_cast<uint32_t>(vramStart >> 18));
+    WREG32(dev, base + MMHUBRegs::MMMC_VM_SYSTEM_APERTURE_HIGH_ADDR,
+           static_cast<uint32_t>(vramEnd >> 18));
+
+    // Default address for accesses outside any mapped range. Upstream
+    // points it at adev->mem_scratch.gpu_addr. We don't have a
+    // mem_scratch yet — point both at 0 (the start of our VRAM); any
+    // such access is a bug anyway and 0 is a safe sink.
+    WREG32(dev,
+        base + MMHUBRegs::MMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_LSB_AT_4C8, 0);
+    WREG32(dev,
+        base + MMHUBRegs::MMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_MSB_AT_4C9, 0);
+
+    // L2 protection fault default address — same situation. Linux uses
+    // adev->dummy_page_addr; we use 0 for the same reason.
+    WREG32(dev, base + MMHUBRegs::MMVM_L2_PROTECTION_FAULT_DEFAULT_ADDR_LO32, 0);
+    WREG32(dev, base + MMHUBRegs::MMVM_L2_PROTECTION_FAULT_DEFAULT_ADDR_HI32, 0);
+
+    // ACTIVE_PAGE_MIGRATION_PTE_READ_RETRY (bit 0x12 = 18) — matches
+    // upstream's RMW; we just write the bit set.
+    WREG32(dev, base + MMHUBRegs::MMVM_L2_PROTECTION_FAULT_CNTL2,
+           (1u << 0x12));
+}
+
+// Port of mmhub_v4_1_0_disable_identity_aperture. Sets the identity
+// aperture to a never-matching range so context 1+ accesses always
+// take the page-table route (not the identity bypass).
+static void
+gart_disable_identity_aperture(const DeviceContext &dev)
+{
+    GART_LOG("disable_identity_aperture");
+    uint32_t base = dev.ip.get(IPBlock::MMHUB);
+    WREG32(dev,
+        base + MMHUBRegs::MMVM_L2_CONTEXT1_IDENTITY_APERTURE_LOW_ADDR_LO32,
+        0xFFFFFFFFu);
+    WREG32(dev,
+        base + MMHUBRegs::MMVM_L2_CONTEXT1_IDENTITY_APERTURE_LOW_ADDR_HI32,
+        0x0000000Fu);
+    WREG32(dev,
+        base + MMHUBRegs::MMVM_L2_CONTEXT1_IDENTITY_APERTURE_HIGH_ADDR_LO32,
+        0);
+    WREG32(dev,
+        base + MMHUBRegs::MMVM_L2_CONTEXT1_IDENTITY_APERTURE_HIGH_ADDR_HI32,
+        0);
+    WREG32(dev,
+        base + MMHUBRegs::MMVM_L2_CONTEXT_IDENTITY_PHYSICAL_OFFSET_LO32, 0);
+    WREG32(dev,
+        base + MMHUBRegs::MMVM_L2_CONTEXT_IDENTITY_PHYSICAL_OFFSET_HI32, 0);
+}
+
+// Port of mmhub_v4_1_0_setup_vmid_config. Configures VM contexts
+// 1..14 with protection-fault defaults + per-context PT addr ranges.
+// Upstream loops 15 contexts; we mirror that. Each context's regs
+// live at a fixed stride (ctx_distance) from context-1's base.
+//
+// The distance constants come from upstream amdgpu_vmhub (Linux's
+// adev->vmhub[0].ctx_distance / ctx_addr_distance). For mmhub_v4_1_0:
+//   ctx_distance      = MMVM_CONTEXT1_CNTL - MMVM_CONTEXT0_CNTL = 1
+//   ctx_addr_distance = stride between CONTEXT1+i pt-start regs = 2
+static void
+gart_setup_vmid_config(const DeviceContext &dev)
+{
+    GART_LOG("setup_vmid_config: programming contexts 1..14");
+    uint32_t base = dev.ip.get(IPBlock::MMHUB);
+    constexpr uint32_t kCtxDistance     = 1;  // CNTL stride
+    constexpr uint32_t kCtxAddrDistance = 2;  // PT start/end stride
+    // Matches upstream MMVM_CONTEXT1_CNTL bit programming. Fields:
+    //   ENABLE_CONTEXT                                = 1   bit 0
+    //   PAGE_TABLE_DEPTH                              = 0   bits 1-3 (num_level=0)
+    //   PAGE_TABLE_BLOCK_SIZE                         = 0   bits 4-7 (block_size-9=0)
+    //   RANGE_PROTECTION_FAULT_ENABLE_DEFAULT          = 1   bit 8
+    //   DUMMY_PAGE_PROTECTION_FAULT_ENABLE_DEFAULT    = 1   bit 9
+    //   PDE0_PROTECTION_FAULT_ENABLE_DEFAULT          = 1   bit 10
+    //   VALID_PROTECTION_FAULT_ENABLE_DEFAULT         = 1   bit 11
+    //   READ_PROTECTION_FAULT_ENABLE_DEFAULT          = 1   bit 12
+    //   WRITE_PROTECTION_FAULT_ENABLE_DEFAULT         = 1   bit 13
+    //   EXECUTE_PROTECTION_FAULT_ENABLE_DEFAULT       = 1   bit 14
+    //   RETRY_PERMISSION_OR_INVALID_PAGE_FAULT        = 1   bit 23 (!amdgpu_noretry)
+    uint32_t cntl = 0;
+    cntl |= (1u << 0);
+    cntl |= (1u << 8);
+    cntl |= (1u << 9);
+    cntl |= (1u << 10);
+    cntl |= (1u << 11);
+    cntl |= (1u << 12);
+    cntl |= (1u << 13);
+    cntl |= (1u << 14);
+    cntl |= (1u << 23);
+    for (uint32_t i = 0; i < 15; i++) {
+        WREG32(dev,
+            base + MMHUBRegs::MMVM_CONTEXT1_CNTL + i * kCtxDistance, cntl);
+        WREG32(dev,
+            base + MMHUBRegs::MMVM_CONTEXT1_PAGE_TABLE_START_ADDR_LO32 +
+                   i * kCtxAddrDistance, 0);
+        WREG32(dev,
+            base + MMHUBRegs::MMVM_CONTEXT1_PAGE_TABLE_START_ADDR_HI32 +
+                   i * kCtxAddrDistance, 0);
+        // Upstream uses max_pfn-1 here; we don't have that yet, set to
+        // 0xFFFFFFFF (all-ones-ish low half) which is the same intent
+        // (give the context the full possible address range).
+        WREG32(dev,
+            base + MMHUBRegs::MMVM_CONTEXT1_PAGE_TABLE_END_ADDR_LO32 +
+                   i * kCtxAddrDistance, 0xFFFFFFFFu);
+        WREG32(dev,
+            base + MMHUBRegs::MMVM_CONTEXT1_PAGE_TABLE_END_ADDR_HI32 +
+                   i * kCtxAddrDistance, 0xFFFFFFFFu);
+    }
+}
+
+// Port of mmhub_v4_1_0_program_invalidation. Programs the 18 TLB
+// invalidation engines with "match everything" address ranges so any
+// invalidation request hits every VM context.
+static void
+gart_program_invalidation(const DeviceContext &dev)
+{
+    GART_LOG("program_invalidation: 18 engines");
+    uint32_t base = dev.ip.get(IPBlock::MMHUB);
+    constexpr uint32_t kEngAddrDistance = 2; // stride between LO/HI registers
+    for (uint32_t i = 0; i < 18; i++) {
+        WREG32(dev,
+            base + MMHUBRegs::MMVM_INVALIDATE_ENG0_ADDR_RANGE_LO32 +
+                   i * kEngAddrDistance, 0xFFFFFFFFu);
+        WREG32(dev,
+            base + MMHUBRegs::MMVM_INVALIDATE_ENG0_ADDR_RANGE_HI32 +
+                   i * kEngAddrDistance, 0x1Fu);
+    }
+}
+
 static void
 gart_init_tlb_regs(const DeviceContext &dev)
 {
+    GART_LOG("init_tlb_regs");
     uint32_t base = dev.ip.get(IPBlock::MMHUB);
     // Match upstream mmhub_v4_1_0_init_tlb_regs exactly:
     //   ENABLE_L1_TLB                    = 1   bit 0
@@ -259,6 +413,7 @@ gart_init_tlb_regs(const DeviceContext &dev)
 static void
 gart_init_cache_regs(const DeviceContext &dev)
 {
+    GART_LOG("init_cache_regs: programming MMVM_L2_CNTL[1..5]");
     uint32_t base = dev.ip.get(IPBlock::MMHUB);
 
     // VM_L2_CNTL — read-modify-write isn't strictly required since we
@@ -300,6 +455,7 @@ gart_init_cache_regs(const DeviceContext &dev)
 static void
 gart_enable_system_domain(const DeviceContext &dev)
 {
+    GART_LOG("enable_system_domain: enable VM context 0");
     uint32_t base = dev.ip.get(IPBlock::MMHUB);
     // MMVM_CONTEXT0_CNTL:
     //   ENABLE_CONTEXT                            = 1   bit 0
@@ -336,18 +492,29 @@ gart_enable(DeviceContext &dev, GARTContext &gart)
     }
     uint64_t ptBaseMC = vramStart + gart.pageTableVRAMOffset;
 
-    GART_LOG("enable: pt_mc=%#llx aperture=[%#llx, %#llx]",
-             ptBaseMC, gart.gartStart, gart.gartEnd);
+    // Compute vram_end from FB_LOCATION_TOP for the system aperture.
+    uint32_t fbTopRaw = RREG32(dev,
+        mmhubBase + MMHUBRegs::MMMC_VM_FB_LOCATION_TOP);
+    uint64_t vramEnd =
+        (((uint64_t)(fbTopRaw & MMHUBRegs::kFBBaseMask))
+         << MMHUBRegs::kFBBaseShift) | 0xFFFFFFULL;
+
+    GART_LOG("enable: pt_mc=%#llx aperture=[%#llx, %#llx] "
+             "vram=[%#llx, %#llx]",
+             ptBaseMC, gart.gartStart, gart.gartEnd,
+             vramStart, vramEnd);
 
     // Full mmhub_v4_1_0_gart_enable register sequence — matches
     // upstream exactly. ORDER MATTERS: gart_enable must run BEFORE
     // psp_load_sos so SOS comes up with GART already configured.
-    // Running it after SOS is loaded stomps on TLB/L2 state SOS set
-    // up for its own bootstrap and causes PSP to drop ring_create.
     gart_init_aperture_regs(dev, gart, ptBaseMC);
+    gart_init_system_aperture_regs(dev, vramStart, vramEnd);
     gart_init_tlb_regs(dev);
     gart_init_cache_regs(dev);
     gart_enable_system_domain(dev);
+    gart_disable_identity_aperture(dev);
+    gart_setup_vmid_config(dev);
+    gart_program_invalidation(dev);
 
     // Read-back smoke check: confirm the start-addr register latched.
     uint32_t readback = RREG32(dev,
