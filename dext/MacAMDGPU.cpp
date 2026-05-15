@@ -1523,6 +1523,14 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                         payloads[i].fw_type == amdgpu::PSPGfxFwType::SDMA_UCODE_TH0) {
                         sdma_loaded_this_call = true;
                     }
+                    // Audit-7 #11: IMUInit stage gates on imu.microcode_loaded.
+                    // Set it once PSP has acked BOTH IMU_I (68) + IMU_D (69).
+                    // We flip the flag on the second of the two — by the time
+                    // both have returned kIOReturnSuccess we know both went
+                    // through. (Order in upstream: I, then D.)
+                    if (payloads[i].fw_type == amdgpu::PSPGfxFwType::IMU_D) {
+                        driver->ivars->bringup.imu.microcode_loaded = true;
+                    }
                 }
                 if (sdma_loaded_this_call) {
                     driver->ivars->bringup.sdma.microcode_loaded = true;

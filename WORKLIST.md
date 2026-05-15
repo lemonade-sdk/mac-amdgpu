@@ -4,7 +4,9 @@ Granular tasks. Status legend: `[ ]` open · `[~]` in progress · `[x]` done · 
 
 Phase numbers match `ROADMAP.md`. Target hardware fixed: Apple Silicon M5 Pro/Max/Ultra + TB5 + AMD Radeon AI PRO R9700 (gfx1201, RDNA4).
 
-Last sync against `git log`: PSP bring-up landed on real R9700 hardware — IP discovery from VRAM, BAR5 register window confirmed, `psp_init_sos_microcode` ported, upstream firmware structs vendored, `psp_14_0_3_sos.bin` loads, PSP ring created (stage 4 reached). GART bootstrap is the next critical-path blocker — `dext/amdgpu/amdgpu_gart.h` landed; tracked in `docs/GART_PORT_PLAN.md` + `docs/DMA_FIX_PLAN.md`.
+Last sync against `git log` (v0.0.58, commit `c8d224e`): PSP ring is end-to-end working on real R9700. 8 bringup stages green (`IPDiscovery → PSPInit → PSPLoadSOS → PSPRingCreate → TMRSetup → SMUInit → GMCInit`). The 6-day silent-drop bug was `PSP_RING_TYPE__KM = 1` (= upstream's `__UM` / RBI ring) instead of `2` (= `__KM` / GPCOM); fixed via the two-agent line-by-line audit pattern. SMU PMFW loaded via PSP ring, SMU mailbox responsive, GMC + MMHUB configured with correct register offsets + GFX12 `IS_PTE` bit + NBIO HDP `remap_hdp_registers` programmed.
+
+**Current blocker (RLCInit returns `kIOReturnUnsupported`):** the LoadFirmware path uses a simple "skip 32-byte common header" extractor that works for SMU PMFW (single-component) but PSP returns `0xFFFF0006 = TEE_ERROR_BAD_PARAMETERS` for SDMA / RLC / uni_mes because those use multi-component firmware layouts (sdma_v3_header, RLC sub-binaries for RLC_G/IRAM/DRAM/P/V/RESTORE_LIST, uni_mes split into CP_MES ucode + CP_MES_DATA at different offsets). Each needs the per-IP header parser from upstream `amdgpu_ucode_init_single_fw`.
 
 ---
 
@@ -89,22 +91,33 @@ Cite Linux source file in commit messages.
 - [x] 169  Vendor upstream firmware structs — `common_firmware_header`, `psp_firmware_header_v1/v2`, `psp_fw_bin_desc` — commit `d53c775`
 - [x] 169a Port `amdgpu_is_kicker_fw` + `kicker_device_list`; expose PCI revision in Identity — commit `3694bd3`
 
-### 1B.0a GART bootstrap — current critical-path blocker
+### 1B.0a GART bootstrap — done (v0.0.51..0.0.58)
 
-See `docs/GART_PORT_PLAN.md` (GART-1 .. GART-7) and `docs/DMA_FIX_PLAN.md` (DMA-4 .. DMA-10). PSP ring DMA needs GART-routable MC addresses for cmd/fence/ring; raw VRAM-backed buffers are silently dropped. Inserts `BringupStage::GARTEnable` between `PSPRingCreate` and `TMRSetup`.
+PSP ring/cmd/fence stayed in VRAM (FB aperture; PSP fetches via internal path), and the host's DMA staging buffer is bound into GART for LOAD_IP_FW payloads. GART is needed for the firmware-load path, not for the ring frames themselves.
 
-- [ ] 140  GART-1: read upstream `amdgpu_gart.c` + `gmc_v12_0_gart_enable`; document PTE format + register pokes
-- [~] 141  GART-2: `dext/amdgpu/amdgpu_gart.h` + GC IP registers (`GCMC_VM_FB_LOCATION_BASE`, `GCVM_CONTEXT0_*`, etc.) — **header landed; .cpp next**
-- [ ] 142  GART-3: allocate page table in VRAM (4 KB at `kGARTPageTableVRAMOffset` after TMR); zero-fill via `bar0_memset_vram`
-- [ ] 143  GART-4: `gart_bind(IOBufferMemoryDescriptor*) → GART MC addr` — PTE write via `bar0_memcpy_to_vram`
-- [ ] 144  GART-5: `gmc_v12_0_gart_enable` port — register pokes + readback validation
-- [ ] 145  GART-6: wire `BringupStage::GARTEnable` into `amdgpu_init.cpp`; refactor `psp_ring_create` / `psp_setup_tmr` to sysmem + GART
-- [ ] 146  GART-7: validate on hw — TMRSetup should clear; fence_buf[0] should reflect fence_value
-- [x] 147  DMA-1: `MemoryWrite64` instead of per-dword `MemoryWrite32` for BAR-aperture VRAM writes (commit `9fcdef1`)
-- [x] 147a DMA-1b: drop PSP fence-wait timeout 10 s → 1 s + bail-on-first-stage-failure — cuts a failed Initialize GPU from 95 s to 4 s (commit `6c51672`)
-- [x] 147b DMA-2: DumpCmdBuf + DumpPSP selectors for ring debugging (commits `9fcdef1`, `f13512c`)
-- [ ] 148  DMA-3: probe `IOMemoryDescriptor::CreateMapping` on BAR0 aperture for 10–50× CPU-side speedup (optional once GART removes the hot path)
-- [ ] 149  SQ-2: investigate write-combined mapping on BAR0 as a fallback to CreateMapping
+- [x] 140  GART-1: read upstream `amdgpu_gart.c` + `gmc_v12_0_gart_enable`; PTE format + register pokes documented
+- [x] 141  GART-2: `dext/amdgpu/amdgpu_gart.h` + MMHUB IP registers — correct offsets confirmed against `mmhub_4_1_0_offset.h`
+- [x] 142  GART-3: page table in VRAM at `kGARTPageTableVRAMOffset` (64 KB → 32 MB GART space), zero-filled via `bar0_memset_vram`
+- [x] 143  GART-4: `gart_bind_sysmem` + `gart_bind_existing(busAddr, size)` — PTE write via `bar0_memcpy_to_vram` with `IS_PTE` bit
+- [x] 144  GART-5: `gart_enable` ports the full `mmhub_v4_1_0_gart_enable` sub-call tree
+- [x] 145  GART-6: inline-bootstrapped from `psp_load_sos` (proper `GMCInit`-before-PSP reorder is task 195)
+- [x] 146  GART-7: validated on hw — PSP ring submits work end-to-end after the `KM=2` fix in commit `c8d224e`
+- [x] 147  DMA-1: `MemoryWrite64` instead of per-dword `MemoryWrite32` for BAR-aperture VRAM writes
+- [x] 147a DMA-1b: drop PSP fence-wait timeout 10 s → 1 s + bail-on-first-stage-failure
+- [x] 147b DMA-2: DumpCmdBuf + DumpPSP selectors for ring debugging
+- [-] 148  DMA-3: probe `IOMemoryDescriptor::CreateMapping` on BAR0 — deferred; current BAR0 path is only on the bringup hot path (PSP ring frames during init), not runtime
+- [-] 149  SQ-2: write-combined mapping on BAR0 — deferred; same reason
+
+### 1B.0b Post-SOS firmware multi-component parsing — current critical-path blocker
+
+LoadFirmware currently does `(common_header.ucode_array_offset_bytes, common_header.ucode_size_bytes)` extraction. Works for SMU PMFW. Fails for SDMA/RLC/uni_mes with `TEE_ERROR_BAD_PARAMETERS` because their layouts have per-IP headers.
+
+- [ ] 130  Vendor per-IP firmware headers: `sdma_firmware_header_v3_0`, `rlc_firmware_header_v2_0..v2_4`, `mes_firmware_header_v1_0`, `imu_firmware_header_v1_0`, `gfx_firmware_header_v2_0`, `psp_firmware_header_v2_0` extensions
+- [ ] 131  Per-IP extractor: `amdgpu_ucode_extract(fwBytes, fw_size, gfxFwType) → (ucode_offset, ucode_size)`. Implements upstream's `amdgpu_ucode_init_single_fw` switch table for: SMU/SDMA TH0/IMU_I/IMU_D/RLC_G/RLC_IRAM/RLC_DRAM/RLC_P/RLC_V/RLC_RESTORE_LIST/CP_MES/CP_MES_DATA/RS64_PFP/RS64_ME/RS64_MEC/RS64 stack variants P0..P3
+- [ ] 132  Per-IP "multi-frame" expansion: one host LoadFirmware(SDMA) → one LOAD_IP_FW frame (TH0=71). One host LoadFirmware(RLC) → multiple frames (G, IRAM, DRAM, …). One host LoadFirmware(uni_mes) → CP_MES + CP_MES_DATA. One LoadFirmware(CP) → PFP + ME + MEC + P0..P3 stacks (multiple files per IP)
+- [ ] 133  Host swift: add per-IP wrapper functions `loadFirmwareRLC(file) { dext-side expansion }`; align the host queue with upstream's `psp_load_non_psp_fw` order (SMU → IMU → RLC → CP_MES → CP RS64 → SDMA)
+- [ ] 134  IMU loading (IMU_I + IMU_D files via `gc_<v>_imu.bin`). RLC autoload chains the rest once IMU is up
+- [ ] 135  Validate on hw: fence advances per frame, resp.status = 0 across the whole chain, `RLCInit` returns success (microcode_loaded flag flips)
 
 ### 1B.2 SMU v14_0_3 — primitives done, depends on PMFW
 - [x] 170  Port `smu_cmn_send_smc_msg_with_param` (MP1 C2PMSG_66/82/90)

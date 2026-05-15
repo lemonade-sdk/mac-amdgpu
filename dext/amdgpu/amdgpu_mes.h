@@ -525,7 +525,9 @@ struct MES_AddQueue {
     uint32_t queue_id;
     uint32_t alignment_mode_setting;
     uint32_t full_sh_mem_config_data;
-    uint32_t pad[8];            // round to 64 dw
+    // Tail pad rounds to 64 dwords (256 bytes). After full_sh_mem_config_data
+    // the running offset is 216; we need 40 more bytes = 10 dwords.
+    uint32_t pad[10];
 };
 static_assert(sizeof(MES_AddQueue) == 64 * 4,
               "MES_AddQueue must be 64 dwords");

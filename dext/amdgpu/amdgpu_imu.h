@@ -30,6 +30,7 @@
 
 #include <stdint.h>
 #include "amdgpu_ip.h"
+#include "amdgpu_regs.h"  // brings in DeviceContext + kern_return_t
 
 namespace amdgpu {
 

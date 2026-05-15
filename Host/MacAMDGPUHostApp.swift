@@ -722,15 +722,20 @@ final class DriverController: NSObject, ObservableObject,
     }
 
     // Stage labels mirror BringupStage in dext/amdgpu/amdgpu_init.h.
+    // Order updated by Agent D (audit #9 #1): IHInit + GMCInit moved
+    // ahead of PSP per upstream amdgpu_device_ip_init phase1 ordering.
     private static let stageNames: [UInt64: String] = [
-        1: "IPDiscovery", 2: "PSPInit", 3: "PSPLoadSOS",
-        4: "PSPRingCreate", 5: "TMRSetup", 6: "SMUInit",
-        7: "GMCInit", 8: "IMUInit", 9: "RLCInit",
-        10: "CPInit", 11: "MESInit", 12: "IHInit",
+        1: "IPDiscovery", 2: "IHInit", 3: "GMCInit",
+        4: "PSPInit", 5: "PSPLoadSOS", 6: "PSPRingCreate",
+        7: "TMRSetup", 8: "SMUInit", 9: "IMUInit",
+        10: "RLCInit", 11: "CPInit", 12: "MESInit",
         13: "GFXInit", 14: "SDMAInit"
     ]
+    // Stage progression for initializeGPU(). LoadFirmware(SMU/IMU/RLC/CP/MES/SDMA)
+    // is interleaved between SMUInit and the per-IP stages — see
+    // initializeGPU() for the exact order.
     private static let stageOrder: [UInt64] = [
-        1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 14
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14
     ]
 
     func testDumpTMR() {
@@ -1133,10 +1138,23 @@ final class DriverController: NSObject, ObservableObject,
             return
         }
 
-        // 4. PSPInit (no firmware yet).
-        testInitDeviceUpTo(2)
+        // Stages 1–3: IPDiscovery → IHInit → GMCInit (no firmware needed).
+        // New order per Agent D's reorder: GMC must be fully up BEFORE
+        // PSP runs, so SOS comes up with the right TLB/L2 state.
+        for s: UInt64 in [1, 2, 3] {
+            if !testInitDeviceUpTo(s) {
+                append("initializeGPU: stopping early — stage \(s) failed; downstream stages depend on it")
+                return
+            }
+        }
 
-        // 5. PSP SOS firmware load. Mirror upstream amdgpu_psp.c
+        // Stage 4: PSPInit (allocates fw_pri).
+        if !testInitDeviceUpTo(4) {
+            append("initializeGPU: stopping early — PSPInit failed")
+            return
+        }
+
+        // PSP SOS firmware load. Mirror upstream amdgpu_psp.c
         // psp_init_sos_microcode line 3700:
         //     if (amdgpu_is_kicker_fw(adev))
         //         "amdgpu/%s_sos_kicker.bin"
@@ -1153,9 +1171,9 @@ final class DriverController: NSObject, ObservableObject,
             append("\(sosName) → FAILED to load")
         }
 
-        // Stages 3-5: PSPLoadSOS → PSPRingCreate → TMRSetup. These don't
+        // Stages 5–7: PSPLoadSOS → PSPRingCreate → TMRSetup. These don't
         // depend on per-IP microcode.
-        for s: UInt64 in [3, 4, 5] {
+        for s: UInt64 in [5, 6, 7] {
             if !testInitDeviceUpTo(s) {
                 append("initializeGPU: stopping early — stage \(s) failed; downstream stages depend on it")
                 return
@@ -1173,19 +1191,16 @@ final class DriverController: NSObject, ObservableObject,
             append("initializeGPU: SMU PMFW load failed; SMUInit will fail")
         }
 
-        // Stage 6: SMUInit (smu_test_message — works once PMFW is up).
-        if !testInitDeviceUpTo(6) {
+        // Stage 8: SMUInit (smu_test_message — works once PMFW is up).
+        if !testInitDeviceUpTo(8) {
             append("initializeGPU: stopping early — SMUInit failed even after PMFW load")
             // Don't return; the per-IP loads below still exercise the PSP ring.
         }
 
-        // Stages 7, 9-12, 14: GMC / IH / RLC / CP / MES / SDMA bringup.
-        for s: UInt64 in [7, 9, 10, 11, 12, 14] {
-            if !testInitDeviceUpTo(s) {
-                append("initializeGPU: stopping early — stage \(s) failed; downstream stages depend on it")
-                break
-            }
-        }
+        // Stages 9–14: IMU / RLC / CP / MES / GFX / SDMA bringup. Each
+        // gates on the prior firmware load below (the loop intentionally
+        // runs AFTER the firmware section so per-IP microcode_loaded
+        // flags are set by the time IMUInit etc. check them).
 
         // Per-IP firmware loads for SDMA / RLC / IMU / CP (RS64) / MES,
         // post-SMU. Each call routes through amdgpu_ucode_extract in the
@@ -1206,6 +1221,15 @@ final class DriverController: NSObject, ObservableObject,
         _ = loadFirmware(kFwFile_MES_UNI, "gc_\(gfx)_uni_mes.bin")
         _ = loadFirmware(kFwFile_SDMA,    "sdma_\(sdma).bin")
 
+        // Stages 9–14: IMU → RLC → CP → MES → GFX → SDMA bringup. Each
+        // gates on its firmware being loaded above.
+        for s: UInt64 in [9, 10, 11, 12, 13, 14] {
+            if !testInitDeviceUpTo(s) {
+                append("initializeGPU: stopping early — stage \(s) failed; downstream stages depend on it")
+                break
+            }
+        }
+
         append("──── initializeGPU done ────")
     }
 
@@ -1225,42 +1249,35 @@ final class DriverController: NSObject, ObservableObject,
         let sdma = ipSDMA!.path
         let gfx  = ipGFX!.path
 
-        // Stage 2: PSPInit (no firmware needed — just alloc fw_pri).
-        testInitDeviceUpTo(2)
+        // Stages 1–3: IPDiscovery → IHInit → GMCInit (no firmware needed).
+        for s: UInt64 in [1, 2, 3] { testInitDeviceUpTo(s) }
 
-        // Stages 3–5: PSPLoadSOS → PSPRingCreate → TMRSetup.
+        // Stage 4: PSPInit (allocates fw_pri).
+        testInitDeviceUpTo(4)
+
+        // Stages 5–7: PSPLoadSOS → PSPRingCreate → TMRSetup.
         if !loadFirmware(kFwSOS, "psp_\(psp)_sos.bin") {
             append("runFullBringup: stop — PSP SOS load failed")
             return
         }
-        for s: UInt64 in [3, 4, 5] { testInitDeviceUpTo(s) }
+        for s: UInt64 in [5, 6, 7] { testInitDeviceUpTo(s) }
 
-        // Stage 6: SMUInit (needs PMFW).
+        // Stage 8: SMUInit (needs PMFW).
         if loadFirmware(kFwIP_SMU, "smu_\(smu).bin") {
-            testInitDeviceUpTo(6)
+            testInitDeviceUpTo(8)
         }
 
-        // Stages 7/12/9: GMCInit, IHInit, RLCInit — no firmware.
-        for s: UInt64 in [7, 12, 9] { testInitDeviceUpTo(s) }
-
-        // SDMA microcode — RDNA4 sdma_v7_1 is sdma_firmware_header_v3_0;
-        // dext extractor emits a single SDMA_UCODE_TH0 (=71) frame.
-        if loadFirmware(kFwFile_SDMA, "sdma_\(sdma).bin") {
-            testInitDeviceUpTo(14)  // SDMAInit
-        }
-
-        // GFX microcode: IMU (2 frames) → RLC (1..5+) → CP PFP/ME/MEC
-        // RS64 (3-5 each) → uni-MES (2). Each call expands per-file via
-        // amdgpu_ucode_extract. Mirrors psp_load_non_psp_fw order on
-        // 14_0_3 + gfx12.
+        // Per-IP firmware loads (extractor expands per-file into N frames).
         _ = loadFirmware(kFwFile_IMU,     "gc_\(gfx)_imu.bin")
         _ = loadFirmware(kFwFile_RLC,     "gc_\(gfx)_rlc.bin")
         _ = loadFirmware(kFwFile_CP_PFP,  "gc_\(gfx)_pfp.bin")
         _ = loadFirmware(kFwFile_CP_ME,   "gc_\(gfx)_me.bin")
         _ = loadFirmware(kFwFile_CP_MEC,  "gc_\(gfx)_mec.bin")
         _ = loadFirmware(kFwFile_MES_UNI, "gc_\(gfx)_uni_mes.bin")
-        testInitDeviceUpTo(11)  // MESInit
-        testInitDeviceUpTo(10)  // CPInit
+        _ = loadFirmware(kFwFile_SDMA,    "sdma_\(sdma).bin")
+
+        // Stages 9–14: IMU → RLC → CP → MES → GFX → SDMA bringup.
+        for s: UInt64 in [9, 10, 11, 12, 13, 14] { testInitDeviceUpTo(s) }
 
         append("runFullBringup: done — see log for stage outcomes")
     }

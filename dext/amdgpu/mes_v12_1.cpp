@@ -301,19 +301,27 @@ mes_set_hw_resources_1(DeviceContext &dev, MESContext &mes)
     //   coop_sch_shared_mc_addr      u64  @ 14 dw
     //   cleaner_shader_fence_mc_addr u64  @ 16 dw
     //   ... padding to 64 dw total.
+    // Natural alignment matches upstream union layout: compiler
+    // inserts 4-byte pads after `header` (to align api_status's u64
+    // fence_addr) and after `flags` (to align mes_debug_ctx_mc_addr).
+    // We sum: header 4 + auto-pad 4 + api_status 16 + _pad_after_status 4
+    // + auto-pad 4 (timestamp align) + timestamp 8 + flags 4
+    // + _pad_after_flags 4 + mes_debug_ctx_mc_addr 8 + size 4 + timeout 4
+    // + coop 8 + cleaner 8 = 80 bytes (= 20 dwords). Round to 64 dw:
+    // pad[44] adds 176 bytes → 256 total.
     struct MES_SetHwResources1 {
         MES_Header_Wire header;                       // dw  0
-        MES_API_Status  api_status;                   // dw  1..4 (16 B)
-        uint32_t        _pad_after_status;            // dw  5  (alignment for u64)
-        uint64_t        timestamp;                    // dw  6..7
-        uint32_t        flags;                        // dw  8
-        uint32_t        _pad_after_flags;             // dw  9  (alignment for u64)
-        uint64_t        mes_debug_ctx_mc_addr;        // dw 10..11
-        uint32_t        mes_debug_ctx_size;           // dw 12
-        uint32_t        mes_kiq_unmap_timeout;        // dw 13
-        uint64_t        coop_sch_shared_mc_addr;      // dw 14..15
-        uint64_t        cleaner_shader_fence_mc_addr; // dw 16..17
-        uint32_t        pad[64 - 18];
+        MES_API_Status  api_status;                   // dw  2..5 (auto-pad at dw 1)
+        uint32_t        _pad_after_status;            // dw  6
+        uint64_t        timestamp;                    // dw  8..9 (auto-pad at dw 7)
+        uint32_t        flags;                        // dw 10
+        uint32_t        _pad_after_flags;             // dw 11
+        uint64_t        mes_debug_ctx_mc_addr;        // dw 12..13
+        uint32_t        mes_debug_ctx_size;           // dw 14
+        uint32_t        mes_kiq_unmap_timeout;        // dw 15
+        uint64_t        coop_sch_shared_mc_addr;      // dw 16..17
+        uint64_t        cleaner_shader_fence_mc_addr; // dw 18..19
+        uint32_t        pad[44];                      // round to 64 dw
     };
     static_assert(sizeof(MES_SetHwResources1) == 64 * 4,
                   "SetHwResources1 must be 64 dw");

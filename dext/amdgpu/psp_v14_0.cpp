@@ -299,28 +299,11 @@ psp_load_sos(DeviceContext &dev, PSPContext &psp)
         return kIOReturnSuccess;
     }
 
-    // Bootstrap GART BEFORE SOS comes up — upstream order is
-    // GMC.hw_init (which calls gart_enable) BEFORE PSP.hw_init. If we
-    // enable GART after SOS is running, our TLB/L2 writes stomp on
-    // state SOS set up for itself and PSP drops subsequent requests.
-    //
-    // (v0.0.55 isolation test confirmed GART is NOT the silent-drop
-    //  cause — PSP dropped frames just as badly with GART disabled.
-    //  Re-enabled because LOAD_IP_FW needs GART for sysmem fw buffers.)
-    if (psp.gart != nullptr && !psp.gart->enabled) {
-        kern_return_t gi = gart_init(dev, *psp.gart);
-        if (gi != kIOReturnSuccess) {
-            PSP_LOG("load_sos: gart_init failed: %#x", gi);
-            return gi;
-        }
-        kern_return_t ge = gart_enable(dev, *psp.gart);
-        if (ge != kIOReturnSuccess) {
-            PSP_LOG("load_sos: gart_enable failed: %#x", ge);
-            return ge;
-        }
-        PSP_LOG("load_sos: GART up — gart_start=%#llx size=%llu KB",
-                psp.gart->gartStart, psp.gart->gartSize >> 10);
-    }
+    // GART is now brought up by `BringupStage::GMCInit` which runs
+    // BEFORE `PSPLoadSOS` per Agent D's reorder (audit #9 #1). The
+    // legacy inline `if (psp.gart && !psp.gart->enabled)` shortcut
+    // here is dead code on the new flow; the bringup orchestrator
+    // guarantees GMC ran first.
 
     if (!psp_wait_for_bootloader(dev)) {
         return kIOReturnTimeout;
