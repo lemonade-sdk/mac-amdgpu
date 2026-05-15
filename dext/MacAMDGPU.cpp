@@ -314,30 +314,61 @@ mac_amdgpu_ensure_open(IOService *opener, MacAMDGPU *driver,
                   "BAR2(visible VRAM)=%llu B",
                   (unsigned)cmd, bdev.bar0Size, bdev.bar2VisibleVRAMSize);
 
-    // MMIO sanity probe — read a few BAR0 dwords we know upstream
-    // amdgpu reads pre-discovery. If they ALL come back 0, the device
-    // isn't actually mapped through DART (despite Memory Space being
-    // on in PCI Command). On a healthy R9700, RCC_CONFIG_MEMSIZE
-    // (mmio dword 0xDE3) returns vram_size_mb (~32768 on the 32 GB
-    // R9700), and PCI vendor/device mirror at the SMN offset 0x0 is
-    // non-zero too.
+    // Read PCI config space + try to wake device to D0.
+    uint32_t bar0_cfg = 0, bar2_cfg = 0, bar5_cfg = 0;
+    uint16_t status = 0;
+    pci->ConfigurationRead32(0x10, &bar0_cfg);
+    pci->ConfigurationRead32(0x18, &bar2_cfg);
+    pci->ConfigurationRead32(0x24, &bar5_cfg);
+    pci->ConfigurationRead16(0x06, &status);
+    MACAMDGPU_LOG("ensure_open: config — BAR0=%#010x BAR2=%#010x "
+                  "BAR5=%#010x status=%#06x cmd=%#06x",
+                  bar0_cfg, bar2_cfg, bar5_cfg, (unsigned)status,
+                  (unsigned)cmd);
+
+    // Look for the PM capability and force D0. The capability list
+    // pointer is at config offset 0x34.
+    uint8_t cap_ptr = 0;
+    pci->ConfigurationRead8(0x34, &cap_ptr);
+    while (cap_ptr != 0 && cap_ptr != 0xFF) {
+        uint16_t cap_hdr = 0;
+        pci->ConfigurationRead16(cap_ptr, &cap_hdr);
+        uint8_t cap_id = cap_hdr & 0xFF;
+        if (cap_id == 0x01) {  // PCI Power Management Capability
+            uint16_t pmcsr = 0;
+            pci->ConfigurationRead16(cap_ptr + 4, &pmcsr);
+            uint8_t state = pmcsr & 0x3;
+            MACAMDGPU_LOG("ensure_open: PM cap at %#x, PMCSR=%#x "
+                          "(power state D%u)", cap_ptr, (unsigned)pmcsr,
+                          (unsigned)state);
+            if (state != 0) {
+                pmcsr = (pmcsr & ~0x3u);  // state bits → 0 (D0)
+                pci->ConfigurationWrite16(cap_ptr + 4, pmcsr);
+                IOSleep(10);
+                pci->ConfigurationRead16(cap_ptr + 4, &pmcsr);
+                MACAMDGPU_LOG("ensure_open: forced D0, PMCSR now %#x",
+                              (unsigned)pmcsr);
+            }
+            break;
+        }
+        cap_ptr = (cap_hdr >> 8) & 0xFF;
+    }
+
+    // MMIO sanity probe — read several BAR0 dwords. On a healthy
+    // R9700 in D0, RCC_CONFIG_MEMSIZE (dword 0xDE3) returns
+    // vram_size_mb (~32768). All-zero reads = device isn't decoding
+    // MMIO yet (D-state, BAR not programmed, or PCIe link issue).
     auto rd = [&](uint32_t dw) -> uint32_t {
         uint32_t v = 0xFFFFFFFFu;
         pci->MemoryRead32(bdev.bar0MemIndex,
                           static_cast<uint64_t>(dw) * 4ULL, &v);
         return v;
     };
-    uint32_t probe[5] = {
-        rd(0x0000),     // MM_INDEX (NBIO indirect access reg)
-        rd(0x0001),     // MM_DATA
-        rd(0x0DE3),     // mmRCC_CONFIG_MEMSIZE (upstream "consistent across SOCs")
-        rd(0x16A00),    // mmIP_DISCOVERY_VERSION
-        rd(0x16061),    // mmMP0_SMN_C2PMSG_33
-    };
     MACAMDGPU_LOG("ensure_open: mmio probe — "
                   "BAR0[0x0000]=%#x BAR0[0x0001]=%#x BAR0[0xDE3]=%#x "
                   "BAR0[0x16A00]=%#x BAR0[0x16061]=%#x",
-                  probe[0], probe[1], probe[2], probe[3], probe[4]);
+                  rd(0x0000), rd(0x0001), rd(0x0DE3), rd(0x16A00),
+                  rd(0x16061));
     return kIOReturnSuccess;
 }
 
