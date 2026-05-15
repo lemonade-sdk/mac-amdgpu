@@ -44,6 +44,10 @@ struct HubContext {
     uint32_t  ctx0_pt_start_hi;
     uint32_t  ctx0_pt_end_lo;
     uint32_t  ctx0_pt_end_hi;
+    uint32_t  ctx1_pt_start_lo;  // CONTEXT1 PT start/end — programmed
+    uint32_t  ctx1_pt_start_hi;  // per-VMID in setup_vmid_config.
+    uint32_t  ctx1_pt_end_lo;
+    uint32_t  ctx1_pt_end_hi;
     uint32_t  ctx0_cntl;
     uint32_t  ctx1_cntl;
     uint32_t  vm_l2_cntl;
@@ -52,6 +56,16 @@ struct HubContext {
     uint32_t  vm_l2_cntl4;
     uint32_t  vm_l2_cntl5;
     uint32_t  vm_l2_protection_fault_cntl;
+    uint32_t  vm_l2_protection_fault_cntl2;
+    uint32_t  vm_l2_protection_fault_default_addr_lo32;
+    uint32_t  vm_l2_protection_fault_default_addr_hi32;
+    // Identity aperture — closed during gart_enable
+    uint32_t  vm_l2_ctx1_identity_aperture_low_lo32;
+    uint32_t  vm_l2_ctx1_identity_aperture_low_hi32;
+    uint32_t  vm_l2_ctx1_identity_aperture_high_lo32;
+    uint32_t  vm_l2_ctx1_identity_aperture_high_hi32;
+    uint32_t  vm_l2_ctx_identity_physical_offset_lo32;
+    uint32_t  vm_l2_ctx_identity_physical_offset_hi32;
     uint32_t  vm_l1_tlb_cntl;
     uint32_t  vm_invalidate_eng0_req;
     uint32_t  vm_invalidate_eng0_ack;
@@ -62,13 +76,27 @@ struct HubContext {
     uint32_t  vm_system_aperture_high_addr;
     uint32_t  vm_system_aperture_default_addr_lo;
     uint32_t  vm_system_aperture_default_addr_hi;
-    uint32_t  vm_context0_default_addr_lo;
-    uint32_t  vm_context0_default_addr_hi;
+    // AGP / FB location regs (MMHUB only really; GFXHUB shadows them).
+    uint32_t  vm_agp_base;
+    uint32_t  vm_agp_top;
+    uint32_t  vm_agp_bot;
+    uint32_t  vm_fb_location_base;
+    uint32_t  vm_fb_location_top;
+    uint32_t  vm_fb_offset;
 
-    // Stride between per-VMID context registers (e.g. CONTEXT0_CNTL
-    // vs CONTEXT1_CNTL). Used to walk all 14 user VMIDs.
+    // Strides between per-VMID/per-engine register blocks. Upstream
+    // computes these as `regCONTEXT1_X - regCONTEXT0_X` in the hub
+    // init function. On RDNA4 these are:
+    //   ctx_distance       = 1   (CONTEXT1_CNTL - CONTEXT0_CNTL)
+    //   ctx_addr_distance  = 2   (CONTEXT1_PT_BASE_ADDR_LO32 - CONTEXT0_PT_BASE_ADDR_LO32)
+    //   eng_distance       = 1   (INVALIDATE_ENG1_REQ - INVALIDATE_ENG0_REQ)
+    //   eng_addr_distance  = 2   (INVALIDATE_ENG1_ADDR_RANGE_LO32 - INVALIDATE_ENG0_ADDR_RANGE_LO32)
+    // Audit #4 F6: previously eng_distance was hard-coded to 4 — that's
+    // wrong. The REQ/ACK/SEM stride is 1; only the ADDR_RANGE stride is 2.
     uint32_t  ctx_distance;
+    uint32_t  ctx_addr_distance;
     uint32_t  eng_distance;
+    uint32_t  eng_addr_distance;
 
     IPBlock   ip;        // which IP this hub lives in (GC for GFXHUB, GMC/MMHUB for MMHUB)
 };
@@ -180,6 +208,13 @@ kern_return_t gmc_hdp_flush(DeviceContext &dev);
 kern_return_t gmc_flush_gpu_tlb(DeviceContext &dev, const GMCContext &gmc,
                                 const HubContext &hub,
                                 uint32_t vmid, uint32_t flush_type);
+
+// set_fault_enable_default — port of mmhub_v4_1_0_set_fault_enable_default
+// + gfxhub_v12_0_set_fault_enable_default. Programs
+// MMVM_L2_PROTECTION_FAULT_CNTL / GCVM_L2_PROTECTION_FAULT_CNTL. Called
+// after gart_enable with value=true.
+kern_return_t gmc_set_fault_enable_default(DeviceContext &dev,
+                                           const HubContext &hub, bool value);
 
 // Top-level GMCInit stage entry — runs the chain.
 kern_return_t gmc_init(DeviceContext &dev, GMCContext &gmc);

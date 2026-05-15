@@ -90,6 +90,14 @@ bringup_ip_discovery(BringupContext &ctx)
 
 //============================================================
 // Stage dispatch.
+//
+// Stage order (audit #9 #1):
+//   IPDiscovery → IHInit → GMCInit → PSPInit → PSPLoadSOS →
+//   PSPRingCreate → TMRSetup → SMUInit → IMUInit → RLCInit →
+//   CPInit → MESInit → GFXInit → SDMAInit
+//
+// Mirrors amdgpu_device_ip_init's phase1 (COMMON + IH + inline GMC)
+// → fw_loading (PSP) → phase2 (everything else).
 //============================================================
 static const char *
 stage_name(BringupStage s)
@@ -97,17 +105,17 @@ stage_name(BringupStage s)
     switch (s) {
     case BringupStage::None:          return "None";
     case BringupStage::IPDiscovery:   return "IPDiscovery";
+    case BringupStage::IHInit:        return "IHInit";
+    case BringupStage::GMCInit:       return "GMCInit";
     case BringupStage::PSPInit:       return "PSPInit";
     case BringupStage::PSPLoadSOS:    return "PSPLoadSOS";
     case BringupStage::PSPRingCreate: return "PSPRingCreate";
     case BringupStage::TMRSetup:      return "TMRSetup";
     case BringupStage::SMUInit:       return "SMUInit";
-    case BringupStage::GMCInit:       return "GMCInit";
     case BringupStage::IMUInit:       return "IMUInit";
     case BringupStage::RLCInit:       return "RLCInit";
     case BringupStage::CPInit:        return "CPInit";
     case BringupStage::MESInit:       return "MESInit";
-    case BringupStage::IHInit:        return "IHInit";
     case BringupStage::GFXInit:       return "GFXInit";
     case BringupStage::SDMAInit:      return "SDMAInit";
     }

@@ -1,21 +1,36 @@
 //
 //  amdgpu_init.h — Phase 1B bringup orchestrator.
 //
-//  Drives the firmware-load + IP-init sequence in dependency order:
+//  Drives the firmware-load + IP-init sequence in upstream-faithful order.
+//  Reference: drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+//             amdgpu_device_ip_init  (line 2299)
 //
-//      0 IPDiscovery   — resolve IP base addresses (hardcoded for R9700
-//                        until we read the on-die discovery table)
-//      1 PSPInit       — allocate PSP fw_pri DMA buffer
-//      2 PSPLoadSOS    — bootloader → SOS firmware load
-//      3 SMUInit       — (stub) SMU v14_0_3 mailbox handshake
-//      4 GMCInit       — (stub) VRAM detect, GART aperture setup
-//      5 IMUInit       — (stub) image management unit
-//      6 RLCInit       — (stub) RLC bringup
-//      7 CPInit        — (stub) command processor firmware
-//      8 MESInit       — (stub) MES v12_1 queue manager
-//      9 IHInit        — (stub) interrupt handler ring
-//     10 GFXInit       — (stub) GFX queue create via MES
-//     11 SDMAInit      — (stub) SDMA v7_1 ring
+//  Upstream sequence:
+//    - COMMON.hw_init                       (we fold into IPDiscovery)
+//    - GMC.hw_init                          (inline before phase1)
+//    - phase1: COMMON + IH hw_init          (we explicitly do IH here)
+//    - amdgpu_device_fw_loading             (PSP.hw_init + SMU fw load)
+//    - phase2: SMU/GFX/MES/SDMA/... hw_init
+//
+//  Stage numbering (audit #9 #1, #4, #7):
+//      0 None
+//      1 IPDiscovery   — on-die discovery + IP base table + NBIO HDP remap
+//      2 IHInit        — interrupt handler ring (phase1, before PSP)
+//      3 GMCInit       — MC init, GART page tables, MMHUB+GFXHUB enable,
+//                        HDP+TLB flush, fault-redirect to dummy_page.
+//                        Must complete BEFORE PSP so the SOS doesn't
+//                        stomp on our L2/TLB state.
+//      4 PSPInit       — allocate PSP fw_pri DMA buffer in VRAM
+//      5 PSPLoadSOS    — bootloader handshake → SOS firmware load
+//      6 PSPRingCreate — KM ring + FB_FW_RESERV query
+//      7 TMRSetup      — psp_setup_tmr (skip path for 14_0_3)
+//      8 SMUInit       — after PSP has LoadFirmware(SMU); mailbox handshake
+//      9 IMUInit       — after PSP has LoadFirmware(IMU_I/D)
+//     10 RLCInit       — after PSP has loaded the RLC sub-bins
+//     11 CPInit        — after RS64 firmwares loaded
+//     12 MESInit       — after CP_MES + CP_MES_DATA loaded
+//     13 GFXInit       — first PM4 submit
+//     14 SDMAInit      — after SDMA TH0
 //
 //  Each stage either runs to completion or returns an error. The
 //  orchestrator is idempotent — repeating a stage that's already
@@ -37,20 +52,23 @@
 
 namespace amdgpu {
 
+// Numbering follows the upstream amdgpu_device_ip_init order.
+// Audit #9: GMCInit MUST run before PSPInit (phase2 sees GART up).
+//           IHInit MUST run before PSPInit (phase1 in upstream).
 enum class BringupStage : uint32_t {
     None          = 0,
     IPDiscovery   = 1,
-    PSPInit       = 2,
-    PSPLoadSOS    = 3,
-    PSPRingCreate = 4,
-    TMRSetup      = 5,
-    SMUInit       = 6,
-    GMCInit       = 7,
-    IMUInit       = 8,
-    RLCInit       = 9,
-    CPInit        = 10,
-    MESInit       = 11,
-    IHInit        = 12,
+    IHInit        = 2,   // upstream phase1: IH.hw_init
+    GMCInit       = 3,   // upstream pre-phase1: GMC.hw_init inline
+    PSPInit       = 4,   // upstream fw_loading: PSP.hw_init
+    PSPLoadSOS    = 5,
+    PSPRingCreate = 6,
+    TMRSetup      = 7,
+    SMUInit       = 8,   // upstream phase2: SMU.hw_init
+    IMUInit       = 9,
+    RLCInit       = 10,
+    CPInit        = 11,
+    MESInit       = 12,
     GFXInit       = 13,
     SDMAInit      = 14,
 };

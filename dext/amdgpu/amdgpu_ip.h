@@ -354,16 +354,32 @@ namespace BootstrapRegs {
     constexpr uint32_t DRIVER_SCRATCH_1   = 0x0095;
     constexpr uint32_t DRIVER_SCRATCH_2   = 0x0096;
 
-    // MP0 IFWI handshake register. Upstream amdgpu_discovery.c
-    // amdgpu_discovery_get_tmr_info() polls this for bit 31 set for
-    // up to 2 seconds before reading MEMSIZE — required on USB4/TB
-    // hotplug because IFWI init isn't complete when the OS sees the
-    // device. Offset matches mp_11_5_0 / mp_12_0_0 / mp_14_0_2
-    // ASIC headers: dword 0x0061 (byte 0x184).
-    constexpr uint32_t MP0_C2PMSG_33      = 0x0061;
+    // MP0 PSP bootloader-ready handshake register. Upstream amdgpu uses
+    // mmMP0_SMN_C2PMSG_35 bit 31 as the authoritative "PSP bootloader
+    // is alive" signal; psp_v14_0_wait_for_bootloader / psp_v*_wait_for_*
+    // all poll C2PMSG_35 specifically. C2PMSG_33 is not used by upstream
+    // as a ready gate on RDNA4 (mp_14_0 has dropped its use).
+    //
+    // Both are pre-IP-base "legacy alias" dword offsets and read identically
+    // regardless of IP base resolution. We use C2PMSG_35 here so the
+    // IFWI poll matches the gate PSP itself drives.
+    // Offset matches mp_11_5_0 / mp_13_0_* / mp_14_0_* ASIC headers
+    // (regMPASP_SMN_C2PMSG_35 = 0x0063).
+    //
+    // Audit #9 #2: was previously C2PMSG_33 (0x0061) — wrong register.
+    constexpr uint32_t MP0_C2PMSG_35      = 0x0063;
     constexpr uint32_t kIFWIReadyMask     = 0x80000000u;
     constexpr uint32_t kIFWIReadyValue    = 0x80000000u;
     constexpr uint64_t kIFWITimeoutMs     = 2000;
+
+    // MP0 SOS sign-of-life. Upstream soc24_need_reset_on_init checks
+    // this register: if non-zero, sOS / driver were already loaded
+    // (warm reboot / kernel re-load) and we need to FLR; if zero,
+    // the card is cold-booted and FLR is unnecessary.
+    // Same dword offset across mp_11_5_0 / mp_13_0_* / mp_14_0_*
+    // (regMPASP_SMN_C2PMSG_81 = 0x0091).
+    // Audit #9 #3.
+    constexpr uint32_t MP0_C2PMSG_81      = 0x0091;
 }
 
 // Upstream constants from amdgpu_discovery.h:

@@ -253,40 +253,38 @@ discover_ips_on_die(DeviceContext &dev, DiscoveryParseResult *outResult)
 {
     if (outResult) memset(outResult, 0, sizeof(*outResult));
 
-    // Step 0: wait for IFWI (Integrated Firmware) init to complete.
-    // Upstream `amdgpu_discovery_get_tmr_info` polls
-    // mmMP0_SMN_C2PMSG_33 bit 31 for up to 2 seconds. On bare-metal
-    // Linux the GPU has long completed IFWI by the time amdgpu loads,
-    // but on USB4/TB hotplug (our case on AS) we genuinely have to
-    // wait. Until IFWI completes, BAR0 register aliases like
-    // mmRCC_CONFIG_MEMSIZE read back as 0.
+    // Step 0: wait for the PSP bootloader to come up. The authoritative
+    // gate in upstream amdgpu is MP0_SMN_C2PMSG_35 bit 31 — that's the
+    // bit psp_v*_wait_for_bootloader (and the discovery path) polls.
+    // Until the bootloader has signalled, BAR5 register aliases like
+    // mmRCC_CONFIG_MEMSIZE read back as 0/garbage.
+    //
+    // Audit #9 #2: previously polled C2PMSG_33 which is *not* the PSP
+    // readiness gate upstream uses. C2PMSG_35 matches both the discovery
+    // path and the psp_load_sos wait_for_bootloader handshake — so by
+    // the time we leave this loop we have the same "PSP alive" signal
+    // PSP itself drives.
     {
         uint64_t waited_ms = 0;
         uint32_t msg = 0;
-        bool ifwi_ready = false;
+        bool psp_ready = false;
         while (waited_ms < BootstrapRegs::kIFWITimeoutMs) {
-            msg = RREG32_abs(dev, BootstrapRegs::MP0_C2PMSG_33);
+            msg = RREG32_abs(dev, BootstrapRegs::MP0_C2PMSG_35);
             if ((msg & BootstrapRegs::kIFWIReadyMask) ==
                 BootstrapRegs::kIFWIReadyValue) {
-                ifwi_ready = true;
+                psp_ready = true;
                 break;
             }
             IOSleep(1);
             waited_ms += 1;
         }
-        // On RDNA4 / NBIO 7_11 the legacy mmMP0_SMN_C2PMSG_33 alias
-        // at dword 0x0061 may not exist — that register moved to MP1
-        // in mp_14_0_2 (regMP1_SMN_C2PMSG_33). We poll the legacy
-        // alias as a best-effort signal, but the authoritative readiness
-        // check is whether mmRCC_CONFIG_MEMSIZE returns a non-zero,
-        // non-FFFFFFFF value below. So warn on timeout, don't bail.
-        if (!ifwi_ready) {
-            DISC_LOG("on-die: IFWI poll inconclusive after %llu ms "
-                     "(MP0_C2PMSG_33=%#x); proceeding — MEMSIZE will "
-                     "be the authoritative ready check", waited_ms, msg);
+        if (!psp_ready) {
+            DISC_LOG("on-die: PSP bootloader poll inconclusive after %llu ms "
+                     "(MP0_C2PMSG_35=%#x); proceeding — MEMSIZE will be the "
+                     "authoritative ready check", waited_ms, msg);
         } else {
-            DISC_LOG("on-die: IFWI ready after %llu ms "
-                     "(MP0_C2PMSG_33=%#x)", waited_ms, msg);
+            DISC_LOG("on-die: PSP bootloader ready after %llu ms "
+                     "(MP0_C2PMSG_35=%#x)", waited_ms, msg);
         }
     }
 
