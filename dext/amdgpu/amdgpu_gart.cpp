@@ -38,15 +38,15 @@ namespace amdgpu {
 constexpr uint64_t kGARTPageTableVRAMOffset = 0x700000;   // 7 MB
 constexpr uint32_t kGARTPageTableBytes      = 4096;       // one 4 KB page
 
-// GART aperture in MC space. We pick a fixed start address well above
-// the VRAM range (vram_end is at 0x80_77700000 for our 30 GB R9700).
-// Upstream's amdgpu_gmc_gart_location picks dynamically; we hard-code
-// to keep things simple for early bringup.
+// GART aperture in MC space. Picked LOW (4 GB MC offset) — safely
+// below vram_start (= 512 GB for our R9700) and well within the
+// 48-bit MC bus on RDNA4. Upstream's amdgpu_gmc_gart_location LOW
+// placement puts GART just below vram_start; the 4 GB origin keeps
+// the math simple and leaves room above for other future apertures.
 //
-//     gart_start = 0x0001_0000_0000_0000  (= 1<<48)
-//
-// Picked far above vram_start (0x80_00000000) so they never overlap.
-constexpr uint64_t kGARTStart = 0x0001000000000000ULL;
+//     gart_start = 0x0000_0001_0000_0000  (= 4 GB)
+//     gart_end   = gart_start + numPTEs * 4 KB - 1
+constexpr uint64_t kGARTStart = 0x0000000100000000ULL;
 
 //============================================================
 // gart_init
@@ -339,6 +339,11 @@ gart_enable(DeviceContext &dev, GARTContext &gart)
     GART_LOG("enable: pt_mc=%#llx aperture=[%#llx, %#llx]",
              ptBaseMC, gart.gartStart, gart.gartEnd);
 
+    // Full mmhub_v4_1_0_gart_enable register sequence — matches
+    // upstream exactly. ORDER MATTERS: gart_enable must run BEFORE
+    // psp_load_sos so SOS comes up with GART already configured.
+    // Running it after SOS is loaded stomps on TLB/L2 state SOS set
+    // up for its own bootstrap and causes PSP to drop ring_create.
     gart_init_aperture_regs(dev, gart, ptBaseMC);
     gart_init_tlb_regs(dev);
     gart_init_cache_regs(dev);

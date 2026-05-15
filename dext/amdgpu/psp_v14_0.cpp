@@ -303,6 +303,25 @@ psp_load_sos(DeviceContext &dev, PSPContext &psp)
         return kIOReturnSuccess;
     }
 
+    // Bootstrap GART BEFORE SOS comes up — upstream order is
+    // GMC.hw_init (which calls gart_enable) BEFORE PSP.hw_init. If we
+    // enable GART after SOS is running, our TLB/L2 writes stomp on
+    // state SOS set up for itself and PSP drops subsequent requests.
+    if (psp.gart != nullptr && !psp.gart->enabled) {
+        kern_return_t gi = gart_init(dev, *psp.gart);
+        if (gi != kIOReturnSuccess) {
+            PSP_LOG("load_sos: gart_init failed: %#x", gi);
+            return gi;
+        }
+        kern_return_t ge = gart_enable(dev, *psp.gart);
+        if (ge != kIOReturnSuccess) {
+            PSP_LOG("load_sos: gart_enable failed: %#x", ge);
+            return ge;
+        }
+        PSP_LOG("load_sos: GART up — gart_start=%#llx size=%llu KB",
+                psp.gart->gartStart, psp.gart->gartSize >> 10);
+    }
+
     if (!psp_wait_for_bootloader(dev)) {
         return kIOReturnTimeout;
     }
@@ -418,29 +437,11 @@ psp_ring_create(DeviceContext &dev, PSPContext &psp)
         return kIOReturnNotReady;
     }
 
-    // Bootstrap GART now if it isn't up. PSP's ring/cmd/fence buffers
-    // need to be reachable via the GPU's GMC — which means GART-mapped
-    // sysmem, not raw VRAM (matches Linux's bare-metal config). Once
-    // GART is enabled, gart_bind_sysmem allocates a sysmem buffer +
-    // DART-maps it + writes PTEs + returns the GART MC address to pass
-    // to PSP.
-    if (psp.gart == nullptr) {
-        PSP_LOG("ring_create: psp.gart == nullptr — wiring missing");
+    // GART must already be up — psp_load_sos bootstraps it before
+    // loading SOS so SOS comes up with the right TLB/L2 state.
+    if (psp.gart == nullptr || !psp.gart->enabled) {
+        PSP_LOG("ring_create: GART not enabled (load SOS first)");
         return kIOReturnNotReady;
-    }
-    if (!psp.gart->enabled) {
-        kern_return_t gi = gart_init(dev, *psp.gart);
-        if (gi != kIOReturnSuccess) {
-            PSP_LOG("ring_create: gart_init failed: %#x", gi);
-            return gi;
-        }
-        kern_return_t ge = gart_enable(dev, *psp.gart);
-        if (ge != kIOReturnSuccess) {
-            PSP_LOG("ring_create: gart_enable failed: %#x", ge);
-            return ge;
-        }
-        PSP_LOG("ring_create: GART up — gart_start=%#llx size=%llu KB",
-                psp.gart->gartStart, psp.gart->gartSize >> 10);
     }
 
     // Allocate ring as a GART-bound sysmem buffer. 16 KB sized to AS
