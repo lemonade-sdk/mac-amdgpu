@@ -302,6 +302,9 @@ mac_amdgpu_ensure_open(IOService *opener, MacAMDGPU *driver,
     bdev.psoCAlive = false;
     bdev.smuOnline = false;
     bdev.gmcReady  = false;
+    // Wire the GART pointer so PSP code can allocate GART-bound buffers
+    // without taking gart& as a parameter through every call.
+    driver->ivars->bringup.psp.gart = &driver->ivars->bringup.gart;
     for (uint8_t bar = 0; bar < 6; bar++) {
         uint8_t  mi = 0;
         uint64_t sz = 0;

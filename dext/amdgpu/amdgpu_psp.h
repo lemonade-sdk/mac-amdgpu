@@ -26,6 +26,7 @@
 #endif
 
 #include "amdgpu_regs.h"
+#include "amdgpu_gart.h"
 
 namespace amdgpu {
 
@@ -80,33 +81,43 @@ struct PSPContext {
 
     bool sosAlive;
 
-    // PSP command ring (km_ring). Allocated via psp_ring_create.
-    // The ring lives in system memory mapped through DART (we don't
-    // yet have a VRAM allocator). 4 KB matches Linux's default.
+    // PSP command ring (km_ring). After the GART port, allocated as
+    // sysmem via gart_bind_sysmem so PSP can route it through the GPU's
+    // GMC. The GARTBinding owns the IOBufferMemoryDescriptor +
+    // IODMACommand lifetime.
+    // Pointer to the GART context owned by BringupContext. Set in
+    // psp_init so PSP code can allocate GART-bound buffers without
+    // taking a GART& parameter everywhere.
+    GARTContext *gart;
+
+    struct GARTBinding ringBinding;
+    uint64_t  ringBusAddr;       // == ringBinding.gartMCAddr
+    void     *ringCPUAddr;       // == ringBinding.cpuAddr
+    uint64_t  ringSize;
+    bool      ringCreated;
+    // Legacy slots — no longer populated, kept for ABI compat with old
+    // code that hasn't been refactored yet.
 #ifdef __APPLE__
     IOBufferMemoryDescriptor *ringBuffer;
     IODMACommand             *ringDMACommand;
 #endif
-    uint64_t  ringBusAddr;
-    void     *ringCPUAddr;
-    uint64_t  ringSize;
-    bool      ringCreated;
 
     // PSP command buffer + fence buffer for ring-submitted commands.
-    // The command buffer holds a single psp_gfx_cmd_resp struct (1 KB);
-    // the fence buffer is a small 64 B word that PSP writes after the
-    // command completes. Both DART-mapped.
+    // Same GART-backed allocation pattern as ringBinding above.
+    struct GARTBinding cmdBinding;
+    struct GARTBinding fenceBinding;
+    uint64_t  cmdBusAddr;
+    void     *cmdCPUAddr;
+    uint64_t  fenceBusAddr;
+    void     *fenceCPUAddr;
+    uint32_t  fenceCounter;
+    // Legacy slots — no longer populated.
 #ifdef __APPLE__
     IOBufferMemoryDescriptor *cmdBuffer;
     IODMACommand             *cmdDMACommand;
     IOBufferMemoryDescriptor *fenceBuffer;
     IODMACommand             *fenceDMACommand;
 #endif
-    uint64_t  cmdBusAddr;
-    void     *cmdCPUAddr;
-    uint64_t  fenceBusAddr;
-    void     *fenceCPUAddr;
-    uint32_t  fenceCounter;
 
     // TMR (Trusted Memory Region) — PSP-owned region used as the
     // staging area for IP firmware loads. Linux puts this in VRAM,

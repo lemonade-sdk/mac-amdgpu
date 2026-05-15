@@ -32,6 +32,7 @@
 #include "amdgpu_cp.h"
 #include "amdgpu_sdma.h"
 #include "amdgpu_mes.h"
+#include "amdgpu_gart.h"
 #include "amdgpu_discovery.h"
 
 namespace amdgpu {
@@ -67,6 +68,7 @@ struct BringupContext {
     CPContext     cp;
     SDMAContext   sdma;
     MESContext    mes;
+    GARTContext   gart;        // GART page-table state + bindings (DMA fix)
 
     BringupStage  reached;   // highest stage that completed
 };

@@ -200,18 +200,19 @@ psp_release(PSPContext &psp)
     psp.cmdCPUAddr = nullptr;
     psp.cmdBusAddr = 0;
 
-    if (psp.ringDMACommand != nullptr) {
-        psp.ringDMACommand->CompleteDMA(kIODMACommandCompleteDMANoOptions);
-        psp.ringDMACommand->release();
-        psp.ringDMACommand = nullptr;
-    }
-    if (psp.ringBuffer != nullptr) {
-        psp.ringBuffer->release();
-        psp.ringBuffer = nullptr;
+    // GART-bound ring/cmd/fence — release via gart_unbind.
+    if (psp.gart != nullptr) {
+        gart_unbind(*psp.gart, &psp.ringBinding);
+        gart_unbind(*psp.gart, &psp.cmdBinding);
+        gart_unbind(*psp.gart, &psp.fenceBinding);
     }
     psp.ringCPUAddr = nullptr;
     psp.ringBusAddr = 0;
     psp.ringSize    = 0;
+    psp.cmdCPUAddr = nullptr;
+    psp.cmdBusAddr = 0;
+    psp.fenceCPUAddr = nullptr;
+    psp.fenceBusAddr = 0;
     psp.ringCreated = false;
 
     if (psp.fwPriDMACommand != nullptr) {
@@ -417,23 +418,45 @@ psp_ring_create(DeviceContext &dev, PSPContext &psp)
         return kIOReturnNotReady;
     }
 
-    // VRAM-backed ring (same reason as fw_pri — PSP reads via GMC,
-    // needs an MC address, not a DART bus address). 16 KB allocation
-    // sized to AS page granularity; PSP uses only the first 4 KB.
-    uint64_t vram_start = psp_read_vram_start(dev);
-    if (vram_start == 0) {
-        PSP_LOG("ring_create: vram_start = 0; MMHUB not ready");
+    // Bootstrap GART now if it isn't up. PSP's ring/cmd/fence buffers
+    // need to be reachable via the GPU's GMC — which means GART-mapped
+    // sysmem, not raw VRAM (matches Linux's bare-metal config). Once
+    // GART is enabled, gart_bind_sysmem allocates a sysmem buffer +
+    // DART-maps it + writes PTEs + returns the GART MC address to pass
+    // to PSP.
+    if (psp.gart == nullptr) {
+        PSP_LOG("ring_create: psp.gart == nullptr — wiring missing");
         return kIOReturnNotReady;
     }
+    if (!psp.gart->enabled) {
+        kern_return_t gi = gart_init(dev, *psp.gart);
+        if (gi != kIOReturnSuccess) {
+            PSP_LOG("ring_create: gart_init failed: %#x", gi);
+            return gi;
+        }
+        kern_return_t ge = gart_enable(dev, *psp.gart);
+        if (ge != kIOReturnSuccess) {
+            PSP_LOG("ring_create: gart_enable failed: %#x", ge);
+            return ge;
+        }
+        PSP_LOG("ring_create: GART up — gart_start=%#llx size=%llu KB",
+                psp.gart->gartStart, psp.gart->gartSize >> 10);
+    }
 
-    psp.ringBuffer      = nullptr;  // no sysmem buffer
-    psp.ringDMACommand  = nullptr;
-    psp.ringBusAddr     = vram_start + kRingVRAMOffset;
-    psp.ringCPUAddr     = nullptr;
-    psp.ringSize        = kPSPKMRingSize;
-
-    // Zero the ring memory in VRAM (small — 16 KB = 4096 dwords).
-    bar0_memset_vram(dev, kRingVRAMOffset, 0, kPSPKMRingBufSize);
+    // Allocate ring as a GART-bound sysmem buffer. 16 KB sized to AS
+    // page granularity; PSP uses only the first 4 KB but the backing
+    // buffer needs to be 16 KB-aligned for DART.
+    kern_return_t br = gart_bind_sysmem(dev, *psp.gart,
+                                        kPSPKMRingBufSize, kASPageSize,
+                                        &psp.ringBinding);
+    if (br != kIOReturnSuccess) {
+        PSP_LOG("ring_create: gart_bind ring failed: %#x", br);
+        return br;
+    }
+    psp.ringBusAddr = psp.ringBinding.gartMCAddr;
+    psp.ringCPUAddr = psp.ringBinding.cpuAddr;
+    psp.ringSize    = kPSPKMRingSize;
+    memset(psp.ringCPUAddr, 0, kPSPKMRingBufSize);
 
     const uint32_t reg64 = SOC15_REG_OFFSET(dev, IPBlock::MP0,
                                             MP0Regs::C2PMSG_64);
@@ -461,11 +484,9 @@ psp_ring_create(DeviceContext &dev, PSPContext &psp)
         PSP_LOG("ring_create: SOS not ready — C2PMSG_64=%#010x "
                 "(masked=%#010x, want %#010x)",
                 v, v & kPSPMboxRespMask, kPSPMboxRespFlag);
-        psp.ringDMACommand->CompleteDMA(kIODMACommandCompleteDMANoOptions);
-        psp.ringDMACommand->release();
-        psp.ringDMACommand = nullptr;
-        psp.ringBuffer->release();
-        psp.ringBuffer = nullptr;
+        if (psp.gart != nullptr) {
+            gart_unbind(*psp.gart, &psp.ringBinding);
+        }
         return kIOReturnTimeout;
     }
     PSP_LOG("ring_create: SOS ready, C2PMSG_64=%#010x", v);
@@ -496,22 +517,29 @@ psp_ring_create(DeviceContext &dev, PSPContext &psp)
     PSP_LOG("ring_created mc=%#llx size=%llu (response=%#010x)",
             psp.ringBusAddr, psp.ringSize, v);
 
-    // VRAM-backed cmd + fence buffers. Same reasoning as ring/fw_pri:
-    // PSP needs an MC address it can route via GMC.
-    psp.cmdBuffer       = nullptr;
-    psp.cmdDMACommand   = nullptr;
-    psp.cmdBusAddr      = vram_start + kCmdBufVRAMOffset;
-    psp.cmdCPUAddr      = nullptr;
+    // GART-bound cmd + fence buffers (sysmem, routed via GMC).
+    kern_return_t bc = gart_bind_sysmem(dev, *psp.gart,
+                                        kPSPCmdBufSize, kASPageSize,
+                                        &psp.cmdBinding);
+    if (bc != kIOReturnSuccess) {
+        PSP_LOG("ring_create: gart_bind cmd_buf failed: %#x", bc);
+        return bc;
+    }
+    psp.cmdBusAddr = psp.cmdBinding.gartMCAddr;
+    psp.cmdCPUAddr = psp.cmdBinding.cpuAddr;
+    memset(psp.cmdCPUAddr, 0, kPSPCmdBufSize);
 
-    psp.fenceBuffer     = nullptr;
-    psp.fenceDMACommand = nullptr;
-    psp.fenceBusAddr    = vram_start + kFenceVRAMOffset;
-    psp.fenceCPUAddr    = nullptr;
-    psp.fenceCounter    = 0;
-
-    // Zero both regions in VRAM.
-    bar0_memset_vram(dev, kCmdBufVRAMOffset, 0, kPSPCmdBufSize);
-    bar0_memset_vram(dev, kFenceVRAMOffset,  0, kPSPFenceBufSize);
+    kern_return_t bf = gart_bind_sysmem(dev, *psp.gart,
+                                        kPSPFenceBufSize, kASPageSize,
+                                        &psp.fenceBinding);
+    if (bf != kIOReturnSuccess) {
+        PSP_LOG("ring_create: gart_bind fence_buf failed: %#x", bf);
+        return bf;
+    }
+    psp.fenceBusAddr = psp.fenceBinding.gartMCAddr;
+    psp.fenceCPUAddr = psp.fenceBinding.cpuAddr;
+    psp.fenceCounter = 0;
+    memset(psp.fenceCPUAddr, 0, kPSPFenceBufSize);
 
     PSP_LOG("cmd_buf mc=%#llx fence_buf mc=%#llx",
             psp.cmdBusAddr, psp.fenceBusAddr);
@@ -558,7 +586,7 @@ psp_ring_cmd_submit(DeviceContext &dev, PSPContext &psp,
     // 1. Get current wptr.
     uint32_t wptr_dw = RREG32(dev, regWptr);
 
-    // 2. Locate the frame slot offset within the ring (VRAM-relative).
+    // 2. Locate the frame slot via the CPU pointer (sysmem now).
     uint32_t frame_slot;
     if ((wptr_dw % ringSizeDw) == 0) {
         frame_slot = 0;
@@ -570,40 +598,35 @@ psp_ring_cmd_submit(DeviceContext &dev, PSPContext &psp,
         PSP_LOG("ring_cmd_submit: wptr %u out of range", wptr_dw);
         return kIOReturnInternalError;
     }
-    uint64_t frame_vram_off = kRingVRAMOffset
-                            + (uint64_t)frame_slot * sizeof(PSPGfxRBFrame);
+    PSPGfxRBFrame *frame =
+        reinterpret_cast<PSPGfxRBFrame *>(psp.ringCPUAddr) + frame_slot;
 
-    // 3. Stage the command buffer in VRAM via BAR0.
-    bar0_memcpy_to_vram(dev, kCmdBufVRAMOffset, cmd, cmdSize);
+    // 3. Stage the command buffer (sysmem memcpy — fast).
+    memcpy(psp.cmdCPUAddr, cmd, cmdSize);
 
     // 4. Bump fence counter, zero the fence dword, build the frame.
     uint32_t fence_index = ++psp.fenceCounter;
-    WBAR0_32(dev, kFenceVRAMOffset, 0);
+    *static_cast<volatile uint32_t *>(psp.fenceCPUAddr) = 0;
 
-    PSPGfxRBFrame frame;
-    memset(&frame, 0, sizeof(frame));
-    frame.cmd_buf_addr_lo = static_cast<uint32_t>(psp.cmdBusAddr & 0xFFFFFFFFu);
-    frame.cmd_buf_addr_hi = static_cast<uint32_t>(psp.cmdBusAddr >> 32);
-    frame.cmd_buf_size    = kPSPGfxCmdRespSize;
-    frame.fence_addr_lo   = static_cast<uint32_t>(psp.fenceBusAddr & 0xFFFFFFFFu);
-    frame.fence_addr_hi   = static_cast<uint32_t>(psp.fenceBusAddr >> 32);
-    frame.fence_value     = fence_index;
-    bar0_memcpy_to_vram(dev, frame_vram_off, &frame, sizeof(frame));
+    memset(frame, 0, sizeof(*frame));
+    frame->cmd_buf_addr_lo = static_cast<uint32_t>(psp.cmdBusAddr & 0xFFFFFFFFu);
+    frame->cmd_buf_addr_hi = static_cast<uint32_t>(psp.cmdBusAddr >> 32);
+    frame->cmd_buf_size    = kPSPGfxCmdRespSize;
+    frame->fence_addr_lo   = static_cast<uint32_t>(psp.fenceBusAddr & 0xFFFFFFFFu);
+    frame->fence_addr_hi   = static_cast<uint32_t>(psp.fenceBusAddr >> 32);
+    frame->fence_value     = fence_index;
 
     // 5. Advance and publish wptr (in dwords).
     wptr_dw = (wptr_dw + frameSizeDw) % ringSizeDw;
     WREG32(dev, regWptr, wptr_dw);
 
-    // 6. Wait for PSP to write the fence value in VRAM (read via BAR0).
-    // PSP should respond in ~1-10 ms when working. Linux uses
-    // adev->usec_timeout ≈ 100ms-1s. We use 1 second — long enough
-    // to absorb startup jitter, short enough that an actual failure
-    // doesn't waste 80 seconds across 8 stages.
+    // 6. Wait for PSP to write the fence value (sysmem volatile read).
+    auto *fencePtr = static_cast<volatile uint32_t *>(psp.fenceCPUAddr);
     const uint64_t kBudgetUs = 1 * 1000000;
     uint64_t elapsed = 0;
     uint32_t observed = 0;
     while (elapsed < kBudgetUs) {
-        observed = RBAR2_32(dev, kFenceVRAMOffset);
+        observed = *fencePtr;
         if (observed == fence_index) break;
         IOSleep(1);
         elapsed += 1000;
@@ -614,11 +637,11 @@ psp_ring_cmd_submit(DeviceContext &dev, PSPContext &psp,
         return kIOReturnTimeout;
     }
 
-    // 7. Read response status from cmd buffer in VRAM.
+    // 7. Read response status from cmd buffer (sysmem read).
     // Upstream psp_gfx_cmd_resp.resp lives at offset 864 (psp_gfx_if.h).
     const uint32_t kRespStatusOffset = 864;
-    uint32_t resp_status = RBAR2_32(dev,
-        kCmdBufVRAMOffset + kRespStatusOffset);
+    uint32_t resp_status = *reinterpret_cast<volatile uint32_t *>(
+        static_cast<uint8_t *>(psp.cmdCPUAddr) + kRespStatusOffset);
     if (outRespStatus) *outRespStatus = resp_status;
     if (resp_status != 0) {
         PSP_LOG("ring_cmd_submit: PSP returned status %#x", resp_status);
