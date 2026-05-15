@@ -595,7 +595,11 @@ psp_ring_cmd_submit(DeviceContext &dev, PSPContext &psp,
     WREG32(dev, regWptr, wptr_dw);
 
     // 6. Wait for PSP to write the fence value in VRAM (read via BAR0).
-    const uint64_t kBudgetUs = 10 * 1000000;  // 10 s
+    // PSP should respond in ~1-10 ms when working. Linux uses
+    // adev->usec_timeout ≈ 100ms-1s. We use 1 second — long enough
+    // to absorb startup jitter, short enough that an actual failure
+    // doesn't waste 80 seconds across 8 stages.
+    const uint64_t kBudgetUs = 1 * 1000000;
     uint64_t elapsed = 0;
     uint32_t observed = 0;
     while (elapsed < kBudgetUs) {

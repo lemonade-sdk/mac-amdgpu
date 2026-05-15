@@ -728,12 +728,12 @@ final class DriverController: NSObject, ObservableObject,
 
     func testDumpPSP() {
         guard openUserClient() else { return }
-        let (kr, out) = callScalar(kSelDumpPSP, outCount: 11)
+        let (kr, out) = callScalar(kSelDumpPSP, outCount: 12)
         if kr != KERN_SUCCESS {
             append(String(format: "dumpPSP: kr=%#x", kr))
             return
         }
-        guard out.count >= 11 else {
+        guard out.count >= 12 else {
             append("dumpPSP: short reply (\(out.count) words)")
             return
         }
@@ -765,6 +765,8 @@ final class DriverController: NSObject, ObservableObject,
             "psp/C2PMSG_81 (sOS sign-of-life, bit 31): %#010x %@",
             c81, (c81 & 0x80000000) != 0 ? "✓ ALIVE" : "✗ NOT ALIVE"))
         append("psp/ring created: \(ringCreated)")
+        let wptr = UInt32(out[11] & 0xFFFFFFFF)
+        append(String(format: "psp/C2PMSG_67 (ring wptr, dwords): %#010x", wptr))
         let mmhubBase = UInt32(out[7] & 0xFFFFFFFF)
         if mmhubBase == 0xFFFFFFFF {
             append("psp/mmhub: UNRESOLVED — MMHUB IP base not discovered")
@@ -813,8 +815,12 @@ final class DriverController: NSObject, ObservableObject,
             UInt32(out[15] & 0xFFFFFFFF)))
     }
 
-    func testInitDeviceUpTo(_ stage: UInt64) {
-        guard openUserClient() else { return }
+    // Returns true if the stage succeeded so initializeGPU can bail
+    // out at the first failure instead of grinding through 8 stages
+    // of timeouts.
+    @discardableResult
+    func testInitDeviceUpTo(_ stage: UInt64) -> Bool {
+        guard openUserClient() else { return false }
         let (kr, out) = callScalar(kSelInitDevice,
                                    input: [stage],
                                    outCount: 1)
@@ -822,9 +828,10 @@ final class DriverController: NSObject, ObservableObject,
         if kr == KERN_SUCCESS, let reached = out.first {
             let reachedName = DriverController.stageNames[reached] ?? "stage\(reached)"
             append("\(name): ok (reached \(reachedName))")
+            return true
         } else {
-            append(String(format:
-                "\(name): FAILED kr=%#x", kr))
+            append(String(format: "\(name): FAILED kr=%#x", kr))
+            return false
         }
     }
 
@@ -1094,10 +1101,16 @@ final class DriverController: NSObject, ObservableObject,
             append("\(sosName) → FAILED to load")
         }
 
-        // 6-8. Each remaining stage prints its own ok/FAILED via
-        // testInitDeviceUpTo's log line.
+        // 6-8. Each remaining stage prints its own ok/FAILED.
+        // Bail out at the FIRST failure — downstream stages depend on
+        // the earlier ones (e.g. SMU/GMC need TMR), so once one stage
+        // times out the rest will too. No point burning 80 seconds on
+        // 8 stages that will all fail the same way.
         for s: UInt64 in [3, 4, 5, 6, 7, 9, 10, 11, 12, 14] {
-            testInitDeviceUpTo(s)
+            if !testInitDeviceUpTo(s) {
+                append("initializeGPU: stopping early — stage \(s) failed; downstream stages depend on it")
+                break
+            }
         }
 
         // Per-IP firmware loads sprinkled in for SMU / SDMA / RLC / MES.

@@ -46,9 +46,18 @@ Status legend: `[ ]` open · `[~]` in progress · `[x]` done · `[!]` blocked ·
 
 - [x] **DMA-1**  Swap `bar0_memcpy_to_vram` and `bar0_memset_vram` to use
   `MemoryWrite64` where the offset + remaining bytes allow it; fall back to
-  `MemoryWrite32` for the last partial dword. Bump version, rebuild, test.
-  *Expected: ~30% staging speedup. Risk: low. Files: `dext/amdgpu/amdgpu_regs.h`.
-  Done in v0.0.36 — half the MMIO calls, expecting ~30–50% speedup.*
+  `MemoryWrite32` for the last partial dword. Done in v0.0.36 — half the
+  MMIO calls.
+
+- [x] **DMA-1b**  Drop fence-wait timeout in `psp_ring_cmd_submit` from 10 s
+  to 1 s; bail out of initializeGPU at first stage failure. Done in v0.0.40 —
+  cut a failed Initialize GPU from 95 s to 4 s.
+
+- [x] **DMA-2**  Verify our `C2PMSG_67` (wptr) writes actually reach PSP. After
+  the offset fix in v0.0.39 the DumpPSP shows wptr advances cleanly (0x10 after
+  one submit, 0x80 after eight). **Our wptr writes ARE landing.** PSP does not
+  process them — fence_buf stays 0, resp.status stays 0, cmd_buf gets read 0
+  times. Conclusion in next item.
 
 - [ ] **DMA-2**  Audit why TMR/SMU/etc. still time out after v0.0.35→v0.0.36
   changes. Confirm the dext running is actually v0.0.36 (kill+respawn), confirm
@@ -93,6 +102,21 @@ Status legend: `[ ]` open · `[~]` in progress · `[x]` done · `[!]` blocked ·
   *Files: `dext/MacAMDGPU.cpp`, `Host/MacAMDGPUHostApp.swift`.*
 
 ### Architecture — GART + sysmem for control buffers
+
+**Why this is now urgent (was "long-term" before):**
+PSP-ring submissions on the R9700 don't work when `cmd_buf` / `fence_buf` /
+`ring_mem` are VRAM-backed. The wptr lands (verified by DumpPSP showing
+C2PMSG_67 advance), but PSP never reads the cmd_buf from VRAM and never
+writes the fence — it just ignores ring frames. This matches Linux's
+expectations: `fw_pri` (loaded via the C2PMSG_36 bootloader handshake) can
+live in either VRAM or GTT, but the PSP **ring** path **requires GART-mapped
+sysmem** (or VRAM-resident BO routed through GART; not raw VRAM).
+
+VRAM-backed `fw_pri` works because PSP reads it during the bootloader phase
+via a different internal path. The ring DMA path on RDNA4 needs MC addresses
+that resolve through GART.
+
+DMA-4..9 are therefore the blocker for any forward progress past PSPRingCreate.
 
 - [ ] **DMA-4**  Read upstream `amdgpu_gart.c` / `gmc_v12_0_gart_*` in full;
   document the minimum bootstrap sequence (alloc GART page table in VRAM, set up

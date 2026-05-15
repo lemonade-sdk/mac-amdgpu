@@ -1073,8 +1073,9 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         //   [8] regMMMC_VM_FB_LOCATION_BASE raw value
         //   [9] regMMMC_VM_FB_LOCATION_TOP raw value
         //   [10] computed vram_start (FB_LOCATION_BASE.FB_BASE << 24)
+        //   [11] C2PMSG_67 (PSP ring wptr — dwords; non-zero ⇒ PSP saw our kick)
         if (arguments->scalarOutput == nullptr ||
-            arguments->scalarOutputCount < 11) {
+            arguments->scalarOutputCount < 12) {
             return kIOReturnBadArgument;
         }
         kern_return_t openRet = mac_amdgpu_ensure_open(this, driver, pci);
@@ -1113,6 +1114,10 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             arguments->scalarOutput[9]  = 0;
             arguments->scalarOutput[10] = 0;
         }
+        // C2PMSG_67 lives at dword offset 0x0083 — the "_67" is the
+        // register's logical name in PSP's spec, not its register-file
+        // offset. (C2PMSG_N actual offset = 0x40 + N.)
+        arguments->scalarOutput[11] = amdgpu::RREG32(dev, mp0_base + 0x0083);
         return kIOReturnSuccess;
     }
 
