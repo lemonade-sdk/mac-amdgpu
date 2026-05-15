@@ -223,9 +223,12 @@ namespace PTEFlags {
     constexpr uint64_t READABLE  = (1ULL << 5);
     constexpr uint64_t WRITEABLE = (1ULL << 6);
     constexpr uint64_t FRAG_4K   = 0;
-    // Standard sysmem mapping for PSP-readable buffers.
+    // Standard sysmem mapping for PSP-readable buffers. Adds the
+    // EXECUTABLE bit to match upstream gart_pte_flags defaults; MTYPE
+    // bits 54-55 are left as 0 = MTYPE_NC (Non-Coherent) which matches
+    // gmc_v12_0_get_vm_pte's default for GTT sysmem PTEs.
     constexpr uint64_t SYSMEM_RW = VALID | SYSTEM | SNOOPED |
-                                   READABLE | WRITEABLE;
+                                   EXECUTABLE | READABLE | WRITEABLE;
 }
 
 // AMDGPU GPU page size is fixed at 4 KB regardless of CPU page size.

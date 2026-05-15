@@ -158,6 +158,11 @@ gart_bind_sysmem(DeviceContext &dev, GARTContext &gart,
                             &pte, sizeof(pte));
     }
 
+    // HDP flush after writing PTEs so GMC sees the new entries before
+    // any GART access. Mirrors upstream amdgpu_gart_invalidate_tlb's
+    // amdgpu_device_flush_hdp call.
+    amdgpu_hdp_flush(dev);
+
     outBinding->sysmemBuffer = buf;
     outBinding->dmaCommand   = dma;
     outBinding->busAddr      = seg.address;
@@ -486,20 +491,37 @@ gart_enable(DeviceContext &dev, GARTContext &gart)
         return kIOReturnNotReady;
     }
 
-    // The MMHUB needs the page-table MC address. Our PT lives at
-    // VRAM offset pageTableVRAMOffset → MC address = vram_start + offset.
-    // Read vram_start fresh in case the caller hasn't cached it.
+    // Compute PT base register value the same way upstream does:
+    //   amdgpu_gmc_pd_addr → gmc_v12_0_get_vm_pde →
+    //       *addr = vram_base_offset + bo_vram_offset - vram_start
+    //   where:
+    //       vram_base_offset = MMMC_VM_FB_OFFSET << 24
+    //       bo_vram_offset   = MC offset of the PT BO (vram_start + pt_off)
+    //       vram_start       = MMMC_VM_FB_LOCATION_BASE << 24
+    //   Then OR in AMDGPU_PTE_VALID.
+    //
+    // For our setup: pt_off = pageTableVRAMOffset (offset within VRAM,
+    // e.g. 0x700000). So pt_base_for_register =
+    //   vram_base_offset + (vram_start + pt_off) - vram_start
+    // =  vram_base_offset + pt_off
     uint32_t mmhubBase = dev.ip.get(IPBlock::MMHUB);
-    uint32_t fbRaw = RREG32(dev,
+    uint32_t fbLocRaw = RREG32(dev,
         mmhubBase + MMHUBRegs::MMMC_VM_FB_LOCATION_BASE);
+    uint32_t fbOffRaw = RREG32(dev,
+        mmhubBase + MMHUBRegs::MMMC_VM_FB_OFFSET);
     uint64_t vramStart =
-        ((uint64_t)(fbRaw & MMHUBRegs::kFBBaseMask))
+        ((uint64_t)(fbLocRaw & MMHUBRegs::kFBBaseMask))
         << MMHUBRegs::kFBBaseShift;
+    uint64_t vramBaseOffset =
+        ((uint64_t)fbOffRaw) << MMHUBRegs::kFBBaseShift;
     if (vramStart == 0) {
         GART_LOG("enable: vram_start=0; cannot compute PT MC addr");
         return kIOReturnNotReady;
     }
-    uint64_t ptBaseMC = vramStart + gart.pageTableVRAMOffset;
+    uint64_t ptBaseMC = vramBaseOffset + gart.pageTableVRAMOffset;
+    GART_LOG("enable: FB_LOC=%#x FB_OFFSET=%#x → vram_start=%#llx "
+             "vram_base_offset=%#llx pt_base=%#llx",
+             fbLocRaw, fbOffRaw, vramStart, vramBaseOffset, ptBaseMC);
 
     // Compute vram_end from FB_LOCATION_TOP for the system aperture.
     uint32_t fbTopRaw = RREG32(dev,
@@ -536,6 +558,11 @@ gart_enable(DeviceContext &dev, GARTContext &gart)
         // Don't fail — register may have side-effects on RMW. Log and
         // continue; the real test is whether PSP-ring submits work.
     }
+
+    // HDP flush after register programming + before returning, so
+    // any pending NBIO writes complete before PSP starts using GART.
+    // Matches upstream gmc_v12_0.c:1019 amdgpu_device_flush_hdp(adev).
+    amdgpu_hdp_flush(dev);
 
     gart.enabled = true;
     GART_LOG("enable: GART context-0 enabled");

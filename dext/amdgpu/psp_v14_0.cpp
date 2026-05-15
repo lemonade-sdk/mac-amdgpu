@@ -621,7 +621,12 @@ psp_ring_cmd_submit(DeviceContext &dev, PSPContext &psp,
     frame->fence_addr_hi   = static_cast<uint32_t>(psp.fenceBusAddr >> 32);
     frame->fence_value     = fence_index;
 
-    // 5. Advance and publish wptr (in dwords).
+    // 5a. HDP flush — drain any host-side write buffers in the GPU's
+    // NBIO so PSP sees our ring frame + cmd_buf when it reads them.
+    // Upstream amdgpu_psp.c calls amdgpu_device_flush_hdp here.
+    amdgpu_hdp_flush(dev);
+
+    // 5b. Advance and publish wptr (in dwords).
     wptr_dw = (wptr_dw + frameSizeDw) % ringSizeDw;
     WREG32(dev, regWptr, wptr_dw);
 

@@ -149,6 +149,25 @@ WBAR0_32(const DeviceContext &ctx, uint64_t byte_offset, uint32_t value)
     ctx.pci->MemoryWrite32(ctx.bar0MemIndex, byte_offset, value);
 }
 
+// HDP (Host Data Path) flush — port of upstream
+// amdgpu_hdp_generic_flush. Drains any host-side write buffers in
+// the GPU's NBIO/HDP block so that subsequent reads by the GPU see
+// our writes. Required between staging a ring frame in sysmem and
+// kicking PSP via the wptr update.
+//
+// HDP flush register: write 0 to (NBIO's rmmio_remap.reg_offset +
+// KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL) in BAR5. For NBIO 7_11 (RDNA4),
+// rmmio_remap.reg_offset = MMIO_REG_HOLE_OFFSET = 0x44000 (byte).
+// KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL = 0. So write 0 to BAR5 byte 0x44000
+// (= dword 0x11000).
+#ifdef __APPLE__
+static inline void
+amdgpu_hdp_flush(const DeviceContext &ctx)
+{
+    ctx.pci->MemoryWrite32(ctx.bar5MemIndex, 0x44000, 0);
+}
+#endif
+
 // memcpy-equivalent for staging a buffer into VRAM via BAR0. Uses
 // MemoryWrite64 in the aligned-8-byte-stride region for ~2× fewer
 // MMIO calls vs all-32-bit writes (DMA-1 in docs/DMA_FIX_PLAN.md).
