@@ -1220,25 +1220,39 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
 
         switch (fwType) {
         case kMacAMDGPUFwTypeSOS: {
-            // Ensure the PSP storage is allocated (PSPInit stage 2)
-            // before trying to load SOS — psp_load_sos requires
-            // fw_pri to be allocated.
+            // Ensure PSPInit ran so fw_pri is allocated.
             auto &br = driver->ivars->bringup;
             if (br.reached < amdgpu::BringupStage::PSPInit) {
                 kern_return_t pir = amdgpu::bringup_to(br,
                     amdgpu::BringupStage::PSPInit);
                 if (pir != kIOReturnSuccess) return pir;
             }
-            psp.sosFirmware     = bin;
-            psp.sosFirmwareSize = fwSize;
-            kern_return_t ret = amdgpu::psp_load_sos(dev, psp);
-            psp.sosFirmware = nullptr;
-            psp.sosFirmwareSize = 0;
+
+            // Parse the AMD firmware header (v1.x or v2.x) and populate
+            // every sub-bin descriptor in psp (sos, kdb, sys, soc_drv,
+            // intf_drv, dbg_drv, ras_drv, ipkeymgr_drv, etc.). Mirrors
+            // upstream amdgpu_psp.c psp_init_sos_microcode.
+            kern_return_t parseRet = amdgpu::psp_parse_sos_microcode(
+                psp, bin, fwSize);
+            if (parseRet != kIOReturnSuccess) {
+                MACAMDGPU_LOG("LoadFirmware(SOS): parse failed kr=%#x",
+                              parseRet);
+                return parseRet;
+            }
+            MACAMDGPU_LOG("LoadFirmware(SOS): parsed package — "
+                          "SOS=%llu KDB=%llu SYS=%llu SOC_DRV=%llu "
+                          "INTF_DRV=%llu DBG_DRV=%llu RAS_DRV=%llu "
+                          "IPKEYMGR=%llu SPL=%llu",
+                          psp.sos.size_bytes, psp.kdb.size_bytes,
+                          psp.sys.size_bytes, psp.soc_drv.size_bytes,
+                          psp.intf_drv.size_bytes, psp.dbg_drv.size_bytes,
+                          psp.ras_drv.size_bytes,
+                          psp.ipkeymgr_drv.size_bytes,
+                          psp.spl.size_bytes);
+
+            // Load each sub-firmware in the upstream order, then SOS.
+            kern_return_t ret = amdgpu::psp_load_sos_package(dev, psp);
             if (ret == kIOReturnSuccess) {
-                // Mark PSPLoadSOS as done so a subsequent
-                // InitDevice(stage>=3) doesn't re-run psp_load_sos
-                // with empty firmware bytes and fail with
-                // kIOReturnBadArgument.
                 if (br.reached < amdgpu::BringupStage::PSPLoadSOS) {
                     br.reached = amdgpu::BringupStage::PSPLoadSOS;
                 }

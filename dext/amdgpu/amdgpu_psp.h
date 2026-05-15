@@ -41,10 +41,40 @@ struct PSPContext {
     void     *fwPriCPUAddr;   // CPU-side ptr for memcpy of firmware
     uint64_t  fwPriSize;
 
-    // SOS firmware blob (handed in via LoadFirmware selector).
-    // For other bootloader components (KDB, SysDrv, etc.) we pass
-    // the binary directly through psp_bootloader_load_component and
-    // don't keep a long-lived pointer.
+    // PSP firmware sub-binary descriptors — mirrors upstream
+    // `struct psp_bin_desc` in amdgpu_psp.h. Each sub-firmware
+    // lives inside the same `psp_<chip>_sos.bin` file, addressed by
+    // start_addr + size_bytes after the header parser has run.
+    // Filled in by psp_parse_sos_microcode() on every fresh LoadFirmware.
+    struct PSPSubBin {
+        const uint8_t *start_addr;
+        uint64_t       size_bytes;
+        uint32_t       fw_version;
+    };
+    PSPSubBin sos;
+    PSPSubBin sys;          // upstream "sys_drv"
+    PSPSubBin kdb;
+    PSPSubBin toc;
+    PSPSubBin spl;
+    PSPSubBin rl;
+    PSPSubBin soc_drv;
+    PSPSubBin intf_drv;
+    PSPSubBin dbg_drv;      // a.k.a. had_drv on psp_v14
+    PSPSubBin ras_drv;
+    PSPSubBin ipkeymgr_drv;
+    PSPSubBin spdm_drv;
+    PSPSubBin sys_drv_aux;  // v1.3 only
+    PSPSubBin sos_aux;      // v1.3 only
+
+    // Owning pointer to the whole `_sos.bin` file when LoadFirmware
+    // hands us the blob — kept alive while sub-bin descriptors point
+    // into it. Currently the dext doesn't own this (host's DMA buffer
+    // is the backing store), but reserved here for the future.
+    const uint8_t *sos_fw_blob;
+    uint64_t       sos_fw_blob_size;
+
+    // Legacy fields used by code that hasn't been refactored to use
+    // .sos.start_addr yet — kept until psp_load_sos is updated.
     const uint8_t *sosFirmware;
     uint64_t       sosFirmwareSize;
 
@@ -98,6 +128,32 @@ struct PSPContext {
 // Idempotent. Returns kIOReturnSuccess on success.
 //
 kern_return_t psp_init(DeviceContext &dev, PSPContext &psp);
+
+//
+// psp_parse_sos_microcode — port of upstream amdgpu_psp.c
+// `psp_init_sos_microcode`. Walks the AMD firmware header in `fw_data`
+// (raw bytes of `psp_<chip>_sos.bin`), auto-detects v1 vs v2 layout,
+// and populates psp.sos / psp.kdb / psp.sys / etc. with pointers into
+// fw_data plus per-sub-binary sizes.
+//
+// The caller retains ownership of fw_data; the sub-bin pointers in
+// PSPContext stay valid only as long as fw_data is alive. Returns
+// kIOReturnSuccess on a recognised header, kIOReturnUnsupported on
+// an unknown header_version_major, kIOReturnBadArgument on bad input.
+//
+kern_return_t psp_parse_sos_microcode(PSPContext &psp,
+                                      const uint8_t *fw_data,
+                                      uint64_t fw_size);
+
+//
+// psp_load_sos_package — port of psp_v14_0's full pre-SOS sequence.
+// Loads KDB → SPL → SYS_DRV → SOC_DRV → INTF_DRV → HAD/DBG_DRV →
+// RAS_DRV → IPKEYMGR_DRV (each via psp_bootloader_load_component),
+// then loads SOS via psp_load_sos. Skips any sub-bin whose size is 0
+// (e.g. SPL on chips that don't ship one). Caller must have already
+// run psp_parse_sos_microcode to populate the sub-bin pointers.
+//
+kern_return_t psp_load_sos_package(DeviceContext &dev, PSPContext &psp);
 
 //
 // psp_release — free fw_pri buffer.

@@ -28,6 +28,7 @@
 #include <PCIDriverKit/IOPCIDevice.h>
 
 #include "amdgpu_psp.h"
+#include "amdgpu_ucode_psp.h"
 
 #define PSP_LOG(fmt, ...) \
     os_log(OS_LOG_DEFAULT, "mac.amdgpu.psp: " fmt, ##__VA_ARGS__)
@@ -811,6 +812,248 @@ psp_load_ip_fw(DeviceContext &dev, PSPContext &psp,
     }
     PSP_LOG("LOAD_IP_FW(type=%u, size=%u) ok", fwType, fwSize);
     return kIOReturnSuccess;
+}
+
+//============================================================
+// psp_parse_sos_microcode — port of upstream amdgpu_psp.c
+// psp_init_sos_microcode. Auto-detects v1 vs v2 header and
+// populates psp.sos / psp.kdb / psp.sys / etc. with pointers
+// into the input firmware blob.
+//============================================================
+
+static void
+set_sub_bin(PSPContext::PSPSubBin &dst,
+            const uint8_t *base, uint32_t offset_bytes,
+            uint32_t size_bytes, uint32_t fw_version)
+{
+    dst.start_addr = (size_bytes > 0) ? (base + offset_bytes) : nullptr;
+    dst.size_bytes = size_bytes;
+    dst.fw_version = fw_version;
+}
+
+kern_return_t
+psp_parse_sos_microcode(PSPContext &psp,
+                        const uint8_t *fw_data, uint64_t fw_size)
+{
+    // Reset every sub-bin so a re-parse doesn't leave stale pointers.
+    psp.sos = psp.sys = psp.kdb = psp.toc = psp.spl = psp.rl =
+        psp.soc_drv = psp.intf_drv = psp.dbg_drv = psp.ras_drv =
+        psp.ipkeymgr_drv = psp.spdm_drv = psp.sys_drv_aux =
+        psp.sos_aux = PSPContext::PSPSubBin{};
+
+    if (fw_data == nullptr || fw_size < sizeof(common_firmware_header)) {
+        PSP_LOG("parse_sos: fw_data null or too small (%llu)", fw_size);
+        return kIOReturnBadArgument;
+    }
+
+    auto *hdr = reinterpret_cast<const common_firmware_header *>(fw_data);
+    uint32_t ucode_off = hdr->ucode_array_offset_bytes;
+    if (ucode_off > fw_size) {
+        PSP_LOG("parse_sos: ucode_array_offset_bytes %#x exceeds fw_size %llu",
+                ucode_off, fw_size);
+        return kIOReturnBadArgument;
+    }
+    const uint8_t *ucode_base = fw_data + ucode_off;
+
+    PSP_LOG("parse_sos: hdr ver %u.%u, ip %u.%u, ucode_size=%u, "
+            "ucode_off=%#x, total=%u",
+            hdr->header_version_major, hdr->header_version_minor,
+            hdr->ip_version_major, hdr->ip_version_minor,
+            hdr->ucode_size_bytes, ucode_off, hdr->size_bytes);
+
+    psp.sos_fw_blob      = fw_data;
+    psp.sos_fw_blob_size = fw_size;
+
+    switch (hdr->header_version_major) {
+    case 1: {
+        // v1.0: only sos. v1.1/1.2: + kdb (and maybe toc). v1.3: +spl/rl/aux.
+        // Note: v1 layouts pack sub-bins WITHIN the ucode region — the
+        // start address is `ucode_base + sub.offset_bytes`. Upstream
+        // does the same.
+        auto *h10 = reinterpret_cast<const psp_firmware_header_v1_0 *>(fw_data);
+        // The "sys" sub-bin doesn't exist as a separate field on v1.0 —
+        // upstream's psp_init_sos_base_fw fills sys.start_addr from
+        // sos.offset_bytes (sys precedes sos in the ucode region for
+        // legacy chips). We mirror that here.
+        set_sub_bin(psp.sys, ucode_base,
+                    0,
+                    h10->sos.offset_bytes,  // sys spans [0, sos_off)
+                    hdr->ucode_version);
+        set_sub_bin(psp.sos, ucode_base,
+                    h10->sos.offset_bytes,
+                    h10->sos.size_bytes,
+                    h10->sos.fw_version);
+
+        if (hdr->header_version_minor >= 1) {
+            auto *h11 = reinterpret_cast<const psp_firmware_header_v1_1 *>(fw_data);
+            set_sub_bin(psp.toc, ucode_base,
+                        h11->toc.offset_bytes,
+                        h11->toc.size_bytes, h11->toc.fw_version);
+            set_sub_bin(psp.kdb, ucode_base,
+                        h11->kdb.offset_bytes,
+                        h11->kdb.size_bytes, h11->kdb.fw_version);
+        }
+        if (hdr->header_version_minor == 2) {
+            // v1.2 redefines: kdb instead of toc
+            auto *h12 = reinterpret_cast<const psp_firmware_header_v1_2 *>(fw_data);
+            set_sub_bin(psp.kdb, ucode_base,
+                        h12->kdb.offset_bytes,
+                        h12->kdb.size_bytes, h12->kdb.fw_version);
+        }
+        if (hdr->header_version_minor == 3) {
+            auto *h13 = reinterpret_cast<const psp_firmware_header_v1_3 *>(fw_data);
+            set_sub_bin(psp.spl, ucode_base,
+                        h13->spl.offset_bytes,
+                        h13->spl.size_bytes, h13->spl.fw_version);
+            set_sub_bin(psp.rl, ucode_base,
+                        h13->rl.offset_bytes,
+                        h13->rl.size_bytes, h13->rl.fw_version);
+            set_sub_bin(psp.sys_drv_aux, ucode_base,
+                        h13->sys_drv_aux.offset_bytes,
+                        h13->sys_drv_aux.size_bytes,
+                        h13->sys_drv_aux.fw_version);
+            set_sub_bin(psp.sos_aux, ucode_base,
+                        h13->sos_aux.offset_bytes,
+                        h13->sos_aux.size_bytes,
+                        h13->sos_aux.fw_version);
+        }
+        return kIOReturnSuccess;
+    }
+    case 2: {
+        // v2.0/v2.1: flexible array of psp_fw_bin_desc tagged by fw_type.
+        // Iterate and route each desc by fw_type. v2.1 has an extra
+        // `psp_aux_fw_bin_index` field we don't currently need (only
+        // relevant for chips with auxiliary SOS variants we don't support
+        // yet).
+        auto *h20 = reinterpret_cast<const psp_firmware_header_v2_0 *>(fw_data);
+        const psp_fw_bin_desc *bin = h20->psp_fw_bin;
+        uint32_t count = h20->psp_fw_bin_count;
+        if (hdr->header_version_minor == 1) {
+            auto *h21 = reinterpret_cast<const psp_firmware_header_v2_1 *>(fw_data);
+            bin = h21->psp_fw_bin;
+            // We don't currently route psp_aux_fw_bin_index; leave the
+            // aux loading for when we encounter a chip that needs it.
+        }
+        if (count > 64) {
+            PSP_LOG("parse_sos: implausible bin_count=%u", count);
+            return kIOReturnBadArgument;
+        }
+        for (uint32_t i = 0; i < count; i++) {
+            const auto &d = bin[i];
+            switch (d.fw_type) {
+            case PSP_FW_TYPE_PSP_SOS:
+                set_sub_bin(psp.sos, ucode_base, d.offset_bytes, d.size_bytes, d.fw_version);
+                break;
+            case PSP_FW_TYPE_PSP_SYS_DRV:
+                set_sub_bin(psp.sys, ucode_base, d.offset_bytes, d.size_bytes, d.fw_version);
+                break;
+            case PSP_FW_TYPE_PSP_KDB:
+                set_sub_bin(psp.kdb, ucode_base, d.offset_bytes, d.size_bytes, d.fw_version);
+                break;
+            case PSP_FW_TYPE_PSP_TOC:
+                set_sub_bin(psp.toc, ucode_base, d.offset_bytes, d.size_bytes, d.fw_version);
+                break;
+            case PSP_FW_TYPE_PSP_SPL:
+                set_sub_bin(psp.spl, ucode_base, d.offset_bytes, d.size_bytes, d.fw_version);
+                break;
+            case PSP_FW_TYPE_PSP_RL:
+                set_sub_bin(psp.rl, ucode_base, d.offset_bytes, d.size_bytes, d.fw_version);
+                break;
+            case PSP_FW_TYPE_PSP_SOC_DRV:
+                set_sub_bin(psp.soc_drv, ucode_base, d.offset_bytes, d.size_bytes, d.fw_version);
+                break;
+            case PSP_FW_TYPE_PSP_INTF_DRV:
+                set_sub_bin(psp.intf_drv, ucode_base, d.offset_bytes, d.size_bytes, d.fw_version);
+                break;
+            case PSP_FW_TYPE_PSP_DBG_DRV:
+                set_sub_bin(psp.dbg_drv, ucode_base, d.offset_bytes, d.size_bytes, d.fw_version);
+                break;
+            case PSP_FW_TYPE_PSP_RAS_DRV:
+                set_sub_bin(psp.ras_drv, ucode_base, d.offset_bytes, d.size_bytes, d.fw_version);
+                break;
+            case PSP_FW_TYPE_PSP_IPKEYMGR_DRV:
+                set_sub_bin(psp.ipkeymgr_drv, ucode_base, d.offset_bytes, d.size_bytes, d.fw_version);
+                break;
+            case PSP_FW_TYPE_PSP_SPDM_DRV:
+                set_sub_bin(psp.spdm_drv, ucode_base, d.offset_bytes, d.size_bytes, d.fw_version);
+                break;
+            default:
+                PSP_LOG("parse_sos: ignoring unknown fw_type=%u "
+                        "(offset=%#x size=%u)",
+                        d.fw_type, d.offset_bytes, d.size_bytes);
+                break;
+            }
+        }
+        return kIOReturnSuccess;
+    }
+    default:
+        PSP_LOG("parse_sos: unsupported header_version_major=%u",
+                hdr->header_version_major);
+        return kIOReturnUnsupported;
+    }
+}
+
+//============================================================
+// psp_load_sos_package — port of psp_v14_0_hw_init's pre-SOS
+// loader sequence. Loads each non-empty sub-firmware via the
+// bootloader interface in the upstream order, then loads SOS.
+//============================================================
+kern_return_t
+psp_load_sos_package(DeviceContext &dev, PSPContext &psp)
+{
+    if (psp_is_sos_alive(dev)) {
+        PSP_LOG("load_sos_package: SOS already alive — skipping");
+        psp.sosAlive = true;
+        return kIOReturnSuccess;
+    }
+
+    struct Step {
+        const char *name;
+        const PSPContext::PSPSubBin *bin;
+        uint32_t bl_cmd;
+    } steps[] = {
+        // Order taken from psp_v14_0_hw_init / psp_hw_start in upstream.
+        // We skip any step whose bin->size_bytes is 0 (e.g. SPL on
+        // chips that don't ship one).
+        { "KDB",        &psp.kdb,         PSP_BL__LOAD_KEY_DATABASE  },
+        { "SPL",        &psp.spl,         PSP_BL__LOAD_TOS_SPL_TABLE },
+        { "SYS_DRV",    &psp.sys,         PSP_BL__LOAD_SYSDRV        },
+        { "SOC_DRV",    &psp.soc_drv,     PSP_BL__LOAD_SOCDRV        },
+        { "INTF_DRV",   &psp.intf_drv,    PSP_BL__LOAD_INTFDRV       },
+        { "DBG/HAD_DRV",&psp.dbg_drv,     PSP_BL__LOAD_HADDRV        },
+        { "RAS_DRV",    &psp.ras_drv,     PSP_BL__LOAD_RASDRV        },
+        { "IPKEYMGR",   &psp.ipkeymgr_drv,PSP_BL__LOAD_IPKEYMGRDRV   },
+    };
+    for (auto &s : steps) {
+        if (s.bin->size_bytes == 0 || s.bin->start_addr == nullptr) {
+            PSP_LOG("load_sos_package: skip %{public}s (not present)", s.name);
+            continue;
+        }
+        PSP_LOG("load_sos_package: %{public}s (%llu bytes) → bl_cmd=%#x",
+                s.name, s.bin->size_bytes, s.bl_cmd);
+        kern_return_t r = psp_bootloader_load_component(
+            dev, psp, s.bin->start_addr, s.bin->size_bytes, s.bl_cmd);
+        if (r != kIOReturnSuccess) {
+            PSP_LOG("load_sos_package: %{public}s FAILED kr=%#x",
+                    s.name, r);
+            return r;
+        }
+    }
+
+    if (psp.sos.size_bytes == 0 || psp.sos.start_addr == nullptr) {
+        PSP_LOG("load_sos_package: SOS sub-bin missing from package");
+        return kIOReturnBadArgument;
+    }
+    PSP_LOG("load_sos_package: SOS (%llu bytes) → final load",
+            psp.sos.size_bytes);
+    // Stash into the legacy slots for now (until psp_load_sos is
+    // refactored to read psp.sos directly).
+    psp.sosFirmware     = psp.sos.start_addr;
+    psp.sosFirmwareSize = psp.sos.size_bytes;
+    kern_return_t r = psp_load_sos(dev, psp);
+    psp.sosFirmware     = nullptr;
+    psp.sosFirmwareSize = 0;
+    return r;
 }
 
 } // namespace amdgpu
