@@ -313,6 +313,31 @@ mac_amdgpu_ensure_open(IOService *opener, MacAMDGPU *driver,
     MACAMDGPU_LOG("ensure_open: PCI opened, cmd=%#x, BAR0=%llu B, "
                   "BAR2(visible VRAM)=%llu B",
                   (unsigned)cmd, bdev.bar0Size, bdev.bar2VisibleVRAMSize);
+
+    // MMIO sanity probe — read a few BAR0 dwords we know upstream
+    // amdgpu reads pre-discovery. If they ALL come back 0, the device
+    // isn't actually mapped through DART (despite Memory Space being
+    // on in PCI Command). On a healthy R9700, RCC_CONFIG_MEMSIZE
+    // (mmio dword 0xDE3) returns vram_size_mb (~32768 on the 32 GB
+    // R9700), and PCI vendor/device mirror at the SMN offset 0x0 is
+    // non-zero too.
+    auto rd = [&](uint32_t dw) -> uint32_t {
+        uint32_t v = 0xFFFFFFFFu;
+        pci->MemoryRead32(bdev.bar0MemIndex,
+                          static_cast<uint64_t>(dw) * 4ULL, &v);
+        return v;
+    };
+    uint32_t probe[5] = {
+        rd(0x0000),     // MM_INDEX (NBIO indirect access reg)
+        rd(0x0001),     // MM_DATA
+        rd(0x0DE3),     // mmRCC_CONFIG_MEMSIZE (upstream "consistent across SOCs")
+        rd(0x16A00),    // mmIP_DISCOVERY_VERSION
+        rd(0x16061),    // mmMP0_SMN_C2PMSG_33
+    };
+    MACAMDGPU_LOG("ensure_open: mmio probe — "
+                  "BAR0[0x0000]=%#x BAR0[0x0001]=%#x BAR0[0xDE3]=%#x "
+                  "BAR0[0x16A00]=%#x BAR0[0x16061]=%#x",
+                  probe[0], probe[1], probe[2], probe[3], probe[4]);
     return kIOReturnSuccess;
 }
 

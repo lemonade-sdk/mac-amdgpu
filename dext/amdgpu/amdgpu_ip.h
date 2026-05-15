@@ -83,8 +83,14 @@ struct IPBaseTable {
         }
     }
 
+    // IIG's IONewZero zero-fills the parent struct without running
+    // C++ ctors, so base[] arrives as 0 instead of 0xFFFFFFFFu.
+    // Treat *both* as "unresolved". A real IP base is never 0 on a
+    // PCIDriverKit-mapped BAR0 (SMN registers start in the 0x40000+
+    // range after the front-end SMUIO block).
     bool isResolved(IPBlock block) const {
-        return base[(int)block] != 0xFFFFFFFFu;
+        uint32_t b = base[(int)block];
+        return b != 0xFFFFFFFFu && b != 0u;
     }
     uint32_t get(IPBlock block) const { return base[(int)block]; }
     void set(IPBlock block, uint32_t b) { base[(int)block] = b; }
