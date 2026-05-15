@@ -311,26 +311,45 @@ ih_drain(const DeviceContext &dev, IHContext &ih,
         : RREG32(dev,
                  SOC15_REG_OFFSET(dev, IPBlock::OSSSYS,
                                   IHRegs::IH_RB_WPTR));
-    // Overflow bit: bit 31 of wptr indicates the GPU's write pointer
-    // wrapped past rptr. Linux logs + clears.
-    if (wptr & (1u << 31)) {
+    // Overflow flag lives in IH_RB_WPTR.RB_OVERFLOW (bit 0) per
+    // osssys_7_0_0_sh_mask.h:206 and ih_v7_0_get_wptr (ih_v7_0.c:462).
+    // The earlier "bit 31" check was bogus.
+    if (wptr & (1u << kIH_RB_WPTR__RB_OVERFLOW__SHIFT)) {
         ih.overflows_seen++;
-        // Clear overflow in IH_RB_CNTL bit 31.
+        // Re-read from MMIO to make sure the overflow latched (the
+        // shadow can race with the engine on the same line) — mirrors
+        // ih_v7_0_get_wptr's second RREG32_NO_KIQ.
+        wptr = RREG32(dev,
+                      SOC15_REG_OFFSET(dev, IPBlock::OSSSYS,
+                                       IHRegs::IH_RB_WPTR));
+        // Recovery per upstream: skip ahead to wptr+32 (drop oldest)
+        // and assert + de-assert IH_RB_CNTL.WPTR_OVERFLOW_CLEAR so a
+        // new overflow can be latched.
         uint32_t cntl_reg = SOC15_REG_OFFSET(dev, IPBlock::OSSSYS,
                                              IHRegs::IH_RB_CNTL);
         uint32_t cntl = RREG32(dev, cntl_reg);
         cntl |= (1u << kIH_RB_CNTL__WPTR_OVERFLOW_CLEAR__SHIFT);
         WREG32(dev, cntl_reg, cntl);
-        IH_LOG("ring overflow seen (count=%llu)", ih.overflows_seen);
-        wptr &= ~(1u << 31);
+        cntl &= ~(1u << kIH_RB_CNTL__WPTR_OVERFLOW_CLEAR__SHIFT);
+        WREG32(dev, cntl_reg, cntl);
+
+        // Clear the overflow bit out of wptr before masking, and
+        // advance rptr to wptr+32 so we start from the oldest entry
+        // still in the ring (ih_v7_0.c:474).
+        wptr &= ~(1u << kIH_RB_WPTR__RB_OVERFLOW__SHIFT);
+        ih.rptr = (wptr + 32) & ih.ptr_mask;
+        IH_LOG("ring overflow seen (count=%llu) — rptr advanced to %#x",
+               ih.overflows_seen, ih.rptr);
     }
 
     wptr &= ih.ptr_mask;
     uint32_t count = 0;
     auto *ring = static_cast<const uint32_t *>(ih.ring_cpu);
     while (ih.rptr != wptr) {
-        // 8 dwords per entry.
-        const uint32_t *e = &ring[ih.rptr];
+        // rptr / wptr are byte offsets; the ring base is dword-typed
+        // so divide by 4 to index. Each IH entry is 8 dwords = 32 B
+        // (amdgpu_ih.c:295: `ih->rptr += 32`).
+        const uint32_t *e = &ring[ih.rptr >> 2];
         IHEntry decoded{};
         decoded.client_id  =  e[0]        & 0xFF;
         decoded.src_id     = (e[0] >> 8)  & 0xFF;
@@ -347,12 +366,12 @@ ih_drain(const DeviceContext &dev, IHContext &ih,
 
         if (dispatch != nullptr) dispatch(decoded, user);
 
-        ih.rptr = (ih.rptr + kIHEntryDwords) & ih.ptr_mask;
+        ih.rptr = (ih.rptr + kIHEntryBytes) & ih.ptr_mask;
         count++;
     }
 
     if (count > 0) {
-        // Advance hardware rptr.
+        // Advance hardware rptr — register also takes bytes.
         WREG32(dev, SOC15_REG_OFFSET(dev, IPBlock::OSSSYS,
                                      IHRegs::IH_RB_RPTR),
                ih.rptr);
