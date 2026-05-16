@@ -1,51 +1,61 @@
 # STATUS
 
-The driver loads, talks to a real AMD GPU on a Mac, brings PSP up,
-loads SMU PMFW via PSP's ring, and gets the SMU mailbox responding.
-It still can't render anything — the GFX/RLC/MES/SDMA microcode load
-path is the next chunk of work.
+Driver runs on a real R9700, brings PSP up, loads SMU PMFW and IMU
+microcode through PSP's ring, gets the SMU mailbox responding, and
+clears the IMUInit stage. Still can't render anything — RLC/CP/MES/SDMA
+firmware loads are the next blocker (PSP rejects them with
+`TEE_ERROR_BAD_PARAMETERS` because the per-IP header offsets in those
+files differ from the simple cases that already work).
 
-**What works (v0.0.58 on real R9700 over Thunderbolt 5):**
+**What works (v0.0.63 on real R9700 over Thunderbolt 5):**
 
 - Card detection + dext attach over TB5
-- Identity reads (VID=`0x1002`, DID=`0x7551`, rev `0xC0`)
+- Identity reads (VID `0x1002`, DID `0x7551`, rev `0xC0`)
 - MMIO via BAR5 (registers) + BAR0 (framebuffer aperture)
-- IP discovery binary read from VRAM via MM_INDEX/MM_DATA, parsed
-  with full multi-`BASE_IDX` support — auto-detected
-  `gfx_12_0_1` / `psp_14_0_3` / `smu_14_0_3` / `sdma_7_0_1` /
-  `mes_12_0_1` / `nbio_7_11` on a live R9700
+- IP discovery from VRAM via MM_INDEX/MM_DATA with full multi-`BASE_IDX`
+  support — `gfx_12_0_1` / `psp_14_0_3` / `smu_14_0_3` / `sdma_7_0_1` /
+  `mes_12_0_1` / `nbio_7_11` auto-detected
+- 9 bringup stages green:
+  `IPDiscovery → IHInit → GMCInit → PSPInit → PSPLoadSOS →
+  PSPRingCreate → TMRSetup → SMUInit → IMUInit`
 - PSP SOS firmware upload + run (kicker / non-kicker selection
   matches upstream `kicker_device_list`)
-- PSP ring (KM / GPCOM) create + first-frame submit, FB_FW_RESERV
-  queries return real responses (fence increments correctly)
-- LOAD_IP_FW for SMU PMFW returns success — PSP TEE accepts it
+- PSP ring (GPCOM / km_ring) create + first-frame submit, `FB_FW_RESERV`
+  queries return real responses, fence increments per submit
+- `LOAD_IP_FW` over the PSP ring for SMU PMFW + IMU_I + IMU_D —
+  firmware bytes copied into `fw_pri` (VRAM) via BAR0 aperture and
+  handed to PSP at its VRAM MC address, matching upstream's
+  `psp_execute_ip_fw_load` + `psp_copy_fw`
 - SMU mailbox responsive (`TestMessage` echoes, `GetVersion` works)
-- GMC + MMHUB bringup (gart_enable with full
-  `mmhub_v4_1_0_gart_enable` register sequence, GFX12 PTE format
-  with `IS_PTE` bit, NBIO HDP `remap_hdp_registers` programmed)
-- DART-mapped sysmem buffers bound into GART for LOAD_IP_FW payloads
+  over MP1 BASE_IDX 1
+- GMC + MMHUB + GFXHUB bringup with the full
+  `mmhub_v4_1_0_gart_enable` / `gfxhub_v12_0_gart_enable` register
+  sequences, GFX12 PTE format with `IS_PTE` bit, NBIO HDP
+  `remap_hdp_registers` programmed
+- GART page table in VRAM at MC `vram_start + 0x800000` (matches
+  upstream `amdgpu_gart_table_vram_alloc`), CONTEXT0 enabled with
+  PT base + START/END + flush via engine 17
 
 **What's next:**
 
-- **Multi-component firmware parsing.** SDMA (sdma_v3 header),
-  RLC (sub-binaries for `RLC_G` / `RLC_IRAM` / `RLC_DRAM` / etc.)
-  and uni_mes (split into `CP_MES` + `CP_MES_DATA`) all currently
-  bounce off PSP with `0xFFFF0006 = TEE_ERROR_BAD_PARAMETERS`
-  because our simple "skip the 32-byte common header" extractor
-  doesn't match their layouts. Each needs the per-IP header
-  parser from upstream `amdgpu_ucode_init_single_fw`.
-- IMU_I / IMU_D loading (currently `IMUInit` is a stub).
-- RLC autoload start, CP RS64 PFP/ME/MEC load with P0..P3 stack
-  variants, MES queue init reorder vs `mes_enable`.
+- **RLC / CP / MES / SDMA firmware parsing.** Each file uses a
+  different per-IP header layout (`rlc_firmware_header_v2_0..v2_4`,
+  `mes_firmware_header_v1_0` ucode+data, `gfx_firmware_header_v2_0`
+  for RS64 PFP/ME/MEC + P0..P3 stacks, `sdma_firmware_header_v3_0`).
+  The per-IP extractor in `dext/amdgpu/amdgpu_ucode_extract.cpp` is
+  in but each file's payloads still bounce off PSP with
+  `0xFFFF0006 = TEE_ERROR_BAD_PARAMETERS` — wrong offsets/sizes for
+  the actual firmware bytes. Need to cross-check field-by-field
+  against upstream `amdgpu_ucode_init_single_fw`.
+- RLC autoload start, CP RS64 PFP/ME/MEC programming, MES
+  `set_hw_resources` + queue init.
 - GFXHUB gart_enable re-run after RLC autoload.
 - First PM4 packet on a GFX12 compute queue.
 
 **To use it:** install the host app, click **Initialize GPU** in the
-test UI, and watch each bring-up stage print as it runs. Expected
-output today: stages 1-7 (`IPDiscovery → PSPInit → PSPLoadSOS →
-PSPRingCreate → TMRSetup → SMUInit → GMCInit`) green, stage 9
-(`RLCInit`) hits `kIOReturnUnsupported` because RLC microcode isn't
-loaded yet.
+test UI, watch each bring-up stage print. Expected output today:
+stages 1–9 green, stage 10 (`RLCInit`) times out because RLC
+microcode never loads.
 
   
 # mac_amdgpu

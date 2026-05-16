@@ -232,7 +232,13 @@ struct MacAMDGPUUserClient_IVars {
     // streams different firmware bytes into the same DART-mapped
     // buffer, so the busAddr is stable). Reset on EnsureDMABuffer
     // when the buffer is reallocated.
+    // Legacy bringup.gart binding handle. Retained until the legacy
+    // amdgpu_gart.cpp parallel path is fully retired.
     amdgpu::GARTBinding dmaGartBinding;
+    // Cached GMC GART MC address for the host's DMA buffer once it's
+    // been bound into gmc.gart_pt_cpu. Reset to 0 when the DMA buffer
+    // is freed.
+    uint64_t            dmaGartMcAddr;
 };
 
 //
@@ -426,6 +432,7 @@ mac_amdgpu_release_dma_buffer(MacAMDGPUUserClient *client)
     // binding's MC addr so the next LOAD_IP_FW path rebinds afresh.
     memset(&client->ivars->dmaGartBinding, 0,
            sizeof(client->ivars->dmaGartBinding));
+    client->ivars->dmaGartMcAddr = 0;
 }
 
 static kern_return_t
@@ -1430,10 +1437,18 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                 (fwType >= 0x200 && fwType < 0x300)) {
 
                 if (ivars->dmaSegmentsCount < 1) return kIOReturnNotReady;
-                auto &gart = driver->ivars->bringup.gart;
-                if (!gart.enabled) {
+                auto &psp = driver->ivars->bringup.psp;
+                if (psp.fwPriBusAddr == 0 || psp.fwPriSize == 0) {
                     return kIOReturnNotReady;
                 }
+
+                // Get CPU pointer to the host's DMA buffer where the .bin
+                // file was streamed. `bin` is a kernel-side pointer to the
+                // start of the buffer; payloads[i].offset_bytes is the
+                // byte offset of the ucode inside it.
+                // (The bin pointer was already set up above via
+                //  ivars->dmaBuffer->GetAddressRange — same as the SOS
+                //  path uses.)
 
                 // Decode the .bin into one-or-more LOAD_IP_FW payloads.
                 amdgpu::UcodePayload payloads[amdgpu::kMaxUcodePayloadsPerFile];
@@ -1444,23 +1459,6 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                                   "for fwType=%#llx size=%llu",
                                   fwType, fwSize);
                     return kIOReturnUnsupported;
-                }
-
-                // Bind the DMA buffer's bus addr range into GART once
-                // (slot is reused across submits since the busAddr is
-                // stable for the lifetime of the DMA buffer). The
-                // per-payload GPU bus address = gartMCAddr + payload
-                // offset_bytes.  Mirrors upstream's GTT-domain-BO flow:
-                // amdgpu_ucode_init_bo allocates ONE big BO, copies all
-                // payloads into it, and each (info->mc_addr, info->ucode_size)
-                // points into that single BO.
-                kern_return_t br = amdgpu::gart_bind_existing(
-                    dev, gart,
-                    ivars->dmaSegments[0].address,
-                    ivars->dmaBufferSize,
-                    &ivars->dmaGartBinding);
-                if (br != kIOReturnSuccess) {
-                    return br;
                 }
 
                 // Side-effect bookkeeping that used to live in the
@@ -1503,12 +1501,32 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                 MACAMDGPU_LOG("LoadFirmware(fwType=%#llx): extractor produced "
                               "%u payload(s)", fwType, count);
                 for (uint32_t i = 0; i < count; i++) {
-                    uint64_t fwBusAddr =
-                        ivars->dmaGartBinding.gartMCAddr + payloads[i].offset_bytes;
-                    MACAMDGPU_LOG("  payload[%u]: fw_type=%u offset=%u size=%u",
+                    // Match upstream psp_execute_ip_fw_load: copy the
+                    // payload bytes into psp.fw_pri (VRAM) via BAR0,
+                    // then pass psp.fwPriBusAddr as the fw_phy_addr.
+                    // PSP fetches firmware via its internal VRAM path
+                    // (FB aperture, no GMC/GART walk needed).
+                    if (payloads[i].size_bytes > psp.fwPriSize) {
+                        MACAMDGPU_LOG("LoadFirmware: payload[%u] %u B > fw_pri %llu B",
+                                      i, payloads[i].size_bytes,
+                                      psp.fwPriSize);
+                        return kIOReturnNoSpace;
+                    }
+                    if ((uint64_t)payloads[i].offset_bytes +
+                            payloads[i].size_bytes > fwSize) {
+                        return kIOReturnBadArgument;
+                    }
+                    amdgpu::bar0_memcpy_to_vram(
+                        dev,
+                        /*vram_byte_offset=*/0,           // fw_pri at vram offset 0
+                        bin + payloads[i].offset_bytes,
+                        payloads[i].size_bytes);
+                    amdgpu::amdgpu_hdp_flush(dev);
+                    uint64_t fwBusAddr = psp.fwPriBusAddr;
+                    MACAMDGPU_LOG("  payload[%u]: fw_type=%u offset=%u size=%u → fw_pri mc=%#llx",
                                   i, payloads[i].fw_type,
                                   payloads[i].offset_bytes,
-                                  payloads[i].size_bytes);
+                                  payloads[i].size_bytes, fwBusAddr);
                     kern_return_t r = amdgpu::psp_load_ip_fw(
                         dev, psp, fwBusAddr,
                         payloads[i].size_bytes, payloads[i].fw_type);

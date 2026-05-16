@@ -47,6 +47,22 @@ constexpr uint64_t kR9700TotalVRAMBytes  = 32ULL * 1024 * 1024 * 1024;
 constexpr uint64_t kGARTInitialSize      = 256ULL * 1024 * 1024;   // 256 MB
 constexpr uint64_t kGARTPageSize         = kASPageSize;            // 16 KB on AS
 
+// Upstream `gmc_v12_0_gart_init` calls `amdgpu_gart_table_vram_alloc`
+// to put the GART page table in VRAM, not sysmem. On GFX12 PSP's
+// PT walker reaches VRAM through the FB aperture (direct, no PCIe
+// hop) but cannot reliably reach DART-mapped sysmem for the PT
+// fetch, so PT-must-be-in-VRAM is a hard requirement.
+//
+// We allocate the PT at a fixed low-VRAM offset that's still inside
+// BAR0's 256 MB aperture (so CPU writes can use bar0_memcpy_to_vram).
+// Layout summary of fixed VRAM offsets used during bringup:
+//   0x00000000..0x00100000  fw_pri  (PSP staging, 1 MB)
+//   0x00100000..0x0010c000  PSP km_ring + cmd_buf + fence_buf
+//   0x00200000..0x00600000  PSP TMR  (4 MB, owned by SOS on 14_0_3)
+//   0x00700000..0x00710000  legacy bringup.gart PT (64 KB)
+//   0x00800000..0x00820000  gmc GART PT (this — 128 KB for 256 MB gart)
+constexpr uint64_t kGMCGartPTVRAMOffset = 0x00800000;
+
 // ----- mc_init -----
 //
 // Port of gmc_v12_0_mc_init (line 727). Linux reads VRAM size from
@@ -417,23 +433,34 @@ gmc_alloc_resources(DeviceContext &dev, GMCContext &gmc)
     if (!gmc.inited) return kIOReturnNotReady;
 
     // GART page table — 16 KB pages, 8 B PTE, padded to AS page.
+    // VRAM-resident (mirrors upstream amdgpu_gart_table_vram_alloc).
+    // gart_pt_bus holds the GPU MC address of the PT, which lives in
+    // the FB aperture so PSP can fetch PT entries directly without
+    // going through PCIe. CPU writes use bar0_memcpy_to_vram.
     uint64_t pt_entries = gmc.gart_size / kASPageSize;
     uint64_t pt_bytes   = pt_entries * 8;
     if (pt_bytes < kASPageSize) pt_bytes = kASPageSize;
     pt_bytes = (pt_bytes + kASPageSize - 1) & ~(kASPageSize - 1);
     gmc.gart_pt_size = pt_bytes;
 
-    void *cpu = nullptr; uint64_t bus = 0;
+    // VRAM MC address of the PT — read live vram_start (FB_LOCATION_BASE)
+    // and add the fixed PT offset within VRAM. Note `gmc.vram_start`
+    // is still 0 in our struct (legacy; we'll fix in a follow-up), so
+    // we read FB_LOCATION_BASE directly here.
+    uint32_t fb_loc_raw = RREG32(dev,
+        dev.ip.get(IPBlock::MMHUB) + MMHUBRegs::MMMC_VM_FB_LOCATION_BASE);
+    uint64_t vram_start_actual =
+        ((uint64_t)(fb_loc_raw & MMHUBRegs::kFBBaseMask))
+        << MMHUBRegs::kFBBaseShift;
+    gmc.gart_pt_buf = nullptr;       // not a sysmem BO
+    gmc.gart_pt_dma = nullptr;
+    gmc.gart_pt_bus = vram_start_actual + kGMCGartPTVRAMOffset;
+    gmc.gart_pt_cpu = nullptr;       // CPU writes go via BAR0 aperture
+    bar0_memset_vram(dev, kGMCGartPTVRAMOffset, 0, pt_bytes);
     kern_return_t r;
-    r = alloc_dma_block(dev, pt_bytes, &gmc.gart_pt_buf,
-                        &gmc.gart_pt_dma, &bus, &cpu);
-    if (r != kIOReturnSuccess) {
-        GMC_LOG("gart page table alloc failed: %#x", r);
-        return r;
-    }
-    gmc.gart_pt_bus = bus;
-    gmc.gart_pt_cpu = cpu;
-    memset(cpu, 0, pt_bytes);  // all PTEs invalid initially
+
+    void *cpu = nullptr; uint64_t bus = 0;
+    (void)bus; (void)cpu;
 
     // dummy_page — destination for protection-fault page redirects.
     r = alloc_dma_block(dev, kASPageSize, &gmc.dummy_page_buf,
@@ -489,8 +516,12 @@ static void
 hub_init_gart_aperture_regs(const DeviceContext &dev,
                             const GMCContext &gmc, const HubContext &h)
 {
-    // PT base address (split lo/hi)
-    uint64_t pt = gmc.gart_pt_bus;
+    // PT base address (split lo/hi). Upstream's amdgpu_gmc_pd_addr ORs
+    // AMDGPU_PTE_VALID into the PD base. Our PT lives in VRAM (per
+    // upstream amdgpu_gart_table_vram_alloc on GFX12), so we use only
+    // VALID — NOT SYSTEM. SYSTEM tells GMC the PT base is a sysmem
+    // bus address; for VRAM-resident PT it would mis-route the walk.
+    uint64_t pt = gmc.gart_pt_bus | PTEFlags::VALID;
     WREG32(dev, SOC15_REG_OFFSET(dev, h.ip, h.ctx0_pt_base_lo),
            (uint32_t)(pt & 0xFFFFFFFFu));
     WREG32(dev, SOC15_REG_OFFSET(dev, h.ip, h.ctx0_pt_base_hi),
@@ -1039,6 +1070,72 @@ gmc_flush_gpu_tlb(DeviceContext &dev, const GMCContext &gmc,
                 req, value, (unsigned)hub.ip, kFlushEng);
         return kIOReturnTimeout;
     }
+    return kIOReturnSuccess;
+}
+
+//============================================================
+// gmc_bind_existing — write GFX12-format PTEs for an external
+// DART-mapped bus address range into the sysmem-backed page table.
+// Mirrors upstream amdgpu_gart_bind for a contiguous mapping, but
+// works against gmc.gart_pt_cpu (host CPU pointer to the PT BO)
+// instead of going through ttm. Returns the GART MC address.
+//
+// GART page granularity = kASPageSize (16 KB on AS). The DMA
+// buffer is naturally 16 KB aligned (DART requires that), so
+// each AS page maps to one PTE.
+//============================================================
+kern_return_t
+gmc_bind_existing(GMCContext &gmc, uint64_t busAddr,
+                  uint64_t sizeBytes, uint64_t *outMcAddr)
+{
+    // Drop the gmc.gart_pt_cpu null check — VRAM PT has no host CPU
+    // pointer; PTE writes go through the BAR0 aperture. Caller must
+    // supply a valid DeviceContext via the new overload below.
+    (void)gmc; (void)busAddr; (void)sizeBytes; (void)outMcAddr;
+    return kIOReturnUnsupported;  // legacy entry point — use the
+                                  // (dev, gmc, ...) overload below.
+}
+
+kern_return_t
+gmc_bind_existing(DeviceContext &dev, GMCContext &gmc, uint64_t busAddr,
+                  uint64_t sizeBytes, uint64_t *outMcAddr)
+{
+    if (!gmc.inited) return kIOReturnNotReady;
+    if (gmc.gart_pt_bus == 0)           return kIOReturnNotReady;
+    if (outMcAddr == nullptr)           return kIOReturnBadArgument;
+    if (busAddr == 0 || sizeBytes == 0) return kIOReturnBadArgument;
+    if ((busAddr & (kASPageSize - 1)) != 0) return kIOReturnNotAligned;
+
+    uint64_t rounded = (sizeBytes + kASPageSize - 1) &
+                       ~((uint64_t)kASPageSize - 1);
+    if (gmc.gart_bump_offset + rounded > gmc.gart_size) {
+        GMC_LOG("gmc_bind_existing: out of GART (need %llu, free %llu)",
+                rounded, gmc.gart_size - gmc.gart_bump_offset);
+        return kIOReturnNoSpace;
+    }
+    uint64_t off = gmc.gart_bump_offset;
+    gmc.gart_bump_offset += rounded;
+
+    uint32_t numPTEs = static_cast<uint32_t>(rounded / kASPageSize);
+    uint64_t firstPTE = off / kASPageSize;
+    for (uint32_t i = 0; i < numPTEs; i++) {
+        uint64_t pa = busAddr + (uint64_t)i * kASPageSize;
+        // GFX12 single-level GART PTE: VALID|SYSTEM|SNOOPED|EXEC|R|W
+        // for sysmem destinations, IS_PTE bit 63 set so the GMC
+        // walker treats the entry as a leaf PTE (not a PDE pointer).
+        uint64_t pte = (pa & ~((uint64_t)0xFFFULL)) |
+                       PTEFlags::SYSMEM_RW;
+        uint64_t pteVRAMOffset = kGMCGartPTVRAMOffset +
+                                 (firstPTE + i) * 8ULL;
+        bar0_memcpy_to_vram(dev, pteVRAMOffset, &pte, sizeof(pte));
+    }
+    amdgpu_hdp_flush(dev);
+
+    *outMcAddr = gmc.gart_start + off;
+    GMC_LOG("bind_existing: %llu bytes @ bus=%#llx → mc=%#llx "
+            "(%u PTEs at idx %llu, PT @ vram_off=%#llx)",
+            rounded, busAddr, *outMcAddr, numPTEs, firstPTE,
+            (uint64_t)kGMCGartPTVRAMOffset);
     return kIOReturnSuccess;
 }
 

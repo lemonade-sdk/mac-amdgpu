@@ -149,6 +149,11 @@ struct GMCContext {
     uint64_t  dummy_page_bus;       // for protection-fault redirect
     uint64_t  mem_scratch_bus;      // default aperture address
 
+    // Bump allocator for sysmem buffers bound into GART (e.g. firmware
+    // staging from the host DMA buffer). Offsets are within
+    // [gart_start, gart_end). Reset to 0 at gmc_init time.
+    uint64_t  gart_bump_offset;
+
     // Hub register offset tables.
     HubContext mmhub;     // MMHUB v4_1_0
     HubContext gfxhub;    // GFXHUB v12_0
@@ -218,5 +223,13 @@ kern_return_t gmc_set_fault_enable_default(DeviceContext &dev,
 
 // Top-level GMCInit stage entry — runs the chain.
 kern_return_t gmc_init(DeviceContext &dev, GMCContext &gmc);
+
+// gmc_bind_existing — write GART PTEs for an existing DART-mapped bus
+// address range into the VRAM-resident page table. Returns the GART
+// MC address PSP uses to reach the bound buffer. PTE writes use the
+// BAR0 aperture (CPU → MMIO → VRAM). Bumps allocator.
+kern_return_t gmc_bind_existing(DeviceContext &dev, GMCContext &gmc,
+                                uint64_t busAddr, uint64_t sizeBytes,
+                                uint64_t *outMcAddr);
 
 } // namespace amdgpu
