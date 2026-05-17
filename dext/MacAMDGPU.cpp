@@ -1517,39 +1517,47 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                 }
 
                 // Submit each (fw_type, offset, size) as a separate
-                // LOAD_IP_FW frame. Bail on first error — upstream
-                // psp_load_non_psp_fw does the same (a failing IP fw
-                // load aborts the whole bringup; we mirror that here
-                // so subsequent failing loads don't mask the first).
+                // LOAD_IP_FW frame. Each payload gets a UNIQUE MC
+                // address inside psp.fwBuf, matching upstream's
+                // `firmware.fw_buf_mc + per-ucode-offset` scheme
+                // (amdgpu_ucode.c:1203 + amdgpu_psp.c:2915). Reusing a
+                // single address for every load makes PSP reject
+                // SDMA / CP_RS64 / MES_UNI with TEE_BAD_PARAMETERS.
+                // Bail on first error — upstream psp_load_non_psp_fw
+                // does the same so we don't mask the first failure.
                 MACAMDGPU_LOG("LoadFirmware(fwType=%#llx): extractor produced "
                               "%u payload(s)", fwType, count);
+                constexpr uint64_t kFwBufAlign = 0x1000; // PAGE_SIZE
                 for (uint32_t i = 0; i < count; i++) {
-                    // Match upstream psp_execute_ip_fw_load: copy the
-                    // payload bytes into psp.fw_pri (VRAM) via BAR0,
-                    // then pass psp.fwPriBusAddr as the fw_phy_addr.
-                    // PSP fetches firmware via its internal VRAM path
-                    // (FB aperture, no GMC/GART walk needed).
-                    if (payloads[i].size_bytes > psp.fwPriSize) {
-                        MACAMDGPU_LOG("LoadFirmware: payload[%u] %u B > fw_pri %llu B",
-                                      i, payloads[i].size_bytes,
-                                      psp.fwPriSize);
-                        return kIOReturnNoSpace;
-                    }
                     if ((uint64_t)payloads[i].offset_bytes +
                             payloads[i].size_bytes > fwSize) {
                         return kIOReturnBadArgument;
                     }
+                    // Bump-allocate a unique slot in fw_buf, mirroring
+                    // upstream `fw_offset += ALIGN(ucode_size, PAGE_SIZE)`.
+                    uint64_t slot_off = psp.fwBufBumpOffset;
+                    uint64_t slot_sz  = (payloads[i].size_bytes +
+                                         kFwBufAlign - 1) & ~(kFwBufAlign - 1);
+                    if (slot_off + slot_sz > psp.fwBufSize) {
+                        MACAMDGPU_LOG("LoadFirmware: fw_buf exhausted "
+                                      "(want %llu @ %llu, cap %llu)",
+                                      slot_sz, slot_off, psp.fwBufSize);
+                        return kIOReturnNoSpace;
+                    }
+                    uint64_t slot_vram_off = psp.fwBufVRAMOffset + slot_off;
+                    uint64_t fwBusAddr     = psp.fwBufBaseMC      + slot_off;
                     amdgpu::bar0_memcpy_to_vram(
-                        dev,
-                        /*vram_byte_offset=*/0,           // fw_pri at vram offset 0
+                        dev, slot_vram_off,
                         bin + payloads[i].offset_bytes,
                         payloads[i].size_bytes);
                     amdgpu::amdgpu_hdp_flush(dev);
-                    uint64_t fwBusAddr = psp.fwPriBusAddr;
-                    MACAMDGPU_LOG("  payload[%u]: fw_type=%u offset=%u size=%u → fw_pri mc=%#llx",
+                    psp.fwBufBumpOffset = slot_off + slot_sz;
+                    MACAMDGPU_LOG("  payload[%u]: fw_type=%u src_off=%u size=%u "
+                                  "→ fw_buf slot vram_off=%#llx mc=%#llx",
                                   i, payloads[i].fw_type,
                                   payloads[i].offset_bytes,
-                                  payloads[i].size_bytes, fwBusAddr);
+                                  payloads[i].size_bytes,
+                                  slot_vram_off, fwBusAddr);
                     kern_return_t r = amdgpu::psp_load_ip_fw(
                         dev, psp, fwBusAddr,
                         payloads[i].size_bytes, payloads[i].fw_type);

@@ -132,6 +132,30 @@ struct PSPContext {
     void     *tmrCPUAddr;
     uint64_t  tmrSize;
     bool      tmrSetUp;
+
+    // ---- firmware.fw_buf-equivalent --------------------------------
+    //
+    // Upstream `amdgpu_ucode_create_bo` allocates ONE big buffer of
+    // size `firmware.fw_size`, with EACH ucode getting its own MC
+    // address inside it (`fw_buf_mc + cumulative PAGE-aligned offset`).
+    // `psp_prep_load_ip_fw_cmd_buf` passes `ucode->mc_addr` (unique per
+    // ucode) as `cmd_load_ip_fw.fw_phy_addr_lo/hi`. PSP then reads the
+    // firmware bytes from that specific address and validates them.
+    //
+    // We used to pass `fwPriBusAddr` (single VRAM address) for EVERY
+    // LOAD_IP_FW, which caused PSP to reject SDMA / CP_RS64 / MES with
+    // TEE_BAD_PARAMETERS (0xFFFF0006) while SMU and IMU happened to
+    // pass. Match upstream: bump-allocate a per-payload offset inside
+    // a dedicated fw_buf region.
+    //
+    // fwBufVRAMOffset is the start of fw_buf within VRAM (BAR0
+    // visible aperture). Each LoadFirmware bumps fwBufBumpOffset by
+    // the page-aligned payload size and uses fwBufBaseMC +
+    // (bump_offset before increment) as the LOAD_IP_FW address.
+    uint64_t  fwBufVRAMOffset;   // offset within VRAM (BAR0 aperture)
+    uint64_t  fwBufBaseMC;       // vram_start + fwBufVRAMOffset
+    uint64_t  fwBufSize;         // total bytes reserved for fw_buf
+    uint64_t  fwBufBumpOffset;   // next available offset within fw_buf
 };
 
 //

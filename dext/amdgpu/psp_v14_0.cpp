@@ -61,6 +61,11 @@ static constexpr uint64_t kRingVRAMOffset  = 0x100000;   // 1 MB
 static constexpr uint64_t kCmdBufVRAMOffset = 0x104000;  // 1 MB + 16 KB
 static constexpr uint64_t kFenceVRAMOffset = 0x108000;   // 1 MB + 32 KB
 static constexpr uint64_t kTMRVRAMOffset   = 0x200000;   // 2 MB (size 4 MB)
+// firmware.fw_buf mirror — unique per-payload addresses for LOAD_IP_FW.
+// GART PT lives at 0x00800000 (~8 MB, 128 KB long); place fw_buf well
+// past that. 8 MB span is plenty for all gfx12 ucodes + stacks.
+static constexpr uint64_t kFwBufVRAMOffset = 0x01000000; // 16 MB
+static constexpr uint64_t kFwBufSize       = 0x00800000; // 8 MB
 
 kern_return_t
 psp_init(DeviceContext &dev, PSPContext &psp)
@@ -95,10 +100,22 @@ psp_init(DeviceContext &dev, PSPContext &psp)
     psp.fwPriSize       = kPSPFwPriBufSize;
     psp.sosAlive        = false;
 
+    // firmware.fw_buf mirror: dedicated VRAM region for per-payload
+    // LOAD_IP_FW staging. Each LoadFirmware bumps fwBufBumpOffset by
+    // its payload size (PAGE-aligned) and passes
+    // `fwBufBaseMC + (old bump offset)` as cmd.fw_phy_addr — matching
+    // upstream's `firmware.fw_buf_mc + per-ucode-offset` scheme.
+    psp.fwBufVRAMOffset = kFwBufVRAMOffset;
+    psp.fwBufBaseMC     = vram_start + kFwBufVRAMOffset;
+    psp.fwBufSize       = kFwBufSize;
+    psp.fwBufBumpOffset = 0;
+
     PSP_LOG("fw_pri ready VRAM-backed @ vram_off=%#llx mc=%#llx size=%llu "
-            "(vram_start=%#llx)",
+            "(vram_start=%#llx); fw_buf @ vram_off=%#llx mc=%#llx size=%#llx",
             (uint64_t)kFwPriVRAMOffset, psp.fwPriBusAddr,
-            psp.fwPriSize, vram_start);
+            psp.fwPriSize, vram_start,
+            (uint64_t)kFwBufVRAMOffset, psp.fwBufBaseMC,
+            (uint64_t)kFwBufSize);
     return kIOReturnSuccess;
 }
 
