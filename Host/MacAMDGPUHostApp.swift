@@ -98,6 +98,11 @@ private let kFwFile_MES_UNI: UInt64 = 0x200 + 3
 private let kFwFile_CP_PFP:  UInt64 = 0x200 + 4
 private let kFwFile_CP_ME:   UInt64 = 0x200 + 5
 private let kFwFile_CP_MEC:  UInt64 = 0x200 + 6
+// gc_<v>_toc.bin — table-of-contents. Required for autoload-supported
+// chips (psp_v14_0_3 / R9700): PSP parses it after ring_create to
+// compute TMR layout. Without it, SDMA/CP/MES LOAD_IP_FW frames are
+// rejected with TEE_BAD_PARAMETERS = 0xFFFF0006.
+private let kFwFile_TOC:     UInt64 = 0x200 + 7
 
 // Bringup stages — match amdgpu_init.h.
 private let kStageIPDiscovery:   UInt64 = 1
@@ -1180,6 +1185,10 @@ final class DriverController: NSObject, ObservableObject,
             }
         }
 
+        // (TOC load was here in v0.0.65/66 — gc_<v>_toc.bin is ONLY
+        // required for AMDGPU_FW_LOAD_RLC_BACKDOOR_AUTO, NOT the
+        // default AMDGPU_FW_LOAD_PSP path we use. See gfx_v12_0.c:644.)
+
         // SMU PMFW MUST be loaded via PSP ring BEFORE SMUInit's mailbox
         // test — otherwise MP1 stays in reset and TestMessage just
         // times out. Mirror upstream psp_load_non_psp_fw ordering: SMU
@@ -1202,24 +1211,24 @@ final class DriverController: NSObject, ObservableObject,
         // runs AFTER the firmware section so per-IP microcode_loaded
         // flags are set by the time IMUInit etc. check them).
 
-        // Per-IP firmware loads for SDMA / RLC / IMU / CP (RS64) / MES,
-        // post-SMU. Each call routes through amdgpu_ucode_extract in the
-        // dext, which decodes the .bin's per-IP header and submits the
-        // right number of LOAD_IP_FW frames (e.g. uni_mes.bin → 2,
-        // rlc.bin → up to 5+, cp_rs64 → 3-5). Order mirrors upstream
-        // psp_load_non_psp_fw's iteration over firmware.ucode[] on
-        // 14_0_3 with autoload_supported=true, which in array order
-        // hits IMU (513-514) before RLC (520-529) before CP_MES (530-531)
-        // and SDMA (480-491). For our bringup we interleave:
-        //   IMU → RLC → CP PFP/ME/MEC → MES → SDMA
-        // — same flavor as psp_load_non_psp_fw, no skipped rungs.
-        _ = loadFirmware(kFwFile_IMU,     "gc_\(gfx)_imu.bin")
-        _ = loadFirmware(kFwFile_RLC,     "gc_\(gfx)_rlc.bin")
+        // Per-IP firmware loads. Order MUST match upstream
+        // psp_load_non_psp_fw's iteration over firmware.ucode[], which
+        // is the AMDGPU_UCODE_ID_* enum order at amdgpu_ucode.h:480-529:
+        //   SDMA_RS64 (490)
+        //   CP_RS64_PFP/ME/MEC + stacks (494-504)
+        //   CP_MES + CP_MES_DATA (509-510)
+        //   IMU_I + IMU_D (513-514)
+        //   RLC sub-bins + RLC_G LAST (520-529)
+        // RLC_G last triggers psp_rlc_autoload_start
+        // (amdgpu_psp.c:3113-3121); anything submitted after that
+        // point gets rejected by SOS as TEE_BAD_PARAMETERS.
+        _ = loadFirmware(kFwFile_SDMA,    "sdma_\(sdma).bin")
         _ = loadFirmware(kFwFile_CP_PFP,  "gc_\(gfx)_pfp.bin")
         _ = loadFirmware(kFwFile_CP_ME,   "gc_\(gfx)_me.bin")
         _ = loadFirmware(kFwFile_CP_MEC,  "gc_\(gfx)_mec.bin")
         _ = loadFirmware(kFwFile_MES_UNI, "gc_\(gfx)_uni_mes.bin")
-        _ = loadFirmware(kFwFile_SDMA,    "sdma_\(sdma).bin")
+        _ = loadFirmware(kFwFile_IMU,     "gc_\(gfx)_imu.bin")
+        _ = loadFirmware(kFwFile_RLC,     "gc_\(gfx)_rlc.bin")
 
         // Stages 9–14: IMU → RLC → CP → MES → GFX → SDMA bringup. Each
         // gates on its firmware being loaded above.
@@ -1268,13 +1277,14 @@ final class DriverController: NSObject, ObservableObject,
         }
 
         // Per-IP firmware loads (extractor expands per-file into N frames).
-        _ = loadFirmware(kFwFile_IMU,     "gc_\(gfx)_imu.bin")
-        _ = loadFirmware(kFwFile_RLC,     "gc_\(gfx)_rlc.bin")
+        // Order matches upstream AMDGPU_UCODE_ID_* iteration; RLC last.
+        _ = loadFirmware(kFwFile_SDMA,    "sdma_\(sdma).bin")
         _ = loadFirmware(kFwFile_CP_PFP,  "gc_\(gfx)_pfp.bin")
         _ = loadFirmware(kFwFile_CP_ME,   "gc_\(gfx)_me.bin")
         _ = loadFirmware(kFwFile_CP_MEC,  "gc_\(gfx)_mec.bin")
         _ = loadFirmware(kFwFile_MES_UNI, "gc_\(gfx)_uni_mes.bin")
-        _ = loadFirmware(kFwFile_SDMA,    "sdma_\(sdma).bin")
+        _ = loadFirmware(kFwFile_IMU,     "gc_\(gfx)_imu.bin")
+        _ = loadFirmware(kFwFile_RLC,     "gc_\(gfx)_rlc.bin")
 
         // Stages 9–14: IMU → RLC → CP → MES → GFX → SDMA bringup.
         for s: UInt64 in [9, 10, 11, 12, 13, 14] { testInitDeviceUpTo(s) }

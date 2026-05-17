@@ -336,9 +336,38 @@ namespace PSPGfxFwType {
 namespace PSPGfxCmd {
     constexpr uint32_t SETUP_TMR             = 5;
     constexpr uint32_t LOAD_IP_FW            = 6;
+    constexpr uint32_t LOAD_TOC              = 0x20;
+    constexpr uint32_t AUTOLOAD_RLC          = 0x21;
     constexpr uint32_t FB_FW_RESERV_ADDR     = 0x50;
     constexpr uint32_t FB_FW_RESERV_EXT_ADDR = 0x51;
 }
+
+//
+// psp_load_toc — port of upstream `psp_load_toc` (amdgpu_psp.c:840).
+// REQUIRED for autoload-supported chips (psp_v14_0_2/3 with R9700).
+// Without TOC parsed, PSP rejects every SDMA/CP/MES LOAD_IP_FW with
+// TEE_BAD_PARAMETERS = 0xFFFF0006 because it doesn't know the TMR
+// slot layout those firmwares are signed against.
+//
+// The TOC bin (gc_<v>_toc.bin) is itself a common-header firmware blob;
+// upstream just copies the WHOLE FILE into fw_pri_buf and sends
+// GFX_CMD_ID_LOAD_TOC. PSP reads it, validates, computes total TMR
+// size needed, and writes that back as `resp.uresp.fw_reserve_info`...
+// actually `cmd_buf_mem->resp.tmr_size` per upstream line 854.
+//
+kern_return_t psp_load_toc(DeviceContext &dev, PSPContext &psp,
+                           const uint8_t *tocBin, uint32_t tocSize,
+                           uint32_t *outTmrSize);
+
+//
+// psp_rlc_autoload_start — port of upstream `psp_rlc_autoload_start`
+// (amdgpu_psp.c:3434). After all GFX firmware has loaded
+// (last = RLC_G), submit GFX_CMD_ID_AUTOLOAD_RLC so PSP starts
+// the autoload sequence and bootstraps GFX/SDMA/MES/CP engines.
+// Upstream calls this from `psp_load_non_psp_fw` immediately after
+// the RLC_G `psp_execute_ip_fw_load` returns success.
+//
+kern_return_t psp_rlc_autoload_start(DeviceContext &dev, PSPContext &psp);
 
 //
 // psp_query_fw_reservation — port of upstream `psp_update_fw_reservation`

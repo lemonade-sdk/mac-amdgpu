@@ -86,14 +86,18 @@ uint32_t extract_sdma(const uint8_t *bin, uint64_t size,
 // Each minor-specific helper (v2_1 / v2_2 / v2_3 / v2_4 / v2_5) emits
 // the sub-bins whose size_bytes is non-zero. We mirror that exactly.
 //
-// Order (matters: matches upstream's array order, which mirrors the
-// firmware.ucode[] index order in amdgpu_ucode.h:478-553):
-//   v2_0 (always)  → RLC_G
-//   v2_1 (>= 1)    → CNTL, GPM_MEM, SRM_MEM
-//   v2_2 (>= 2)    → IRAM, DRAM
-//   v2_3 (== 3)    → RLC_P, RLC_V
-//   v2_4 (== 4)    → GLOBAL/SE0/SE1/SE2/SE3 tap delays
-//   v2_5 (== 5)    → IRAM_1, DRAM_1 (not shipped on RDNA4)
+// Order (CRITICAL: must match upstream's `firmware.ucode[]` iteration,
+// which is the AMDGPU_UCODE_ID_* enum order at amdgpu_ucode.h:515-529:
+//   TAP_DELAYS (v2.4)
+//   RESTORE_LIST_CNTL / GPM_MEM / SRM_MEM (v2.1)
+//   RLC_IRAM / RLC_DRAM (v2.2)
+//   RLC_P / RLC_V (v2.3)
+//   RLC_G LAST (v2.0)
+//
+// RLC_G must be emitted LAST — upstream `psp_load_non_psp_fw`
+// triggers `psp_rlc_autoload_start` right after RLC_G loads
+// (amdgpu_psp.c:3113-3121), and PSP rejects subsequent RLC sub-bins
+// with TEE_BAD_PARAMETERS once autoload has been kicked.
 //
 // Offset fields are file-relative when computed as
 //   (struct-pointer + offset_bytes) - bin
@@ -109,66 +113,9 @@ uint32_t extract_rlc(const uint8_t *bin, uint64_t size,
 
     uint32_t n = 0;
 
-    // ---- v2.0 — RLC_G is the main RLC ucode -------------------------
-    // amdgpu_rlc.c:331-340 (sets info->ucode_id = AMDGPU_UCODE_ID_RLC_G)
-    // amdgpu_ucode.c:1107-1111 (default case: header.ucode_array_offset
-    //                            + header.ucode_size_bytes)
-    // amdgpu_psp.c:2704-2706 (AMDGPU_UCODE_ID_RLC_G → GFX_FW_TYPE_RLC_G=8)
-    n = push(out, n, PSPGfxFwType::RLC_G,
-             hv2_0->header.ucode_array_offset_bytes,
-             hv2_0->header.ucode_size_bytes, size);
-
-    // ---- v2.1 — save/restore lists ----------------------------------
-    if (mnr >= 1 && size >= sizeof(rlc_firmware_header_v2_1)) {
-        auto *hv2_1 = reinterpret_cast<const rlc_firmware_header_v2_1 *>(bin);
-        // amdgpu_rlc.c:366-389
-        // amdgpu_ucode.c:920-931 (RLC_RESTORE_LIST_{CNTL,GPM_MEM,SRM_MEM})
-        // amdgpu_psp.c:2707-2715
-        n = push(out, n, PSPGfxFwType::RLC_RESTORE_LIST_SRM_CNTL,
-                 hv2_1->save_restore_list_cntl_offset_bytes,
-                 hv2_1->save_restore_list_cntl_size_bytes, size);
-        n = push(out, n, PSPGfxFwType::RLC_RESTORE_LIST_GPM_MEM,
-                 hv2_1->save_restore_list_gpm_offset_bytes,
-                 hv2_1->save_restore_list_gpm_size_bytes, size);
-        n = push(out, n, PSPGfxFwType::RLC_RESTORE_LIST_SRM_MEM,
-                 hv2_1->save_restore_list_srm_offset_bytes,
-                 hv2_1->save_restore_list_srm_size_bytes, size);
-    }
-
-    // ---- v2.2 — IRAM + DRAM -----------------------------------------
-    if (mnr >= 2 && size >= sizeof(rlc_firmware_header_v2_2)) {
-        auto *hv2_2 = reinterpret_cast<const rlc_firmware_header_v2_2 *>(bin);
-        // amdgpu_rlc.c:404-420
-        // amdgpu_ucode.c:932-939 (RLC_IRAM / RLC_DRAM)
-        // amdgpu_psp.c:2716-2721
-        n = push(out, n, PSPGfxFwType::RLC_IRAM,
-                 hv2_2->rlc_iram_ucode_offset_bytes,
-                 hv2_2->rlc_iram_ucode_size_bytes, size);
-        n = push(out, n, PSPGfxFwType::RLC_DRAM_BOOT,
-                 hv2_2->rlc_dram_ucode_offset_bytes,
-                 hv2_2->rlc_dram_ucode_size_bytes, size);
-    }
-
-    // ---- v2.3 — RLC_P + RLC_V ---------------------------------------
-    if (mnr == 3 && size >= sizeof(rlc_firmware_header_v2_3)) {
-        auto *hv2_3 = reinterpret_cast<const rlc_firmware_header_v2_3 *>(bin);
-        // amdgpu_rlc.c:439-455
-        // amdgpu_ucode.c:948-955 (RLC_P / RLC_V)
-        // amdgpu_psp.c:2698-2703
-        n = push(out, n, PSPGfxFwType::RLC_P,
-                 hv2_3->rlcp_ucode_offset_bytes,
-                 hv2_3->rlcp_ucode_size_bytes, size);
-        n = push(out, n, PSPGfxFwType::RLC_V,
-                 hv2_3->rlcv_ucode_offset_bytes,
-                 hv2_3->rlcv_ucode_size_bytes, size);
-    }
-
-    // ---- v2.4 — tap delays ------------------------------------------
+    // ---- v2.4 — tap delays (first per upstream enum 515-519) --------
     if (mnr == 4 && size >= sizeof(rlc_firmware_header_v2_4)) {
         auto *hv2_4 = reinterpret_cast<const rlc_firmware_header_v2_4 *>(bin);
-        // amdgpu_rlc.c:475-515
-        // amdgpu_ucode.c:956-975
-        // amdgpu_psp.c:2728-2741
         n = push(out, n, PSPGfxFwType::GLOBAL_TAP_DELAYS,
                  hv2_4->global_tap_delays_ucode_offset_bytes,
                  hv2_4->global_tap_delays_ucode_size_bytes, size);
@@ -185,6 +132,50 @@ uint32_t extract_rlc(const uint8_t *bin, uint64_t size,
                  hv2_4->se3_tap_delays_ucode_offset_bytes,
                  hv2_4->se3_tap_delays_ucode_size_bytes, size);
     }
+
+    // ---- v2.1 — save/restore lists (enum 520-522) -------------------
+    if (mnr >= 1 && size >= sizeof(rlc_firmware_header_v2_1)) {
+        auto *hv2_1 = reinterpret_cast<const rlc_firmware_header_v2_1 *>(bin);
+        n = push(out, n, PSPGfxFwType::RLC_RESTORE_LIST_SRM_CNTL,
+                 hv2_1->save_restore_list_cntl_offset_bytes,
+                 hv2_1->save_restore_list_cntl_size_bytes, size);
+        n = push(out, n, PSPGfxFwType::RLC_RESTORE_LIST_GPM_MEM,
+                 hv2_1->save_restore_list_gpm_offset_bytes,
+                 hv2_1->save_restore_list_gpm_size_bytes, size);
+        n = push(out, n, PSPGfxFwType::RLC_RESTORE_LIST_SRM_MEM,
+                 hv2_1->save_restore_list_srm_offset_bytes,
+                 hv2_1->save_restore_list_srm_size_bytes, size);
+    }
+
+    // ---- v2.2 — IRAM + DRAM (enum 523-524) --------------------------
+    if (mnr >= 2 && size >= sizeof(rlc_firmware_header_v2_2)) {
+        auto *hv2_2 = reinterpret_cast<const rlc_firmware_header_v2_2 *>(bin);
+        n = push(out, n, PSPGfxFwType::RLC_IRAM,
+                 hv2_2->rlc_iram_ucode_offset_bytes,
+                 hv2_2->rlc_iram_ucode_size_bytes, size);
+        n = push(out, n, PSPGfxFwType::RLC_DRAM_BOOT,
+                 hv2_2->rlc_dram_ucode_offset_bytes,
+                 hv2_2->rlc_dram_ucode_size_bytes, size);
+    }
+
+    // ---- v2.3 — RLC_P + RLC_V (enum 527-528) ------------------------
+    if (mnr == 3 && size >= sizeof(rlc_firmware_header_v2_3)) {
+        auto *hv2_3 = reinterpret_cast<const rlc_firmware_header_v2_3 *>(bin);
+        n = push(out, n, PSPGfxFwType::RLC_P,
+                 hv2_3->rlcp_ucode_offset_bytes,
+                 hv2_3->rlcp_ucode_size_bytes, size);
+        n = push(out, n, PSPGfxFwType::RLC_V,
+                 hv2_3->rlcv_ucode_offset_bytes,
+                 hv2_3->rlcv_ucode_size_bytes, size);
+    }
+
+    // ---- v2.0 — RLC_G LAST (enum 529 — triggers rlc_autoload_start) -
+    // amdgpu_psp.c:3113-3121 calls psp_rlc_autoload_start immediately
+    // after RLC_G loads — anything submitted after this point gets
+    // rejected by SOS as TEE_BAD_PARAMETERS.
+    n = push(out, n, PSPGfxFwType::RLC_G,
+             hv2_0->header.ucode_array_offset_bytes,
+             hv2_0->header.ucode_size_bytes, size);
 
     return n;
 }

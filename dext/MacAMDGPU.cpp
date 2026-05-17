@@ -125,6 +125,13 @@ enum {
     kMacAMDGPUFwTypeFile_CP_PFP     = 0x200 + 4,
     kMacAMDGPUFwTypeFile_CP_ME      = 0x200 + 5,
     kMacAMDGPUFwTypeFile_CP_MEC     = 0x200 + 6,
+    // gc_<v>_toc.bin — table of contents that PSP parses to compute
+    // the TMR layout for autoload-supported chips. Required BEFORE any
+    // LOAD_IP_FW for SDMA/CP/MES (those firmwares live in TMR slots
+    // PSP allocates from the TOC; without it PSP rejects them with
+    // TEE_BAD_PARAMETERS = 0xFFFF0006). Mirrors upstream psp_load_toc
+    // (amdgpu_psp.c:840), called from psp_tmr_init.
+    kMacAMDGPUFwTypeFile_TOC        = 0x200 + 7,
 };
 
 enum {
@@ -1419,6 +1426,22 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         case kMacAMDGPUFwTypeIPKeyMgrDrv:
             return amdgpu::psp_bootloader_load_component(
                 dev, psp, bin, fwSize, amdgpu::PSPBootloaderCmd::LoadIPKeyMgrDrv);
+        case kMacAMDGPUFwTypeFile_TOC: {
+            // gc_<v>_toc.bin — required BEFORE any IP firmware load on
+            // autoload-supported chips (psp_v14_0_3 / R9700). PSP parses
+            // the TOC to compute TMR layout; without this it rejects
+            // SDMA/CP/MES LOAD_IP_FW with TEE_BAD_PARAMETERS (0xFFFF0006).
+            // Mirrors upstream psp_load_toc (amdgpu_psp.c:840) called
+            // from psp_tmr_init.
+            uint32_t tmr_size = 0;
+            kern_return_t r = amdgpu::psp_load_toc(
+                dev, psp, bin, static_cast<uint32_t>(fwSize), &tmr_size);
+            if (r == kIOReturnSuccess) {
+                MACAMDGPU_LOG("LoadFirmware(TOC): PSP needs tmr_size=%u",
+                              tmr_size);
+            }
+            return r;
+        }
         default:
             // Post-SOS IP firmware path. Two host fwType encodings:
             //   0x100..0x1FF  single-payload IP firmware (legacy);
@@ -1548,6 +1571,19 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                     // through. (Order in upstream: I, then D.)
                     if (payloads[i].fw_type == amdgpu::PSPGfxFwType::IMU_D) {
                         driver->ivars->bringup.imu.microcode_loaded = true;
+                    }
+                    // RLC_G is the LAST GFX firmware per upstream
+                    // amdgpu_ucode.h enum order (529). Upstream
+                    // psp_load_non_psp_fw calls psp_rlc_autoload_start
+                    // immediately after this returns — see
+                    // amdgpu_psp.c:3113-3121. Mirror that here.
+                    if (payloads[i].fw_type == amdgpu::PSPGfxFwType::RLC_G) {
+                        kern_return_t a = amdgpu::psp_rlc_autoload_start(
+                            dev, psp);
+                        if (a != kIOReturnSuccess) {
+                            MACAMDGPU_LOG("rlc_autoload_start FAILED kr=%#x", a);
+                            return a;
+                        }
                     }
                 }
                 if (sdma_loaded_this_call) {

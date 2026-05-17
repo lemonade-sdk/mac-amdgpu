@@ -811,6 +811,123 @@ psp_query_fw_reservation(DeviceContext &dev, PSPContext &psp)
     return r2;
 }
 
+//
+// psp_load_toc — port of upstream `psp_load_toc` (amdgpu_psp.c:840).
+// Stages the gc_<v>_toc.bin file in fw_pri (VRAM via BAR0) and submits
+// GFX_CMD_ID_LOAD_TOC. PSP parses the TOC, validates, and writes the
+// total TMR size needed for autoload back into the cmd_buf response.
+// Must run AFTER ring_create + FB_FW_RESERV queries but BEFORE any
+// LOAD_IP_FW for SDMA / CP_RS64 / MES (those firmwares occupy TMR
+// slots whose layout PSP only knows once the TOC is parsed).
+//
+kern_return_t
+psp_load_toc(DeviceContext &dev, PSPContext &psp,
+             const uint8_t *tocBin, uint32_t tocSize,
+             uint32_t *outTmrSize)
+{
+    if (!psp.ringCreated) {
+        PSP_LOG("load_toc: ring not created");
+        return kIOReturnNotReady;
+    }
+    if (tocBin == nullptr || tocSize < sizeof(common_firmware_header)) {
+        return kIOReturnBadArgument;
+    }
+
+    // Parse common header — upstream psp_init_toc_microcode pulls
+    // payload offset + size from `header.ucode_array_offset_bytes` and
+    // `header.ucode_size_bytes`, then psp_load_toc only copies/submits
+    // that PAYLOAD (NOT the whole file). Sending the file as-is gets
+    // rejected by PSP with status 0x11 because the signature & size
+    // don't match what was signed.
+    auto *hdr = reinterpret_cast<const common_firmware_header *>(tocBin);
+    uint32_t payload_offset = hdr->ucode_array_offset_bytes;
+    uint32_t payload_size   = hdr->ucode_size_bytes;
+    if (payload_offset == 0 ||
+        (uint64_t)payload_offset + payload_size > tocSize) {
+        PSP_LOG("load_toc: header bad — off=%u size=%u file=%u",
+                payload_offset, payload_size, tocSize);
+        return kIOReturnBadArgument;
+    }
+    if (payload_size > psp.fwPriSize) {
+        PSP_LOG("load_toc: payload %u B > fw_pri %llu B",
+                payload_size, psp.fwPriSize);
+        return kIOReturnNoSpace;
+    }
+
+    // 1. Stage the TOC PAYLOAD ONLY in fw_pri via BAR0. Mirrors
+    //    upstream psp_copy_fw(psp, psp->toc.start_addr, psp->toc.size_bytes).
+    bar0_memcpy_to_vram(dev, /*vram_byte_offset=*/0,
+                        tocBin + payload_offset, payload_size);
+    amdgpu_hdp_flush(dev);
+
+    // 2. Build LOAD_TOC frame.
+    uint8_t cmd_buf[kPSPGfxCmdRespSize];
+    memset(cmd_buf, 0, sizeof(cmd_buf));
+    auto *cmd_hdr = reinterpret_cast<PSPGfxCmdRespHeader *>(cmd_buf);
+    cmd_hdr->buf_size    = sizeof(cmd_buf);
+    cmd_hdr->buf_version = kPSPGfxCmdBufVersion;
+    cmd_hdr->cmd_id      = PSPGfxCmd::LOAD_TOC;
+
+    // psp_gfx_cmd_load_toc layout (psp_gfx_if.h):
+    //   uint32_t toc_phy_addr_lo;  // +0
+    //   uint32_t toc_phy_addr_hi;  // +4
+    //   uint32_t toc_size;         // +8 — PAYLOAD size, NOT file size
+    auto *toc = reinterpret_cast<uint32_t *>(cmd_buf + 28);
+    toc[0] = static_cast<uint32_t>(psp.fwPriBusAddr & 0xFFFFFFFFu);
+    toc[1] = static_cast<uint32_t>(psp.fwPriBusAddr >> 32);
+    toc[2] = payload_size;
+
+    uint32_t resp = 0;
+    kern_return_t r = psp_ring_cmd_submit(dev, psp, cmd_buf,
+                                          kPSPGfxCmdRespSize, &resp);
+    if (r != kIOReturnSuccess) {
+        PSP_LOG("LOAD_TOC FAILED kr=%#x resp=%#x (payload off=%u size=%u)",
+                r, resp, payload_offset, payload_size);
+        return r;
+    }
+
+    // 3. Read tmr_size from response. psp_gfx_resp.tmr_size lives at
+    //    offset 16 (per psp_gfx_if.h response struct).
+    uint32_t tmr_size = RBAR2_32(dev, kCmdBufVRAMOffset + 16);
+    if (outTmrSize) *outTmrSize = tmr_size;
+    PSP_LOG("LOAD_TOC ok — PSP reported tmr_size=%u (%#x)",
+            tmr_size, tmr_size);
+    return kIOReturnSuccess;
+}
+
+//
+// psp_rlc_autoload_start — port of upstream `psp_rlc_autoload_start`
+// (amdgpu_psp.c:3434). Submits a cmd-id-only frame
+// (GFX_CMD_ID_AUTOLOAD_RLC = 0x21) telling SOS that all GFX firmware
+// has been pre-staged; SOS then drives the per-IP autoload sequence.
+// Caller MUST have already loaded all RS64 CP / MES / IMU / RLC
+// sub-bins ending with RLC_G — this command kicks off the actual
+// engine bringup PSP-side.
+//
+kern_return_t
+psp_rlc_autoload_start(DeviceContext &dev, PSPContext &psp)
+{
+    if (!psp.ringCreated) {
+        return kIOReturnNotReady;
+    }
+    uint8_t cmd_buf[kPSPGfxCmdRespSize];
+    memset(cmd_buf, 0, sizeof(cmd_buf));
+    auto *hdr = reinterpret_cast<PSPGfxCmdRespHeader *>(cmd_buf);
+    hdr->buf_size    = sizeof(cmd_buf);
+    hdr->buf_version = kPSPGfxCmdBufVersion;
+    hdr->cmd_id      = PSPGfxCmd::AUTOLOAD_RLC;
+
+    uint32_t resp = 0;
+    kern_return_t r = psp_ring_cmd_submit(dev, psp, cmd_buf,
+                                          kPSPGfxCmdRespSize, &resp);
+    if (r != kIOReturnSuccess) {
+        PSP_LOG("rlc_autoload_start: FAILED kr=%#x resp=%#x", r, resp);
+        return r;
+    }
+    PSP_LOG("rlc_autoload_start: ok (resp=%#x)", resp);
+    return kIOReturnSuccess;
+}
+
 //============================================================
 // psp_parse_sos_microcode — port of upstream amdgpu_psp.c
 // psp_init_sos_microcode. Auto-detects v1 vs v2 header and
