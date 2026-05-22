@@ -43,6 +43,17 @@ private let kSelDisableSmuFeatures:  UInt32 = 33
 private let kSelSDMACopyVRAM:        UInt32 = 34
 // v0.1.26 — KIQ PM4 NOP+fence smoke test.
 private let kSelCPKIQSmoke:          UInt32 = 35
+// v0.1.28 — command-stream submission ABI.
+private let kSelSubmitIB:        UInt32 = 19
+private let kSelWaitFence:       UInt32 = 20
+private let kSelCSCreate:        UInt32 = 37
+private let kSelCSWriteDwords:   UInt32 = 38
+private let kSelCSDestroy:       UInt32 = 39
+
+// CS IP types — match kMacAMDGPUCSIPType* in dext/MacAMDGPU.cpp.
+private let kCSIPTypeSDMA:    UInt64 = 0
+private let kCSIPTypeGFX:     UInt64 = 1
+private let kCSIPTypeCompute: UInt64 = 2
 
 // v0.1.27 — BO management ABI. Selectors 16–18 existed pre-v0.1.27
 // (legacy: bump-allocate a sub-range of the client DMA buffer). They
@@ -259,6 +270,8 @@ struct ContentView: View {
                 Button("Identity") { controller.testGetIdentity() }
                 Button("BARs") { controller.testGetBARInfo() }
                 Button("Query") { controller.testQueryInfo() }
+                Button("CS Smoke") { controller.testCSSmokeSDMA() }
+                    .help("v0.1.28 — Drive the new CS submission ABI: CSCreate(SDMA) → CSWriteDwords(4×NOP) → SubmitIB → WaitFence(1s) → CSDestroy.")
                 Button("BO Smoke") { controller.testBOSmoke() }
                     .help("v0.1.27 BO ABI smoke test: alloc VRAM + GTT BOs, "
                           + "round-trip GetInfo, map GTT BO, write pattern, free.")
@@ -1226,6 +1239,79 @@ final class DriverController: NSObject, ObservableObject,
             expected, observed, gpuVa))
         if kr != KERN_SUCCESS && status == 0 {
             append(String(format: "  (kr=%#x)", kr))
+        }
+    }
+
+    // v0.1.28 — exercise the command-stream submission ABI end-to-end:
+    //   CSCreate(SDMA) → CSWriteDwords(NOP*4) → SubmitIB → WaitFence(1s) → CSDestroy.
+    //
+    // SDMA OP_NOP is `0` (the whole header dword) which the engine
+    // happily consumes; we emit four to prove that bulk-append works
+    // and that the trailing FENCE packet the dext appends signals
+    // correctly. This is the SDMA-only first pass — GFX/Compute path
+    // returns kIOReturnUnsupported until v0.1.29 lands MES user-queues.
+    func testCSSmokeSDMA() {
+        guard openUserClient() else { return }
+
+        // Step 1: create CS on SDMA engine 0.
+        let (krC, outC) = callScalar(kSelCSCreate,
+                                     input: [kCSIPTypeSDMA, 0],
+                                     outCount: 1)
+        guard krC == KERN_SUCCESS, let handle = outC.first, handle != 0 else {
+            append(String(format: "CS smoke: CSCreate failed kr=%#x", krC))
+            return
+        }
+        append(String(format: "CS smoke: created handle=%#llx (SDMA0)", handle))
+
+        // Step 2: append 4 dwords (SDMA NOPs).
+        // CSWriteDwords expects 10 scalars: [handle, dw0..dw7, count].
+        let writeIn: [UInt64] = [handle,
+                                 0, 0, 0, 0, 0, 0, 0, 0,  // 8 NOP dwords
+                                 4]                        // count=4
+        let (krW, _) = callScalar(kSelCSWriteDwords,
+                                  input: writeIn,
+                                  outCount: 1)
+        if krW != KERN_SUCCESS {
+            append(String(format: "CS smoke: CSWriteDwords failed kr=%#x", krW))
+            _ = callScalar(kSelCSDestroy, input: [handle], outCount: 1)
+            return
+        }
+        append("CS smoke: appended 4 NOP dwords")
+
+        // Step 3: submit.
+        let (krS, outS) = callScalar(kSelSubmitIB,
+                                     input: [handle],
+                                     outCount: 1)
+        guard krS == KERN_SUCCESS, let fence = outS.first else {
+            append(String(format: "CS smoke: SubmitIB failed kr=%#x", krS))
+            _ = callScalar(kSelCSDestroy, input: [handle], outCount: 1)
+            return
+        }
+        append(String(format: "CS smoke: submitted, fence_handle=%#llx", fence))
+
+        // Step 4: wait 1 s (timeout in ns).
+        let (krWf, outWf) = callScalar(kSelWaitFence,
+                                       input: [fence, 1_000_000_000],
+                                       outCount: 1)
+        let status = outWf.first ?? 0xFF
+        switch krWf {
+        case KERN_SUCCESS where status == 0:
+            append("CS smoke: WaitFence ok — fence signaled")
+        case KERN_SUCCESS:
+            append(String(format: "CS smoke: WaitFence ok but status=%llu", status))
+        default:
+            append(String(format:
+                "CS smoke: WaitFence kr=%#x status=%llu", krWf, status))
+        }
+
+        // Step 5: destroy.
+        let (krD, _) = callScalar(kSelCSDestroy,
+                                  input: [handle],
+                                  outCount: 1)
+        if krD != KERN_SUCCESS {
+            append(String(format: "CS smoke: CSDestroy kr=%#x", krD))
+        } else {
+            append("CS smoke: destroyed handle")
         }
     }
 

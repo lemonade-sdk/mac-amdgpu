@@ -86,6 +86,23 @@ enum {
     // (fence write to a VRAM-resident slot). Confirms CP MEC firmware
     // is processing PM4 packets from the KIQ ring.
     kMacAMDGPUMethodCPKIQSmoke         = 35,
+    // v0.1.28 — command-stream submission ABI. Userspace builds a CS
+    // dword-by-dword via the dext and submits via the existing SubmitIB
+    // selector (19), which now consumes a CS handle instead of a BO.
+    // First pass: SDMA IP only; GFX/COMPUTE return kIOReturnUnsupported.
+    kMacAMDGPUMethodCSCreate          = 37,
+    kMacAMDGPUMethodCSWriteDwords     = 38,
+    kMacAMDGPUMethodCSDestroy         = 39,
+};
+
+// v0.1.28 — IP types accepted by CSCreate. Match the upstream
+// AMDGPU_HW_IP_* layout where convenient (GFX=0, COMPUTE=1, SDMA=2 in
+// libdrm); we renumber locally to keep SDMA at 0 because that's the
+// only IP we ship in v0.1.28.
+enum {
+    kMacAMDGPUCSIPTypeSDMA    = 0,
+    kMacAMDGPUCSIPTypeGFX     = 1,
+    kMacAMDGPUCSIPTypeCompute = 2,
 };
 
 // QueryInfo "info type" tags — input scalarInput[0]. Output shape
@@ -227,6 +244,24 @@ struct BOEntry {
     void     *cpu_addr;
 };
 
+// v0.1.28 — command-stream entry. One per CSCreate; freed by
+// CSDestroy. The cpu_buffer is dext-owned scratch storage that
+// userspace appends to via CSWriteDwords; SubmitIB walks the
+// accumulated dwords and turns them into ring writes on the chosen
+// IP. Handle layout: (index << 16) | generation.
+#define MACAMDGPU_MAX_CS              16
+#define MACAMDGPU_CS_CAPACITY_DW      1024
+struct CSEntry {
+    bool       in_use;
+    uint32_t   ip_type;       // kMacAMDGPUCSIPType{SDMA,GFX,Compute}
+    uint32_t   capacity_dw;   // capacity of cpu_buffer in dwords
+    uint32_t   written_dw;    // dwords appended so far
+    uint32_t  *cpu_buffer;    // dext-owned scratch (IONewZero(uint32_t, capacity))
+    uint32_t   generation;
+    uint32_t   last_fence;    // fence value emitted by the latest SubmitIB
+    uint32_t   ip_instance;   // for SDMA: which engine (0 or 1)
+};
+
 // Bits 0..127 of irqPending track raw MSI-X vector firings (one bit
 // per vector, capped at 128 — anything beyond would land in word 2+,
 // reserved for IH-routed events below).
@@ -294,6 +329,13 @@ struct MacAMDGPUUserClient_IVars {
     uint64_t  boBumpOffset;
     uint32_t  boGenCounter;
 
+    // v0.1.28 — command-stream table. cs_handle = (index << 16) | gen.
+    // CSCreate allocates `cpu_buffer` (1024 dwords) per slot; CSDestroy
+    // frees it; SubmitIB consumes the accumulated dwords and emits a
+    // ring submission on the chosen IP (SDMA only in this version).
+    CSEntry   cs[MACAMDGPU_MAX_CS];
+    uint32_t  csGenCounter;
+
     // GART binding for the DMA buffer. Lazily populated on the first
     // LOAD_IP_FW submit; reused across subsequent submits (the host
     // streams different firmware bytes into the same DART-mapped
@@ -334,6 +376,45 @@ mac_amdgpu_bo_lookup(MacAMDGPUUserClient_IVars *ivars, uint64_t handle)
     BOEntry *e = &ivars->bos[idx];
     if (!e->in_use || e->generation != gen) return nullptr;
     return e;
+}
+
+//
+// CS handle helpers — v0.1.28. Handle layout matches spec:
+// (index << 16) | (generation & 0xFFFF). Generation is bumped on
+// destroy so stale handles map to a freed slot fail lookup.
+//
+static inline uint64_t
+mac_amdgpu_cs_make_handle(uint32_t generation, uint32_t index)
+{
+    return (static_cast<uint64_t>(index & 0xFFFFu) << 16) |
+           static_cast<uint64_t>(generation & 0xFFFFu);
+}
+
+static CSEntry *
+mac_amdgpu_cs_lookup(MacAMDGPUUserClient_IVars *ivars, uint64_t handle)
+{
+    if (ivars == nullptr) return nullptr;
+    uint32_t idx = static_cast<uint32_t>((handle >> 16) & 0xFFFFu);
+    uint32_t gen = static_cast<uint32_t>(handle & 0xFFFFu);
+    if (idx >= MACAMDGPU_MAX_CS) return nullptr;
+    CSEntry *e = &ivars->cs[idx];
+    if (!e->in_use || (e->generation & 0xFFFFu) != gen) return nullptr;
+    return e;
+}
+
+static void
+mac_amdgpu_cs_free_slot(CSEntry *e)
+{
+    if (e == nullptr) return;
+    if (e->cpu_buffer != nullptr) {
+        IOSafeDeleteNULL(e->cpu_buffer, uint32_t, e->capacity_dw);
+    }
+    e->in_use = false;
+    e->ip_type = 0;
+    e->capacity_dw = 0;
+    e->written_dw = 0;
+    e->last_fence = 0;
+    e->ip_instance = 0;
 }
 
 //
@@ -1052,6 +1133,16 @@ IMPL(MacAMDGPUUserClient, Stop)
         driver->ivars->pciOpen = false;
         driver->ivars->openerUserClient = nullptr;
         MACAMDGPU_LOG("PCI closed on UserClient Stop");
+    }
+
+    // v0.1.28 — release any CS scratch buffers the client forgot to
+    // destroy. Each CSCreate allocates an IONewZero(uint32_t, cap) block.
+    if (ivars != nullptr) {
+        for (uint32_t i = 0; i < MACAMDGPU_MAX_CS; i++) {
+            if (ivars->cs[i].in_use) {
+                mac_amdgpu_cs_free_slot(&ivars->cs[i]);
+            }
+        }
     }
 
     IOSafeDeleteNULL(ivars, MacAMDGPUUserClient_IVars, 1);
@@ -2576,16 +2667,90 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
     }
 
     case kMacAMDGPUMethodSubmitIB: {
-        // scalarInput[0] = ib BO handle
-        // scalarInput[1] = ib size in dwords
-        // scalarInput[2] = (reserved — queue id, must be 0 for now)
-        // scalarOutput[0] = fence_value to wait on (returns 0 on err)
+        // v0.1.28 — repurposed as the CS submission entrypoint.
+        //   scalarInput[0] = cs_handle (from CSCreate)
+        //   scalarOutput[0] = fence_handle (== cs_handle for now;
+        //                     one-fence-per-CS in this revision)
+        //
+        // Legacy callers that pass (bo_handle, ib_dw, 0) are still
+        // accepted via the BO fallback path below — kept so that any
+        // pre-v0.1.28 test code keeps compiling. New code MUST use the
+        // CS path.
         if (arguments->scalarInput == nullptr ||
-            arguments->scalarInputCount < 3 ||
+            arguments->scalarInputCount < 1 ||
             arguments->scalarOutput == nullptr ||
             arguments->scalarOutputCount < 1) {
             return kIOReturnBadArgument;
         }
+        if (!driver->ivars->pciOpen) return kIOReturnNotOpen;
+
+        // First try the new CS-handle path.
+        CSEntry *cs = mac_amdgpu_cs_lookup(ivars, arguments->scalarInput[0]);
+        if (cs != nullptr) {
+            if (cs->written_dw == 0) return kIOReturnBadArgument;
+            switch (cs->ip_type) {
+            case kMacAMDGPUCSIPTypeSDMA: {
+                // Append the user CS dwords directly into the SDMA
+                // ring as an inline submission, then close with a
+                // FENCE packet so WaitFence can poll a WB slot. This
+                // is the simplest valid SDMA submission shape — no
+                // GART-bound IB needed, which sidesteps the DART/TB5
+                // sysmem-read trap (see feedback_mac_amdgpu_dart_tb5
+                // _pcie_reads memory).
+                auto &b = driver->ivars->bringup;
+                if (cs->ip_instance >= amdgpu::kSDMAInstanceCount) {
+                    return kIOReturnBadArgument;
+                }
+                auto &inst = b.sdma.instance[cs->ip_instance];
+                if (!inst.inited || !inst.enabled) return kIOReturnNotReady;
+
+                // Pre-clear our fence slot at WB+0xC0 (0x80 belongs to
+                // sdma_ring_test/copy_linear_test) and emit user
+                // dwords + FENCE.
+                auto *wb_bytes = static_cast<volatile uint8_t *>(inst.wb_cpu);
+                volatile uint32_t *fence_cpu =
+                    reinterpret_cast<volatile uint32_t *>(wb_bytes + 0xC0);
+                *fence_cpu = 0;
+                const uint64_t fence_gpu   = inst.wb_bus + 0xC0;
+                // Distinctive sentinel; the upper bits encode "CS" so a
+                // WB dump distinguishes user CS submits from the ring
+                // self-test (sdma_ring_test uses 0xCAFEC0DE).
+                const uint32_t fence_value = 0xC50000u | (cs->generation & 0xFFFFu);
+
+                uint32_t wrote = amdgpu::sdma_ring_write(
+                    inst, cs->cpu_buffer, cs->written_dw);
+                if (wrote != cs->written_dw) return kIOReturnNoSpace;
+
+                uint32_t pkt[4];
+                pkt[0] = amdgpu::SDMA_PKT_HEADER_OP(amdgpu::SDMA_OP_FENCE);
+                pkt[1] = static_cast<uint32_t>(fence_gpu);
+                pkt[2] = static_cast<uint32_t>(fence_gpu >> 32);
+                pkt[3] = fence_value;
+                if (amdgpu::sdma_ring_write(inst, pkt, 4) != 4) {
+                    return kIOReturnNoSpace;
+                }
+                kern_return_t r = amdgpu::sdma_kick_doorbell(b.device, inst);
+                if (r != kIOReturnSuccess) return r;
+
+                cs->last_fence = fence_value;
+                // fence_handle == cs_handle in this revision; userspace
+                // passes it straight to WaitFence.
+                arguments->scalarOutput[0] = arguments->scalarInput[0];
+                return kIOReturnSuccess;
+            }
+            case kMacAMDGPUCSIPTypeGFX:
+            case kMacAMDGPUCSIPTypeCompute:
+                // GFX / COMPUTE submission needs MES user-queue MQD
+                // plumbing that's deferred to v0.1.29 — the structural
+                // ABI is what ships in v0.1.28.
+                return kIOReturnUnsupported;
+            default:
+                return kIOReturnBadArgument;
+            }
+        }
+
+        // Legacy BO-handle fallback (pre-v0.1.28 callers).
+        if (arguments->scalarInputCount < 3) return kIOReturnBadArgument;
         BOEntry *e = mac_amdgpu_bo_lookup(ivars, arguments->scalarInput[0]);
         if (e == nullptr) return kIOReturnBadArgument;
         uint64_t ib_dw = arguments->scalarInput[1];
@@ -2593,10 +2758,7 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             return kIOReturnBadArgument;
         }
         if (arguments->scalarInput[2] != 0) return kIOReturnUnsupported;
-        if (!driver->ivars->pciOpen) return kIOReturnNotOpen;
 
-        // The BO bytes live in our DMABuffer; map a CPU pointer via
-        // GetAddressRange to copy them into the CP ring.
         IOAddressSegment seg = {};
         if (ivars->dmaBuffer->GetAddressRange(&seg) != kIOReturnSuccess) {
             return kIOReturnInternalError;
@@ -2605,8 +2767,6 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             seg.address + e->byte_offset);
 
         auto &cp = driver->ivars->bringup.cp;
-        // Stage the IB body into the ring, then append a fence so we
-        // know when the CP has drained it.
         uint32_t wrote = amdgpu::cp_ring_write(cp, ib_words,
                                                static_cast<uint32_t>(ib_dw));
         if (wrote != ib_dw) return kIOReturnNoSpace;
@@ -2708,19 +2868,77 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
     }
 
     case kMacAMDGPUMethodWaitFence: {
-        // scalarInput[0] = fence_value to wait for
-        // scalarInput[1] = timeout_us
-        // scalarOutput[0] = observed fence value
+        // v0.1.28 — repurposed for CS-handle-based fences. Spec:
+        //   scalarInput[0] = fence_handle (== cs_handle for now)
+        //   scalarInput[1] = timeout_ns
+        //   scalarOutput[0] = status (0=signaled, 1=timeout)
+        //
+        // Internally we still drive a us-resolution busy-wait — the
+        // ns precision is exposed for API symmetry with the Vulkan
+        // semaphore wait shape we'll need in v0.2.0.
         if (arguments->scalarInput == nullptr ||
             arguments->scalarInputCount < 2 ||
             arguments->scalarOutput == nullptr ||
             arguments->scalarOutputCount < 1) {
             return kIOReturnBadArgument;
         }
-        uint64_t target  = arguments->scalarInput[0];
-        uint64_t to_us   = arguments->scalarInput[1];
-        if (to_us == 0) to_us = 1000000ull;
+        uint64_t fence_handle = arguments->scalarInput[0];
+        uint64_t to_ns        = arguments->scalarInput[1];
+        if (to_ns == 0) to_ns = 1000000000ull;  // 1 s default
 
+        // CS-handle path.
+        CSEntry *cs = mac_amdgpu_cs_lookup(ivars, fence_handle);
+        if (cs != nullptr) {
+            if (cs->last_fence == 0) {
+                // Nothing was submitted on this CS — treat as immediate
+                // signal so caller can shortcut empty-CS waits.
+                arguments->scalarOutput[0] = 0;
+                return kIOReturnSuccess;
+            }
+            switch (cs->ip_type) {
+            case kMacAMDGPUCSIPTypeSDMA: {
+                auto &b = driver->ivars->bringup;
+                if (cs->ip_instance >= amdgpu::kSDMAInstanceCount) {
+                    arguments->scalarOutput[0] = 1;
+                    return kIOReturnBadArgument;
+                }
+                auto &inst = b.sdma.instance[cs->ip_instance];
+                if (inst.wb_cpu == nullptr) return kIOReturnNotReady;
+                auto *wb_bytes = static_cast<volatile uint8_t *>(inst.wb_cpu);
+                volatile uint32_t *fence_cpu =
+                    reinterpret_cast<volatile uint32_t *>(wb_bytes + 0xC0);
+
+                const uint64_t to_us = to_ns / 1000ull + 1;
+                const uint64_t step_us = 50;
+                uint64_t elapsed = 0;
+                while (elapsed < to_us) {
+                    if (*fence_cpu == cs->last_fence) {
+                        arguments->scalarOutput[0] = 0;  // signaled
+                        return kIOReturnSuccess;
+                    }
+                    uint32_t scratch = 0;
+                    for (int i = 0; i < 1000; i++) { scratch ^= *fence_cpu; }
+                    (void)scratch;
+                    elapsed += step_us;
+                }
+                arguments->scalarOutput[0] = 1;  // timeout
+                return kIOReturnTimeout;
+            }
+            case kMacAMDGPUCSIPTypeGFX:
+            case kMacAMDGPUCSIPTypeCompute:
+                return kIOReturnUnsupported;
+            default:
+                return kIOReturnBadArgument;
+            }
+        }
+
+        // Legacy fence-value path (pre-v0.1.28 callers): treat
+        // scalarInput[0] as a CP fence target and scalarInput[1] as
+        // timeout_us (the original shape). Documented as deprecated;
+        // remove once macamdgpu_ping is rewired to the CS ABI.
+        uint64_t target = fence_handle;
+        uint64_t to_us  = arguments->scalarInput[1];
+        if (to_us == 0) to_us = 1000000ull;
         auto &cp = driver->ivars->bringup.cp;
         if (cp.fence_cpu == nullptr) return kIOReturnNotReady;
 
@@ -2741,6 +2959,99 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         }
         arguments->scalarOutput[0] = *cp.fence_cpu;
         return kIOReturnTimeout;
+    }
+
+    case kMacAMDGPUMethodCSCreate: {
+        // v0.1.28 — allocate a CS slot + scratch buffer.
+        //   scalarInput[0] = ip_type (kMacAMDGPUCSIPType*)
+        //   scalarInput[1] = ip_instance (optional; SDMA engine 0 or 1)
+        //   scalarOutput[0] = cs_handle (== 0 on failure)
+        if (arguments->scalarInput == nullptr ||
+            arguments->scalarInputCount < 1 ||
+            arguments->scalarOutput == nullptr ||
+            arguments->scalarOutputCount < 1) {
+            return kIOReturnBadArgument;
+        }
+        const uint32_t ip_type =
+            static_cast<uint32_t>(arguments->scalarInput[0]);
+        const uint32_t ip_inst = arguments->scalarInputCount >= 2
+            ? static_cast<uint32_t>(arguments->scalarInput[1])
+            : 0;
+        if (ip_type != kMacAMDGPUCSIPTypeSDMA &&
+            ip_type != kMacAMDGPUCSIPTypeGFX &&
+            ip_type != kMacAMDGPUCSIPTypeCompute) {
+            return kIOReturnBadArgument;
+        }
+        // Find a free slot.
+        int idx = -1;
+        for (uint32_t i = 0; i < MACAMDGPU_MAX_CS; i++) {
+            if (!ivars->cs[i].in_use) { idx = static_cast<int>(i); break; }
+        }
+        if (idx < 0) {
+            arguments->scalarOutput[0] = 0;
+            return kIOReturnNoResources;
+        }
+        CSEntry *e = &ivars->cs[idx];
+        e->cpu_buffer = IONewZero(uint32_t, MACAMDGPU_CS_CAPACITY_DW);
+        if (e->cpu_buffer == nullptr) {
+            arguments->scalarOutput[0] = 0;
+            return kIOReturnNoMemory;
+        }
+        e->in_use      = true;
+        e->ip_type     = ip_type;
+        e->ip_instance = ip_inst;
+        e->capacity_dw = MACAMDGPU_CS_CAPACITY_DW;
+        e->written_dw  = 0;
+        e->last_fence  = 0;
+        e->generation  = ++ivars->csGenCounter;
+        // Wrap generation so we never emit a zero gen for an in-use
+        // slot (a zero-gen handle is reserved for "invalid").
+        if ((e->generation & 0xFFFFu) == 0) {
+            e->generation = ++ivars->csGenCounter;
+        }
+        arguments->scalarOutput[0] =
+            mac_amdgpu_cs_make_handle(e->generation,
+                                      static_cast<uint32_t>(idx));
+        return kIOReturnSuccess;
+    }
+
+    case kMacAMDGPUMethodCSWriteDwords: {
+        // v0.1.28 — append up to 8 dwords per call.
+        //   scalarInput[0]    = cs_handle
+        //   scalarInput[1..8] = dwords to append (low 32 bits used)
+        //   scalarInput[9]    = count (1..8)
+        // No output on success beyond kIOReturnSuccess.
+        if (arguments->scalarInput == nullptr ||
+            arguments->scalarInputCount < 10) {
+            return kIOReturnBadArgument;
+        }
+        CSEntry *e = mac_amdgpu_cs_lookup(ivars, arguments->scalarInput[0]);
+        if (e == nullptr) return kIOReturnBadArgument;
+        const uint64_t count_in = arguments->scalarInput[9];
+        if (count_in == 0 || count_in > 8) return kIOReturnBadArgument;
+        const uint32_t count = static_cast<uint32_t>(count_in);
+        if (e->written_dw + count > e->capacity_dw) {
+            return kIOReturnNoSpace;
+        }
+        for (uint32_t i = 0; i < count; i++) {
+            e->cpu_buffer[e->written_dw + i] =
+                static_cast<uint32_t>(arguments->scalarInput[1 + i]);
+        }
+        e->written_dw += count;
+        return kIOReturnSuccess;
+    }
+
+    case kMacAMDGPUMethodCSDestroy: {
+        // v0.1.28 — free a CS slot.
+        //   scalarInput[0] = cs_handle
+        if (arguments->scalarInput == nullptr ||
+            arguments->scalarInputCount < 1) {
+            return kIOReturnBadArgument;
+        }
+        CSEntry *e = mac_amdgpu_cs_lookup(ivars, arguments->scalarInput[0]);
+        if (e == nullptr) return kIOReturnBadArgument;
+        mac_amdgpu_cs_free_slot(e);
+        return kIOReturnSuccess;
     }
 
     default:

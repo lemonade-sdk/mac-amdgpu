@@ -15,9 +15,9 @@
 	<key>CFBundlePackageType</key>
 	<string>DEXT</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.27</string>
+	<string>0.1.28</string>
 	<key>CFBundleVersion</key>
-	<string>127</string>
+	<string>128</string>
 	<key>OSBundleUsageDescription</key>
 	<string>Native AMD GPU driver for Radeon AI PRO R9700 (RDNA4, gfx1201) over Thunderbolt 5.</string>
 	<!--
