@@ -72,6 +72,9 @@ enum {
     kMacAMDGPUMethodDumpTMR           = 24,
     kMacAMDGPUMethodDumpPSP           = 25,
     kMacAMDGPUMethodDumpCmdBuf        = 26,
+    // v0.1.24 — runtime engine health snapshot + DPM toggle.
+    kMacAMDGPUMethodLiveStatus        = 30,
+    kMacAMDGPUMethodDisableSmuFeatures = 33,
 };
 
 // QueryInfo "info type" tags — input scalarInput[0]. Output shape
@@ -1247,6 +1250,74 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         arguments->scalarOutput[14] = ringU32(4);
         arguments->scalarOutput[15] = ringU32(8);
         return kIOReturnSuccess;
+    }
+
+    case kMacAMDGPUMethodLiveStatus: {
+        // v0.1.24 — runtime engine health snapshot. Lets userspace
+        // verify "is the dext + GPU still alive" post-bringup without
+        // re-running stages. Reads live engine status regs through
+        // SOC15 + asks SMU which DPM features are currently running.
+        if (arguments->scalarOutput == nullptr ||
+            arguments->scalarOutputCount < 8) {
+            return kIOReturnBadArgument;
+        }
+        auto &bdev = driver->ivars->bringup.device;
+        // Defaults: 0 means "unreadable".
+        for (uint32_t i = 0; i < 8; i++) arguments->scalarOutput[i] = 0;
+        if (bdev.ip.isResolved(amdgpu::IPBlock::GC)) {
+            // GRBM_STATUS + CP_STAT live at GC BASE_IDX 0;
+            // RLC_RLCS_BOOTLOAD_STATUS at GC BASE_IDX 1.
+            arguments->scalarOutput[0] = amdgpu::RREG32(bdev,
+                SOC15_REG_OFFSET_BIDX(bdev, amdgpu::IPBlock::GC, 0,
+                                      0x0DA4));               // regGRBM_STATUS
+            arguments->scalarOutput[1] = amdgpu::RREG32(bdev,
+                SOC15_REG_OFFSET_BIDX(bdev, amdgpu::IPBlock::GC, 0,
+                                      amdgpu::GCRegs::CP_STAT));
+            arguments->scalarOutput[2] = amdgpu::RREG32(bdev,
+                SOC15_REG_OFFSET_BIDX(bdev, amdgpu::IPBlock::GC, 1,
+                                      amdgpu::GCRegs::RLC_RLCS_BOOTLOAD_STATUS));
+            // SDMA0/1 status regs use sdma_reg_offset which is also
+            // GC-relative on RDNA4.
+            arguments->scalarOutput[3] = amdgpu::RREG32(bdev,
+                amdgpu::sdma_reg_offset(bdev, 0, amdgpu::SDMARegs::STATUS_REG));
+            arguments->scalarOutput[4] = amdgpu::RREG32(bdev,
+                amdgpu::sdma_reg_offset(bdev, 1, amdgpu::SDMARegs::STATUS_REG));
+        }
+        if (bdev.ip.isResolved(amdgpu::IPBlock::MP1, /*baseIdx=*/1) &&
+            bdev.smuOnline) {
+            uint32_t lo = 0, hi = 0;
+            (void)amdgpu::smu_send_msg_with_param(bdev,
+                amdgpu::PPSMC::GetRunningSmuFeaturesLow, 0, &lo);
+            (void)amdgpu::smu_send_msg_with_param(bdev,
+                amdgpu::PPSMC::GetRunningSmuFeaturesHigh, 0, &hi);
+            arguments->scalarOutput[5] = lo;
+            arguments->scalarOutput[6] = hi;
+        }
+        arguments->scalarOutput[7] = driver->ivars->bringup.reached
+                                     == amdgpu::BringupStage::SDMAInit ? 1 : 0;
+        return kIOReturnSuccess;
+    }
+
+    case kMacAMDGPUMethodDisableSmuFeatures: {
+        // v0.1.24 — turn DPM off via PMFW. Without a chip-specific
+        // fan curve (smu_set_default_dpm_table), PMFW defaults fan to
+        // MAX when DPM is enabled. Sending DisableAllSmuFeatures parks
+        // it and the fan drops to idle. Reverse by re-running
+        // Initialize GPU (smc_hw_setup re-sends EnableAllSmuFeatures).
+        auto &bdev = driver->ivars->bringup.device;
+        if (!bdev.smuOnline) return kIOReturnNotReady;
+        if (arguments->scalarOutput != nullptr &&
+            arguments->scalarOutputCount >= 1) {
+            arguments->scalarOutput[0] = 0;
+        }
+        kern_return_t r = amdgpu::smu_send_msg(bdev,
+            amdgpu::PPSMC::DisableAllSmuFeatures);
+        if (arguments->scalarOutput != nullptr &&
+            arguments->scalarOutputCount >= 1) {
+            arguments->scalarOutput[0] = static_cast<uint64_t>(r);
+        }
+        MACAMDGPU_LOG("DisableSmuFeatures: kr=%#x", r);
+        return r;
     }
 
     case kMacAMDGPUMethodSetupInterrupts:

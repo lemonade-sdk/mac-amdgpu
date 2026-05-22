@@ -36,6 +36,9 @@ private let kSelGetDiagnostics:  UInt32 = 23
 private let kSelDumpTMR:         UInt32 = 24
 private let kSelDumpPSP:         UInt32 = 25
 private let kSelDumpCmdBuf:      UInt32 = 26
+// v0.1.24 — runtime engine health + DPM toggle.
+private let kSelLiveStatus:          UInt32 = 30
+private let kSelDisableSmuFeatures:  UInt32 = 33
 
 // Firmware type tags — match MacAMDGPU.cpp enum.
 private let kFwSOS:         UInt64 = 0
@@ -219,6 +222,10 @@ struct ContentView: View {
                     .help("Read SOC15-resolved MP0 C2PMSG_33/35/36/64/81 registers.")
                 Button("Dump Cmd") { controller.testDumpCmdBuf() }
                     .help("Read VRAM cmd_buf + fence + ring after a submit attempt.")
+                Button("Live Status") { controller.testLiveStatus() }
+                    .help("Snapshot GRBM/CP/RLC/SDMA0/1/SMU running features — proves the dext+GPU are still responsive.")
+                Button("Quiet Fan") { controller.testDisableSmuFeatures() }
+                    .help("DisableAllSmuFeatures (PPSMC 0x7) — parks DPM so PMFW stops defaulting fan to MAX. Re-run Initialize GPU to undo.")
                 Button("Ping") { controller.testPing() }
                 Button("Identity") { controller.testGetIdentity() }
                 Button("BARs") { controller.testGetBARInfo() }
@@ -883,6 +890,80 @@ final class DriverController: NSObject, ObservableObject,
         append(String(format: "ring_mem [+0..+11]: %#010x %#010x %#010x",
             UInt32(out[13] & 0xFFFFFFFF), UInt32(out[14] & 0xFFFFFFFF),
             UInt32(out[15] & 0xFFFFFFFF)))
+    }
+
+    // v0.1.24 — runtime engine health snapshot. Proves the dext +
+    // GPU are still responsive after bringup (or after a long idle).
+    // Decodes GRBM_STATUS busy bits + SDMA STATUS_REG idle bits + the
+    // SMU running-features bitmap so the user can see at a glance
+    // which engines are alive.
+    func testLiveStatus() {
+        guard openUserClient() else { return }
+        let (kr, out) = callScalar(kSelLiveStatus, outCount: 8)
+        if kr != KERN_SUCCESS {
+            append(String(format: "LiveStatus: kr=%#x (dext may have died)", kr))
+            return
+        }
+        guard out.count >= 8 else {
+            append("LiveStatus: short reply (\(out.count) words)")
+            return
+        }
+        let grbm     = UInt32(out[0] & 0xFFFFFFFF)
+        let cp_stat  = UInt32(out[1] & 0xFFFFFFFF)
+        let bootload = UInt32(out[2] & 0xFFFFFFFF)
+        let sdma0    = UInt32(out[3] & 0xFFFFFFFF)
+        let sdma1    = UInt32(out[4] & 0xFFFFFFFF)
+        let feat_lo  = UInt32(out[5] & 0xFFFFFFFF)
+        let feat_hi  = UInt32(out[6] & 0xFFFFFFFF)
+        let sdmaReached = (out[7] & 1) != 0
+
+        append("── Live Status ──")
+        append(String(format:
+            "GRBM_STATUS=%#010x CP_STAT=%#010x RLC_BOOTLOAD=%#010x",
+            grbm, cp_stat, bootload))
+        let bootloadOk = (bootload & 0x80000000) != 0
+        append("  GC: bringup_complete=\(sdmaReached ? "yes" : "no")  " +
+               "BOOTLOAD bit31=\(bootloadOk ? "set" : "clear")")
+        // SDMA STATUS_REG decode — same bits as sdma_log_status in dext.
+        func sdmaDecode(_ s: UInt32) -> String {
+            let idle      = (s >> 0)  & 1
+            let rb_empty  = (s >> 4)  & 1
+            let rb_full   = (s >> 9)  & 1
+            let ib_idle   = (s >> 12) & 1
+            let srbm_idle = (s >> 17) & 1
+            return "idle=\(idle) rb_empty=\(rb_empty) rb_full=\(rb_full) " +
+                   "ib_idle=\(ib_idle) srbm_idle=\(srbm_idle)"
+        }
+        append(String(format: "SDMA0 STATUS_REG=%#010x (%@)",
+                      sdma0, sdmaDecode(sdma0)))
+        append(String(format: "SDMA1 STATUS_REG=%#010x (%@)",
+                      sdma1, sdmaDecode(sdma1)))
+        append(String(format:
+            "SMU running features: hi=%#010x lo=%#010x", feat_hi, feat_lo))
+        let anyAlive = (grbm | cp_stat | sdma0 | sdma1 | feat_lo | feat_hi) != 0
+        append("→ dext + GPU \(anyAlive ? "ALIVE ✓" : "may be unresponsive ✗")")
+    }
+
+    // v0.1.24 — DisableAllSmuFeatures (PPSMC 0x7). Parks DPM so PMFW
+    // stops defaulting fan to MAX. The fan should drop within a few
+    // seconds. Reverse by re-running Initialize GPU (which re-sends
+    // EnableAllSmuFeatures via smu_smc_hw_setup).
+    func testDisableSmuFeatures() {
+        guard openUserClient() else { return }
+        let (kr, out) = callScalar(kSelDisableSmuFeatures, outCount: 1)
+        if kr != KERN_SUCCESS {
+            append(String(format: "DisableSmuFeatures: kr=%#x", kr))
+            return
+        }
+        let resp = out.first.map { UInt32($0 & 0xFFFFFFFF) } ?? 0
+        if resp == 0 {
+            append("DisableSmuFeatures: ok — DPM parked, fan should drop. " +
+                   "Re-run Initialize GPU to re-enable DPM.")
+        } else {
+            append(String(format:
+                "DisableSmuFeatures: PMFW resp=%#x (non-zero — message may not be supported on this PMFW build)",
+                resp))
+        }
     }
 
     // Returns true if the stage succeeded so initializeGPU can bail
