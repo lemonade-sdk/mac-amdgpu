@@ -55,6 +55,9 @@ private let kCSIPTypeSDMA:    UInt64 = 0
 private let kCSIPTypeGFX:     UInt64 = 1
 private let kCSIPTypeCompute: UInt64 = 2
 
+// v0.1.29 — Per-state GFXCLK soft-clamp.
+private let kSelSetPowerState:       UInt32 = 40
+
 // v0.1.27 — BO management ABI. Selectors 16–18 existed pre-v0.1.27
 // (legacy: bump-allocate a sub-range of the client DMA buffer). They
 // now also accept the new (size, domain, alignment, flags) shape for
@@ -266,6 +269,16 @@ struct ContentView: View {
                     .help("VRAM→VRAM 4 KB SDMA COPY_LINEAR smoke test. Proves the SDMA engine processes a packet end-to-end + writes its fence.")
                 Button("CP NOP") { controller.testCPKIQSmoke() }
                     .help("v0.1.26 — first PM4 packet on KIQ: NOP + RELEASE_MEM(0xDEADBEEF). Verifies CP MEC firmware processes PM4.")
+                Button("Power: Auto") { controller.testSetPowerState(0) }
+                    .help("v0.1.29 — clear GFXCLK soft-clamp (PMFW picks).")
+                Button("Power: Low") { controller.testSetPowerState(1) }
+                    .help("v0.1.29 — cap GFXCLK at 200 MHz.")
+                Button("Power: Nominal") { controller.testSetPowerState(2) }
+                    .help("v0.1.29 — same as Auto: no GFXCLK clamp.")
+                Button("Power: High") { controller.testSetPowerState(3) }
+                    .help("v0.1.29 — floor GFXCLK at 1500 MHz.")
+                Button("Power: Peak") { controller.testSetPowerState(4) }
+                    .help("v0.1.29 — pin GFXCLK to 2400 MHz (compute).")
                 Button("Ping") { controller.testPing() }
                 Button("Identity") { controller.testGetIdentity() }
                 Button("BARs") { controller.testGetBARInfo() }
@@ -1007,6 +1020,33 @@ final class DriverController: NSObject, ObservableObject,
         } else {
             append(String(format:
                 "DisableSmuFeatures: PMFW resp=%#x (non-zero — message may not be supported on this PMFW build)",
+                resp))
+        }
+    }
+
+    // v0.1.29 — pick a coarse GFXCLK soft-clamp via PMFW.
+    //   state: 0=auto, 1=low, 2=nominal, 3=high, 4=peak
+    // The dext maps these to SetSoftMin/MaxByFreq(GFXCLK,…). Logs the
+    // dext-side kIOReturn so we can tell "PMFW happy" from
+    // "UnknownCmd" right in the UI.
+    func testSetPowerState(_ state: UInt64) {
+        guard openUserClient() else { return }
+        let names = ["Auto", "Low", "Nominal", "High", "Peak"]
+        let label = state < UInt64(names.count) ? names[Int(state)] :
+                                                  "state=\(state)"
+        let (kr, out) = callScalar(kSelSetPowerState,
+                                   input: [state],
+                                   outCount: 1)
+        if kr != KERN_SUCCESS {
+            append(String(format: "SetPowerState(\(label)): kr=%#x", kr))
+            return
+        }
+        let resp = out.first.map { UInt32($0 & 0xFFFFFFFF) } ?? 0
+        if resp == 0 {
+            append("SetPowerState(\(label)): ok")
+        } else {
+            append(String(format:
+                "SetPowerState(\(label)): dext kr=%#x (PMFW likely rejected one of the soft-clamp msgs — may not be exposed on this PMFW build)",
                 resp))
         }
     }

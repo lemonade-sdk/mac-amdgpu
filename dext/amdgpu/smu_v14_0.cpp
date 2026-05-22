@@ -283,6 +283,28 @@ smu_smc_hw_setup(DeviceContext &dev, PSPContext &psp)
         SMU_LOG("smc_hw_setup: SetDriverDramAddr ok (hi=%#x lo=%#x)", hi, lo);
     }
 
+    // 3.5 v0.1.29 — UseDefaultPPTable. The full pptable-from-VBIOS
+    //     parser is documented as a follow-up; for now we ask PMFW to
+    //     fall back to the IFWI-baked default powerplay table. This is
+    //     what populates the fan curve + chip-specific DPM tables that
+    //     PMFW otherwise leaves zeroed (which is why the fan defaults
+    //     to MAX after EnableAllSmuFeatures).
+    //
+    //     Best-effort like SetAllowedFeaturesMask{Low,High}: if this
+    //     PMFW build doesn't expose the message (UnknownCmd / 0xFE),
+    //     log and continue. RunDcBtc still runs; the chip still boots.
+    {
+        kern_return_t r = smu_send_msg(dev, PPSMC::UseDefaultPPTable);
+        if (r != kIOReturnSuccess) {
+            SMU_LOG("smc_hw_setup: UseDefaultPPTable non-fatal kr=%#x — "
+                    "PMFW may already have applied its IFWI default. "
+                    "Full VBIOS pptable parse is deferred.", r);
+        } else {
+            SMU_LOG("smc_hw_setup: UseDefaultPPTable ok — IFWI default "
+                    "pptable applied");
+        }
+    }
+
     // 4. RunDcBtc — boot-time calibration. Upstream: smu_v14_0.c:1558.
     //    No parameter, no return value parsing (resp=0 == success).
     {
@@ -292,6 +314,22 @@ smu_smc_hw_setup(DeviceContext &dev, PSPContext &psp)
             return r;
         }
         SMU_LOG("smc_hw_setup: RunDcBtc ok");
+    }
+
+    // 4.5 v0.1.29 — NotifyPowerSource(AC). Upstream amdgpu_smu.c:1662
+    //     smu_smc_hw_setup calls smu_notify_display_change /
+    //     smu_set_power_source after RunDcBtc with the current power
+    //     source. We're an external GPU so assume AC (param=1). Some
+    //     PMFW builds don't expose this message — same non-fatal pattern
+    //     as SetAllowedFeaturesMask{Low,High} above.
+    {
+        kern_return_t r = smu_send_msg_with_param(
+            dev, PPSMC::NotifyPowerSource, /*AC*/ 1, nullptr);
+        if (r != kIOReturnSuccess) {
+            SMU_LOG("smc_hw_setup: NotifyPowerSource(AC) non-fatal kr=%#x", r);
+        } else {
+            SMU_LOG("smc_hw_setup: NotifyPowerSource(AC) ok");
+        }
     }
 
     // 5. Set allowed features mask. v0.1.20 test result: PMFW returns

@@ -323,7 +323,28 @@ namespace PPSMC {
     constexpr uint32_t SetToolsDramAddrLow        = 0x11;
     constexpr uint32_t TransferTableSmu2Dram      = 0x12;
     constexpr uint32_t TransferTableDram2Smu      = 0x13;
+    // v0.1.29 — pptable defaulting. PMFW falls back to the IFWI-baked
+    // default powerplay table on this message; gives us a real fan
+    // curve + populates the chip-specific allowed-feature mask.
+    constexpr uint32_t UseDefaultPPTable          = 0x14;
+    // v0.1.29 — per-state GFXCLK soft-clamp messages. Encoding is
+    // (clk_id << 16) | freq_mhz; clk_id=0 == PPCLK_GFXCLK on v14.
+    // See smu_v14_0_set_soft_freq_limited_range (smu_v14_0.c:1099).
+    constexpr uint32_t SetSoftMinByFreq           = 0x19;
+    constexpr uint32_t SetSoftMaxByFreq           = 0x1A;
+    // v0.1.29 — AC/DC source notify. Upstream smu_smc_hw_setup sends
+    // this after RunDcBtc. Param: 0=DC, 1=AC. Opcode per upstream
+    // smu_v14_0_2_ppsmc.h (#define PPSMC_MSG_NotifyPowerSource 0x35).
+    constexpr uint32_t NotifyPowerSource          = 0x35;
     constexpr uint32_t RunDcBtc                   = 0x36;
+}
+
+// PPCLK enum (subset) — drivers/gpu/drm/amd/pm/swsmu/inc/pmfw_if/
+// smu14_driver_if_v14_0.h:456. clk_id is encoded in the high 16 bits
+// of the PPSMC SetSoftMin/Max param.
+namespace PPCLK {
+    constexpr uint32_t GFXCLK = 0;
+    constexpr uint32_t SOCCLK = 1;
 }
 
 // Linux SMU mailbox response codes — smu_msg_v1_decode_response().

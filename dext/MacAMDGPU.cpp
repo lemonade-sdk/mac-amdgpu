@@ -93,6 +93,9 @@ enum {
     kMacAMDGPUMethodCSCreate          = 37,
     kMacAMDGPUMethodCSWriteDwords     = 38,
     kMacAMDGPUMethodCSDestroy         = 39,
+    // v0.1.29 — per-state GFXCLK soft-clamp. scalarInput[0] selects
+    // a power state (0=auto, 1=low, 2=nominal, 3=high, 4=peak).
+    kMacAMDGPUMethodSetPowerState      = 40,
 };
 
 // v0.1.28 — IP types accepted by CSCreate. Match the upstream
@@ -103,6 +106,15 @@ enum {
     kMacAMDGPUCSIPTypeSDMA    = 0,
     kMacAMDGPUCSIPTypeGFX     = 1,
     kMacAMDGPUCSIPTypeCompute = 2,
+};
+
+// v0.1.29 — Power state IDs (in sync with Swift host).
+enum {
+    kMacAMDGPUPowerStateAuto    = 0,
+    kMacAMDGPUPowerStateLow     = 1,
+    kMacAMDGPUPowerStateNominal = 2,
+    kMacAMDGPUPowerStateHigh    = 3,
+    kMacAMDGPUPowerStatePeak    = 4,
 };
 
 // QueryInfo "info type" tags — input scalarInput[0]. Output shape
@@ -1567,6 +1579,104 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         }
         MACAMDGPU_LOG("DisableSmuFeatures: kr=%#x", r);
         return r;
+    }
+
+    case kMacAMDGPUMethodSetPowerState: {
+        // v0.1.29 — per-state GFXCLK soft-clamp via PMFW.
+        //
+        // Maps a coarse "power state" (auto / low / nominal / high / peak)
+        // to a pair of SetSoftMin/MaxByFreq PMFW messages on PPCLK_GFXCLK
+        // (clk_id=0 on v14). Encoding per upstream
+        // smu_v14_0_set_soft_freq_limited_range (smu_v14_0.c:1099):
+        //   param = (clk_id << 16) | freq_mhz
+        // with clk_id=0 == PPCLK_GFXCLK.
+        //
+        // scalarOutput[0] = kIOReturn of the first failing message,
+        // 0 on full success.
+        if (arguments->scalarInputCount < 1) {
+            return kIOReturnBadArgument;
+        }
+        auto &bdev = driver->ivars->bringup.device;
+        if (!bdev.smuOnline) return kIOReturnNotReady;
+
+        const uint64_t state = arguments->scalarInput[0];
+        if (arguments->scalarOutput != nullptr &&
+            arguments->scalarOutputCount >= 1) {
+            arguments->scalarOutput[0] = 0;
+        }
+
+        // Build (min_mhz, max_mhz). Zero means "skip that side".
+        // 0xFFFF means "PMFW pick" (passed through unchanged into the
+        // low 16 bits of the param).
+        uint32_t min_mhz = 0, max_mhz = 0;
+        bool valid = true;
+        switch (state) {
+        case kMacAMDGPUPowerStateAuto:
+            min_mhz = 0;       // SetSoftMin(0)   → unclamp lower bound
+            max_mhz = 0xFFFFu; // SetSoftMax(FFFF)→ PMFW pick
+            break;
+        case kMacAMDGPUPowerStateLow:
+            min_mhz = 0;
+            max_mhz = 200;
+            break;
+        case kMacAMDGPUPowerStateNominal:
+            // Same as auto.
+            min_mhz = 0;
+            max_mhz = 0xFFFFu;
+            break;
+        case kMacAMDGPUPowerStateHigh:
+            min_mhz = 1500;
+            max_mhz = 0;       // leave max alone
+            break;
+        case kMacAMDGPUPowerStatePeak:
+            min_mhz = 2400;
+            max_mhz = 2400;
+            break;
+        default:
+            valid = false;
+            break;
+        }
+        if (!valid) {
+            MACAMDGPU_LOG("SetPowerState: bad state=%llu", state);
+            return kIOReturnBadArgument;
+        }
+
+        const uint32_t clk_id = amdgpu::PPCLK::GFXCLK; // 0
+        kern_return_t firstErr = kIOReturnSuccess;
+
+        // SetSoftMaxByFreq first (upstream order).
+        if (max_mhz != 0) {
+            uint32_t param = (clk_id << 16) | (max_mhz & 0xFFFFu);
+            kern_return_t r = amdgpu::smu_send_msg_with_param(
+                bdev, amdgpu::PPSMC::SetSoftMaxByFreq, param, nullptr);
+            MACAMDGPU_LOG("SetPowerState: SetSoftMaxByFreq(GFXCLK,%u) kr=%#x",
+                          max_mhz, r);
+            if (r != kIOReturnSuccess && firstErr == kIOReturnSuccess) {
+                firstErr = r;
+            }
+        }
+        // Then SetSoftMinByFreq.
+        if (min_mhz != 0 ||
+            state == kMacAMDGPUPowerStateAuto ||
+            state == kMacAMDGPUPowerStateNominal) {
+            uint32_t param = (clk_id << 16) | (min_mhz & 0xFFFFu);
+            kern_return_t r = amdgpu::smu_send_msg_with_param(
+                bdev, amdgpu::PPSMC::SetSoftMinByFreq, param, nullptr);
+            MACAMDGPU_LOG("SetPowerState: SetSoftMinByFreq(GFXCLK,%u) kr=%#x",
+                          min_mhz, r);
+            if (r != kIOReturnSuccess && firstErr == kIOReturnSuccess) {
+                firstErr = r;
+            }
+        }
+
+        if (arguments->scalarOutput != nullptr &&
+            arguments->scalarOutputCount >= 1) {
+            arguments->scalarOutput[0] =
+                static_cast<uint64_t>(firstErr);
+        }
+        MACAMDGPU_LOG("SetPowerState: state=%llu min=%u max=%u kr=%#x",
+                      state, min_mhz, max_mhz, firstErr);
+        return firstErr;
     }
 
     case kMacAMDGPUMethodSetupInterrupts:
