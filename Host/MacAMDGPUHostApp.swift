@@ -39,6 +39,8 @@ private let kSelDumpCmdBuf:      UInt32 = 26
 // v0.1.24 — runtime engine health + DPM toggle.
 private let kSelLiveStatus:          UInt32 = 30
 private let kSelDisableSmuFeatures:  UInt32 = 33
+// v0.1.25 — VRAM->VRAM SDMA copy smoke test.
+private let kSelSDMACopyVRAM:        UInt32 = 34
 
 // v0.1.27 — BO management ABI. Selectors 16–18 existed pre-v0.1.27
 // (legacy: bump-allocate a sub-range of the client DMA buffer). They
@@ -247,6 +249,8 @@ struct ContentView: View {
                     .help("Snapshot GRBM/CP/RLC/SDMA0/1/SMU running features — proves the dext+GPU are still responsive.")
                 Button("Quiet Fan") { controller.testDisableSmuFeatures() }
                     .help("DisableAllSmuFeatures (PPSMC 0x7) — parks DPM so PMFW stops defaulting fan to MAX. Re-run Initialize GPU to undo.")
+                Button("SDMA Copy") { controller.testSDMACopyVRAM() }
+                    .help("VRAM→VRAM 4 KB SDMA COPY_LINEAR smoke test. Proves the SDMA engine processes a packet end-to-end + writes its fence.")
                 Button("Ping") { controller.testPing() }
                 Button("Identity") { controller.testGetIdentity() }
                 Button("BARs") { controller.testGetBARInfo() }
@@ -1117,6 +1121,67 @@ final class DriverController: NSObject, ObservableObject,
             append(String(format: "bo smoke: GTT  BOFree kr=%#x", kf2))
         }
         append("bo smoke: done")
+    // v0.1.25 — VRAM->VRAM SDMA copy smoke test. Allocates src+dst
+    // from the dext-side VRAM bump allocator, stages a known pattern
+    // via BAR0, asks SDMA0 to COPY_LINEAR, and reads dst back via
+    // MM_INDEX/MM_DATA. End-to-end proof that the engine processes a
+    // packet and writes its fence (sysmem-free; AS+TB5 safe).
+    func testSDMACopyVRAM() {
+        guard openUserClient() else { return }
+        // bytes=4096, instance=0 (defaults)
+        let (kr, out) = callScalar(kSelSDMACopyVRAM,
+                                   input: [4096, 0],
+                                   outCount: 7)
+        if kr != KERN_SUCCESS {
+            append(String(format:
+                "SDMA Copy: kr=%#x (dext rejected the call)", kr))
+            return
+        }
+        guard out.count >= 7 else {
+            append("SDMA Copy: short reply (\(out.count) words)")
+            return
+        }
+        let status     = Int32(bitPattern: UInt32(out[0] & 0xFFFFFFFF))
+        let elapsedUs  = out[1]
+        let mismatched = UInt32(out[2] & 0xFFFFFFFF)
+        let firstBad   = UInt32(out[3] & 0xFFFFFFFF)
+        let bytes      = out[4]
+        let srcVA      = UInt32(out[5] & 0xFFFFFFFF)
+        let dstVA      = UInt32(out[6] & 0xFFFFFFFF)
+
+        // Decode the SDMA status. kIOReturnSuccess == 0; the canonical
+        // mac error codes (kIOReturnTimeout etc.) are full mach codes,
+        // so just classify into the three the plan calls out.
+        let statusLabel: String
+        switch status {
+        case 0:
+            statusLabel = mismatched == 0 ? "OK"
+                                          : "engine ran but readback differs"
+        case Int32(bitPattern: 0xE00002D6):  // kIOReturnTimeout
+            statusLabel = "TIMEOUT (engine never wrote the fence)"
+        case Int32(bitPattern: 0xE00002BC):  // kIOReturnBadArgument
+            statusLabel = "BAD_ARG"
+        case Int32(bitPattern: 0xE00002D9):  // kIOReturnNotReady
+            statusLabel = "NOT_READY (SDMA not brought up?)"
+        case Int32(bitPattern: 0xE00002BE):  // kIOReturnNoSpace
+            statusLabel = "NO_SPACE (ring or VRAM)"
+        default:
+            statusLabel = String(format: "kr=%#x", UInt32(bitPattern: status))
+        }
+
+        append("── SDMA Copy ──")
+        append(String(format:
+            "SDMA Copy: %llu B status=%d (%@) mismatched=%u elapsed=%llu µs",
+            bytes, status, statusLabel, mismatched, elapsedUs))
+        append(String(format:
+            "  src=0x%08x dst=0x%08x", srcVA, dstVA))
+        if mismatched > 0 {
+            append(String(format:
+                "  first mismatched dword @ byte_offset=0x%x (%u/%llu mismatches)",
+                firstBad, mismatched, bytes / 4))
+        } else if status == 0 {
+            append("  → SDMA engine alive, packet executed, fence written ✓")
+        }
     }
 
     // Returns true if the stage succeeded so initializeGPU can bail

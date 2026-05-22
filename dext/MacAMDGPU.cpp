@@ -77,6 +77,11 @@ enum {
     kMacAMDGPUMethodDisableSmuFeatures = 33,
     // v0.1.27: per-BO map.
     kMacAMDGPUMethodBOMap             = 36,
+    // v0.1.25 — VRAM->VRAM SDMA copy smoke test (sysmem-free variant of
+    // kMacAMDGPUMethodSDMACopyTest). GART-bound sysmem is fragile on
+    // AS+TB5 (see feedback_mac_amdgpu_dart_tb5_pcie_reads), so we run
+    // src+dst out of VRAM and verify via MM_INDEX/MM_DATA readback.
+    kMacAMDGPUMethodSDMACopyVRAM      = 34,
 };
 
 // QueryInfo "info type" tags — input scalarInput[0]. Output shape
@@ -2053,6 +2058,156 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             to_us ? to_us : 1000000ull);
         arguments->scalarOutput[0] = static_cast<uint64_t>(r);
         return r;
+    }
+
+    case kMacAMDGPUMethodSDMACopyVRAM: {
+        // v0.1.25 — VRAM->VRAM SDMA copy smoke test.
+        //
+        // GART-bound sysmem is structurally fragile on AS+TB5 (see
+        // feedback_mac_amdgpu_dart_tb5_pcie_reads), so this variant
+        // allocates both src and dst from the VRAM bump allocator and
+        // verifies the result via MM_INDEX/MM_DATA — entirely
+        // bus-aperture independent. Proves SDMA can fetch, copy, and
+        // write through the GMC walk.
+        //
+        // Input:
+        //   scalarInput[0] = byte count (default 4096 if 0; cap 16 KB)
+        //   scalarInput[1] = SDMA instance (0 or 1; default 0)
+        // Output (count=7):
+        //   [0] kIOReturn from sdma_copy_linear_test (0 = ok)
+        //   [1] elapsed_us (0 — no monotonic clock plumbed yet)
+        //   [2] mismatched dword count
+        //   [3] first mismatched dword byte-offset (0 if all ok)
+        //   [4] bytes copied
+        //   [5] src.gpu_va & 0xFFFFFFFF
+        //   [6] dst.gpu_va & 0xFFFFFFFF
+        if (arguments->scalarOutput == nullptr ||
+            arguments->scalarOutputCount < 7) {
+            return kIOReturnBadArgument;
+        }
+        if (driver == nullptr || driver->ivars == nullptr) {
+            return kIOReturnNotReady;
+        }
+        auto &bringup = driver->ivars->bringup;
+        auto &dev     = bringup.device;
+        auto &gmc     = bringup.gmc;
+        auto &sdma    = bringup.sdma;
+        if (!gmc.vram_alloc.is_inited()) {
+            MACAMDGPU_LOG("SDMACopyVRAM: vram_alloc not initialised "
+                          "(GMC stage hasn't run)");
+            return kIOReturnNotReady;
+        }
+        uint64_t bytes_in =
+            (arguments->scalarInput != nullptr &&
+             arguments->scalarInputCount >= 1)
+                ? arguments->scalarInput[0]
+                : 0;
+        uint64_t inst_in  =
+            (arguments->scalarInput != nullptr &&
+             arguments->scalarInputCount >= 2)
+                ? arguments->scalarInput[1]
+                : 0;
+        if (bytes_in == 0) bytes_in = 4096;
+        // Stack buffer cap — keep it modest so we don't blow the dext
+        // stack and stay well within the 16 KB AS page.
+        constexpr uint64_t kMaxBytes = 16384;
+        if (bytes_in > kMaxBytes) bytes_in = kMaxBytes;
+        // 4-byte align — SDMA COPY_LINEAR works in bytes but our
+        // readback walks dwords.
+        bytes_in &= ~uint64_t(3);
+        if (bytes_in == 0) return kIOReturnBadArgument;
+        if (inst_in >= amdgpu::kSDMAInstanceCount) {
+            return kIOReturnBadArgument;
+        }
+        auto &sdma_inst = sdma.instance[inst_in];
+        if (!sdma_inst.inited || !sdma_inst.enabled) {
+            MACAMDGPU_LOG("SDMACopyVRAM: SDMA%llu not ready "
+                          "(inited=%d enabled=%d)",
+                          (unsigned long long)inst_in,
+                          (int)sdma_inst.inited,
+                          (int)sdma_inst.enabled);
+            return kIOReturnNotReady;
+        }
+
+        // Allocate two VRAM slots (16 KB-aligned by the bump
+        // allocator's AS-page floor). These are not freed — the bump
+        // allocator has no free; they persist until dext unload, which
+        // is fine for a smoke test that runs once.
+        amdgpu::VRAMAllocation src{};
+        amdgpu::VRAMAllocation dst{};
+        if (!gmc.vram_alloc.alloc(bytes_in, amdgpu::kASPageSize, &src)) {
+            MACAMDGPU_LOG("SDMACopyVRAM: VRAM alloc for src failed "
+                          "(bytes=%llu)", (unsigned long long)bytes_in);
+            return kIOReturnNoSpace;
+        }
+        if (!gmc.vram_alloc.alloc(bytes_in, amdgpu::kASPageSize, &dst)) {
+            MACAMDGPU_LOG("SDMACopyVRAM: VRAM alloc for dst failed "
+                          "(bytes=%llu)", (unsigned long long)bytes_in);
+            return kIOReturnNoSpace;
+        }
+        const uint64_t src_vram_off = src.gpu_va - gmc.vram_start;
+        const uint64_t dst_vram_off = dst.gpu_va - gmc.vram_start;
+
+        // Build a known pattern: incrementing dwords 0xCAFE0000..n-1.
+        uint32_t pattern_buf[kMaxBytes / 4];
+        const uint32_t n_dwords = static_cast<uint32_t>(bytes_in / 4);
+        for (uint32_t i = 0; i < n_dwords; i++) {
+            pattern_buf[i] = 0xCAFE0000u + i;
+        }
+
+        // Stage src; pre-poison dst so a no-op would be visible.
+        amdgpu::bar0_memcpy_to_vram(dev, src_vram_off,
+                                    pattern_buf, bytes_in);
+        amdgpu::bar0_memset_vram(dev, dst_vram_off, 0xDEADBEEFu,
+                                 bytes_in);
+        amdgpu::amdgpu_hdp_flush(dev);
+
+        MACAMDGPU_LOG("SDMACopyVRAM: SDMA%llu  bytes=%llu  "
+                      "src.gpu_va=%#llx (vram_off=%#llx)  "
+                      "dst.gpu_va=%#llx (vram_off=%#llx)",
+                      (unsigned long long)inst_in,
+                      (unsigned long long)bytes_in,
+                      (unsigned long long)src.gpu_va,
+                      (unsigned long long)src_vram_off,
+                      (unsigned long long)dst.gpu_va,
+                      (unsigned long long)dst_vram_off);
+
+        kern_return_t r = amdgpu::sdma_copy_linear_test(
+            dev, sdma_inst,
+            src.gpu_va, dst.gpu_va,
+            static_cast<uint32_t>(bytes_in),
+            /*timeout_us=*/100000ull);
+
+        // Readback regardless of fence status — even a partial copy
+        // tells us whether the engine touched dst at all.
+        uint32_t mismatched = 0;
+        uint32_t first_bad_off = 0;
+        bool first_bad_set = false;
+        for (uint32_t i = 0; i < n_dwords; i++) {
+            uint32_t g = amdgpu::RVRAM32_via_mm(
+                dev, dst_vram_off + uint64_t(i) * 4);
+            if (g != pattern_buf[i]) {
+                if (!first_bad_set) {
+                    first_bad_off = i * 4;
+                    first_bad_set = true;
+                }
+                mismatched++;
+            }
+        }
+        MACAMDGPU_LOG("SDMACopyVRAM: result kr=%#x mismatched=%u/%u "
+                      "first_bad_off=%#x",
+                      r, mismatched, n_dwords, first_bad_off);
+
+        arguments->scalarOutput[0] = static_cast<uint64_t>(r);
+        arguments->scalarOutput[1] = 0;  // elapsed_us — no mach time yet
+        arguments->scalarOutput[2] = static_cast<uint64_t>(mismatched);
+        arguments->scalarOutput[3] = static_cast<uint64_t>(first_bad_off);
+        arguments->scalarOutput[4] = bytes_in;
+        arguments->scalarOutput[5] = src.gpu_va & 0xFFFFFFFFull;
+        arguments->scalarOutput[6] = dst.gpu_va & 0xFFFFFFFFull;
+        // Always return success at the IOConnect layer; the actual
+        // SDMA kr lives in scalarOutput[0] so the host can decode it.
+        return kIOReturnSuccess;
     }
 
     case kMacAMDGPUMethodLoadDiscoveryBin: {
