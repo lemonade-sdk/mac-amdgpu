@@ -8,9 +8,10 @@
 //
 //  For "Hello PM4" the minimum we need:
 //      1. Allocate the clear-state buffer (CSB) in VRAM.
-//      2. Wait for the RLC microcode autoload chain to complete
-//         (the PSP loads RLC + PFP + ME + MEC + MES microcode in
-//         sequence; we poll regRLC_RLCS_BOOTLOAD_STATUS bit31).
+//      2. Trigger hardware autoload via CG/Pg enable + SRM setup.
+//      3. Wait for RLC microcode autoload chain to complete
+//         (the PSP loads RLC sub-bins into TEE memory; CG/Pg trigger
+//          the hardware pull, we poll regRLC_RLCS_BOOTLOAD_STATUS bit31).
 //
 //  Sources:
 //      drivers/gpu/drm/amd/amdgpu/amdgpu_rlc.c
@@ -84,6 +85,7 @@ struct RLCContext {
     bool             csb_populated;     // gfx12_cs_data filled in?
     bool             csib_programmed;   // RLC_CSIB_ADDR_* written?
     bool             srm_enabled;       // RLC_SRM_CNTL.SRM_ENABLE set?
+    bool             microcode_loaded;  // RLC sub-bins + RLC_G all OK from PSP?
 
     // CSB allocation in VRAM (via GMC's VRAM bump allocator).
     VRAMAllocation   clear_state;
@@ -132,9 +134,12 @@ kern_return_t rlc_setup_csb_buffer(const DeviceContext &dev,
 kern_return_t rlc_enable_srm(const DeviceContext &dev, RLCContext &rlc);
 
 //
-// Top-level RLCInit stage entry. Calls rlc_alloc_csb then
-// rlc_wait_for_autoload_complete then rlc_setup_csb_buffer then
-// rlc_enable_srm.
+// Top-level RLCInit stage entry. Mirrors upstream
+// gfx_v12_0_hw_init + gfx_v12_0_rlc_resume(PSP):
+//   1) wait_for_autoload → 2) alloc_csb → 3) setup_csb_buffer
+//      → 4) enable_srm
+// PSP+IMU autoload runs autonomously after psp_rlc_autoload_start;
+// the driver waits for completion, then programs CSB and SRM.
 //
 kern_return_t rlc_init_full(const DeviceContext &dev,
                             GMCContext &gmc, RLCContext &rlc);

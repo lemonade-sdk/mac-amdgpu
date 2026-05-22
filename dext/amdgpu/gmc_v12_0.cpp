@@ -59,9 +59,9 @@ constexpr uint64_t kGARTPageSize         = kASPageSize;            // 16 KB on A
 //   0x00000000..0x00100000  fw_pri  (PSP staging, 1 MB)
 //   0x00100000..0x0010c000  PSP km_ring + cmd_buf + fence_buf
 //   0x00200000..0x00600000  PSP TMR  (4 MB, owned by SOS on 14_0_3)
-//   0x00700000..0x00710000  legacy bringup.gart PT (64 KB)
-//   0x00800000..0x00820000  gmc GART PT (this — 128 KB for 256 MB gart)
-constexpr uint64_t kGMCGartPTVRAMOffset = 0x00800000;
+//   0x00700000..0x00780000  gmc GART PT (512 KB = 65536 PTEs = 256 MB)
+constexpr uint64_t kGMCGartPTVRAMOffset = 0x00700000;
+constexpr uint32_t   kGMCGartPTBytes      = 512 * 1024;  // 512 KB = 65536 PTEs = 256 MB aperture
 
 // ----- mc_init -----
 //
@@ -85,16 +85,36 @@ gmc_mc_init(DeviceContext &dev, GMCContext &gmc)
         gmc.visible_vram_size = 256ULL * 1024 * 1024;
     }
 
-    // VRAM at GPU-VA 0..(real_vram_size). GART will sit above.
-    gmc.vram_start = 0;
-    gmc.vram_end   = gmc.real_vram_size - 1;
+    // Read the SOS-programmed FB_LOCATION_BASE + FB_OFFSET from MMHUB
+    // so vram_start/fb_start/vram_base_offset reflect REAL MC space
+    // (matches upstream gmc_v12_0_vram_gtt_location + mmhub_v4_1_0
+    // get_fb_location / get_mc_fb_offset). Previously we left
+    // vram_start=0 / vram_base_offset=0 — that produced a system
+    // aperture computed against the wrong base, which broke PSP
+    // LOAD_IP_FW for TMR-resident IPs (SDMA/CP_RS64/MES/RLC) while
+    // SMU/IMU passed because they use SOS-internal paths bypassing
+    // the configurable system aperture.
+    uint64_t vram_start_actual = 0;
+    uint64_t vram_base_offset_actual = 0;
+    if (dev.ip.isResolved(IPBlock::MMHUB)) {
+        uint32_t mmhub_base = dev.ip.get(IPBlock::MMHUB);
+        uint32_t fb_base_raw = RREG32(dev,
+            mmhub_base + MMHUBRegs::MMMC_VM_FB_LOCATION_BASE);
+        vram_start_actual =
+            ((uint64_t)(fb_base_raw & MMHUBRegs::kFBBaseMask))
+            << MMHUBRegs::kFBBaseShift;
+        uint32_t fb_offset_raw = RREG32(dev,
+            mmhub_base + MMHUBRegs::MMMC_VM_FB_OFFSET);
+        vram_base_offset_actual = (uint64_t)fb_offset_raw << 24;
+    }
 
-    // FB aperture mirrors VRAM in our layout.
-    gmc.fb_start = gmc.vram_start;
-    gmc.fb_end   = gmc.vram_end;
+    gmc.vram_start       = vram_start_actual;
+    gmc.vram_end         = vram_start_actual + gmc.real_vram_size - 1;
+    gmc.fb_start         = gmc.vram_start;
+    gmc.fb_end           = gmc.vram_end;
+    gmc.vram_base_offset = vram_base_offset_actual;
 
-    // GART aperture starts immediately above VRAM. 256 MB initial
-    // size — well under DART's 1.5 GB ceiling.
+    // GART aperture starts immediately above VRAM, page-aligned.
     gmc.gart_size  = kGARTInitialSize;
     gmc.gart_start = (gmc.vram_end + 1 + kGARTPageSize - 1)
                      & ~(kGARTPageSize - 1);
@@ -106,19 +126,24 @@ gmc_mc_init(DeviceContext &dev, GMCContext &gmc)
     gmc.num_level   = 3;
     gmc.block_size  = 9;
     gmc.max_pfn     = (1ULL << 48) >> 12;   // 48-bit VA / 4 KB
-    gmc.vram_base_offset = 0;
 
-    // AGP aperture — unused on our config, set to non-overlapping
-    // far-away range so any stray reads are recognisable.
-    gmc.agp_start = 0xFFFFFFFF00000000ULL;
-    gmc.agp_end   = 0xFFFFFFFFFFFFFFFFULL;
+    // AGP aperture — upstream `amdgpu_gmc_set_agp_default` sentinel
+    // (amdgpu_gmc.c:392-394): start=0xffffffffffff (48-bit max), end=0,
+    // size=0. With agp_end=0 < fb_end, the system aperture HIGH bound
+    // in init_system_aperture_regs picks fb_end (correct). Our prior
+    // values (0xFFFFFFFF00000000 / 0xFFFFFFFFFFFFFFFF) bloated the
+    // aperture HIGH to the full 64-bit range and AGP_TOP to a value
+    // the hardware treats as "AGP enabled everywhere".
+    gmc.agp_start = 0xFFFFFFFFFFFFULL;     // 48-bit max = AGP disabled
+    gmc.agp_end   = 0ULL;
 
     GMC_LOG("mc_init: real_vram=%llu MB visible=%llu MB "
-            "vram=[%#llx..%#llx] gart=[%#llx..%#llx]",
+            "vram=[%#llx..%#llx] gart=[%#llx..%#llx] fb_offset=%#llx",
             gmc.real_vram_size  >> 20,
             gmc.visible_vram_size >> 20,
             gmc.vram_start, gmc.vram_end,
-            gmc.gart_start, gmc.gart_end);
+            gmc.gart_start, gmc.gart_end,
+            gmc.vram_base_offset);
 
     gmc.inited = true;
     return kIOReturnSuccess;
@@ -140,14 +165,42 @@ gmc_vram_alloc_init(DeviceContext &dev, GMCContext &gmc)
     if (!gmc.inited) return kIOReturnNotReady;
     if (gmc.vram_alloc.is_inited()) return kIOReturnSuccess;
 
-    // Top of VRAM (real) - visible_size = base of visible window.
-    uint64_t visible_base = gmc.vram_start
-                          + (gmc.real_vram_size - gmc.visible_vram_size);
-    gmc.vram_alloc.init(visible_base, gmc.visible_vram_size, nullptr);
-    GMC_LOG("vram_alloc: range [%#llx..%#llx) size=%llu MB",
-            visible_base,
-            visible_base + gmc.visible_vram_size,
-            gmc.visible_vram_size >> 20);
+    // BAR0 (framebuffer aperture) maps the LOW 256 MB of VRAM on our
+    // R9700 + Apple Silicon setup — confirmed via runtime MMHUB read in
+    // the v0.1.21 diag dump: FB_LOCATION_BASE = vram_start (no offset).
+    //
+    // On most AMD desktop systems the visible aperture sits at the TOP
+    // of VRAM (ReBAR moves it). Our setup is different — bar0_memcpy_to_vram
+    // writes a BAR0-relative offset, and any vram_offset > 256 MB lands
+    // outside the mapped PCIe range. The v0.1.21 dext crashed in
+    // rlc_setup_csb_buffer because the bump allocator handed out
+    // gpu_va = vram_start + (32GB - 16KB), so the CSB's vram_byte_offset
+    // was ~2 GB — far outside BAR0's 256 MB window.
+    //
+    // Pin the allocator to the LOW visible region. PSP's hardcoded slots
+    // (fwPri, ring, cmdbuf, fence, TMR, fwBuf) occupy 0..24 MB; the bump
+    // allocator runs top-down from 256 MB → 24 MB before colliding,
+    // which leaves ~232 MB of allocatable VRAM and headroom on top.
+    constexpr uint64_t kPspReservedTopBytes = 0x01800000;  // 24 MB (above fwBuf)
+    uint64_t visible_base = gmc.vram_start;
+    uint64_t aperture_size = gmc.visible_vram_size;
+    if (aperture_size <= kPspReservedTopBytes) {
+        GMC_LOG("vram_alloc: visible_vram_size %llu MB <= PSP reservation, "
+                "can't allocate", aperture_size >> 20);
+        return kIOReturnNoMemory;
+    }
+    // Effective range: [vram_start + 24MB, vram_start + visible_vram_size).
+    // The bump allocator is top-down, so first alloc lands at the top of
+    // the visible aperture (still inside BAR0).
+    gmc.vram_alloc.init(visible_base + kPspReservedTopBytes,
+                        aperture_size - kPspReservedTopBytes,
+                        nullptr);
+    GMC_LOG("vram_alloc: range [%#llx..%#llx) size=%llu MB "
+            "(BAR0-mapped LOW VRAM, PSP-reserved 0..%lluMB skipped)",
+            visible_base + kPspReservedTopBytes,
+            visible_base + aperture_size,
+            (aperture_size - kPspReservedTopBytes) >> 20,
+            kPspReservedTopBytes >> 20);
     return kIOReturnSuccess;
 }
 
@@ -432,12 +485,14 @@ gmc_alloc_resources(DeviceContext &dev, GMCContext &gmc)
     if (gmc.gart_pt_buf != nullptr) return kIOReturnSuccess;
     if (!gmc.inited) return kIOReturnNotReady;
 
-    // GART page table — 16 KB pages, 8 B PTE, padded to AS page.
+    // GART page table — 4 KB GPU pages (matches upstream
+    // AMDGPU_GPU_PAGE_SIZE; MMHUB is programmed for >>12 stride in
+    // hub_init_gart_aperture_regs). 8 B PTE, padded to AS page.
     // VRAM-resident (mirrors upstream amdgpu_gart_table_vram_alloc).
     // gart_pt_bus holds the GPU MC address of the PT, which lives in
     // the FB aperture so PSP can fetch PT entries directly without
     // going through PCIe. CPU writes use bar0_memcpy_to_vram.
-    uint64_t pt_entries = gmc.gart_size / kASPageSize;
+    uint64_t pt_entries = gmc.gart_size / kAMDGPUGPUPageSize;
     uint64_t pt_bytes   = pt_entries * 8;
     if (pt_bytes < kASPageSize) pt_bytes = kASPageSize;
     pt_bytes = (pt_bytes + kASPageSize - 1) & ~(kASPageSize - 1);
@@ -937,8 +992,15 @@ gmc_init(DeviceContext &dev, GMCContext &gmc)
     r = gmc_alloc_resources(dev, gmc);
     if (r != kIOReturnSuccess) return r;
 
-    // MMIO programming gated on IP bases being resolved (set via
-    // SetIPBase or LoadDiscoveryBin from userspace).
+    // MMHUB only — mirrors upstream gmc_v12_0_gart_enable
+    // (gmc_v12_0.c:999-1024) which dispatches to mmhub_v4_1_0_gart_enable
+    // and NOT to gfxhub. GFXHUB is programmed later by
+    // gfxhub_v12_0_gart_enable, called from gfx_v12_0_hw_init
+    // (gfx_v12_0.c:3697) AFTER psp_hw_init / psp_load_fw. We do the
+    // same — gmc_gfxhub_gart_enable now runs in stage GFXInit so PSP
+    // sees GFXHUB CONTEXT0 at hardware-reset values when it validates
+    // GFX-block firmware (otherwise PSP rejects SDMA/CP/MES/RLC with
+    // status 0xFFFF0006 / 0x5 while still accepting SMU/IMU).
     if (dev.ip.isResolved(gmc.mmhub.ip)) {
         r = gmc_mmhub_gart_enable(dev, gmc);
         if (r != kIOReturnSuccess) {
@@ -947,15 +1009,6 @@ gmc_init(DeviceContext &dev, GMCContext &gmc)
         }
     } else {
         GMC_LOG("skipping mmhub_gart_enable — IP base unresolved");
-    }
-    if (dev.ip.isResolved(gmc.gfxhub.ip)) {
-        r = gmc_gfxhub_gart_enable(dev, gmc);
-        if (r != kIOReturnSuccess) {
-            GMC_LOG("gfxhub_gart_enable failed: %#x", r);
-            return r;
-        }
-    } else {
-        GMC_LOG("skipping gfxhub_gart_enable — IP base unresolved");
     }
 
     // HDP flush — invalidate HDP cache so the GPU sees the page-
@@ -975,15 +1028,11 @@ gmc_init(DeviceContext &dev, GMCContext &gmc)
         }
     }
 
-    // Flush TLBs on both hubs (vmid=0, legacy flush type). This
-    // ensures the page tables are picked up before the first GPU
-    // memory access through GART.
-    // Mirrors gmc_v12_0_gart_enable (gmc_v12_0.c:1024).
+    // MMHUB-only TLB flush (matches upstream gmc_v12_0_gart_enable
+    // dispatch to mmhub.gart_enable only). The gfxhub flush happens
+    // later when gmc_gfxhub_gart_enable runs in GFXInit.
     if (dev.ip.isResolved(gmc.mmhub.ip)) {
         gmc_flush_gpu_tlb(dev, gmc, gmc.mmhub, /*vmid*/ 0, /*type*/ 0);
-    }
-    if (dev.ip.isResolved(gmc.gfxhub.ip)) {
-        gmc_flush_gpu_tlb(dev, gmc, gmc.gfxhub, /*vmid*/ 0, /*type*/ 0);
     }
 
     dev.gmcReady = true;
@@ -1116,10 +1165,16 @@ gmc_bind_existing(DeviceContext &dev, GMCContext &gmc, uint64_t busAddr,
     uint64_t off = gmc.gart_bump_offset;
     gmc.gart_bump_offset += rounded;
 
-    uint32_t numPTEs = static_cast<uint32_t>(rounded / kASPageSize);
-    uint64_t firstPTE = off / kASPageSize;
+    // GMC is programmed with 4 KB GPU-page granularity (PAGE_TABLE_START
+    // = gart_start >> 12). One PTE = 4 KB of GART space. Apple Silicon
+    // CPU pages are 16 KB, so each AS-page-aligned DART chunk needs
+    // FOUR PTEs at 4 KB stride. Mirrors upstream amdgpu_gart_map which
+    // writes one PTE per AMDGPU_GPU_PAGE_SIZE (= 4 KB) regardless of
+    // host CPU page size.
+    uint32_t numPTEs  = static_cast<uint32_t>(rounded / kAMDGPUGPUPageSize);
+    uint64_t firstPTE = off / kAMDGPUGPUPageSize;
     for (uint32_t i = 0; i < numPTEs; i++) {
-        uint64_t pa = busAddr + (uint64_t)i * kASPageSize;
+        uint64_t pa = busAddr + (uint64_t)i * kAMDGPUGPUPageSize;
         // GFX12 single-level GART PTE: VALID|SYSTEM|SNOOPED|EXEC|R|W
         // for sysmem destinations, IS_PTE bit 63 set so the GMC
         // walker treats the entry as a leaf PTE (not a PDE pointer).
@@ -1133,7 +1188,7 @@ gmc_bind_existing(DeviceContext &dev, GMCContext &gmc, uint64_t busAddr,
 
     *outMcAddr = gmc.gart_start + off;
     GMC_LOG("bind_existing: %llu bytes @ bus=%#llx → mc=%#llx "
-            "(%u PTEs at idx %llu, PT @ vram_off=%#llx)",
+            "(%u PTEs @ 4KB stride starting at PT idx %llu, PT vram_off=%#llx)",
             rounded, busAddr, *outMcAddr, numPTEs, firstPTE,
             (uint64_t)kGMCGartPTVRAMOffset);
     return kIOReturnSuccess;

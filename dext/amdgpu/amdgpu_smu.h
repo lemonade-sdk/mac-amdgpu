@@ -113,4 +113,50 @@ kern_return_t smu_transfer_table_dram_to_smu(const DeviceContext &dev,
 kern_return_t smu_transfer_table_smu_to_dram(const DeviceContext &dev,
                                              uint32_t table_id);
 
+//
+// smu_smc_hw_setup — minimal port of upstream `smu_smc_hw_setup`
+// (amdgpu_smu.c:1662) for psp_v14_0_3 / R9700.
+//
+// Mirrors the SMU PMFW handshake that runs between PSP fw_load and the
+// BOOTLOAD_STATUS poll in upstream's IP-block init. v0.1.18-0.1.19
+// confirmed that PSP accepts every command (LOAD_IP_FW + AUTOLOAD_RLC
+// + LOAD_ASD all resp=0) but `regRLC_RLCS_BOOTLOAD_STATUS` stays at 0.
+// Hypothesis: PMFW must run `EnableAllSmuFeatures` to bring DPM /
+// GFX clocks online before the IMU autoload state machine can complete.
+//
+// What this DOES port (v0.1.20):
+//   1. GetDriverIfVersion         — sanity-check SMC IF version.
+//   2. SetDriverDramAddrHigh+Low  — point SMU at a 64 KB VRAM-resident
+//                                    driver_table (allocated via psp.fwBuf
+//                                    bump allocator; SMU reads through
+//                                    GMC, same path as PSP).
+//   3. RunDcBtc                   — boot-time calibration.
+//   4. SetAllowedFeaturesMaskLow  — 0xFFFFFFFF (allow all low features).
+//      SetAllowedFeaturesMaskHigh — 0xFFFFFFFF (allow all high features).
+//   5. EnableAllSmuFeatures       — the master DPM switch.
+//   6. GetRunningSmuFeaturesLow   — log which features actually came up.
+//      GetRunningSmuFeaturesHigh
+//
+// What this does NOT port (deferred to later versions if v0.1.20 doesn't
+// unblock autoload):
+//   - pptable upload (TransferTableDram2Smu) — relies on SCPM default
+//     or VBIOS-injected pptable. R9700 confirmed SCPM is OFF in PSP
+//     runtime DB, but PMFW may use a baked-in default OK for autoload.
+//   - SetDefaultDpmTable / SetMinDeepSleepDcefclk — informational.
+//   - Thermal alert + display change notifications — non-critical.
+//   - Max sustainable clocks query — informational.
+//
+// Pre-conditions:
+//   - PSP fw_load complete (SMU PMFW running, responds to TestMessage)
+//   - psp.fwBuf has at least 64 KB available
+//
+// Side effects:
+//   - Reserves 64 KB at psp.fwBufBumpOffset (driver_table area).
+//   - Sends 8-9 PPSMC messages.
+//
+// Returns kIOReturnSuccess on full success; any PMFW message returning
+// a non-OK response status is logged and propagated as kIOReturnError.
+//
+kern_return_t smu_smc_hw_setup(DeviceContext &dev, struct PSPContext &psp);
+
 } // namespace amdgpu

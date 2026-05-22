@@ -911,7 +911,9 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
     (void)target;
     (void)reference;
 
+    MACAMDGPU_LOG("ExternalMethod entry: sel=%llu args=%p", selector, arguments);
     if (arguments == nullptr) {
+        MACAMDGPU_LOG("ExternalMethod: arguments==nullptr → BadArgument");
         return kIOReturnBadArgument;
     }
 
@@ -987,8 +989,18 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
     case kMacAMDGPUMethodGetDiagnostics: {
         // Returns: cfg (cmd/status, BAR0..5 low+high), PM cap, BAR0/2/5
         // MMIO probes so the host can see exactly what each BAR reads.
+        MACAMDGPU_LOG("GetDiagnostics entry: scalarInput=%p inCount=%u "
+                      "scalarOutput=%p outCount=%u",
+                      arguments->scalarInput,
+                      (unsigned)arguments->scalarInputCount,
+                      arguments->scalarOutput,
+                      (unsigned)arguments->scalarOutputCount);
         if (arguments->scalarOutput == nullptr ||
             arguments->scalarOutputCount < 16) {
+            MACAMDGPU_LOG("GetDiagnostics: rejecting — outScalar=%p "
+                          "outCount=%u (need >=16)",
+                          arguments->scalarOutput,
+                          (unsigned)arguments->scalarOutputCount);
             return kIOReturnBadArgument;
         }
         kern_return_t openRet = mac_amdgpu_ensure_open(this, driver, pci);
@@ -1426,6 +1438,42 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         case kMacAMDGPUFwTypeIPKeyMgrDrv:
             return amdgpu::psp_bootloader_load_component(
                 dev, psp, bin, fwSize, amdgpu::PSPBootloaderCmd::LoadIPKeyMgrDrv);
+        case kMacAMDGPUFwTypeTA: {
+            // Parse psp_<chip>_ta.bin, stage the ASD ucode into a
+            // dedicated fwBuf VRAM slot. psp.asd will hold the staged
+            // MC address + size; psp_asd_initialize uses those after
+            // AUTOLOAD_RLC ack-s. Upstream order — amdgpu_psp.c:3153:
+            //     psp_load_non_psp_fw → psp_asd_initialize → psp_rl_load
+            // Skipping ASD leaves PSP in a partial state where the GC
+            // autoload state machine doesn't fire (v0.1.18 symptom).
+            auto &br = driver->ivars->bringup;
+            if (br.reached < amdgpu::BringupStage::PSPInit) {
+                kern_return_t pir = amdgpu::bringup_to(br,
+                    amdgpu::BringupStage::PSPInit);
+                if (pir != kIOReturnSuccess) return pir;
+            }
+            if (psp.fwBufSize == 0) {
+                MACAMDGPU_LOG("LoadFirmware(TA): fwBuf not initialized");
+                return kIOReturnNotReady;
+            }
+            kern_return_t r = amdgpu::psp_parse_ta_microcode(
+                dev, psp, bin, fwSize);
+            if (r != kIOReturnSuccess) {
+                MACAMDGPU_LOG("LoadFirmware(TA): parse failed kr=%#x", r);
+                return r;
+            }
+            if (psp.asd.parsed) {
+                MACAMDGPU_LOG("LoadFirmware(TA): ASD staged size=%u "
+                              "mc=%#llx fw_version=%#x",
+                              psp.asd.size_bytes, psp.asd.ucode_mc_addr,
+                              psp.asd.fw_version);
+            } else {
+                MACAMDGPU_LOG("LoadFirmware(TA): no ASD sub-bin found "
+                              "(parser returned success) — proceeding "
+                              "without ASD");
+            }
+            return kIOReturnSuccess;
+        }
         case kMacAMDGPUFwTypeFile_TOC: {
             // gc_<v>_toc.bin — required BEFORE any IP firmware load on
             // autoload-supported chips (psp_v14_0_3 / R9700). PSP parses
@@ -1434,11 +1482,17 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             // Mirrors upstream psp_load_toc (amdgpu_psp.c:840) called
             // from psp_tmr_init.
             uint32_t tmr_size = 0;
+            uint32_t toc_resp = 0;
             kern_return_t r = amdgpu::psp_load_toc(
-                dev, psp, bin, static_cast<uint32_t>(fwSize), &tmr_size);
+                dev, psp, bin, static_cast<uint32_t>(fwSize),
+                &tmr_size, &toc_resp);
             if (r == kIOReturnSuccess) {
                 MACAMDGPU_LOG("LoadFirmware(TOC): PSP needs tmr_size=%u",
                               tmr_size);
+            } else {
+                MACAMDGPU_LOG("LoadFirmware(TOC): PSP rejected — "
+                              "kr=%#x resp_status=%#x (file=%llu B)",
+                              r, toc_resp, fwSize);
             }
             return r;
         }
@@ -1464,14 +1518,14 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                 if (psp.fwPriBusAddr == 0 || psp.fwPriSize == 0) {
                     return kIOReturnNotReady;
                 }
-
-                // Get CPU pointer to the host's DMA buffer where the .bin
-                // file was streamed. `bin` is a kernel-side pointer to the
-                // start of the buffer; payloads[i].offset_bytes is the
-                // byte offset of the ucode inside it.
-                // (The bin pointer was already set up above via
-                //  ivars->dmaBuffer->GetAddressRange — same as the SOS
-                //  path uses.)
+                // fw_buf VRAM-backed (psp_setup_fw_buf_sysmem ported but
+                // dormant): GART-bound sysmem path landed every
+                // LOAD_IP_FW into resp=0x11 even after PerformOperation
+                // cache flush + maxAddressBits=32 + MTYPE@bit54 fix —
+                // PSP can't read this Mac's DART-mapped IOVA via the
+                // PT walk for unknown reasons. VRAM path unblocks
+                // SMU/IMU; SDMA/CP/MES/RLC stay failing pending a
+                // different attack.
 
                 // Decode the .bin into one-or-more LOAD_IP_FW payloads.
                 amdgpu::UcodePayload payloads[amdgpu::kMaxUcodePayloadsPerFile];
@@ -1516,15 +1570,13 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                     }
                 }
 
-                // Submit each (fw_type, offset, size) as a separate
-                // LOAD_IP_FW frame. Each payload gets a UNIQUE MC
-                // address inside psp.fwBuf, matching upstream's
-                // `firmware.fw_buf_mc + per-ucode-offset` scheme
-                // (amdgpu_ucode.c:1203 + amdgpu_psp.c:2915). Reusing a
-                // single address for every load makes PSP reject
-                // SDMA / CP_RS64 / MES_UNI with TEE_BAD_PARAMETERS.
-                // Bail on first error — upstream psp_load_non_psp_fw
-                // does the same so we don't mask the first failure.
+                // Submit each payload as its own LOAD_IP_FW frame. Stage
+                // bytes into a unique slot inside psp.fwBuf (VRAM) via
+                // BAR0; address handed to PSP is `fwBufBaseMC + slot_off`
+                // — a VRAM MC address the FB aperture resolves directly.
+                // (psp_setup_fw_buf_sysmem ports the upstream GART path
+                // but PSP rejects sysmem fw_phy_addr on this Mac for
+                // reasons we haven't pinned down; VRAM unblocks SMU/IMU.)
                 MACAMDGPU_LOG("LoadFirmware(fwType=%#llx): extractor produced "
                               "%u payload(s)", fwType, count);
                 constexpr uint64_t kFwBufAlign = 0x1000; // PAGE_SIZE
@@ -1533,8 +1585,6 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                             payloads[i].size_bytes > fwSize) {
                         return kIOReturnBadArgument;
                     }
-                    // Bump-allocate a unique slot in fw_buf, mirroring
-                    // upstream `fw_offset += ALIGN(ucode_size, PAGE_SIZE)`.
                     uint64_t slot_off = psp.fwBufBumpOffset;
                     uint64_t slot_sz  = (payloads[i].size_bytes +
                                          kFwBufAlign - 1) & ~(kFwBufAlign - 1);
@@ -1546,18 +1596,59 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                     }
                     uint64_t slot_vram_off = psp.fwBufVRAMOffset + slot_off;
                     uint64_t fwBusAddr     = psp.fwBufBaseMC      + slot_off;
-                    amdgpu::bar0_memcpy_to_vram(
-                        dev, slot_vram_off,
-                        bin + payloads[i].offset_bytes,
-                        payloads[i].size_bytes);
-                    amdgpu::amdgpu_hdp_flush(dev);
+                    // If psp_setup_fw_buf_sysmem succeeded earlier in
+                    // PSPInit, fwBufSysmemCPU != nullptr and fwBufBaseMC
+                    // points at the GART MC address of the sysmem
+                    // staging buffer. Match upstream amdgpu_ucode_init_bo
+                    // by memcpy'ing directly into the CPU-mapped sysmem
+                    // buffer instead of streaming via BAR0 to VRAM.
+                    // The buffer is DART-pinned + GART-bound so PSP
+                    // can read it through the GMC walk.
+                    if (psp.fwBufSysmemCPU != nullptr) {
+                        memcpy(
+                            static_cast<uint8_t *>(psp.fwBufSysmemCPU) +
+                                slot_off,
+                            bin + payloads[i].offset_bytes,
+                            payloads[i].size_bytes);
+                    } else {
+                        amdgpu::bar0_memcpy_to_vram(
+                            dev, slot_vram_off,
+                            bin + payloads[i].offset_bytes,
+                            payloads[i].size_bytes);
+                        amdgpu::amdgpu_hdp_flush(dev);
+                    }
                     psp.fwBufBumpOffset = slot_off + slot_sz;
                     MACAMDGPU_LOG("  payload[%u]: fw_type=%u src_off=%u size=%u "
-                                  "→ fw_buf slot vram_off=%#llx mc=%#llx",
+                                  "→ vram_off=%#llx mc=%#llx",
                                   i, payloads[i].fw_type,
                                   payloads[i].offset_bytes,
                                   payloads[i].size_bytes,
                                   slot_vram_off, fwBusAddr);
+
+                    // Read-back diagnostic for the first payload of
+                    // each .bin: compare source dwords vs what the
+                    // GPU sees at the same VRAM offset via the
+                    // MM_INDEX/MM_DATA register pair (which reads
+                    // through GMC — the same path PSP uses for
+                    // LOAD_IP_FW.fw_phy_addr). If src == gpu_read,
+                    // PSP's rejection is protocol-level (not a data
+                    // path bug). If they differ, the data isn't
+                    // reaching the GPU's view of memory.
+                    if (i == 0) {
+                        const uint32_t *s =
+                            reinterpret_cast<const uint32_t *>(
+                                bin + payloads[i].offset_bytes);
+                        uint32_t g0 = amdgpu::RVRAM32_via_mm(dev, slot_vram_off + 0);
+                        uint32_t g1 = amdgpu::RVRAM32_via_mm(dev, slot_vram_off + 4);
+                        uint32_t g2 = amdgpu::RVRAM32_via_mm(dev, slot_vram_off + 8);
+                        uint32_t g3 = amdgpu::RVRAM32_via_mm(dev, slot_vram_off + 12);
+                        MACAMDGPU_LOG("  readback fw_type=%u @ vram_off=%#llx: "
+                                      "src=%08x %08x %08x %08x  "
+                                      "gpu=%08x %08x %08x %08x",
+                                      payloads[i].fw_type, slot_vram_off,
+                                      s[0], s[1], s[2], s[3],
+                                      g0, g1, g2, g3);
+                    }
                     kern_return_t r = amdgpu::psp_load_ip_fw(
                         dev, psp, fwBusAddr,
                         payloads[i].size_bytes, payloads[i].fw_type);
@@ -1572,25 +1663,67 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                         payloads[i].fw_type == amdgpu::PSPGfxFwType::SDMA_UCODE_TH0) {
                         sdma_loaded_this_call = true;
                     }
-                    // Audit-7 #11: IMUInit stage gates on imu.microcode_loaded.
-                    // Set it once PSP has acked BOTH IMU_I (68) + IMU_D (69).
-                    // We flip the flag on the second of the two — by the time
-                    // both have returned kIOReturnSuccess we know both went
-                    // through. (Order in upstream: I, then D.)
                     if (payloads[i].fw_type == amdgpu::PSPGfxFwType::IMU_D) {
                         driver->ivars->bringup.imu.microcode_loaded = true;
                     }
-                    // RLC_G is the LAST GFX firmware per upstream
-                    // amdgpu_ucode.h enum order (529). Upstream
-                    // psp_load_non_psp_fw calls psp_rlc_autoload_start
-                    // immediately after this returns — see
-                    // amdgpu_psp.c:3113-3121. Mirror that here.
+                    // RLC_G is LAST per upstream enum order; trigger
+                    // AUTOLOAD_RLC immediately after it acks. (IFWI-only
+                    // fallback was tested in 0.0.91: AUTOLOAD_RLC without
+                    // sub-bin loads returned TEE_ERROR_ITEM_NOT_FOUND
+                    // = 0xFFFF0007 — proves SOS does NOT have firmware
+                    // pre-loaded from IFWI. LOAD_IP_FW must succeed.)
                     if (payloads[i].fw_type == amdgpu::PSPGfxFwType::RLC_G) {
                         kern_return_t a = amdgpu::psp_rlc_autoload_start(
                             dev, psp);
                         if (a != kIOReturnSuccess) {
                             MACAMDGPU_LOG("rlc_autoload_start FAILED kr=%#x", a);
                             return a;
+                        }
+                        driver->ivars->bringup.rlc.microcode_loaded = true;
+
+                        // Upstream amdgpu_psp.c:3153 — psp_asd_initialize
+                        // runs BETWEEN psp_load_non_psp_fw (which ends
+                        // with AUTOLOAD_RLC) and psp_rl_load. Hypothesis
+                        // (v0.1.19): loading the first TA transitions
+                        // PSP from "loading mode" into "system ready",
+                        // and only then does the GC autoload state
+                        // machine actually fire. v0.1.18 skipped this
+                        // call and BOOTLOAD_STATUS stayed at 0 forever.
+                        //
+                        // psp_asd_initialize is a no-op (returns success)
+                        // if the host didn't send the TA bin, so this
+                        // is safe to add unconditionally.
+                        kern_return_t asd =
+                            amdgpu::psp_asd_initialize(dev, psp);
+                        if (asd != kIOReturnSuccess) {
+                            MACAMDGPU_LOG("psp_asd_initialize FAILED kr=%#x "
+                                          "(resp=%#x) — autoload may stay "
+                                          "stuck",
+                                          asd, psp.asd.resp_status);
+                            // Continue rather than abort: if ASD is
+                            // truly required, BOOTLOAD_STATUS poll
+                            // (RLCInit) will time out and surface the
+                            // real symptom — but we want to see
+                            // psp_rl_load's resp too as diagnostic
+                            // signal, so we don't return here.
+                        }
+
+                        // Upstream amdgpu_psp.c:3159 follows
+                        // psp_asd_initialize with psp_rl_load. PSP's
+                        // GC autoload state machine may also wait for
+                        // REG_LIST (fw_type=67). psp.rl is populated
+                        // from the v2 SOS package by
+                        // psp_parse_sos_microcode. psp_rl_load is
+                        // best-effort on Apple Silicon: v0.1.15/0.1.16
+                        // both saw PSP return resp=0x11 on REG_LIST.
+                        // The same RL bytes from psp_14_0_3_sos.bin
+                        // work on Linux. Warn and continue.
+                        kern_return_t rl =
+                            amdgpu::psp_rl_load(dev, psp);
+                        if (rl != kIOReturnSuccess) {
+                            MACAMDGPU_LOG("psp_rl_load returned kr=%#x — "
+                                          "continuing (PSP-side quirk on AS, "
+                                          "not autoload-gating)", rl);
                         }
                     }
                 }

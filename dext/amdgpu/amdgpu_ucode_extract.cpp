@@ -241,26 +241,32 @@ uint32_t extract_cp_rs64(const uint8_t *bin, uint64_t size,
     uint32_t stack_fw_types[4] = {0,0,0,0};
     uint32_t num_stacks = 0;
 
+    // Stack counts MUST match upstream gfx_v12_0_init_microcode
+     // (gfx_v12_0.c:605-642). For gfx_v12_0 (RDNA4) registered stacks:
+    //   PFP: P0 only          (num_pipe_per_me=1)
+    //   ME:  P0 only          (num_pipe_per_me=1)
+    //   MEC: P0 + P1 only     (num_pipe_per_mec=2)
+    // Older gfx_v11_0 had 2/2/4 stacks (P0+P1, P0+P1, P0..P3). We
+    // initially emitted gfx_v11_0 counts which made PSP accept extra
+    // fw_types (91, 93, 96, 97) that don't have TMR slots on gfx_v12_0
+    // — those slots end up either discarded or potentially corrupting
+    // adjacent slots.
     switch (family) {
     case RS64Family::PFP:
         ucode_fw_type   = PSPGfxFwType::RS64_PFP;
         stack_fw_types[0] = PSPGfxFwType::RS64_PFP_P0;
-        stack_fw_types[1] = PSPGfxFwType::RS64_PFP_P1;
-        num_stacks = 2;
+        num_stacks = 1;
         break;
     case RS64Family::ME:
         ucode_fw_type   = PSPGfxFwType::RS64_ME;
         stack_fw_types[0] = PSPGfxFwType::RS64_ME_P0;
-        stack_fw_types[1] = PSPGfxFwType::RS64_ME_P1;
-        num_stacks = 2;
+        num_stacks = 1;
         break;
     case RS64Family::MEC:
         ucode_fw_type   = PSPGfxFwType::RS64_MEC;
         stack_fw_types[0] = PSPGfxFwType::RS64_MEC_P0;
         stack_fw_types[1] = PSPGfxFwType::RS64_MEC_P1;
-        stack_fw_types[2] = PSPGfxFwType::RS64_MEC_P2;
-        stack_fw_types[3] = PSPGfxFwType::RS64_MEC_P3;
-        num_stacks = 4;
+        num_stacks = 2;
         break;
     }
 
@@ -292,20 +298,31 @@ uint32_t extract_cp_rs64(const uint8_t *bin, uint64_t size,
 //                            mes_ucode_data_offset_bytes for data)
 //   amdgpu_psp.c:2665-2676 (CP_MES → 33, CP_MES_DATA / MES_STACK → 34)
 //
-// NOTE: PSP wants CP_MES (=33) for the sched pipe (amdgpu_mes_init_microcode
-// case AMDGPU_MES_SCHED_PIPE → AMDGPU_UCODE_ID_CP_MES → GFX_FW_TYPE_CP_MES).
-// CP_MES1 (=81) is for KIQ pipe; we don't expose KIQ on R9700 yet, so
-// the uni_mes file we ship is sched-pipe only.
+// gfx_v12_0 default is `enable_uni_mes=true` (amdgpu_discovery.c:2700-2701)
+// and mes_v12_0_early_init loops over AMDGPU_MAX_MES_PIPES=2, registering
+// both SCHED (pipe 0 → CP_MES=33 + CP_MES_DATA=34) and KIQ (pipe 1 →
+// CP_MES_KIQ=81 + MES_KIQ_STACK=82) from the SAME uni_mes.bin bytes.
+// PSP's autoload manifest references both pipes — without the KIQ
+// payloads in TMR, AUTOLOAD_RLC accepts the cmd but the autoload state
+// machine bails silently when it can't find the KIQ slot.
 uint32_t extract_mes(const uint8_t *bin, uint64_t size,
                      UcodePayload out[]) {
     if (size < sizeof(mes_firmware_header_v1_0)) return 0;
     auto *hdr = reinterpret_cast<const mes_firmware_header_v1_0 *>(bin);
     if (hdr->header.header_version_major != 1) return 0;
     uint32_t n = 0;
+    // SCHED pipe (pipe 0)
     n = push(out, n, PSPGfxFwType::CP_MES,
              hdr->mes_ucode_offset_bytes,
              hdr->mes_ucode_size_bytes, size);
     n = push(out, n, PSPGfxFwType::CP_MES_DATA,
+             hdr->mes_ucode_data_offset_bytes,
+             hdr->mes_ucode_data_size_bytes, size);
+    // KIQ pipe (pipe 1) — same bytes, different fw_type tag
+    n = push(out, n, PSPGfxFwType::CP_MES_KIQ,
+             hdr->mes_ucode_offset_bytes,
+             hdr->mes_ucode_size_bytes, size);
+    n = push(out, n, PSPGfxFwType::MES_KIQ_STACK,
              hdr->mes_ucode_data_offset_bytes,
              hdr->mes_ucode_data_size_bytes, size);
     return n;

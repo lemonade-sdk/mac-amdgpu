@@ -1,61 +1,73 @@
 # STATUS
 
-Driver runs on a real R9700, brings PSP up, loads SMU PMFW and IMU
-microcode through PSP's ring, gets the SMU mailbox responding, and
-clears the IMUInit stage. Still can't render anything — RLC/CP/MES/SDMA
-firmware loads are the next blocker (PSP rejects them with
-`TEE_ERROR_BAD_PARAMETERS` because the per-IP header offsets in those
-files differ from the simple cases that already work).
+**v0.1.22 — full bringup achieved.** Every IP block initializes on
+hardware. PSP loads all firmware, IMU autoload state machine fires,
+RLC programs CSB, CP / MES / SDMA all sign off as ready. The GPU is in
+a state where it could execute work submitted through KIQ / MES.
 
-**What works (v0.0.63 on real R9700 over Thunderbolt 5):**
+**What works (v0.1.22 on real R9700 over Thunderbolt 5):**
 
 - Card detection + dext attach over TB5
 - Identity reads (VID `0x1002`, DID `0x7551`, rev `0xC0`)
-- MMIO via BAR5 (registers) + BAR0 (framebuffer aperture)
+- MMIO via BAR5 (registers) + BAR0 (framebuffer aperture, low 256 MB
+  of VRAM)
 - IP discovery from VRAM via MM_INDEX/MM_DATA with full multi-`BASE_IDX`
   support — `gfx_12_0_1` / `psp_14_0_3` / `smu_14_0_3` / `sdma_7_0_1` /
   `mes_12_0_1` / `nbio_7_11` auto-detected
-- 9 bringup stages green:
+- **All 15 bringup stages green:**
   `IPDiscovery → IHInit → GMCInit → PSPInit → PSPLoadSOS →
-  PSPRingCreate → TMRSetup → SMUInit → IMUInit`
-- PSP SOS firmware upload + run (kicker / non-kicker selection
-  matches upstream `kicker_device_list`)
-- PSP ring (GPCOM / km_ring) create + first-frame submit, `FB_FW_RESERV`
-  queries return real responses, fence increments per submit
-- `LOAD_IP_FW` over the PSP ring for SMU PMFW + IMU_I + IMU_D —
-  firmware bytes copied into `fw_pri` (VRAM) via BAR0 aperture and
-  handed to PSP at its VRAM MC address, matching upstream's
-  `psp_execute_ip_fw_load` + `psp_copy_fw`
-- SMU mailbox responsive (`TestMessage` echoes, `GetVersion` works)
-  over MP1 BASE_IDX 1
+  PSPRingCreate → TMRSetup → PSPFwLoad → SMUInit → IMUInit →
+  RLCInit → CPInit → MESInit → GFXInit → SDMAInit`
+- PSP SOS + bootloader chain (KDB / SPL / SYS / SOC / INTF / DBG / RAS /
+  IPKEYMGR), kicker / non-kicker selection per upstream
+- PSP GPCOM (km_ring=2) create + 25+ frames acked (`LOAD_IP_FW` ×24 +
+  `AUTOLOAD_RLC` + `LOAD_ASD`), every fence increments, every
+  `resp_status=0`
+- TA bin parser → `psp_asd_initialize` (LOAD_ASD cmd_id=0x4) wired
+  between `AUTOLOAD_RLC` and `psp_rl_load`, matching upstream order
+- SMU mailbox handshake (`smu_smc_hw_setup`) — `SetDriverDramAddr` →
+  `RunDcBtc` → `EnableAllSmuFeatures` — PMFW transitions DPM on
+  (running feature mask `0x488f19e_0x38fffcfb`), which is what unblocks
+  the IMU autoload state machine. Without this, `BOOTLOAD_STATUS`
+  stays at 0 forever even though PSP signs off on everything.
 - GMC + MMHUB + GFXHUB bringup with the full
   `mmhub_v4_1_0_gart_enable` / `gfxhub_v12_0_gart_enable` register
   sequences, GFX12 PTE format with `IS_PTE` bit, NBIO HDP
   `remap_hdp_registers` programmed
-- GART page table in VRAM at MC `vram_start + 0x800000` (matches
+- GART page table in VRAM at MC `vram_start + 0x700000` (matches
   upstream `amdgpu_gart_table_vram_alloc`), CONTEXT0 enabled with
   PT base + START/END + flush via engine 17
+- VRAM bump allocator pinned to BAR0-mapped LOW region
+  `[vram_start + 24MB, vram_start + 256MB)` — skips PSP's hardcoded
+  fwPri / ring / cmdbuf / fence / TMR / fwBuf slots, stays inside the
+  visible aperture on this hardware (BAR0 maps the BOTTOM of VRAM here,
+  unlike most desktop AMD systems)
+- RLC autoload completes (`regRLC_RLCS_BOOTLOAD_STATUS = 0x8000003f`,
+  `regGRBM_STATUS = 0x382c`, `regCGCG_CGLS_CTRL = 0x0001003c`)
+- CSB allocation + content fill (75 dwords from `gfx12_cs_data` table),
+  `RLC_CSIB_ADDR_{HI,LO,LENGTH}` programmed
+- `RLC_SRM_CNTL` SRM + auto-incr enabled
 
 **What's next:**
 
-- **RLC / CP / MES / SDMA firmware parsing.** Each file uses a
-  different per-IP header layout (`rlc_firmware_header_v2_0..v2_4`,
-  `mes_firmware_header_v1_0` ucode+data, `gfx_firmware_header_v2_0`
-  for RS64 PFP/ME/MEC + P0..P3 stacks, `sdma_firmware_header_v3_0`).
-  The per-IP extractor in `dext/amdgpu/amdgpu_ucode_extract.cpp` is
-  in but each file's payloads still bounce off PSP with
-  `0xFFFF0006 = TEE_ERROR_BAD_PARAMETERS` — wrong offsets/sizes for
-  the actual firmware bytes. Need to cross-check field-by-field
-  against upstream `amdgpu_ucode_init_single_fw`.
-- RLC autoload start, CP RS64 PFP/ME/MEC programming, MES
-  `set_hw_resources` + queue init.
-- GFXHUB gart_enable re-run after RLC autoload.
-- First PM4 packet on a GFX12 compute queue.
+- **First PM4 packet on a real ring.** KIQ / MES bringup is done at the
+  microcode level (`set_hw_resources` succeeds), but no live work has
+  been submitted yet. A `PACKET3_NOP` + fence write smoke test is the
+  obvious first step.
+- **SDMA copy test** — DMA a few bytes VRAM→VRAM and verify via
+  `MM_INDEX`/`MM_DATA` readback.
+- **MES queue management** — expose a real GFX queue to userspace via
+  the existing `MacAMDGPUUserClient`.
+- **BO management + userspace ABI** — currently the host owns a single
+  DMA buffer; production code needs per-client BO sub-ranges, alloc /
+  free / map, and a stable userspace ABI.
+- **Mesa winsys** — once BOs + submit work, plug into RADV via a custom
+  winsys (Phase 2). Mesa stays vendored; only the winsys + WSI layer is
+  rewritten.
 
 **To use it:** install the host app, click **Initialize GPU** in the
-test UI, watch each bring-up stage print. Expected output today:
-stages 1–9 green, stage 10 (`RLCInit`) times out because RLC
-microcode never loads.
+test UI, watch each bring-up stage print. Expected output as of v0.1.22:
+all 15 stages green.
 
   
 # mac_amdgpu
@@ -246,12 +258,38 @@ the host app bundle — `xcodegen` adds the repo's `firmware/`
 directory there. The **Pick Firmware Folder…** button exists only
 to override that for testing.
 
-A successful run today gets through `IPDiscovery → PSPInit →
-PSPLoadSOS → PSPRingCreate → TMRSetup` plus an interleaved
-LoadFirmware of `smu_<v>.bin` via the PSP ring, then `SMUInit →
-GMCInit`. The next blocker is `RLCInit`, which returns
-`kIOReturnUnsupported` until SDMA / RLC / uni_mes microcode parsing
-is finished (see `docs/audit/00_SUMMARY.md`).
+A successful run today (v0.1.22) clears every bring-up stage:
+
+```
+IPDiscovery   ok
+IHInit        ok
+GMCInit       ok
+PSPInit       ok
+PSPLoadSOS    ok
+PSPRingCreate ok
+TMRSetup      ok
+PSPFwLoad     ok
+SMUInit       ok
+IMUInit       ok
+RLCInit       ok
+CPInit        ok
+MESInit       ok
+GFXInit       ok
+SDMAInit      ok
+```
+
+For granular dext-side diagnostics, tail the dext log:
+
+```
+log stream --predicate 'eventMessage CONTAINS "mac.amdgpu"'
+```
+
+The session leading to v0.1.22 is documented under
+[`docs/audit-2026-05-22/`](docs/audit-2026-05-22/) — synthesis report,
+per-agent forensic audits, and the two version plans
+(`PLAN_v0.1.19_psp_asd_initialize.md`,
+`PLAN_v0.1.20_smu_hw_setup.md`) that drove the EnableAllSmuFeatures
+and BAR0-mapped-LOW-VRAM fixes.
 
 ## Entitlement reference
 
@@ -309,12 +347,9 @@ These four surprises eat most of an afternoon if you don't know about them.
 - `dext/` — the DriverKit system extension (C++ inside an IOService).
 - `project.yml` — xcodegen spec; regenerates `MacAMDGPU.xcodeproj`.
 - `scripts/` — build, install, and ping/test helpers.
-- `docs/` — porting notes, Apple-VFIO reference notes, AS/DART limit
-  cheat-sheets, and the phase-by-phase port plans.
+- `docs/` — bringup audits and version plans. `audit-2026-05-22/`
+  holds the synthesis + per-agent forensic reports that produced
+  v0.1.19–v0.1.22.
 - `upstream/` — vendored Linux + Mesa source for reference. Gitignored.
 - `firmware/` — AMD GPU microcode (GFX11 + GFX12 families), copied
   from linux-firmware. Tracked in the repo.
-
-For granular task state see [`WORKLIST.md`](WORKLIST.md). For the phase
-plan see [`ROADMAP.md`](ROADMAP.md). For the divergences-from-Linux
-summary see [`docs/PORTING_NOTES.md`](docs/PORTING_NOTES.md).

@@ -47,6 +47,12 @@ private let kFwIntfDrv:     UInt64 = 5
 private let kFwDbgDrv:      UInt64 = 6
 private let kFwRASDrv:      UInt64 = 7
 private let kFwIPKeyMgrDrv: UInt64 = 8
+// psp_<chip>_ta.bin — Trusted Application package. Currently we
+// extract just the ASD sub-binary; psp_asd_initialize runs between
+// AUTOLOAD_RLC and psp_rl_load (amdgpu_psp.c:3153). Required for the
+// PSP GC autoload state machine to fire on R9700 (v0.1.18 symptom:
+// BOOTLOAD_STATUS stuck at 0 without this).
+private let kFwTA:          UInt64 = 9
 private let kFwIP_SMU:      UInt64 = 0x100 + 18
 // SDMA on RDNA4 / gfx12 = sdma_v7_1 = RS64 SDMA, packaged as a single
 // firmware. Upstream `amdgpu_sdma_init_microcode` for v3.0 headers
@@ -584,6 +590,8 @@ final class DriverController: NSObject, ObservableObject,
 
     // Mirrors upstream amdgpu_ucode.c kicker_device_list[]: cards that
     // need the `_kicker` firmware variant instead of the plain one.
+    // (Tested 0xC0 as kicker in v0.0.81 — kicker SOS bootloader timed
+    // out, confirming rev=0xC0 is non-kicker. Upstream list is correct.)
     private static let kickerDeviceList: [(device: UInt16, revision: UInt8)] = [
         (0x744B, 0x00),
         (0x7551, 0xC8),
@@ -732,15 +740,15 @@ final class DriverController: NSObject, ObservableObject,
     private static let stageNames: [UInt64: String] = [
         1: "IPDiscovery", 2: "IHInit", 3: "GMCInit",
         4: "PSPInit", 5: "PSPLoadSOS", 6: "PSPRingCreate",
-        7: "TMRSetup", 8: "SMUInit", 9: "IMUInit",
-        10: "RLCInit", 11: "CPInit", 12: "MESInit",
-        13: "GFXInit", 14: "SDMAInit"
+        7: "TMRSetup", 8: "PSPFwLoad", 9: "SMUInit", 10: "IMUInit",
+        11: "RLCInit", 12: "CPInit", 13: "MESInit",
+        14: "GFXInit", 15: "SDMAInit"
     ]
     // Stage progression for initializeGPU(). LoadFirmware(SMU/IMU/RLC/CP/MES/SDMA)
-    // is interleaved between SMUInit and the per-IP stages — see
+    // is interleaved between TMRSetup and PSPFwLoad — see
     // initializeGPU() for the exact order.
     private static let stageOrder: [UInt64] = [
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
     ]
 
     func testDumpTMR() {
@@ -1185,54 +1193,72 @@ final class DriverController: NSObject, ObservableObject,
             }
         }
 
-        // (TOC load was here in v0.0.65/66 — gc_<v>_toc.bin is ONLY
-        // required for AMDGPU_FW_LOAD_RLC_BACKDOOR_AUTO, NOT the
-        // default AMDGPU_FW_LOAD_PSP path we use. See gfx_v12_0.c:644.)
-
-        // SMU PMFW MUST be loaded via PSP ring BEFORE SMUInit's mailbox
-        // test — otherwise MP1 stays in reset and TestMessage just
-        // times out. Mirror upstream psp_load_non_psp_fw ordering: SMU
-        // first (because 14_0_3 has autoload_supported=true and
-        // pmfw_centralized_cstate_management=false).
-        if loadFirmware(kFwIP_SMU, "smu_\(smu).bin") {
-            append("smu_\(smu).bin → loaded")
+        // TA package — psp_<chip>_ta.bin. The dext parses it and stages
+        // the ASD sub-binary into a fwBuf VRAM slot. psp_asd_initialize
+        // (post-AUTOLOAD_RLC) references that slot via GFX_CMD_ID_LOAD_ASD.
+        // Mirrors upstream psp_v14_0_init_microcode (psp_v14_0.c:75/83)
+        // which calls psp_init_ta_microcode for IP_VERSION(14,0,2/3/5).
+        // Kicker chips use the _kicker suffix per amdgpu_is_kicker_fw.
+        let taName = isKicker ? "psp_\(psp)_ta_kicker.bin"
+                              : "psp_\(psp)_ta.bin"
+        if loadFirmware(kFwTA, taName) {
+            append("\(taName) → loaded")
         } else {
-            append("initializeGPU: SMU PMFW load failed; SMUInit will fail")
+            append("\(taName) → FAILED to load (PSP autoload may stall)")
         }
 
-        // Stage 8: SMUInit (smu_test_message — works once PMFW is up).
-        if !testInitDeviceUpTo(8) {
-            append("initializeGPU: stopping early — SMUInit failed even after PMFW load")
-            // Don't return; the per-IP loads below still exercise the PSP ring.
+        // (No TOC load on psp_v14_0_3 — upstream's psp_v14_0_init_microcode
+        // only calls psp_init_toc_microcode for IP_VERSION(14,0,5); for
+        // (14,0,2) and (14,0,3) it calls psp_init_sos + psp_init_ta only.
+        // psp->toc.start_addr stays NULL, so psp_tmr_init's
+        // `if (psp->toc.start_addr) psp_load_toc(...)` is skipped.)
+
+        // Per-IP firmware load order MUST match upstream's
+        // psp_load_non_psp_fw (amdgpu_psp.c:3051): SMU first (special-cased
+        // when autoload_supported), then iterate firmware.ucode[] in
+        // AMDGPU_UCODE_ID enum order (amdgpu_ucode.h:479-552). For
+        // psp_v14_0_3 + gfx_v12 the loaded IDs in order are:
+        //   SDMA_UCODE_TH0 → CP_RS64_PFP/ME/MEC(+stacks) → CP_MES/_DATA
+        //   → IMU_I/_D → RLC_* sub-bins → RLC_G (LAST → AUTOLOAD_RLC).
+        //
+        // Loading out of order causes PSP to reject with status 0x5 on
+        // the first frame, then 0xFFFF0006 on every subsequent frame
+        // because PSP gets stuck in an error state.
+        //
+        // SMU/IMU/RLC have `_kicker.bin` variants that upstream selects
+        // when `amdgpu_is_kicker_fw(adev)` is true (smu_v14_0.c:83,
+        // imu_v12_0.c:51, gfx_v12_0.c:617). Mirror the full upstream
+        // selection — not just SOS.
+        let smuName = isKicker ? "smu_\(smu)_kicker.bin"
+                               : "smu_\(smu).bin"
+        let imuName = isKicker ? "gc_\(gfx)_imu_kicker.bin"
+                               : "gc_\(gfx)_imu.bin"
+        let rlcName = isKicker ? "gc_\(gfx)_rlc_kicker.bin"
+                               : "gc_\(gfx)_rlc.bin"
+        if loadFirmware(kFwIP_SMU, smuName) {
+            append("\(smuName) → loaded")
+        } else {
+            append("initializeGPU: SMU PMFW load failed")
         }
-
-        // Stages 9–14: IMU / RLC / CP / MES / GFX / SDMA bringup. Each
-        // gates on the prior firmware load below (the loop intentionally
-        // runs AFTER the firmware section so per-IP microcode_loaded
-        // flags are set by the time IMUInit etc. check them).
-
-        // Per-IP firmware loads. Order MUST match upstream
-        // psp_load_non_psp_fw's iteration over firmware.ucode[], which
-        // is the AMDGPU_UCODE_ID_* enum order at amdgpu_ucode.h:480-529:
-        //   SDMA_RS64 (490)
-        //   CP_RS64_PFP/ME/MEC + stacks (494-504)
-        //   CP_MES + CP_MES_DATA (509-510)
-        //   IMU_I + IMU_D (513-514)
-        //   RLC sub-bins + RLC_G LAST (520-529)
-        // RLC_G last triggers psp_rlc_autoload_start
-        // (amdgpu_psp.c:3113-3121); anything submitted after that
-        // point gets rejected by SOS as TEE_BAD_PARAMETERS.
         _ = loadFirmware(kFwFile_SDMA,    "sdma_\(sdma).bin")
         _ = loadFirmware(kFwFile_CP_PFP,  "gc_\(gfx)_pfp.bin")
         _ = loadFirmware(kFwFile_CP_ME,   "gc_\(gfx)_me.bin")
         _ = loadFirmware(kFwFile_CP_MEC,  "gc_\(gfx)_mec.bin")
         _ = loadFirmware(kFwFile_MES_UNI, "gc_\(gfx)_uni_mes.bin")
-        _ = loadFirmware(kFwFile_IMU,     "gc_\(gfx)_imu.bin")
-        _ = loadFirmware(kFwFile_RLC,     "gc_\(gfx)_rlc.bin")
+        _ = loadFirmware(kFwFile_IMU,     imuName)
+        _ = loadFirmware(kFwFile_RLC,     rlcName)
 
-        // Stages 9–14: IMU → RLC → CP → MES → GFX → SDMA bringup. Each
-        // gates on its firmware being loaded above.
-        for s: UInt64 in [9, 10, 11, 12, 13, 14] {
+        // Stage 8: PSPFwLoad — synchronization point. Validates that
+        // all firmware was loaded by the LoadFirmware calls above.
+        if !testInitDeviceUpTo(8) {
+            append("initializeGPU: stopping early — PSPFwLoad validation failed")
+            return
+        }
+
+        // Stages 9–15: SMUInit → IMUInit → RLCInit → CPInit → MESInit →
+        // GFXInit → SDMAInit. Each gates on its firmware being loaded
+        // above (the microcode_loaded flags are set by LoadFirmware).
+        for s: UInt64 in [9, 10, 11, 12, 13, 14, 15] {
             if !testInitDeviceUpTo(s) {
                 append("initializeGPU: stopping early — stage \(s) failed; downstream stages depend on it")
                 break
@@ -1265,29 +1291,52 @@ final class DriverController: NSObject, ObservableObject,
         testInitDeviceUpTo(4)
 
         // Stages 5–7: PSPLoadSOS → PSPRingCreate → TMRSetup.
-        if !loadFirmware(kFwSOS, "psp_\(psp)_sos.bin") {
+        let isKickerFB = DriverController.amdgpuIsKickerFw(
+            deviceId: pciDeviceId, revision: pciRevision)
+        let sosNameFB = isKickerFB ? "psp_\(psp)_sos_kicker.bin"
+                                   : "psp_\(psp)_sos.bin"
+        if !loadFirmware(kFwSOS, sosNameFB) {
             append("runFullBringup: stop — PSP SOS load failed")
             return
         }
         for s: UInt64 in [5, 6, 7] { testInitDeviceUpTo(s) }
 
-        // Stage 8: SMUInit (needs PMFW).
-        if loadFirmware(kFwIP_SMU, "smu_\(smu).bin") {
-            testInitDeviceUpTo(8)
-        }
+        // (See note in initializeGPUBlocking — no TOC load on psp_v14_0_3.)
 
-        // Per-IP firmware loads (extractor expands per-file into N frames).
-        // Order matches upstream AMDGPU_UCODE_ID_* iteration; RLC last.
+        // Per-IP firmware load order: see note in initializeGPUBlocking —
+        // must match upstream psp_load_non_psp_fw enum iteration:
+        //   SMU → SDMA → CP_RS64 → MES → IMU → RLC (RLC_G last).
+        // Kicker variants used when amdgpu_is_kicker_fw(adev) is true.
+        let smuNameFB = isKickerFB ? "smu_\(smu)_kicker.bin"
+                                   : "smu_\(smu).bin"
+        let imuNameFB = isKickerFB ? "gc_\(gfx)_imu_kicker.bin"
+                                   : "gc_\(gfx)_imu.bin"
+        let rlcNameFB = isKickerFB ? "gc_\(gfx)_rlc_kicker.bin"
+                                   : "gc_\(gfx)_rlc.bin"
+        if !loadFirmware(kFwIP_SMU, smuNameFB) {
+            append("runFullBringup: SMU PMFW load failed")
+        }
         _ = loadFirmware(kFwFile_SDMA,    "sdma_\(sdma).bin")
         _ = loadFirmware(kFwFile_CP_PFP,  "gc_\(gfx)_pfp.bin")
         _ = loadFirmware(kFwFile_CP_ME,   "gc_\(gfx)_me.bin")
         _ = loadFirmware(kFwFile_CP_MEC,  "gc_\(gfx)_mec.bin")
         _ = loadFirmware(kFwFile_MES_UNI, "gc_\(gfx)_uni_mes.bin")
-        _ = loadFirmware(kFwFile_IMU,     "gc_\(gfx)_imu.bin")
-        _ = loadFirmware(kFwFile_RLC,     "gc_\(gfx)_rlc.bin")
+        _ = loadFirmware(kFwFile_IMU,     imuNameFB)
+        _ = loadFirmware(kFwFile_RLC,     rlcNameFB)
 
-        // Stages 9–14: IMU → RLC → CP → MES → GFX → SDMA bringup.
-        for s: UInt64 in [9, 10, 11, 12, 13, 14] { testInitDeviceUpTo(s) }
+        // Stage 8: PSPFwLoad — synchronization point. Validates that
+        // all firmware was loaded by the host-side LoadFirmware calls
+        // above. The microcode_loaded flags (sdma, imu, etc.) are set
+        // by the LoadFirmware selector as each payload submits.
+        if !testInitDeviceUpTo(8) {
+            append("runFullBringup: stop — PSPFwLoad validation failed")
+            return
+        }
+
+        // Stages 9–15: SMUInit → IMUInit → RLCInit → CPInit → MESInit →
+        // GFXInit → SDMAInit. Each gates on its firmware being loaded
+        // above (the microcode_loaded flags are set by LoadFirmware).
+        for s: UInt64 in [9, 10, 11, 12, 13, 14, 15] { testInitDeviceUpTo(s) }
 
         append("runFullBringup: done — see log for stage outcomes")
     }

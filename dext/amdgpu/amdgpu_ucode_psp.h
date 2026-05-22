@@ -125,6 +125,34 @@ struct psp_firmware_header_v2_1 {
     psp_fw_bin_desc            psp_fw_bin[];
 } __attribute__((packed));
 
+// ---- TA (Trusted Application) v2 layout --------------------------------
+//
+// psp_<chip>_ta.bin uses the same byte layout as psp_firmware_header_v2_0
+// (common header + uint32_t bin_count + psp_fw_bin_desc[]) but the
+// descriptors are tagged with ta_fw_type instead of psp_fw_type. Walked
+// by parse_ta_v2_microcode in upstream amdgpu_psp.c:3947.
+
+enum ta_fw_type {
+    TA_FW_TYPE_UNKOWN              = 0,
+    TA_FW_TYPE_PSP_ASD             = 1,
+    TA_FW_TYPE_PSP_XGMI            = 2,
+    TA_FW_TYPE_PSP_RAS             = 3,
+    TA_FW_TYPE_PSP_HDCP            = 4,
+    TA_FW_TYPE_PSP_DTM             = 5,
+    TA_FW_TYPE_PSP_RAP             = 6,
+    TA_FW_TYPE_PSP_SECUREDISPLAY   = 7,
+    TA_FW_TYPE_PSP_XGMI_AUX        = 8,
+    TA_FW_TYPE_MAX_INDEX,
+};
+
+// Same byte layout as psp_firmware_header_v2_0; renamed for clarity at
+// the parser call sites.
+struct ta_firmware_header_v2_0 {
+    common_firmware_header     header;
+    uint32_t                   ta_fw_bin_count;
+    psp_fw_bin_desc            ta_fw_bin[];
+} __attribute__((packed));
+
 // =======================================================================
 // Per-IP firmware headers — vendored verbatim from upstream amdgpu_ucode.h
 // =======================================================================

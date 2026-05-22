@@ -31,3 +31,6 @@ DerivedData/
 /tmp/macamdgpu_activate.log
 /tmp/ping_entitlements.plist
 /tmp/minimal_dext_entitlements.plist
+
+# IDE / editor scratch dirs.
+.pi/

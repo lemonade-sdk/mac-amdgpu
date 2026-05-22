@@ -111,13 +111,14 @@ sdma_alloc_storage(DeviceContext &dev, SDMAInstance &inst)
     inst.wptr           = 0;
     // Doorbell index — DWORD offset into the doorbell BAR (BAR2).
     // SOC21 layout (nv.c:580-583, amdgpu_doorbell.h:210-211):
-    //     adev->doorbell_index.sdma_engine[0] = AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0 = 0x100
-    //     adev->doorbell_index.sdma_engine[1] = AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE1 = 0x10A
+    //     adev->doorbell_index.sdma_engine[0] = 0x100
+    //     adev->doorbell_index.sdma_engine[1] = 0x10A
     // sdma_v7_1.c:1329-1330 assigns
     //     ring->doorbell_index = adev->doorbell_index.sdma_engine[i] << 1;
     // which is the DWORD offset written into the SDMA_QUEUE0_DOORBELL_OFFSET
     // register and consumed by the engine to filter doorbell traffic.
-    inst.doorbell_index = (inst.instance == 0) ? 0x200u : 0x214u;
+    // We shift by 1 here to match the upstream pattern.
+    inst.doorbell_index = (dev.doorbell.index.sdma_engine[inst.instance] << 1);
     inst.inited         = true;
 
     SDMA_LOG("instance %u: ring %u dwords @ bus %#llx, "

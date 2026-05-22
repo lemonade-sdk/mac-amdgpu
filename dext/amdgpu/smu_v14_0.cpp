@@ -15,6 +15,7 @@
 #include <os/log.h>
 #include <DriverKit/IOLib.h>
 #include "amdgpu_smu.h"
+#include "amdgpu_psp.h"   // PSPContext (for fwBuf bump allocator in smc_hw_setup)
 
 #define SMU_LOG(fmt, ...) \
     os_log(OS_LOG_DEFAULT, "mac.amdgpu.smu: " fmt, ##__VA_ARGS__)
@@ -197,6 +198,178 @@ smu_get_version(const DeviceContext &dev, uint32_t *outVer)
                 (v >>  8) & 0xFF,  v        & 0xFF);
     }
     return ret;
+}
+
+//============================================================
+// smu_smc_hw_setup — minimal port of upstream smu_smc_hw_setup
+// (amdgpu_smu.c:1662). v0.1.20 hypothesis: PMFW must enable DPM
+// features for the IMU autoload state machine to fire after
+// AUTOLOAD_RLC. PSP-side LOAD_IP_FW for SMU brings PMFW up; this
+// function then completes the SMU<->driver handshake.
+//
+// Sequence (matches upstream order, minimal subset):
+//   1. GetDriverIfVersion         — sanity-check IF version.
+//   2. SetDriverDramAddrHigh+Low  — point SMU at a 64 KB driver_table
+//                                    region (VRAM, reached via GMC).
+//   3. RunDcBtc                   — boot-time calibration.
+//   4. SetAllowedFeaturesMaskLow  — 0xFFFFFFFF
+//      SetAllowedFeaturesMaskHigh — 0xFFFFFFFF
+//   5. EnableAllSmuFeatures       — master DPM enable.
+//   6. GetRunningSmuFeaturesLow+High — log what came up.
+//
+// Driver-table allocation: bump 64 KB out of psp.fwBuf (VRAM slot
+// allocator already used by ASD + LOAD_IP_FW per-payload staging).
+// SMU is on-die and reads via the same GMC PSP uses — the VRAM
+// MC address resolves.
+//============================================================
+
+kern_return_t
+smu_smc_hw_setup(DeviceContext &dev, PSPContext &psp)
+{
+    constexpr uint64_t kDriverTableSize  = 0x10000;   // 64 KB
+    constexpr uint64_t kFwBufAlign       = 0x1000;    // PAGE_SIZE
+
+    // 1. Sanity-check the SMU driver IF version. Upstream logs but does
+    //    NOT abort on version mismatch on most chips — we mirror that.
+    {
+        uint32_t if_ver = 0;
+        kern_return_t r = smu_send_msg_with_param(
+            dev, PPSMC::GetDriverIfVersion, 0, &if_ver);
+        if (r != kIOReturnSuccess) {
+            SMU_LOG("smc_hw_setup: GetDriverIfVersion FAILED kr=%#x", r);
+            return r;
+        }
+        SMU_LOG("smc_hw_setup: SMC IF version = %#x", if_ver);
+    }
+
+    // 2. Allocate driver_table from psp.fwBuf (VRAM slot allocator).
+    //    SMU stores tool/metric/dpm tables here when we request transfers.
+    //    Upstream uses amdgpu_bo_create_kernel for this; we reuse our
+    //    existing per-payload bump allocator for the same VRAM region.
+    if (psp.fwBufSize == 0) {
+        SMU_LOG("smc_hw_setup: psp.fwBuf not initialized");
+        return kIOReturnNotReady;
+    }
+    uint64_t slot_off = psp.fwBufBumpOffset;
+    uint64_t slot_sz  = (kDriverTableSize + kFwBufAlign - 1) & ~(kFwBufAlign - 1);
+    if (slot_off + slot_sz > psp.fwBufSize) {
+        SMU_LOG("smc_hw_setup: fwBuf exhausted (want %llu @ %llu, cap %llu)",
+                slot_sz, slot_off, psp.fwBufSize);
+        return kIOReturnNoSpace;
+    }
+    uint64_t driver_table_mc = psp.fwBufBaseMC + slot_off;
+    psp.fwBufBumpOffset = slot_off + slot_sz;
+
+    SMU_LOG("smc_hw_setup: driver_table @ mc=%#llx size=%llu",
+            driver_table_mc, slot_sz);
+
+    // 3. Send SetDriverDramAddrHigh + Low. Upstream calls these
+    //    unconditionally in smu_v14_0_set_driver_table_location (line 641).
+    {
+        uint32_t hi = static_cast<uint32_t>(driver_table_mc >> 32);
+        uint32_t lo = static_cast<uint32_t>(driver_table_mc & 0xFFFFFFFFu);
+        kern_return_t r;
+
+        r = smu_send_msg_with_param(dev, PPSMC::SetDriverDramAddrHigh, hi, nullptr);
+        if (r != kIOReturnSuccess) {
+            SMU_LOG("smc_hw_setup: SetDriverDramAddrHigh(%#x) FAILED kr=%#x", hi, r);
+            return r;
+        }
+        r = smu_send_msg_with_param(dev, PPSMC::SetDriverDramAddrLow, lo, nullptr);
+        if (r != kIOReturnSuccess) {
+            SMU_LOG("smc_hw_setup: SetDriverDramAddrLow(%#x) FAILED kr=%#x", lo, r);
+            return r;
+        }
+        SMU_LOG("smc_hw_setup: SetDriverDramAddr ok (hi=%#x lo=%#x)", hi, lo);
+    }
+
+    // 4. RunDcBtc — boot-time calibration. Upstream: smu_v14_0.c:1558.
+    //    No parameter, no return value parsing (resp=0 == success).
+    {
+        kern_return_t r = smu_send_msg(dev, PPSMC::RunDcBtc);
+        if (r != kIOReturnSuccess) {
+            SMU_LOG("smc_hw_setup: RunDcBtc FAILED kr=%#x", r);
+            return r;
+        }
+        SMU_LOG("smc_hw_setup: RunDcBtc ok");
+    }
+
+    // 5. Set allowed features mask. v0.1.20 test result: PMFW returns
+    //    UnknownCmd (0xFE) for both SetAllowedFeaturesMaskLow and
+    //    SetAllowedFeaturesMaskHigh on this firmware build, even though
+    //    upstream smu_v14_0_2_ppt.c's message map registers them.
+    //
+    //    Theory: the deployed SMU 14.0.3 PMFW (version 0.104.76.0) uses
+    //    a baked-in default allow-mask from IFWI and doesn't expose the
+    //    runtime mask-set messages. We skip these and try
+    //    EnableAllSmuFeatures directly — if PMFW honors its IFWI default,
+    //    DPM features still come up.
+    //
+    //    Best-effort: log the failure but don't abort. Re-evaluate if
+    //    EnableAllSmuFeatures also fails.
+    {
+        kern_return_t r;
+        r = smu_send_msg_with_param(dev, PPSMC::SetAllowedFeaturesMaskLow,
+                                    0xFFFFFFFFu, nullptr);
+        if (r != kIOReturnSuccess) {
+            SMU_LOG("smc_hw_setup: SetAllowedFeaturesMaskLow non-fatal "
+                    "kr=%#x — proceeding to EnableAllSmuFeatures with "
+                    "PMFW default mask", r);
+        }
+        r = smu_send_msg_with_param(dev, PPSMC::SetAllowedFeaturesMaskHigh,
+                                    0xFFFFFFFFu, nullptr);
+        if (r != kIOReturnSuccess) {
+            SMU_LOG("smc_hw_setup: SetAllowedFeaturesMaskHigh non-fatal "
+                    "kr=%#x", r);
+        }
+    }
+
+    // 6. EnableAllSmuFeatures — THE master DPM switch.
+    //    Upstream calls smu_system_features_control(smu, true), which
+    //    sends this message. After this, PMFW starts driving GFX/SOC
+    //    clocks out of bootup-idle.
+    //
+    //    This is the message we MOST want to succeed. If PMFW also
+    //    returns UnknownCmd here, we'd know feature control is wholly
+    //    PMFW-internal on this chip and the autoload state machine must
+    //    be unblocked by some other means.
+    {
+        kern_return_t r = smu_send_msg(dev, PPSMC::EnableAllSmuFeatures);
+        if (r != kIOReturnSuccess) {
+            SMU_LOG("smc_hw_setup: EnableAllSmuFeatures FAILED kr=%#x — "
+                    "if UnknownCmd, PMFW feature control is autoload-"
+                    "internal on this chip", r);
+            // Continue to the diagnostic readback — log what features
+            // ARE running even though we couldn't toggle them.
+        } else {
+            SMU_LOG("smc_hw_setup: EnableAllSmuFeatures ok");
+        }
+    }
+
+    // 7. Read back which features actually came online. Pure diagnostic
+    //    — upstream stores into smu->smu_feature.supported_bits, we just
+    //    log. Failures here are non-fatal (some old PMFW silently drops
+    //    GetRunningSmuFeatures*).
+    {
+        uint32_t lo = 0, hi = 0;
+        kern_return_t r;
+        r = smu_send_msg_with_param(dev, PPSMC::GetRunningSmuFeaturesLow,
+                                    0, &lo);
+        if (r != kIOReturnSuccess) {
+            SMU_LOG("smc_hw_setup: GetRunningSmuFeaturesLow FAILED kr=%#x — "
+                    "(non-fatal)", r);
+        }
+        r = smu_send_msg_with_param(dev, PPSMC::GetRunningSmuFeaturesHigh,
+                                    0, &hi);
+        if (r != kIOReturnSuccess) {
+            SMU_LOG("smc_hw_setup: GetRunningSmuFeaturesHigh FAILED kr=%#x — "
+                    "(non-fatal)", r);
+        }
+        SMU_LOG("smc_hw_setup: running features = %#x_%#x", hi, lo);
+    }
+
+    SMU_LOG("smc_hw_setup: ok");
+    return kIOReturnSuccess;
 }
 
 } // namespace amdgpu

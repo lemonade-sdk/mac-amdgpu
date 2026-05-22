@@ -24,13 +24,14 @@
 //      5 PSPLoadSOS    — bootloader handshake → SOS firmware load
 //      6 PSPRingCreate — KM ring + FB_FW_RESERV query
 //      7 TMRSetup      — psp_setup_tmr (skip path for 14_0_3)
-//      8 SMUInit       — after PSP has LoadFirmware(SMU); mailbox handshake
-//      9 IMUInit       — after PSP has LoadFirmware(IMU_I/D)
-//     10 RLCInit       — after PSP has loaded the RLC sub-bins
-//     11 CPInit        — after RS64 firmwares loaded
-//     12 MESInit       — after CP_MES + CP_MES_DATA loaded
-//     13 GFXInit       — first PM4 submit
-//     14 SDMAInit      — after SDMA TH0
+//      8 PSPFwLoad     — load_non_psp_fw: SMU→IMU→RLC→autoload→CP→SDMA→MES
+//      9 SMUInit       — after PSP has LoadFirmware(SMU); mailbox handshake
+//     10 IMUInit       — after PSP has LoadFirmware(IMU_I/D)
+//     11 RLCInit       — after PSP has loaded the RLC sub-bins
+//     12 CPInit        — after RS64 firmwares loaded
+//     13 MESInit       — after CP_MES + CP_MES_DATA loaded
+//     14 GFXInit       — first PM4 submit
+//     15 SDMAInit      — after SDMA TH0
 //
 //  Each stage either runs to completion or returns an error. The
 //  orchestrator is idempotent — repeating a stage that's already
@@ -52,6 +53,9 @@
 #include "amdgpu_imu.h"
 #include "amdgpu_gfx.h"
 
+// Forward declaration — defined in amdgpu_ip.h
+struct DoorbellState;
+
 namespace amdgpu {
 
 // Numbering follows the upstream amdgpu_device_ip_init order.
@@ -66,13 +70,14 @@ enum class BringupStage : uint32_t {
     PSPLoadSOS    = 5,
     PSPRingCreate = 6,
     TMRSetup      = 7,
-    SMUInit       = 8,   // upstream phase2: SMU.hw_init
-    IMUInit       = 9,
-    RLCInit       = 10,
-    CPInit        = 11,
-    MESInit       = 12,
-    GFXInit       = 13,
-    SDMAInit      = 14,
+    PSPFwLoad     = 8,   // upstream fw_loading: psp_load_non_psp_fw
+    SMUInit       = 9,   // upstream phase2: SMU.hw_init
+    IMUInit       = 10,
+    RLCInit       = 11,
+    CPInit        = 12,
+    MESInit       = 13,
+    GFXInit       = 14,
+    SDMAInit      = 15,
 };
 
 //
@@ -91,6 +96,7 @@ struct BringupContext {
     GARTContext   gart;        // GART page-table state + bindings (DMA fix)
     IMUContext    imu;         // IMU microcode-loaded gate
     GFXConfig     gfx;         // gfx_constants_init harvest + caps
+    DoorbellState doorbell;    // BAR2 doorbell index map + state
 
     BringupStage  reached;   // highest stage that completed
 };
@@ -107,5 +113,38 @@ kern_return_t bringup_to(BringupContext &ctx, BringupStage target);
 // TODO(phase1b): replace with on-die discovery-binary read.
 //
 kern_return_t bringup_ip_discovery(BringupContext &ctx);
+
+//
+// Doorbell init — mirrors upstream amdgpu_doorbell_init
+// (amdgpu_doorbell_mgr.c:193). Records BAR2 base/size and
+// populates the doorbell_index map with ASIC-specific values.
+//
+// On Apple Silicon BAR2 is accessed via IOPCIDevice::MemoryRead32/
+// Write32 (not as a linear mapping), so base=0. The size is read
+// from PCI config space. The doorbell_index map is ASIC-specific
+// and hardcoded for RDNA4 (gfx1201).
+//
+// Returns kIOReturnSuccess on success, kIOReturnNotReady if BAR2
+// is not mapped.
+//
+kern_return_t doorbell_init(DeviceContext &dev, DoorbellState &db);
+
+//
+// psp_load_all_fw — orchestrates loading all non-PSP firmware
+// (SMU, IMU, RLC, CP, SDMA, MES) through the PSP ring.
+//
+// This is the dext-side equivalent of upstream's psp_load_non_psp_fw
+// (amdgpu_psp.c:3051). It calls psp_load_non_psp_fw with a
+// FirmwareLoader callback that reads firmware from the host's
+// DMABuffer.
+//
+// The caller must have already loaded all firmware files into the
+// DMABuffer via the host-side LoadFirmware selector. This function
+// just needs to know where to find each firmware's payloads.
+//
+// Returns kIOReturnSuccess on success, or the first error encountered.
+//
+kern_return_t psp_load_all_fw(DeviceContext &dev, PSPContext &psp,
+                              const FirmwareLoader &loader);
 
 } // namespace amdgpu

@@ -1,25 +1,19 @@
 //
-//  amdgpu_gart.h — GART (Graphics Address Remapping Table) bootstrap.
+//  amdgpu_gart.h — GART (Graphics Address Remapping Table) binding helpers.
 //
-//  The GART is the GPU's flat-page-table IOMMU for sysmem. Once enabled,
-//  the GPU's GMC translates MC addresses in the GART range to host-physical
-//  addresses by walking PTEs in a small VRAM-resident page table.
-//
-//  We need GART up before PSP ring submissions work, because PSP's ring/DMA
-//  path refuses to read VRAM-backed cmd_buf/fence_buf — it expects a
-//  GART-routable MC address (or GTT) like Linux's bare-metal config.
+//  The GART page table itself is managed by GMC (gmc_v12_0.cpp).
+//  This module provides functions to bind sysmem buffers into the
+//  GART by writing PTEs into the VRAM-resident page table.
 //
 //  Layout on RDNA4:
 //      - 4 KB GPU page granularity (regardless of host CPU page size — note
 //        Apple Silicon CPU is 16 KB pages, so each CPU page = 4 GPU PTEs).
 //      - PTE is 8 bytes: high bits = host phys addr (DART bus on AS), low
 //        bits = flags (VALID, SYSTEM, R/W, etc.).
-//      - We allocate the page table in VRAM (small — one 4 KB page maps
-//        2 MB of GART space — plenty for boot).
 //
-//  Mirrors upstream `amdgpu_gart.c` + `gmc_v12_0_gart_enable` +
-//  `mmhub_v4_1_0_gart_enable`. See docs/GART_PORT_PLAN.md for the task
-//  breakdown.
+//  Mirrors upstream `amdgpu_gart.c` (amdgpu_gart_table_vram_alloc,
+//  amdgpu_gart_map). The gart_enable() register programming has been
+//  moved to gmc_v12_0.cpp (gmc_mmhub_gart_enable).
 //
 
 #pragma once
@@ -72,25 +66,6 @@ struct GARTContext {
 };
 
 //
-// gart_init — initialize GARTContext state. Picks a fixed PT location
-// in VRAM (after PSP buffers + TMR). Idempotent.
-//
-kern_return_t gart_init(DeviceContext &dev, GARTContext &gart);
-
-//
-// gart_enable — port of mmhub_v4_1_0_gart_enable. Programs the GPU's
-// MMHUB registers to use our page table. Requires gart_init() first.
-//
-// Sequence (matches upstream sub-functions):
-//   init_gart_aperture_regs   — page-table base/start/end MC addresses
-//   init_system_aperture_regs — AGP + system aperture defaults
-//   init_tlb_regs             — enable L1 TLB
-//   init_cache_regs           — enable L2 cache
-//   enable_system_domain      — turn on VM context 0
-//
-kern_return_t gart_enable(DeviceContext &dev, GARTContext &gart);
-
-//
 // gart_bind_sysmem — allocate a sysmem buffer, DART-map it, bind into
 // GART, return the GART MC address to pass to PSP. The IODMACommand is
 // stashed in the GARTBinding so we can release it later.
@@ -117,7 +92,7 @@ void gart_unbind(GARTContext &gart, GARTBinding *binding);
 // Writes PTEs at the next free GART slot. The caller retains ownership
 // of the underlying IOBufferMemoryDescriptor / IODMACommand — this
 // function doesn't take a reference. PTEs stay live until the GART is
-// reset (`gart_init` re-zero's the page table) or the binding is
+// reset (GMC re-zero's the page table) or the binding is
 // overwritten by another bind at the same offset.
 //
 // Idempotent across re-binds of the same buffer: if the same busAddr/

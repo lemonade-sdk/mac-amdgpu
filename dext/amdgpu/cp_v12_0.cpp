@@ -551,10 +551,10 @@ cp_init_full(DeviceContext &dev, GMCContext &gmc, CPContext &cp)
     kern_return_t r = cp_alloc_storage(dev, gmc, cp);
     if (r != kIOReturnSuccess) return r;
 
-    // Pin doorbell index 0 for the GFX ring on first PM4 — the
-    // simplest possible assignment. Real driver would allocate from
-    // a doorbell ID pool.
-    cp.doorbell_index = 0;
+    // Pin doorbell index for the GFX ring from the doorbell_index map.
+    // gfx_ring0 = 0 for RDNA4 (gfx1201). Real driver would allocate
+    // from a doorbell ID pool.
+    cp.doorbell_index = dev.doorbell.index.gfx_ring0;
 
     // Skip MMIO programming if IP base isn't resolved (e.g. user
     // hasn't loaded the discovery binary yet). Storage stays staged.

@@ -126,10 +126,10 @@ mes_alloc_storage(DeviceContext &dev, MESInstance &inst)
     inst.ring_rptr_gpu_addr = inst.wb_bus + 0x00;
     inst.ring_wptr_gpu_addr = inst.wb_bus + 0x40;
     inst.ring_size_dwords   = kMES_RING_SIZE / 4;
-    // Doorbell index: Sched pipe gets slot 0x20, KIQ pipe 0x22.
-    // First-PM4 picks arbitrary slots that don't collide with
-    // CP doorbell 0 (used by cp_v12_0) or SDMA 0x10/0x12.
-    inst.doorbell_index = 0x20;
+    // Doorbell index: Sched pipe gets slot from doorbell_index map.
+    // MES ring0 doorbell offset (BAR2 DWORD offset) — matches
+    // doorbell.index.mes_ring0 = 0x20 in the ASIC-specific map.
+    inst.doorbell_index = dev.doorbell.index.mes_ring0;
 
     inst.inited = true;
     MES_LOG("storage: EOP %#llx, MQD %#llx, ring %#llx, cmd %#llx",

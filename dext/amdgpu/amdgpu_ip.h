@@ -84,7 +84,11 @@ enum class IPBlock : uint8_t {
 // IP base is never 0 on a PCIDriverKit-mapped BAR (SMN registers
 // start in the 0x40000+ range after the SMUIO front-end block).
 struct IPBaseTable {
-    static constexpr int kMaxBaseSegments = 5;
+    // Some IPs (esp. NBIO on RDNA4) declare BASE_IDX up to 5 — see
+    // regBIF_BIF256_CI256_RC3X4_USB4_PCIE_MST_CTRL_3_BASE_IDX=5 in
+    // nbio_7_11_0_offset.h. That means we need slot index 5, i.e. at
+    // least 6 entries. Use 8 for some headroom.
+    static constexpr int kMaxBaseSegments = 8;
     uint32_t base[(int)IPBlock::Count][kMaxBaseSegments];
 
     constexpr IPBaseTable() : base{} {
@@ -271,13 +275,24 @@ namespace PTEFlags {
     // walks the entry as if it points to another PDE level and faults
     // on the resulting garbage address. amdgpu_vm.h:133.
     constexpr uint64_t IS_PTE    = (1ULL << 63);
+    // GFX12 / RDNA4 MTYPE field is at bits 54-55 per upstream
+    // amdgpu_vm.h:125: #define AMDGPU_PTE_MTYPE_GFX12_SHIFT(mtype)
+    // ((uint64_t)(mtype) << 54). MTYPE=2 = Uncached (UC) per upstream
+    // AMDGPU_PTE_MTYPE_GFX12(0ULL, MTYPE_UC) at gmc_v12_0.c:799.
+    //
+    // Prior to this fix we had `(2ULL << 57)` which planted MTYPE in
+    // bits 58-59 (above the actual MTYPE field). PSP's PT walker then
+    // saw MTYPE=0 (NC=cached) plus a stray set bit at 58, which fed
+    // scrambled bytes into the signature check and made every
+    // GART-bound LOAD_IP_FW reject with resp=0x11.
+    constexpr uint64_t MTYPE_GFX12_UC = (2ULL << 54);
     // Standard sysmem mapping for PSP-readable buffers. Adds IS_PTE
-    // (mandatory on GFX12) + EXECUTABLE to match upstream gart_pte_flags
-    // defaults; MTYPE bits 54-55 left at 0 = MTYPE_NC (Non-Coherent)
-    // which matches gmc_v12_0_get_vm_pte's default for GTT sysmem PTEs.
+    // (mandatory on GFX12) + EXECUTABLE + MTYPE_GFX12_UC to match
+    // upstream gart_pte_flags defaults (amdgpu_vm.h:97-106,
+    // gmc_v12_0.c:799).
     constexpr uint64_t SYSMEM_RW = VALID | SYSTEM | SNOOPED |
                                    EXECUTABLE | READABLE | WRITEABLE |
-                                   IS_PTE;
+                                   IS_PTE | MTYPE_GFX12_UC;
 }
 
 // AMDGPU GPU page size is fixed at 4 KB regardless of CPU page size.
@@ -287,10 +302,28 @@ constexpr uint32_t kAMDGPUGPUPageShift = 12;
 
 // PPSMC messages — drivers/gpu/drm/amd/pm/swsmu/inc/pmfw_if/
 // smu_v14_0_2_ppsmc.h. Tiny subset; expand as we wire up features.
+//
+// v0.1.20 added the feature-enable + driver-table-location + RunDcBtc
+// messages needed to mirror upstream smu_smc_hw_setup (amdgpu_smu.c:1662)
+// so PMFW transitions out of bootup-idle and unblocks the IMU autoload
+// state machine (BOOTLOAD_STATUS poll in gfx_v12_0_hw_init).
 namespace PPSMC {
-    constexpr uint32_t TestMessage         = 0x01;
-    constexpr uint32_t GetSmuVersion       = 0x02;
-    constexpr uint32_t GetDriverIfVersion  = 0x03;
+    constexpr uint32_t TestMessage                = 0x01;
+    constexpr uint32_t GetSmuVersion              = 0x02;
+    constexpr uint32_t GetDriverIfVersion         = 0x03;
+    constexpr uint32_t SetAllowedFeaturesMaskLow  = 0x04;
+    constexpr uint32_t SetAllowedFeaturesMaskHigh = 0x05;
+    constexpr uint32_t EnableAllSmuFeatures       = 0x06;
+    constexpr uint32_t DisableAllSmuFeatures      = 0x07;
+    constexpr uint32_t GetRunningSmuFeaturesLow   = 0x0C;
+    constexpr uint32_t GetRunningSmuFeaturesHigh  = 0x0D;
+    constexpr uint32_t SetDriverDramAddrHigh      = 0x0E;
+    constexpr uint32_t SetDriverDramAddrLow       = 0x0F;
+    constexpr uint32_t SetToolsDramAddrHigh       = 0x10;
+    constexpr uint32_t SetToolsDramAddrLow        = 0x11;
+    constexpr uint32_t TransferTableSmu2Dram      = 0x12;
+    constexpr uint32_t TransferTableDram2Smu      = 0x13;
+    constexpr uint32_t RunDcBtc                   = 0x36;
 }
 
 // Linux SMU mailbox response codes — smu_msg_v1_decode_response().
@@ -382,6 +415,55 @@ namespace BootstrapRegs {
     constexpr uint32_t MP0_C2PMSG_81      = 0x0091;
 }
 
+// NBIO registers — RDNA4 NBIO 7_11 family.
+// Offsets from upstream asic_reg/nbio/nbio_7_11_0_offset.h.
+// All added to the NBIO IP base (discovered via on-die discovery).
+namespace NBIORegs {
+    // SMN indirect-access register pair (port of nbio_v7_11_get_pcie_*
+    // _offset, nbio_v7_11.c:229/234). Both at BASE_IDX 0.
+    //
+    // The nbio_7_11_0 offset header defines TWO variants:
+    //   BIF_BX1_PCIE_INDEX2 = 0x800e  (PCIe Function 0 — our PF)
+    //   BIF_BX1_PCIE_INDEX2 = 0x000e  (PCIe Function 1)
+    //
+    // Linux upstream uses BX1 (0x000E). v0.1.3 probe confirmed that
+    // BX1 at BAR5 byte 0x38 actually holds the written value (low 2
+    // bits get masked off as expected for a dword-address register),
+    // while BX0 at byte 0x20038 returns 0xFFFFFFFF (not mapped).
+    constexpr uint32_t BIF_BX1_PCIE_INDEX2               = 0x000E;
+    constexpr uint32_t BIF_BX1_PCIE_DATA2                = 0x000F;
+
+    // regRCC_DEV0_EPF0_0_RCC_DOORBELL_APER_EN — enables doorbell aperture.
+    // Bit 0 = BIF_DOORBELL_APER_EN. Port of nbio_v7_11_enable_doorbell_aperture
+    // (nbio_v7_11.c:136). Offset 0x00C0, BASE_IDX 2 per nbio_7_11_0_offset.h.
+    constexpr uint32_t RCC_DOORBELL_APER_EN              = 0x00C0;
+
+    // regBIF_BX1_INTERRUPT_CNTL / _CNTL2 — IH dummy-page + interrupt cfg.
+    // Port of nbio_v7_11_ih_control (nbio_v7_11.c:196). BASE_IDX 2.
+    constexpr uint32_t INTERRUPT_CNTL                    = 0x00F1;
+    constexpr uint32_t INTERRUPT_CNTL2                   = 0x00F2;
+    constexpr uint32_t kINTERRUPT_CNTL_DUMMY_RD_OVERRIDE_MASK = 0x00000001u;
+    constexpr uint32_t kINTERRUPT_CNTL_REQ_NONSNOOP_EN_MASK   = 0x00000008u;
+
+    // regBIF_BIF256_CI256_RC3X4_USB4_PCIE_MST_CTRL_3 — PCIe master ctrl
+    // for the GPU's PCIe root port. nbio_v7_11_init_registers sets the
+    // SWUS_MAX_READ_REQUEST_SIZE_MODE bit so the GPU can issue 4 KB MRRs
+    // (default is 512 B). Offset 0x4201C6, BASE_IDX 5.
+    constexpr uint32_t PCIE_MST_CTRL_3                   = 0x4201C6;
+    constexpr uint32_t kSWUS_MAX_READ_REQUEST_SIZE_MODE_MASK = 0x08000000u; // bit 27
+    constexpr uint32_t kSWUS_MAX_READ_REQUEST_SIZE_MODE_SHIFT = 27;
+    constexpr uint32_t kSWUS_MAX_READ_REQUEST_SIZE_PRIV_MASK = 0x30000000u; // bits 28-29
+    constexpr uint32_t kSWUS_MAX_READ_REQUEST_SIZE_PRIV_SHIFT = 28;
+
+    // regRCC_DEV0_EPF5_STRAP4 — root-complex strap for the GPU's EPF5
+    // function. nbio_v7_11_init_registers clears bit 23. Per
+    // discussions in upstream commits this strap gates the IMU/RLC
+    // boot path; without the clear, the autoload state machine never
+    // takes the GC out of reset. Offset 0xD284, BASE_IDX 5.
+    constexpr uint32_t RCC_DEV0_EPF5_STRAP4              = 0xD284;
+    constexpr uint32_t kRCC_DEV0_EPF5_STRAP4_BIT23       = 0x00800000u;
+}
+
 // Upstream constants from amdgpu_discovery.h:
 //     DISCOVERY_TMR_OFFSET = (64 << 10)   = 64 KB
 //     DISCOVERY_TMR_SIZE   = (10 << 10)   = 10 KB (actual binary)
@@ -431,5 +513,45 @@ constexpr uint32_t kPSPRingTypeUM = 1;
 // usable area is 4 KB via C2PMSG_71. The trailing 12 KB is unused.
 constexpr uint32_t kPSPKMRingSize    = 0x1000;
 constexpr uint32_t kPSPKMRingBufSize = 16384;
+
+// ============================================================
+// Doorbell index map + state — mirrors upstream
+// amdgpu_doorbell_index (amdgpu_drv.h) and amdgpu_doorbell_mgr.
+//
+// On RDNA4 / gfx1201 the doorbell BAR is BAR2. Each ring/IP
+// block is assigned a dword index into the BAR2 aperture.
+// The doorbell aperture must be enabled by NBIO bif init
+// (nbio_v7_11_enable_doorbell_aperture) before writes to
+// BAR2 + (index * 4) reach the target ring.
+//
+// Upstream values from amdgpu_doorbell_index (amdgpu_drv.c):
+//   gfx_ring0_doorbell_index     = 0
+//   gfx_ring1_doorbell_index     = 1
+//   sdma0_doorbell_index         = 2
+//   sdma1_doorbell_index         = 3
+//   ih_doorbell_index            = 4
+//   mes_ring0_doorbell_index     = 5
+//   compute_doorbell_index       = 6
+//   max_assignment               = 6 (or 8 with MES)
+//
+// We add MES entries (mes_ring0=7, compute=8) for RDNA4.
+// ============================================================
+struct DoorbellIndex {
+    uint32_t gfx_ring0     = 0;
+    uint32_t gfx_ring1     = 1;
+    uint32_t sdma_engine[4] = {2, 3, 4, 5};  // sdma0=2, sdma1=3, sdma2=4, sdma3=5
+    uint32_t ih            = 6;
+    uint32_t mes_ring0     = 7;
+    uint32_t compute       = 8;
+    uint32_t max_assignment = 8;
+};
+
+// Doorbell state — mirrors upstream amdgpu_doorbell.
+struct DoorbellState {
+    uint64_t base = 0;               // BAR2 base address (0 on AS — accessed via MemoryRead/Write)
+    uint64_t size = 0;               // BAR2 size in bytes
+    uint32_t num_kernel_doorbells = 0;  // min(size/4, max_assignment + 1) + 0x400 (Vega+ compat)
+    DoorbellIndex index;             // ASIC-specific doorbell index map
+};
 
 } // namespace amdgpu

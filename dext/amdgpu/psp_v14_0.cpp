@@ -25,10 +25,12 @@
 #include <DriverKit/IOLib.h>
 #include <DriverKit/IOBufferMemoryDescriptor.h>
 #include <DriverKit/IODMACommand.h>
+#include <DriverKit/IOMemoryMap.h>
 #include <PCIDriverKit/IOPCIDevice.h>
 
 #include "amdgpu_psp.h"
 #include "amdgpu_ucode_psp.h"
+#include "amdgpu_gmc.h"
 
 #define PSP_LOG(fmt, ...) \
     os_log(OS_LOG_DEFAULT, "mac.amdgpu.psp: " fmt, ##__VA_ARGS__)
@@ -105,17 +107,292 @@ psp_init(DeviceContext &dev, PSPContext &psp)
     // its payload size (PAGE-aligned) and passes
     // `fwBufBaseMC + (old bump offset)` as cmd.fw_phy_addr — matching
     // upstream's `firmware.fw_buf_mc + per-ucode-offset` scheme.
-    psp.fwBufVRAMOffset = kFwBufVRAMOffset;
-    psp.fwBufBaseMC     = vram_start + kFwBufVRAMOffset;
+    psp.fwBufVRAMOffset = kFwBufVRAMOffset;   // legacy; sysmem path overrides
+    psp.fwBufBaseMC     = vram_start + kFwBufVRAMOffset;  // placeholder
     psp.fwBufSize       = kFwBufSize;
     psp.fwBufBumpOffset = 0;
+    psp.fwBufSysmemBuffer  = nullptr;
+    psp.fwBufSysmemDMA     = nullptr;
+    psp.fwBufSysmemCPU     = nullptr;
+    psp.fwBufSysmemBusAddr = 0;
 
     PSP_LOG("fw_pri ready VRAM-backed @ vram_off=%#llx mc=%#llx size=%llu "
-            "(vram_start=%#llx); fw_buf @ vram_off=%#llx mc=%#llx size=%#llx",
+            "(vram_start=%#llx); fw_buf @ vram_off=%#llx mc=%#llx size=%#llx "
+            "(VRAM placeholder — psp_setup_fw_buf_sysmem replaces with GART)",
             (uint64_t)kFwPriVRAMOffset, psp.fwPriBusAddr,
             psp.fwPriSize, vram_start,
             (uint64_t)kFwBufVRAMOffset, psp.fwBufBaseMC,
             (uint64_t)kFwBufSize);
+    return kIOReturnSuccess;
+}
+
+//============================================================
+// psp_read_runtime_db — port of upstream psp_get_runtime_db_entry +
+// the calls in psp_sw_init (amdgpu_psp.c:376-449, 471-503).
+//
+// Reads the PSP runtime data header at (vram_size - 0x100000), then
+// walks the directory looking for PSP_RUNTIME_ENTRY_TYPE_BOOT_CONFIG
+// (0x5) and PSP_RUNTIME_ENTRY_TYPE_PPTABLE_ERR_STATUS (0x6). Populates
+// psp.bootCfgBitmask, psp.scpmStatus, psp.scpmEnabled.
+//
+// For psp_v14_0_3 the runtime DB is informational — IFWI POSTs the
+// card so we don't actually need to drive memory training. We still
+// read it so we have parity with upstream and can log non-default
+// boot config flags if present.
+//============================================================
+kern_return_t
+psp_read_runtime_db(DeviceContext &dev, PSPContext &psp,
+                    uint64_t vram_size_bytes)
+{
+    if (psp.runtimeDbRead) return kIOReturnSuccess;  // idempotent
+
+    constexpr uint64_t kPSP_RUNTIME_DB_OFFSET    = 0x100000ULL;
+    constexpr uint16_t kPSP_RUNTIME_DB_COOKIE_ID = 0x0ed5;
+    constexpr uint32_t kMAX_ENTRY_COUNT          = 0x40;
+    constexpr uint32_t kENTRY_TYPE_BOOT_CONFIG   = 0x5;
+    constexpr uint32_t kENTRY_TYPE_PPTABLE_ERR   = 0x6;
+
+    if (vram_size_bytes <= kPSP_RUNTIME_DB_OFFSET) {
+        PSP_LOG("runtime_db: vram_size %llu too small", vram_size_bytes);
+        return kIOReturnNotReady;
+    }
+
+    const uint64_t db_pos = vram_size_bytes - kPSP_RUNTIME_DB_OFFSET;
+
+    // Header: uint16 cookie + uint16 version (4 bytes).
+    uint32_t hdr_dw = RVRAM32_via_mm(dev, db_pos);
+    uint16_t cookie  = static_cast<uint16_t>(hdr_dw & 0xFFFFu);
+    uint16_t version = static_cast<uint16_t>(hdr_dw >> 16);
+
+    psp.runtimeDbCookie  = cookie;
+    psp.runtimeDbVersion = version;
+    psp.runtimeDbRead    = true;
+
+    if (cookie != kPSP_RUNTIME_DB_COOKIE_ID) {
+        PSP_LOG("runtime_db: cookie %#x at VRAM+%#llx (expected %#x) — "
+                "runtime DB absent",
+                cookie, db_pos, kPSP_RUNTIME_DB_COOKIE_ID);
+        return kIOReturnSuccess;  // not an error — db just doesn't exist
+    }
+
+    // Directory: uint16 entry_count, then entry_list[N] of 8-byte entries.
+    // entry_count lives in low 16 of the first dword after the header.
+    const uint64_t dir_pos = db_pos + 4ULL;
+    uint32_t dir_first_dw = RVRAM32_via_mm(dev, dir_pos);
+    uint16_t entry_count = static_cast<uint16_t>(dir_first_dw & 0xFFFFu);
+
+    if (entry_count >= kMAX_ENTRY_COUNT) {
+        PSP_LOG("runtime_db: invalid entry_count=%u (max %u)",
+                entry_count, kMAX_ENTRY_COUNT);
+        return kIOReturnInvalid;
+    }
+
+    PSP_LOG("runtime_db: cookie=%#x ver=%#x entry_count=%u (db @ VRAM+%#llx)",
+            cookie, version, entry_count, db_pos);
+
+    // entry_list starts 4 bytes after dir_pos (after the entry_count u16
+    // + 2-byte pad — directory header is itself dword-aligned).
+    // Each entry: u32 type, u16 offset, u16 size = 8 bytes.
+    const uint64_t entry_list_pos = dir_pos + 4ULL;
+
+    for (uint16_t i = 0; i < entry_count; i++) {
+        const uint64_t e_pos = entry_list_pos + (uint64_t)i * 8ULL;
+        uint32_t e_type   = RVRAM32_via_mm(dev, e_pos);
+        uint32_t e_offsz  = RVRAM32_via_mm(dev, e_pos + 4ULL);
+        uint16_t e_offset = static_cast<uint16_t>(e_offsz & 0xFFFFu);
+        uint16_t e_size   = static_cast<uint16_t>(e_offsz >> 16);
+
+        if (e_type == kENTRY_TYPE_BOOT_CONFIG && e_size >= 4) {
+            uint32_t bitmask = RVRAM32_via_mm(dev, db_pos + e_offset);
+            psp.bootCfgBitmask = bitmask;
+            PSP_LOG("runtime_db: BOOT_CONFIG bitmask=%#x", bitmask);
+        } else if (e_type == kENTRY_TYPE_PPTABLE_ERR && e_size >= 4) {
+            uint32_t status = RVRAM32_via_mm(dev, db_pos + e_offset);
+            psp.scpmStatus = status;
+            psp.scpmEnabled = (status != 0);
+            PSP_LOG("runtime_db: PPTABLE_ERR scpm_status=%u (enabled=%d)",
+                    status, psp.scpmEnabled ? 1 : 0);
+        }
+    }
+    return kIOReturnSuccess;
+}
+
+//
+// psp_setup_fw_buf_sysmem — port of upstream amdgpu_ucode_create_bo's
+// default branch (amdgpu_ucode.c:1148-1166): allocate fw_buf in sysmem
+// (Linux GTT, Mac DART-mapped IOBufferMemoryDescriptor), then bind it
+// into GART so PSP sees a single contiguous MC-routable address space
+// inside which each LOAD_IP_FW payload gets a unique offset.
+//
+// Replaces the VRAM-placeholder fw_buf set up by psp_init. After this
+// runs, psp.fwBufBaseMC is the GART MC address — that's the address
+// passed into LOAD_IP_FW.fw_phy_addr.
+//
+kern_return_t
+psp_setup_fw_buf_sysmem(DeviceContext &dev, PSPContext &psp, GMCContext &gmc)
+{
+    if (psp.fwBufSysmemBuffer != nullptr) {
+        return kIOReturnSuccess;  // idempotent
+    }
+    if (psp.fwBufSize == 0) {
+        PSP_LOG("setup_fw_buf_sysmem: psp_init not called");
+        return kIOReturnNotReady;
+    }
+    if (gmc.gart_start == 0) {
+        PSP_LOG("setup_fw_buf_sysmem: GMC GART not enabled "
+                "(gart_start=0) — bring up GMC first");
+        return kIOReturnNotReady;
+    }
+
+    // Allocate the staging buffer as sysmem, kASPageSize-aligned (DART
+    // requirement on Apple Silicon — see [[mac_amdgpu_as_dart_limits]]).
+    // Mirrors upstream amdgpu_bo_create_kernel(adev->firmware.fw_size,
+    // PAGE_SIZE, AMDGPU_GEM_DOMAIN_GTT, ...).
+    IOBufferMemoryDescriptor *buf = nullptr;
+    kern_return_t r = IOBufferMemoryDescriptor::Create(
+        kIOMemoryDirectionOutIn, psp.fwBufSize, kASPageSize, &buf);
+    if (r != kIOReturnSuccess || buf == nullptr) {
+        PSP_LOG("setup_fw_buf_sysmem: buffer alloc failed: %#x", r);
+        return r != kIOReturnSuccess ? r : kIOReturnNoMemory;
+    }
+    buf->SetLength(psp.fwBufSize);
+
+    // DART-map: pin to a GPU-bus address. We require a SINGLE segment
+    // because GART is set up to expect contiguous-PCI-addressed regions
+    // (upstream's create_bo + amdgpu_ucode_init_bo make the same
+    // assumption for the kernel-allocated firmware BO).
+    //
+    // maxAddressBits = 32 — force DART to allocate an IOVA that fits in
+    // 32 bits so the AMD GPU's PCIe DMA can definitely reach it. With
+    // maxAddressBits=64 DART placed our buffer at IOVA 0x82060000
+    // (~2 GB), and PSP returned resp=0x11 even though our PT walk and
+    // memcpy looked correct end-to-end — likely the GPU's PCIe path on
+    // this Mac can't issue reads above some threshold below 0x82000000.
+    IODMACommandSpecification spec = {};
+    spec.options        = kIODMACommandSpecificationNoOptions;
+    spec.maxAddressBits = 32;
+    IODMACommand *dma = nullptr;
+    r = IODMACommand::Create(dev.pci, kIODMACommandCreateNoOptions, &spec, &dma);
+    if (r != kIOReturnSuccess || dma == nullptr) {
+        buf->release();
+        PSP_LOG("setup_fw_buf_sysmem: IODMACommand::Create failed: %#x", r);
+        return r != kIOReturnSuccess ? r : kIOReturnNoMemory;
+    }
+    uint64_t flags = 0;
+    uint32_t segCount = 1;
+    IOAddressSegment seg = {};
+    r = dma->PrepareForDMA(kIODMACommandPrepareForDMANoOptions, buf, 0,
+                           psp.fwBufSize, &flags, &segCount, &seg);
+    if (r != kIOReturnSuccess || segCount != 1) {
+        dma->release();
+        buf->release();
+        PSP_LOG("setup_fw_buf_sysmem: PrepareForDMA failed: %#x segs=%u",
+                r, segCount);
+        return r != kIOReturnSuccess ? r : kIOReturnNotAligned;
+    }
+
+    // Get a CPU-side mapping with cache INHIBITED. On Apple Silicon,
+    // DART does not snoop CPU caches for TB5-attached devices — so any
+    // CPU writes that linger in L1/L2 are invisible to the GPU's PCIe
+    // reads (v0.1.12 self-test confirmed: writing 0xDEADBEEF via the
+    // default cacheable mapping, then reading via MMHUB GMC, returned
+    // 0s — the cached writes never made it to DRAM before the GPU
+    // read). kIOMemoryMapCacheModeInhibit forces every CPU access
+    // straight to DRAM, bypassing the cache.
+    IOMemoryMap *uncachedMap = nullptr;
+    r = buf->CreateMapping(
+        kIOMemoryMapCacheModeInhibit,
+        /*address  =*/ 0,
+        /*offset   =*/ 0,
+        /*length   =*/ psp.fwBufSize,
+        /*alignment=*/ 0,
+        &uncachedMap);
+    if (r != kIOReturnSuccess || uncachedMap == nullptr) {
+        dma->CompleteDMA(kIODMACommandCompleteDMANoOptions);
+        dma->release();
+        buf->release();
+        PSP_LOG("setup_fw_buf_sysmem: CreateMapping(uncached) kr=%#x", r);
+        return r != kIOReturnSuccess ? r : kIOReturnNoMemory;
+    }
+    const uint64_t cpu_uncached_addr = uncachedMap->GetAddress();
+
+    // Bind the whole bus range into GART. After this, GMC-routable MC
+    // address `gart_mc + i*kASPageSize` resolves to sysmem bus address
+    // `seg.address + i*kASPageSize`. Mirrors upstream's per-ucode
+    // amdgpu_bo_gpu_offset(ucode->bo) which returns the GART-mapped
+    // MC address for GTT-domain BOs.
+    uint64_t gart_mc = 0;
+    r = gmc_bind_existing(dev, gmc, seg.address, psp.fwBufSize, &gart_mc);
+    if (r != kIOReturnSuccess) {
+        dma->CompleteDMA(kIODMACommandCompleteDMANoOptions);
+        dma->release();
+        buf->release();
+        PSP_LOG("setup_fw_buf_sysmem: gmc_bind_existing failed: %#x", r);
+        return r;
+    }
+
+    psp.fwBufSysmemBuffer  = buf;
+    psp.fwBufSysmemDMA     = dma;
+    psp.fwBufSysmemCPU     = reinterpret_cast<void *>(cpu_uncached_addr);
+    psp.fwBufSysmemBusAddr = seg.address;
+    psp.fwBufBaseMC        = gart_mc;          // <- now GART, not VRAM
+    psp.fwBufBumpOffset    = 0;
+
+    PSP_LOG("setup_fw_buf_sysmem: %llu B @ bus=%#llx → gart_mc=%#llx, "
+            "cpu=%p (replaces VRAM-backed placeholder)",
+            psp.fwBufSize, psp.fwBufSysmemBusAddr, psp.fwBufBaseMC,
+            psp.fwBufSysmemCPU);
+
+    // GART self-test: write a sentinel via the CPU pointer, flush the
+    // CPU cache, then read it back via the GART MC address using
+    // RVRAM32_via_mm (which goes through MMHUB GMC — the same walk
+    // PSP performs for LOAD_IP_FW.fw_phy_addr).
+    //
+    // Three outcomes:
+    //   - readback = sentinel : MMHUB GART walk works end-to-end.
+    //     PSP's resp=0x11 on GART addresses is a PSP-side policy
+    //     check (fw_phy_addr must be VRAM-resident on this chip).
+    //   - readback = 0        : MMHUB walks but reads 0 — PTE
+    //     translates but DART/sysmem doesn't return our data.
+    //   - readback = 0xFFFFFFFF : walk faulted / aborted.
+    //
+    // Mirrors the diagnostic style of the smn-probe; results inform
+    // whether to keep chasing GART or switch fw_buf to VRAM permanently.
+    {
+        uint32_t *cpu_dw = reinterpret_cast<uint32_t *>(psp.fwBufSysmemCPU);
+        constexpr uint32_t kSentinel0 = 0xDEADBEEFu;
+        constexpr uint32_t kSentinel1 = 0xCAFEBABEu;
+        cpu_dw[0] = kSentinel0;
+        cpu_dw[1] = kSentinel1;
+
+        // Read the sentinels back THROUGH THE SAME CPU MAPPING — if
+        // this returns 0, the writes never made it past the CPU side
+        // (cache-inhibit mapping silently fell back to cacheable, or
+        // is pointing at the wrong physical pages). If it returns the
+        // sentinels, the writes ARE in DRAM and the MMHUB→DART read
+        // is what's broken.
+        uint32_t cpu_rb0 = cpu_dw[0];
+        uint32_t cpu_rb1 = cpu_dw[1];
+
+        // Read back via MMHUB GMC (same path PSP uses).
+        uint32_t rb0 = RVRAM32_via_mm(dev, gart_mc + 0);
+        uint32_t rb1 = RVRAM32_via_mm(dev, gart_mc + 4);
+
+        PSP_LOG("gart-selftest: cpu-readback {%#x, %#x}  "
+                "mmhub-readback {%#x, %#x}",
+                cpu_rb0, cpu_rb1, rb0, rb1);
+        PSP_LOG("gart-selftest: wrote {%#x, %#x} @ cpu=%p, "
+                "readback via MMHUB @ gart_mc=%#llx → {%#x, %#x}  (%s)",
+                kSentinel0, kSentinel1, psp.fwBufSysmemCPU,
+                gart_mc, rb0, rb1,
+                (rb0 == kSentinel0 && rb1 == kSentinel1)
+                    ? "MATCH — GART walk works, PSP rejects GART addr"
+                    : (rb0 == 0 && rb1 == 0)
+                        ? "ZEROS — walk OK, DART/sysmem read returns 0"
+                        : (rb0 == 0xFFFFFFFFu)
+                            ? "ABORT — walk faulted"
+                            : "MISMATCH");
+    }
     return kIOReturnSuccess;
 }
 
@@ -135,7 +412,7 @@ struct PSPGfxRBFrame {
     uint8_t  frame_type;
     uint8_t  reserved1[2];
     uint32_t reserved2[7];
-};
+} __attribute__((packed));
 static_assert(sizeof(PSPGfxRBFrame) == 64, "PSPGfxRBFrame must be 64 B");
 
 constexpr uint32_t kPSPGfxCmdRespSize = 1024;  // upstream psp_gfx_cmd_resp
@@ -154,17 +431,28 @@ struct PSPGfxCmdSetupTmr {
     uint32_t tmr_flags;         // bit0=sriov, bit1=virt_phy_addr (we set this)
     uint32_t system_phy_addr_lo;
     uint32_t system_phy_addr_hi;
-};
+} __attribute__((packed));
+static_assert(sizeof(PSPGfxCmdSetupTmr) == 24,
+              "PSPGfxCmdSetupTmr must be 24 B (matches upstream "
+              "psp_gfx_cmd_setup_tmr)");
 
 struct PSPGfxCmdLoadIpFw {
     uint32_t fw_phy_addr_lo;
     uint32_t fw_phy_addr_hi;
     uint32_t fw_size;
     uint32_t fw_type;           // enum psp_gfx_fw_type (host-endian u32)
-};
+} __attribute__((packed));
+static_assert(sizeof(PSPGfxCmdLoadIpFw) == 16,
+              "PSPGfxCmdLoadIpFw must be 16 B (matches upstream "
+              "psp_gfx_cmd_load_ip_fw)");
 
 // Layout of the cmd_resp buffer's leading fields. Matches upstream
-// `struct psp_gfx_cmd_resp` for the bits we actually write.
+// `struct psp_gfx_cmd_resp` for the bits we actually write. Per the
+// AMD freedesktop thread (Patryk Simon's struct-packing trap finding,
+// [[reference_amd_freedesktop_thread]]): explicitly mark __packed
+// because Clang on macOS doesn't apply implicit packing the way Linux
+// GCC + __le32 does. All-uint32_t means the static_assert should hold
+// either way, but make it explicit + checked so it can't regress.
 struct PSPGfxCmdRespHeader {
     uint32_t buf_size;
     uint32_t buf_version;       // PSP_GFX_CMD_BUF_VERSION = 1
@@ -174,7 +462,10 @@ struct PSPGfxCmdRespHeader {
     uint32_t resp_offset;       // 0
     uint32_t resp_buf_size;     // 0
     // cmd union starts at offset 28
-};
+} __attribute__((packed));
+static_assert(sizeof(PSPGfxCmdRespHeader) == 28,
+              "PSPGfxCmdRespHeader must be 28 B (cmd union starts at "
+              "this offset in upstream psp_gfx_cmd_resp)");
 constexpr uint32_t kPSPGfxCmdBufVersion = 1;
 
 void
@@ -241,6 +532,24 @@ psp_release(PSPContext &psp)
     psp.fwPriBusAddr = 0;
     psp.fwPriSize    = 0;
     psp.sosAlive     = false;
+
+    // Sysmem-backed fw_buf (GART-bound) — release the IODMACommand +
+    // IOBufferMemoryDescriptor pair. The GART page-table entries stay
+    // until the next gmc reset; for now that's a non-issue because the
+    // GMC bump allocator never reclaims slots either.
+    if (psp.fwBufSysmemDMA != nullptr) {
+        psp.fwBufSysmemDMA->CompleteDMA(kIODMACommandCompleteDMANoOptions);
+        psp.fwBufSysmemDMA->release();
+        psp.fwBufSysmemDMA = nullptr;
+    }
+    if (psp.fwBufSysmemBuffer != nullptr) {
+        psp.fwBufSysmemBuffer->release();
+        psp.fwBufSysmemBuffer = nullptr;
+    }
+    psp.fwBufSysmemCPU     = nullptr;
+    psp.fwBufSysmemBusAddr = 0;
+    psp.fwBufBaseMC        = 0;
+    psp.fwBufBumpOffset    = 0;
 }
 
 bool
@@ -327,12 +636,15 @@ psp_load_sos(DeviceContext &dev, PSPContext &psp)
     }
 
     // Stage the SOS image in fw_pri (VRAM via BAR0 aperture).
-    // NOTE: we don't memset the full 1 MB like upstream — each BAR0
-    // dword write is ~10x slower on AS, so a full 1 MB memset takes
-    // ~2.6 sec. Just zero exactly what the firmware doesn't cover.
-    // For SOS specifically, since this is the final load and the file
-    // is large, skip the trailing zero entirely; PSP should not read
-    // past sosFirmwareSize when the descriptor reports it.
+    // Upstream psp_v14_0_bootloader_load_sos (psp_v14_0.c:217) memsets
+    // the entire 1 MB fw_pri buffer to zero before memcpy — same as
+    // for every other bootloader component (line 143). Without this,
+    // stale bytes from prior loads sit at fw_pri[sosFirmwareSize..1MB]
+    // and PSP may hash/validate past the declared size, rejecting
+    // with status 0x11 (signature/size mismatch). Our own psp_load_toc
+    // code already documents this exact failure mode. The ~2.6 sec
+    // BAR0-memset cost is acceptable once at init time.
+    bar0_memset_vram(dev, kFwPriVRAMOffset, 0, psp.fwPriSize);
     bar0_memcpy_to_vram(dev, kFwPriVRAMOffset,
                         psp.sosFirmware, psp.sosFirmwareSize);
 
@@ -404,7 +716,13 @@ psp_bootloader_load_component(DeviceContext &dev, PSPContext &psp,
     }
 
     // Stage the sub-firmware in fw_pri (VRAM via BAR0 aperture).
-    // Skip the full-1MB memset (too slow on AS — see psp_load_sos).
+    // Upstream psp_v14_0_bootloader_load_component (psp_v14_0.c:143)
+    // memsets the entire 1 MB fw_pri buffer to zero before memcpy.
+    // Skipping the memset leaves stale bytes from prior bootloader
+    // loads at fw_pri[binSize..1MB]; PSP may hash/validate beyond the
+    // declared size and reject with status 0x11 (signature/size
+    // mismatch) — same failure mode our psp_load_toc code documents.
+    bar0_memset_vram(dev, kFwPriVRAMOffset, 0, psp.fwPriSize);
     bar0_memcpy_to_vram(dev, kFwPriVRAMOffset, bin, binSize);
 
     const uint32_t regAddr = SOC15_REG_OFFSET(dev, IPBlock::MP0,
@@ -674,15 +992,48 @@ psp_setup_tmr(DeviceContext &dev, PSPContext &psp)
         return kIOReturnNotReady;
     }
 
-    // psp_v14_0_x: boot_time_tmr + autoload → skip the cmd. SOS owns
-    // the TMR. Mark "set up" so psp_load_ip_fw isn't blocked.
+    // psp_v14_0_x: boot_time_tmr + autoload → skip SETUP_TMR. SOS owns
+    // the TMR allocation. But upstream's psp_tmr_init (amdgpu_psp.c:881-890)
+    // ALSO calls psp_load_toc when `psp->toc.start_addr` is non-null —
+    // and on psp_v14_0_3 it IS non-null because parse_sos_bin_descriptor
+    // extracts the PSP_FW_TYPE_PSP_TOC sub-bin from psp_14_0_3_sos.bin.
+    // Without that LOAD_TOC submit, PSP doesn't know the per-IP TMR slot
+    // layout, so it rejects every TMR-resident LOAD_IP_FW (SDMA/CP_RS64/
+    // MES/RLC) with TEE_BAD_PARAMETERS (0xFFFF0006) and AUTOLOAD_RLC
+    // returns TEE_ERROR_ITEM_NOT_FOUND (0xFFFF0007). SMU + IMU pass
+    // because they bypass TMR slotting.
     if (kIP_PSP.major == 14) {
         psp.tmrBusAddr = 0;  // SOS-managed; we have no MC address
         psp.tmrCPUAddr = nullptr;
         psp.tmrSize    = 0;
-        psp.tmrSetUp   = true;
-        PSP_LOG("setup_tmr: SKIP (psp_v14_0_%u — boot_time_tmr by SOS, "
-                "see psp_skip_tmr in upstream amdgpu_psp.c:906)",
+
+        if (psp.toc.start_addr != nullptr && psp.toc.size_bytes > 0) {
+            uint32_t tmr_size = 0, toc_resp = 0;
+            kern_return_t tr = psp_load_toc_subbin(
+                dev, psp,
+                psp.toc.start_addr,
+                static_cast<uint32_t>(psp.toc.size_bytes),
+                &tmr_size, &toc_resp);
+            if (tr != kIOReturnSuccess) {
+                PSP_LOG("setup_tmr: LOAD_TOC sub-bin FAILED kr=%#x "
+                        "resp=%#x (toc_size=%llu); TMR-resident "
+                        "LOAD_IP_FW will likely reject",
+                        tr, toc_resp, psp.toc.size_bytes);
+                return tr;
+            }
+            PSP_LOG("setup_tmr: LOAD_TOC sub-bin ok — PSP reported "
+                    "tmr_size=%u (%#x) from %llu-byte sub-bin",
+                    tmr_size, tmr_size, psp.toc.size_bytes);
+        } else {
+            PSP_LOG("setup_tmr: NO TOC sub-bin in SOS package "
+                    "(toc.start_addr=%p size=%llu) — skipping LOAD_TOC; "
+                    "expect TMR-resident LOAD_IP_FW to fail",
+                    psp.toc.start_addr, psp.toc.size_bytes);
+        }
+
+        psp.tmrSetUp = true;
+        PSP_LOG("setup_tmr: SKIP SETUP_TMR (psp_v14_0_%u — boot_time_tmr "
+                "by SOS, see psp_skip_tmr in upstream amdgpu_psp.c:906)",
                 (unsigned)kIP_PSP.rev);
         return kIOReturnSuccess;
     }
@@ -705,9 +1056,11 @@ psp_setup_tmr(DeviceContext &dev, PSPContext &psp)
     uint8_t cmd_buf[kPSPGfxCmdRespSize];
     memset(cmd_buf, 0, sizeof(cmd_buf));
     auto *hdr = reinterpret_cast<PSPGfxCmdRespHeader *>(cmd_buf);
-    hdr->buf_size    = sizeof(cmd_buf);
-    hdr->buf_version = kPSPGfxCmdBufVersion;
-    hdr->cmd_id      = PSPGfxCmd::SETUP_TMR;
+    // buf_size/buf_version intentionally left at 0 — upstream's
+    // acquire_psp_cmd_buf memsets the whole struct and never writes
+    // these fields; PSP firmware on v14_0_3 may treat nonzero values
+    // as version mismatch. Only cmd_id is set.
+    hdr->cmd_id      =PSPGfxCmd::SETUP_TMR;
 
     auto *tmr = reinterpret_cast<PSPGfxCmdSetupTmr *>(cmd_buf + 28);
     tmr->buf_phy_addr_lo    = static_cast<uint32_t>(psp.tmrBusAddr & 0xFFFFFFFFu);
@@ -764,9 +1117,11 @@ psp_load_ip_fw(DeviceContext &dev, PSPContext &psp,
     uint8_t cmd_buf[kPSPGfxCmdRespSize];
     memset(cmd_buf, 0, sizeof(cmd_buf));
     auto *hdr = reinterpret_cast<PSPGfxCmdRespHeader *>(cmd_buf);
-    hdr->buf_size    = sizeof(cmd_buf);
-    hdr->buf_version = kPSPGfxCmdBufVersion;
-    hdr->cmd_id      = PSPGfxCmd::LOAD_IP_FW;
+    // buf_size/buf_version intentionally left at 0 — upstream's
+    // acquire_psp_cmd_buf memsets the whole struct and never writes
+    // these fields; PSP firmware on v14_0_3 may treat nonzero values
+    // as version mismatch. Only cmd_id is set.
+    hdr->cmd_id      =PSPGfxCmd::LOAD_IP_FW;
 
     auto *load = reinterpret_cast<PSPGfxCmdLoadIpFw *>(cmd_buf + 28);
     load->fw_phy_addr_lo = static_cast<uint32_t>(fwBusAddr & 0xFFFFFFFFu);
@@ -796,15 +1151,24 @@ psp_query_fw_reservation(DeviceContext &dev, PSPContext &psp)
         uint8_t cmd_buf[kPSPGfxCmdRespSize];
         memset(cmd_buf, 0, sizeof(cmd_buf));
         auto *hdr = reinterpret_cast<PSPGfxCmdRespHeader *>(cmd_buf);
-        hdr->buf_size    = sizeof(cmd_buf);
-        hdr->buf_version = kPSPGfxCmdBufVersion;
+        // buf_size/buf_version left at 0 (upstream behavior).
         hdr->cmd_id      = cmd_id;
         uint32_t resp = 0;
         kern_return_t r = psp_ring_cmd_submit(dev, psp, cmd_buf,
                                               kPSPGfxCmdRespSize, &resp);
         if (r == kIOReturnSuccess) {
-            PSP_LOG("query_fw_reservation: %{public}s ok (resp=%#x)",
-                    name, resp);
+            // Pull reserve_base_address + reserve_size out of the response
+            // buffer. Layout: psp_gfx_uresp_fw_reserve_info lives inside
+            // psp_gfx_resp.uresp (offset +64 within resp). resp sits at
+            // +864 in cmd_buf. Field order is hi-then-lo (unusual).
+            constexpr uint32_t kUrespOff = 864 + 64;
+            uint32_t addr_hi = RBAR2_32(dev, kCmdBufVRAMOffset + kUrespOff + 0);
+            uint32_t addr_lo = RBAR2_32(dev, kCmdBufVRAMOffset + kUrespOff + 4);
+            uint32_t rsv_sz  = RBAR2_32(dev, kCmdBufVRAMOffset + kUrespOff + 8);
+            uint64_t addr    = ((uint64_t)addr_hi << 32) | addr_lo;
+            PSP_LOG("query_fw_reservation: %{public}s ok (resp=%#x) "
+                    "addr=%#llx size=%#x",
+                    name, resp, addr, rsv_sz);
             return kIOReturnSuccess;
         }
         // PSP_ERR_UNKNOWN_COMMAND (0x100) means SOS too old to know this
@@ -840,7 +1204,7 @@ psp_query_fw_reservation(DeviceContext &dev, PSPContext &psp)
 kern_return_t
 psp_load_toc(DeviceContext &dev, PSPContext &psp,
              const uint8_t *tocBin, uint32_t tocSize,
-             uint32_t *outTmrSize)
+             uint32_t *outTmrSize, uint32_t *outRespStatus)
 {
     if (!psp.ringCreated) {
         PSP_LOG("load_toc: ring not created");
@@ -872,8 +1236,14 @@ psp_load_toc(DeviceContext &dev, PSPContext &psp,
     }
 
     // 1. Stage the TOC PAYLOAD ONLY in fw_pri via BAR0. Mirrors
-    //    upstream psp_copy_fw(psp, psp->toc.start_addr, psp->toc.size_bytes).
-    bar0_memcpy_to_vram(dev, /*vram_byte_offset=*/0,
+    //    upstream psp_copy_fw(psp, psp->toc.start_addr, psp->toc.size_bytes)
+    //    — which zeros the WHOLE fw_pri buffer first (amdgpu_psp.c:4191)
+    //    THEN memcpys the payload. Without the zero, stale bytes from the
+    //    prior SOS sub-bin loads sit at fw_pri[payload_size..]; PSP reads
+    //    or hashes past the declared toc_size and rejects with status 0x11
+    //    (signature/size mismatch).
+    bar0_memset_vram(dev, kFwPriVRAMOffset, 0, psp.fwPriSize);
+    bar0_memcpy_to_vram(dev, kFwPriVRAMOffset,
                         tocBin + payload_offset, payload_size);
     amdgpu_hdp_flush(dev);
 
@@ -881,9 +1251,8 @@ psp_load_toc(DeviceContext &dev, PSPContext &psp,
     uint8_t cmd_buf[kPSPGfxCmdRespSize];
     memset(cmd_buf, 0, sizeof(cmd_buf));
     auto *cmd_hdr = reinterpret_cast<PSPGfxCmdRespHeader *>(cmd_buf);
-    cmd_hdr->buf_size    = sizeof(cmd_buf);
-    cmd_hdr->buf_version = kPSPGfxCmdBufVersion;
-    cmd_hdr->cmd_id      = PSPGfxCmd::LOAD_TOC;
+    // buf_size/buf_version intentionally left at 0 (upstream behavior).
+    cmd_hdr->cmd_id      =PSPGfxCmd::LOAD_TOC;
 
     // psp_gfx_cmd_load_toc layout (psp_gfx_if.h):
     //   uint32_t toc_phy_addr_lo;  // +0
@@ -897,6 +1266,7 @@ psp_load_toc(DeviceContext &dev, PSPContext &psp,
     uint32_t resp = 0;
     kern_return_t r = psp_ring_cmd_submit(dev, psp, cmd_buf,
                                           kPSPGfxCmdRespSize, &resp);
+    if (outRespStatus) *outRespStatus = resp;
     if (r != kIOReturnSuccess) {
         PSP_LOG("LOAD_TOC FAILED kr=%#x resp=%#x (payload off=%u size=%u)",
                 r, resp, payload_offset, payload_size);
@@ -908,6 +1278,82 @@ psp_load_toc(DeviceContext &dev, PSPContext &psp,
     uint32_t tmr_size = RBAR2_32(dev, kCmdBufVRAMOffset + 16);
     if (outTmrSize) *outTmrSize = tmr_size;
     PSP_LOG("LOAD_TOC ok — PSP reported tmr_size=%u (%#x)",
+            tmr_size, tmr_size);
+    return kIOReturnSuccess;
+}
+
+//
+// psp_load_toc_subbin — submit GFX_CMD_ID_LOAD_TOC using the TOC
+// SUB-BINARY that lives INSIDE psp_<chip>_sos.bin (v2 descriptor
+// PSP_FW_TYPE_PSP_TOC). Unlike `psp_load_toc` which takes a separate
+// gc_<v>_toc.bin file and slices its common_firmware_header, this
+// helper expects `subBin/subSize` to ALREADY be the payload bytes —
+// the SOS parser (`psp_parse_sos_microcode`) extracts those.
+//
+// Mirrors upstream `psp_tmr_init`'s branch (amdgpu_psp.c:881-890):
+//   if (psp->toc.start_addr && psp->toc.size_bytes && psp->fw_pri_buf)
+//       psp_load_toc(psp, &tmr_size);
+// where `psp_load_toc` body (amdgpu_psp.c:840-859) is:
+//   psp_copy_fw(psp, psp->toc.start_addr, psp->toc.size_bytes);
+//   psp_prep_load_toc_cmd_buf(cmd, psp->fw_pri_mc_addr, psp->toc.size_bytes);
+//   psp_cmd_submit_buf(...)
+//
+// PSP reads the TOC, builds the TMR slot map for SDMA/CP_RS64/MES/RLC,
+// and returns tmr_size. Without this, every TMR-resident LOAD_IP_FW
+// gets rejected with TEE_BAD_PARAMETERS, and AUTOLOAD_RLC returns
+// TEE_ERROR_ITEM_NOT_FOUND (0xFFFF0007) — the symptom we observe.
+//
+kern_return_t
+psp_load_toc_subbin(DeviceContext &dev, PSPContext &psp,
+                   const uint8_t *subBin, uint32_t subSize,
+                   uint32_t *outTmrSize, uint32_t *outRespStatus)
+{
+    if (!psp.ringCreated) {
+        PSP_LOG("load_toc_subbin: ring not created");
+        return kIOReturnNotReady;
+    }
+    if (subBin == nullptr || subSize == 0) {
+        PSP_LOG("load_toc_subbin: empty (subBin=%p subSize=%u)",
+                subBin, subSize);
+        return kIOReturnBadArgument;
+    }
+    if (subSize > psp.fwPriSize) {
+        PSP_LOG("load_toc_subbin: payload %u B > fw_pri %llu B",
+                subSize, psp.fwPriSize);
+        return kIOReturnNoSpace;
+    }
+
+    // Mirror upstream psp_copy_fw: zero whole 1 MB fw_pri, memcpy
+    // payload at offset 0.
+    bar0_memset_vram(dev, kFwPriVRAMOffset, 0, psp.fwPriSize);
+    bar0_memcpy_to_vram(dev, kFwPriVRAMOffset, subBin, subSize);
+    amdgpu_hdp_flush(dev);
+
+    uint8_t cmd_buf[kPSPGfxCmdRespSize];
+    memset(cmd_buf, 0, sizeof(cmd_buf));
+    auto *cmd_hdr = reinterpret_cast<PSPGfxCmdRespHeader *>(cmd_buf);
+    // buf_size/buf_version intentionally left at 0 (upstream behavior).
+    cmd_hdr->cmd_id      =PSPGfxCmd::LOAD_TOC;
+
+    auto *toc = reinterpret_cast<uint32_t *>(cmd_buf + 28);
+    toc[0] = static_cast<uint32_t>(psp.fwPriBusAddr & 0xFFFFFFFFu);
+    toc[1] = static_cast<uint32_t>(psp.fwPriBusAddr >> 32);
+    toc[2] = subSize;
+
+    uint32_t resp = 0;
+    kern_return_t r = psp_ring_cmd_submit(dev, psp, cmd_buf,
+                                          kPSPGfxCmdRespSize, &resp);
+    if (outRespStatus) *outRespStatus = resp;
+    if (r != kIOReturnSuccess) {
+        PSP_LOG("LOAD_TOC (sub-bin) FAILED kr=%#x resp=%#x "
+                "(size=%u, fw_pri_mc=%#llx)",
+                r, resp, subSize, psp.fwPriBusAddr);
+        return r;
+    }
+
+    uint32_t tmr_size = RBAR2_32(dev, kCmdBufVRAMOffset + 16);
+    if (outTmrSize) *outTmrSize = tmr_size;
+    PSP_LOG("LOAD_TOC (sub-bin) ok — PSP reported tmr_size=%u (%#x)",
             tmr_size, tmr_size);
     return kIOReturnSuccess;
 }
@@ -930,9 +1376,11 @@ psp_rlc_autoload_start(DeviceContext &dev, PSPContext &psp)
     uint8_t cmd_buf[kPSPGfxCmdRespSize];
     memset(cmd_buf, 0, sizeof(cmd_buf));
     auto *hdr = reinterpret_cast<PSPGfxCmdRespHeader *>(cmd_buf);
-    hdr->buf_size    = sizeof(cmd_buf);
-    hdr->buf_version = kPSPGfxCmdBufVersion;
-    hdr->cmd_id      = PSPGfxCmd::AUTOLOAD_RLC;
+    // buf_size/buf_version intentionally left at 0 — upstream's
+    // acquire_psp_cmd_buf memsets the whole struct and never writes
+    // these fields; PSP firmware on v14_0_3 may treat nonzero values
+    // as version mismatch. Only cmd_id is set.
+    hdr->cmd_id      =PSPGfxCmd::AUTOLOAD_RLC;
 
     uint32_t resp = 0;
     kern_return_t r = psp_ring_cmd_submit(dev, psp, cmd_buf,
@@ -942,6 +1390,315 @@ psp_rlc_autoload_start(DeviceContext &dev, PSPContext &psp)
         return r;
     }
     PSP_LOG("rlc_autoload_start: ok (resp=%#x)", resp);
+    return kIOReturnSuccess;
+}
+
+//
+// psp_rl_load — direct port of upstream `psp_rl_load`
+// (amdgpu_psp.c:1152). Submits the PSP-embedded Register List firmware
+// via LOAD_IP_FW with fw_type=GFX_FW_TYPE_REG_LIST=67. The RL bytes
+// were extracted from the v2 SOS package by psp_parse_sos_microcode
+// into psp.rl (PSP_FW_TYPE_PSP_RL sub-bin descriptor).
+//
+// CRITICAL for autoload: upstream calls this right after
+// psp_load_non_psp_fw (which ended with AUTOLOAD_RLC). PSP's autoload
+// state machine waits for REG_LIST to arrive before completing GC
+// bringup — without it, BOOTLOAD_STATUS never transitions and GC
+// stays in reset even though all other firmware loads acknowledged.
+//
+// Mirrors upstream byte-for-byte:
+//   memset(psp->fw_pri_buf, 0, PSP_1_MEG);
+//   memcpy(psp->fw_pri_buf, psp->rl.start_addr, psp->rl.size_bytes);
+//   cmd.cmd_load_ip_fw.fw_phy_addr = psp->fw_pri_mc_addr;
+//   cmd.cmd_load_ip_fw.fw_size     = psp->rl.size_bytes;
+//   cmd.cmd_load_ip_fw.fw_type     = GFX_FW_TYPE_REG_LIST;
+//
+// We use the same fwPri buffer that worked for SOS/bootloader loading
+// (vram_start + 0, 1 MB). Sysmem-via-GART is unavailable on Apple
+// Silicon (see [[feedback_mac_amdgpu_dart_tb5_pcie_reads]]).
+//
+kern_return_t
+psp_rl_load(DeviceContext &dev, PSPContext &psp)
+{
+    if (!psp.ringCreated) return kIOReturnNotReady;
+    if (psp.rl.start_addr == nullptr || psp.rl.size_bytes == 0) {
+        PSP_LOG("rl_load: psp.rl absent (size=%llu, ptr=%p) — skipping "
+                "(SOS package may not include RL)",
+                (unsigned long long)psp.rl.size_bytes, psp.rl.start_addr);
+        return kIOReturnSuccess;
+    }
+    if (psp.fwPriSize == 0) {
+        PSP_LOG("rl_load: fwPri not initialized");
+        return kIOReturnNotReady;
+    }
+    if (psp.rl.size_bytes > psp.fwPriSize) {
+        PSP_LOG("rl_load: RL %llu > fwPri %llu — too large",
+                (unsigned long long)psp.rl.size_bytes,
+                (unsigned long long)psp.fwPriSize);
+        return kIOReturnNoMemory;
+    }
+
+    // memset fwPri to zero (PSP_1_MEG = 1 MB region), then memcpy
+    // RL bytes into it. fwPri lives at VRAM offset 0, so we use
+    // bar0_memset_vram + bar0_memcpy_to_vram for both ops.
+    bar0_memset_vram(dev, kFwPriVRAMOffset, 0, psp.fwPriSize);
+    bar0_memcpy_to_vram(dev, kFwPriVRAMOffset,
+                        psp.rl.start_addr, psp.rl.size_bytes);
+    amdgpu_hdp_flush(dev);
+
+    // Submit LOAD_IP_FW with fw_phy_addr = fwPriBusAddr, fw_type = REG_LIST.
+    kern_return_t r = psp_load_ip_fw(dev, psp, psp.fwPriBusAddr,
+                                     static_cast<uint32_t>(psp.rl.size_bytes),
+                                     PSPGfxFwType::REG_LIST);
+    if (r != kIOReturnSuccess) {
+        PSP_LOG("rl_load: LOAD_IP_FW(REG_LIST, size=%llu, mc=%#llx) "
+                "FAILED kr=%#x",
+                (unsigned long long)psp.rl.size_bytes,
+                psp.fwPriBusAddr, r);
+        return r;
+    }
+    PSP_LOG("rl_load: ok (size=%llu, mc=%#llx)",
+            (unsigned long long)psp.rl.size_bytes, psp.fwPriBusAddr);
+    return kIOReturnSuccess;
+}
+
+//============================================================
+// psp_parse_ta_microcode — port of upstream parse_ta_v2_microcode
+// (amdgpu_psp.c:3947) for the ASD sub-binary specifically.
+//
+// psp_<chip>_ta.bin layout (v2.0):
+//   common_firmware_header (32 B)
+//   uint32_t ta_fw_bin_count
+//   psp_fw_bin_desc ta_fw_bin[ta_fw_bin_count]  (16 B each)
+//   ucode_array starts at common_firmware_header.ucode_array_offset_bytes
+//
+// Each ta_fw_bin descriptor:
+//   fw_type     — ta_fw_type enum (TA_FW_TYPE_PSP_ASD = 1, etc.)
+//   fw_version
+//   offset_bytes — relative to ucode_array_offset_bytes
+//   size_bytes
+//
+// We walk the array looking for TA_FW_TYPE_PSP_ASD, BAR0-stage the
+// ASD ucode into a dedicated fwBuf VRAM slot, and store the resulting
+// MC address + size in psp.asd. psp_asd_initialize later builds a
+// LOAD_ASD cmd referencing that slot.
+//============================================================
+
+kern_return_t
+psp_parse_ta_microcode(DeviceContext &dev, PSPContext &psp,
+                       const uint8_t *ta_data, uint64_t ta_size)
+{
+    // Reset the ASD context — fresh parse, no stale pointers.
+    psp.asd = PSPContext::ASDContext{};
+
+    if (ta_data == nullptr || ta_size < sizeof(common_firmware_header)) {
+        PSP_LOG("parse_ta: ta_data null or too small (%llu)", ta_size);
+        return kIOReturnBadArgument;
+    }
+    auto *hdr = reinterpret_cast<const common_firmware_header *>(ta_data);
+    if (hdr->ucode_array_offset_bytes > ta_size) {
+        PSP_LOG("parse_ta: ucode_array_offset %#x > ta_size %llu",
+                hdr->ucode_array_offset_bytes, ta_size);
+        return kIOReturnBadArgument;
+    }
+
+    PSP_LOG("parse_ta: hdr ver %u.%u, ip %u.%u, ucode_size=%u, "
+            "ucode_off=%#x, total=%u",
+            hdr->header_version_major, hdr->header_version_minor,
+            hdr->ip_version_major, hdr->ip_version_minor,
+            hdr->ucode_size_bytes,
+            hdr->ucode_array_offset_bytes, hdr->size_bytes);
+
+    // R9700 ships v2.0 TA packages. v1.0 would need a different parser
+    // (legacy named-field layout) — we don't support those chips here.
+    if (hdr->header_version_major != 2) {
+        PSP_LOG("parse_ta: unsupported header_version_major=%u "
+                "(only v2.0 supported)", hdr->header_version_major);
+        return kIOReturnUnsupported;
+    }
+
+    auto *h20 = reinterpret_cast<const ta_firmware_header_v2_0 *>(ta_data);
+    uint32_t count = h20->ta_fw_bin_count;
+    if (count == 0 || count > 64) {
+        PSP_LOG("parse_ta: implausible ta_fw_bin_count=%u", count);
+        return kIOReturnBadArgument;
+    }
+    // Make sure the descriptor array fits inside the file.
+    uint64_t arr_end = sizeof(ta_firmware_header_v2_0) +
+                       (uint64_t)count * sizeof(psp_fw_bin_desc);
+    if (arr_end > ta_size) {
+        PSP_LOG("parse_ta: bin array (count=%u) exceeds ta_size", count);
+        return kIOReturnBadArgument;
+    }
+
+    const uint8_t *ucode_base = ta_data + hdr->ucode_array_offset_bytes;
+    const psp_fw_bin_desc *bin = h20->ta_fw_bin;
+
+    // Iterate. Log every descriptor for visibility; only stash ASD.
+    bool found_asd = false;
+    for (uint32_t i = 0; i < count; i++) {
+        PSP_LOG("parse_ta: desc[%u] fw_type=%u version=%#x offset=%u size=%u",
+                i, bin[i].fw_type, bin[i].fw_version,
+                bin[i].offset_bytes, bin[i].size_bytes);
+        if (bin[i].fw_type != TA_FW_TYPE_PSP_ASD) continue;
+        if (bin[i].size_bytes == 0) {
+            PSP_LOG("parse_ta: ASD descriptor has zero size — skip");
+            continue;
+        }
+        // Boundary check the ASD slice lives inside the file.
+        if ((uint64_t)hdr->ucode_array_offset_bytes +
+            bin[i].offset_bytes + bin[i].size_bytes > ta_size) {
+            PSP_LOG("parse_ta: ASD ucode (off=%u + size=%u) exceeds ta_size",
+                    bin[i].offset_bytes, bin[i].size_bytes);
+            return kIOReturnBadArgument;
+        }
+        const uint8_t *asd_src = ucode_base + bin[i].offset_bytes;
+        uint32_t asd_size      = bin[i].size_bytes;
+
+        // Page-align the slot size to match the fwBuf bump allocator.
+        constexpr uint64_t kFwBufAlign = 0x1000;
+        uint64_t slot_off = psp.fwBufBumpOffset;
+        uint64_t slot_sz  = (asd_size + kFwBufAlign - 1) & ~(kFwBufAlign - 1);
+        if (slot_off + slot_sz > psp.fwBufSize) {
+            PSP_LOG("parse_ta: fw_buf exhausted (want %llu @ %llu, cap %llu)",
+                    slot_sz, slot_off, psp.fwBufSize);
+            return kIOReturnNoSpace;
+        }
+        uint64_t slot_vram_off = psp.fwBufVRAMOffset + slot_off;
+        uint64_t slot_mc_addr  = psp.fwBufBaseMC     + slot_off;
+
+        // Stage ASD ucode into the slot. Use sysmem path if available
+        // (matches LOAD_IP_FW path used for IP firmwares), otherwise
+        // stream via BAR0 to VRAM.
+        if (psp.fwBufSysmemCPU != nullptr) {
+            memcpy(static_cast<uint8_t *>(psp.fwBufSysmemCPU) + slot_off,
+                   asd_src, asd_size);
+        } else {
+            bar0_memcpy_to_vram(dev, slot_vram_off, asd_src, asd_size);
+            amdgpu_hdp_flush(dev);
+        }
+        psp.fwBufBumpOffset = slot_off + slot_sz;
+
+        psp.asd.parsed         = true;
+        psp.asd.size_bytes     = asd_size;
+        psp.asd.fw_version     = bin[i].fw_version;
+        psp.asd.ucode_mc_addr  = slot_mc_addr;
+        psp.asd.ucode_vram_off = slot_vram_off;
+        psp.asd.session_id     = 0;
+        psp.asd.resp_status    = 0;
+
+        PSP_LOG("parse_ta: ASD staged (size=%u, mc=%#llx, vram_off=%#llx, "
+                "fw_version=%#x)",
+                asd_size, slot_mc_addr, slot_vram_off, bin[i].fw_version);
+        found_asd = true;
+        break;
+    }
+
+    if (!found_asd) {
+        PSP_LOG("parse_ta: no ASD descriptor in TA bin (parsed %u entries) "
+                "— psp_asd_initialize will be a no-op", count);
+        // Not a fatal error — return success. psp_asd_initialize sees
+        // !psp.asd.parsed and skips.
+        return kIOReturnSuccess;
+    }
+    return kIOReturnSuccess;
+}
+
+//============================================================
+// psp_asd_initialize — port of upstream psp_asd_initialize +
+// psp_ta_load (amdgpu_psp.c:1225, 1380) for the ASD case.
+//
+// Builds a GFX_CMD_ID_LOAD_ASD (0x4) cmd_buf pointing at the
+// VRAM-staged ASD ucode (set up by psp_parse_ta_microcode) and
+// submits via the PSP ring. Critical for autoload state machine:
+// upstream calls this between psp_rlc_autoload_start and
+// psp_rl_load (amdgpu_psp.c:3153). Skipping it appears to leave
+// PSP in a partial state where the GC autoload chain doesn't fire
+// — this was the v0.1.18 symptom (BOOTLOAD_STATUS stuck at 0).
+//
+// PSP_ASD_SHARED_MEM_SIZE = 0 in upstream (amdgpu_psp.h:68), so
+// the cmd_buf shared-mem fields stay zero.
+//
+// Returns kIOReturnSuccess if PSP acks with resp_status == 0, or
+// if no TA bin was loaded (no-op). Failure cases are logged.
+//============================================================
+
+kern_return_t
+psp_asd_initialize(DeviceContext &dev, PSPContext &psp)
+{
+    if (!psp.ringCreated) {
+        PSP_LOG("asd_initialize: PSP ring not created");
+        return kIOReturnNotReady;
+    }
+    if (!psp.asd.parsed || psp.asd.size_bytes == 0) {
+        PSP_LOG("asd_initialize: no ASD staged (parsed=%d, size=%u) — "
+                "skipping (host did not send TA bin)",
+                psp.asd.parsed, psp.asd.size_bytes);
+        return kIOReturnSuccess;
+    }
+
+    // Build the LOAD_ASD command in a 1 KB cmd_resp-sized buffer matching
+    // upstream's `struct psp_gfx_cmd_resp` layout. The host-side
+    // cmd_buf VRAM at kCmdBufVRAMOffset is the one PSP reads — we
+    // stage there directly via BAR0.
+    constexpr uint32_t kCmdRespSize = 1024;
+    uint8_t cmd_buf[kCmdRespSize];
+    memset(cmd_buf, 0, kCmdRespSize);
+
+    // Header (matches PSPCmdRespHeader at offsets 0..15):
+    //   +0  buf_size       (left 0 — informational only, see [[rb_frame_minimal]])
+    //   +4  buf_version    (0)
+    //   +8  cmd_id         = PSPGfxCmd::LOAD_ASD = 4
+    //   +12 resp_buf_addr  (we use the same cmd_buf for response — 0)
+    auto *hdr = reinterpret_cast<PSPGfxCmdRespHeader *>(cmd_buf);
+    hdr->cmd_id = PSPGfxCmd::LOAD_ASD;
+
+    // psp_gfx_cmd_load_ta lives at offset 28 (after the 7-dword header).
+    // Layout (psp_gfx_if.h:129):
+    //   uint32_t app_phy_addr_lo
+    //   uint32_t app_phy_addr_hi
+    //   uint32_t app_len
+    //   uint32_t cmd_buf_phy_addr_lo  (0 — no shared mem for ASD)
+    //   uint32_t cmd_buf_phy_addr_hi  (0)
+    //   uint32_t cmd_buf_len          (0 = PSP_ASD_SHARED_MEM_SIZE)
+    constexpr uint32_t kCmdLoadTaOffset = 28;
+    uint32_t *cmd_words =
+        reinterpret_cast<uint32_t *>(cmd_buf + kCmdLoadTaOffset);
+    cmd_words[0] = static_cast<uint32_t>(psp.asd.ucode_mc_addr & 0xFFFFFFFFu);
+    cmd_words[1] = static_cast<uint32_t>((psp.asd.ucode_mc_addr >> 32) & 0xFFFFFFFFu);
+    cmd_words[2] = psp.asd.size_bytes;
+    cmd_words[3] = 0;  // cmd_buf_phy_addr_lo
+    cmd_words[4] = 0;  // cmd_buf_phy_addr_hi
+    cmd_words[5] = 0;  // cmd_buf_len (PSP_ASD_SHARED_MEM_SIZE == 0)
+
+    PSP_LOG("asd_initialize: submitting LOAD_ASD (mc=%#llx, size=%u)",
+            psp.asd.ucode_mc_addr, psp.asd.size_bytes);
+
+    uint32_t resp_status = 0;
+    kern_return_t r = psp_ring_cmd_submit(dev, psp, cmd_buf, kCmdRespSize,
+                                          &resp_status);
+    psp.asd.resp_status = resp_status;
+    if (r != kIOReturnSuccess) {
+        PSP_LOG("asd_initialize: psp_ring_cmd_submit FAILED kr=%#x "
+                "resp_status=%#x", r, resp_status);
+        return r;
+    }
+
+    // The response status sits at offset 864 of the cmd_buf (we already
+    // verified via psp_ring_cmd_submit). Session ID lives further down
+    // at the start of psp_gfx_resp.session_id — per upstream
+    // psp_gfx_if.h, the resp union starts at offset 864 and session_id
+    // is the first dword: offset 864.
+    //
+    // But psp_ring_cmd_submit reads resp_status from offset 864 too.
+    // session_id is at offset 868 (next dword after status, since
+    // psp_gfx_resp = { uint32_t status; uint32_t session_id; ... }).
+    constexpr uint32_t kRespSessionIdOffset = 864 + 4;
+    psp.asd.session_id = RBAR2_32(dev,
+        kCmdBufVRAMOffset + kRespSessionIdOffset);
+
+    PSP_LOG("asd_initialize: ok (session_id=%#x, resp=%#x)",
+            psp.asd.session_id, resp_status);
     return kIOReturnSuccess;
 }
 
@@ -1185,6 +1942,236 @@ psp_load_sos_package(DeviceContext &dev, PSPContext &psp)
     psp.sosFirmware     = nullptr;
     psp.sosFirmwareSize = 0;
     return r;
+}
+
+//============================================================
+// psp_load_non_psp_fw — port of upstream amdgpu_psp.c:3051
+//
+// Loads all non-PSP firmware (SMU, IMU, RLC, CP, SDMA, MES) through
+// the PSP ring in the correct upstream order. Mirrors the
+// psp_load_non_psp_fw function from Linux's amdgpu_psp.c.
+//
+// The caller provides firmware data via the FirmwareLoader callback.
+// Each callback receives a fw_type and returns (bus_addr, size) for
+// the firmware payload. The caller is responsible for staging the
+// firmware bytes into psp.fw_buf (VRAM) at the correct offset.
+//
+// Upstream order (AMDGPU_UCODE_ID_* enum, amdgpu_ucode.h:515-529):
+//   1. SMU (GFX_FW_TYPE_SMU = 18)
+//   2. IMU_I (68) + IMU_D (69)
+//   3. RLC sub-bins in order:
+//      a. GLOBAL_TAP_DELAYS (v2.4 only)
+//      b. SE0-3_TAP_DELAYS (v2.4 only)
+//      c. RLC_RESTORE_LIST_SRM_CNTL (v2.1+)
+//      d. RLC_RESTORE_LIST_GPM_MEM (v2.1+)
+//      e. RLC_RESTORE_LIST_SRM_MEM (v2.1+)
+//      f. RLC_IRAM (v2.2+)
+//      g. RLC_DRAM (v2.2+)
+//      h. RLC_P (v2.3+)
+//      i. RLC_V (v2.3+)
+//      j. RLC_G (always — LAST, triggers autoload)
+//   4. psp_rlc_autoload_start() ← CRITICAL
+//   5. CP_RS64: PFP + stacks, ME + stacks, MEC + stacks
+//   6. SDMA (GFX_FW_TYPE_SDMA_UCODE_TH0 = 71)
+//   7. MES: CP_MES + CP_MES_DATA
+//
+// Returns kIOReturnSuccess on success, or the first error encountered.
+//
+kern_return_t
+psp_load_non_psp_fw(DeviceContext &dev, PSPContext &psp,
+                    const FirmwareLoader &loader)
+{
+    kern_return_t r;
+    uint64_t fwBusAddr = 0;
+    uint32_t fwSize = 0;
+
+    PSP_LOG("load_non_psp_fw: starting firmware load sequence");
+
+    // 1. Load SMU firmware
+    r = loader.get_payload(PSPGfxFwType::SMU, fwBusAddr, fwSize);
+    if (r != kIOReturnSuccess) {
+        PSP_LOG("load_non_psp_fw: SMU load failed kr=%#x", r);
+        return r;
+    }
+    r = psp_load_ip_fw(dev, psp, fwBusAddr, fwSize, PSPGfxFwType::SMU);
+    if (r != kIOReturnSuccess) {
+        PSP_LOG("load_non_psp_fw: SMU LOAD_IP_FW failed kr=%#x", r);
+        return r;
+    }
+    PSP_LOG("load_non_psp_fw: SMU loaded (size=%u)", fwSize);
+
+    // 2. Load IMU firmware (I + D)
+    r = loader.get_payload(PSPGfxFwType::IMU_I, fwBusAddr, fwSize);
+    if (r == kIOReturnSuccess) {
+        r = psp_load_ip_fw(dev, psp, fwBusAddr, fwSize, PSPGfxFwType::IMU_I);
+        if (r != kIOReturnSuccess) {
+            PSP_LOG("load_non_psp_fw: IMU_I LOAD_IP_FW failed kr=%#x", r);
+            return r;
+        }
+        PSP_LOG("load_non_psp_fw: IMU_I loaded (size=%u)", fwSize);
+    }
+    r = loader.get_payload(PSPGfxFwType::IMU_D, fwBusAddr, fwSize);
+    if (r == kIOReturnSuccess) {
+        r = psp_load_ip_fw(dev, psp, fwBusAddr, fwSize, PSPGfxFwType::IMU_D);
+        if (r != kIOReturnSuccess) {
+            PSP_LOG("load_non_psp_fw: IMU_D LOAD_IP_FW failed kr=%#x", r);
+            return r;
+        }
+        PSP_LOG("load_non_psp_fw: IMU_D loaded (size=%u)", fwSize);
+    }
+
+    // 3. Load RLC sub-bins in correct upstream enum order.
+    //    Each sub-bin is loaded via LOAD_IP_FW. RLC_G must be LAST
+    //    because upstream calls psp_rlc_autoload_start() immediately
+    //    after RLC_G loads (amdgpu_psp.c:3113-3121).
+    {
+        struct RLCSubBin {
+            uint32_t fw_type;
+            const char *name;
+        } bins[] = {
+            { PSPGfxFwType::GLOBAL_TAP_DELAYS,    "GLOBAL_TAP_DELAYS" },
+            { PSPGfxFwType::SE0_TAP_DELAYS,       "SE0_TAP_DELAYS" },
+            { PSPGfxFwType::SE1_TAP_DELAYS,       "SE1_TAP_DELAYS" },
+            { PSPGfxFwType::SE2_TAP_DELAYS,       "SE2_TAP_DELAYS" },
+            { PSPGfxFwType::SE3_TAP_DELAYS,       "SE3_TAP_DELAYS" },
+            { PSPGfxFwType::RLC_RESTORE_LIST_SRM_CNTL, "RLC_RESTORE_LIST_SRM_CNTL" },
+            { PSPGfxFwType::RLC_RESTORE_LIST_GPM_MEM,  "RLC_RESTORE_LIST_GPM_MEM" },
+            { PSPGfxFwType::RLC_RESTORE_LIST_SRM_MEM,  "RLC_RESTORE_LIST_SRM_MEM" },
+            { PSPGfxFwType::RLC_IRAM,             "RLC_IRAM" },
+            { PSPGfxFwType::RLC_DRAM_BOOT,        "RLC_DRAM_BOOT" },
+            { PSPGfxFwType::RLC_P,                "RLC_P" },
+            { PSPGfxFwType::RLC_V,                "RLC_V" },
+            { PSPGfxFwType::RLC_G,                "RLC_G" },
+        };
+
+        for (auto &bin : bins) {
+            r = loader.get_payload(bin.fw_type, fwBusAddr, fwSize);
+            if (r == kIOReturnUnsupported) {
+                // This sub-bin is not present in this firmware version.
+                PSP_LOG("load_non_psp_fw: %s not present (v2.x variant)",
+                        bin.name);
+                continue;
+            }
+            if (r != kIOReturnSuccess) {
+                PSP_LOG("load_non_psp_fw: %s get_payload failed kr=%#x",
+                        bin.name, r);
+                return r;
+            }
+            r = psp_load_ip_fw(dev, psp, fwBusAddr, fwSize, bin.fw_type);
+            if (r != kIOReturnSuccess) {
+                PSP_LOG("load_non_psp_fw: %s LOAD_IP_FW failed kr=%#x",
+                        bin.name, r);
+                return r;
+            }
+            PSP_LOG("load_non_psp_fw: %s loaded (size=%u)", bin.name, fwSize);
+
+            // CRITICAL: After RLC_G, trigger autoload.
+            // Upstream: amdgpu_psp.c:3113-3121
+            if (bin.fw_type == PSPGfxFwType::RLC_G) {
+                r = psp_rlc_autoload_start(dev, psp);
+                if (r != kIOReturnSuccess) {
+                    PSP_LOG("load_non_psp_fw: rlc_autoload_start FAILED kr=%#x",
+                            r);
+                    return r;
+                }
+                PSP_LOG("load_non_psp_fw: RLC autoload started");
+            }
+        }
+    }
+
+    // 4. Load CP RS64 firmware (PFP, ME, MEC + per-pipe stacks).
+    //    Each CP file emits: ucode + 2-4 stack payloads.
+    {
+        struct CPSubBin {
+            uint32_t fw_type;
+            const char *name;
+        } bins[] = {
+            { PSPGfxFwType::RS64_PFP,       "RS64_PFP" },
+            { PSPGfxFwType::RS64_PFP_P0,    "RS64_PFP_P0" },
+            { PSPGfxFwType::RS64_PFP_P1,    "RS64_PFP_P1" },
+            { PSPGfxFwType::RS64_ME,        "RS64_ME" },
+            { PSPGfxFwType::RS64_ME_P0,     "RS64_ME_P0" },
+            { PSPGfxFwType::RS64_ME_P1,     "RS64_ME_P1" },
+            { PSPGfxFwType::RS64_MEC,       "RS64_MEC" },
+            { PSPGfxFwType::RS64_MEC_P0,    "RS64_MEC_P0" },
+            { PSPGfxFwType::RS64_MEC_P1,    "RS64_MEC_P1" },
+            { PSPGfxFwType::RS64_MEC_P2,    "RS64_MEC_P2" },
+            { PSPGfxFwType::RS64_MEC_P3,    "RS64_MEC_P3" },
+        };
+
+        for (auto &bin : bins) {
+            r = loader.get_payload(bin.fw_type, fwBusAddr, fwSize);
+            if (r == kIOReturnUnsupported) {
+                PSP_LOG("load_non_psp_fw: %s not present",
+                        bin.name);
+                continue;
+            }
+            if (r != kIOReturnSuccess) {
+                PSP_LOG("load_non_psp_fw: %s get_payload failed kr=%#x",
+                        bin.name, r);
+                return r;
+            }
+            r = psp_load_ip_fw(dev, psp, fwBusAddr, fwSize, bin.fw_type);
+            if (r != kIOReturnSuccess) {
+                PSP_LOG("load_non_psp_fw: %s LOAD_IP_FW failed kr=%#x",
+                        bin.name, r);
+                return r;
+            }
+            PSP_LOG("load_non_psp_fw: %s loaded (size=%u)", bin.name, fwSize);
+        }
+    }
+
+    // 5. Load SDMA firmware (single RS64 TH0 payload for RDNA4).
+    r = loader.get_payload(PSPGfxFwType::SDMA_UCODE_TH0, fwBusAddr, fwSize);
+    if (r == kIOReturnUnsupported) {
+        PSP_LOG("load_non_psp_fw: SDMA not present");
+    } else if (r != kIOReturnSuccess) {
+        PSP_LOG("load_non_psp_fw: SDMA get_payload failed kr=%#x", r);
+        return r;
+    } else {
+        r = psp_load_ip_fw(dev, psp, fwBusAddr, fwSize,
+                           PSPGfxFwType::SDMA_UCODE_TH0);
+        if (r != kIOReturnSuccess) {
+            PSP_LOG("load_non_psp_fw: SDMA LOAD_IP_FW failed kr=%#x", r);
+            return r;
+        }
+        PSP_LOG("load_non_psp_fw: SDMA loaded (size=%u)", fwSize);
+    }
+
+    // 6. Load MES firmware (CP_MES + CP_MES_DATA for uni_mes packaging).
+    {
+        struct MESBin {
+            uint32_t fw_type;
+            const char *name;
+        } bins[] = {
+            { PSPGfxFwType::CP_MES,       "CP_MES" },
+            { PSPGfxFwType::CP_MES_DATA,  "CP_MES_DATA" },
+        };
+
+        for (auto &bin : bins) {
+            r = loader.get_payload(bin.fw_type, fwBusAddr, fwSize);
+            if (r == kIOReturnUnsupported) {
+                PSP_LOG("load_non_psp_fw: %s not present",
+                        bin.name);
+                continue;
+            }
+            if (r != kIOReturnSuccess) {
+                PSP_LOG("load_non_psp_fw: %s get_payload failed kr=%#x",
+                        bin.name, r);
+                return r;
+            }
+            r = psp_load_ip_fw(dev, psp, fwBusAddr, fwSize, bin.fw_type);
+            if (r != kIOReturnSuccess) {
+                PSP_LOG("load_non_psp_fw: %s LOAD_IP_FW failed kr=%#x",
+                        bin.name, r);
+                return r;
+            }
+            PSP_LOG("load_non_psp_fw: %s loaded (size=%u)", bin.name, fwSize);
+        }
+    }
+
+    PSP_LOG("load_non_psp_fw: all firmware loaded successfully");
+    return kIOReturnSuccess;
 }
 
 } // namespace amdgpu

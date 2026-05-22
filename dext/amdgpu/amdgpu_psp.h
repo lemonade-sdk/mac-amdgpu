@@ -25,10 +25,26 @@
 #include <DriverKit/IODMACommand.h>
 #endif
 
+#include <functional>
 #include "amdgpu_regs.h"
 #include "amdgpu_gart.h"
 
 namespace amdgpu {
+
+// FirmwareLoader — callback interface for psp_load_non_psp_fw.
+// The caller implements get_payload() to provide firmware data for
+// each fw_type. The loader is responsible for staging the firmware
+// bytes into psp.fw_buf (VRAM) at the correct offset and returning
+// the GPU bus address and size.
+struct FirmwareLoader {
+    // Given a fw_type, return (bus_addr, size) for the firmware payload.
+    // Returns kIOReturnSuccess if the payload exists, kIOReturnUnsupported
+    // if this fw_type is not present in the current firmware version.
+    using GetPayloadFn = std::function<kern_return_t(uint32_t fw_type,
+                                                      uint64_t &out_bus_addr,
+                                                      uint32_t &out_size)>;
+    GetPayloadFn get_payload;
+};
 
 struct PSPContext {
     // Primary firmware buffer — PSP reads each binary from here.
@@ -67,6 +83,25 @@ struct PSPContext {
     PSPSubBin sys_drv_aux;  // v1.3 only
     PSPSubBin sos_aux;      // v1.3 only
 
+    // ASD (Authenticated Secure Display) TA descriptor — extracted from
+    // psp_<chip>_ta.bin by psp_parse_ta_microcode(). Upstream calls
+    // psp_asd_initialize between AUTOLOAD_RLC and psp_rl_load
+    // (amdgpu_psp.c:3153); skipping it appears to leave PSP in a partial
+    // state where the GC autoload state machine doesn't fire (v0.1.18
+    // symptom). We pre-stage the ASD ucode into a dedicated VRAM slot
+    // during LoadFirmware(TA) since the host DMA buffer gets overwritten
+    // by the next LoadFirmware call before psp_asd_initialize runs.
+    struct ASDContext {
+        bool      parsed;         // psp_parse_ta_microcode populated this
+        uint32_t  size_bytes;     // ASD ucode size from TA bin descriptor
+        uint32_t  fw_version;
+        uint64_t  ucode_mc_addr;  // VRAM MC address of staged ASD ucode
+        uint64_t  ucode_vram_off; // BAR0-relative VRAM offset (for re-staging)
+        uint32_t  session_id;     // PSP-assigned, post-load
+        uint32_t  resp_status;    // last LOAD_ASD response status
+    };
+    ASDContext asd;
+
     // Owning pointer to the whole `_sos.bin` file when LoadFirmware
     // hands us the blob — kept alive while sub-bin descriptors point
     // into it. Currently the dext doesn't own this (host's DMA buffer
@@ -80,6 +115,16 @@ struct PSPContext {
     uint64_t       sosFirmwareSize;
 
     bool sosAlive;
+
+    // PSP runtime database — populated by psp_read_runtime_db() during
+    // PSPInit. Mirrors upstream psp_sw_init's read of the runtime data
+    // header at (mc_vram_size - PSP_RUNTIME_DB_OFFSET=0x100000).
+    bool      runtimeDbRead;
+    uint16_t  runtimeDbCookie;   // PSP_RUNTIME_DB_COOKIE_ID = 0x0ed5 expected
+    uint16_t  runtimeDbVersion;
+    uint32_t  bootCfgBitmask;    // BOOT_CFG_FEATURE_* flags
+    uint32_t  scpmStatus;        // 0=disabled, 1=enabled, 2=enabled+err
+    bool      scpmEnabled;
 
     // PSP command ring (km_ring). After the GART port, allocated as
     // sysmem via gart_bind_sysmem so PSP can route it through the GPU's
@@ -152,10 +197,22 @@ struct PSPContext {
     // visible aperture). Each LoadFirmware bumps fwBufBumpOffset by
     // the page-aligned payload size and uses fwBufBaseMC +
     // (bump_offset before increment) as the LOAD_IP_FW address.
-    uint64_t  fwBufVRAMOffset;   // offset within VRAM (BAR0 aperture)
-    uint64_t  fwBufBaseMC;       // vram_start + fwBufVRAMOffset
+    uint64_t  fwBufVRAMOffset;   // legacy VRAM offset (unused after sysmem port)
+    uint64_t  fwBufBaseMC;       // GART MC address PSP uses (post sysmem port)
     uint64_t  fwBufSize;         // total bytes reserved for fw_buf
     uint64_t  fwBufBumpOffset;   // next available offset within fw_buf
+
+    // Sysmem backing for fw_buf — matches upstream amdgpu_ucode_create_bo
+    // which allocates fw_buf in GTT (AMDGPU_GEM_DOMAIN_GTT) on the
+    // default non-sriov/non-debug path. PSP reads the firmware bytes via
+    // GMC, which resolves the GART MC address to sysmem through the
+    // page table programmed by gmc_init.
+#ifdef __APPLE__
+    IOBufferMemoryDescriptor *fwBufSysmemBuffer;
+    IODMACommand             *fwBufSysmemDMA;
+#endif
+    void     *fwBufSysmemCPU;    // CPU-side ptr for memcpy of payloads
+    uint64_t  fwBufSysmemBusAddr;// DART-mapped bus addr (input to GART bind)
 };
 
 //
@@ -163,6 +220,30 @@ struct PSPContext {
 // Idempotent. Returns kIOReturnSuccess on success.
 //
 kern_return_t psp_init(DeviceContext &dev, PSPContext &psp);
+
+// psp_read_runtime_db — port of upstream psp_get_runtime_db_entry +
+// psp_sw_init runtime DB read (amdgpu_psp.c:376-449, 471-503). Reads
+// the PSP runtime data header at (vram_size - 0x100000) and fills in
+// boot_cfg_bitmask + scpm_status if the cookie matches.
+kern_return_t psp_read_runtime_db(DeviceContext &dev, PSPContext &psp,
+                                  uint64_t vram_size_bytes);
+
+//
+// psp_setup_fw_buf_sysmem — allocate firmware staging buffer in sysmem
+// and bind it into GART. Matches upstream amdgpu_ucode_create_bo which
+// allocates fw_buf in GTT (AMDGPU_GEM_DOMAIN_GTT) on the non-sriov path
+// (amdgpu_ucode.c:1148-1166). After this call psp.fwBufBaseMC is the
+// GART MC address PSP should use in LOAD_IP_FW.fw_phy_addr.
+//
+// Requires GMC to be initialised (gmc.gart_start populated, page table
+// allocated, MMHUB GART enabled). Call after GMCInit, on or before the
+// first IP firmware load.
+//
+// Idempotent — second call is a no-op.
+//
+struct GMCContext;
+kern_return_t psp_setup_fw_buf_sysmem(DeviceContext &dev, PSPContext &psp,
+                                      GMCContext &gmc);
 
 //
 // psp_parse_sos_microcode — port of upstream amdgpu_psp.c
@@ -331,12 +412,23 @@ namespace PSPGfxFwType {
     constexpr uint32_t RS64_MES_STACK  = 77;
     constexpr uint32_t RS64_KIQ        = 78;
     constexpr uint32_t RS64_KIQ_STACK  = 79;
+    // PSP-embedded Register List (REG_LIST). Loaded via psp_rl_load AFTER
+    // AUTOLOAD_RLC — PSP's autoload state machine waits for this firmware
+    // to arrive before completing GC bringup. psp.rl is populated from
+    // the v2 SOS package by psp_parse_sos_microcode (PSP_FW_TYPE_PSP_RL).
+    constexpr uint32_t REG_LIST        = 67;
     // uni_mes packaging: ucode + data loaded as two LOAD_IP_FW frames.
     constexpr uint32_t CP_MES          = 33;
     constexpr uint32_t CP_MES_DATA     = 34;
     // Note: upstream `enum psp_gfx_fw_type` calls this MES_STACK (=34);
     // we use CP_MES_DATA as a clearer name for the uni_mes data half.
     constexpr uint32_t MES_STACK       = 34;   // alias of CP_MES_DATA
+    // KIQ pipe variants — psp_gfx_if.h:285-286. Same uni_mes.bin bytes
+    // as CP_MES/CP_MES_DATA but tagged differently so PSP places them
+    // in the KIQ TMR slot. Required on RDNA4 because enable_uni_mes=1
+    // is the default and mes_v12_0_early_init registers both pipes.
+    constexpr uint32_t CP_MES_KIQ      = 81;
+    constexpr uint32_t MES_KIQ_STACK   = 82;
 
     // RLC sub-firmwares (v2.1+). All emitted from a single rlc.bin
     // file when the relevant rlc_firmware_header_v2_x has non-zero
@@ -358,6 +450,10 @@ namespace PSPGfxFwType {
 
 // GFX command IDs (subset). Full list in upstream psp_gfx_if.h.
 namespace PSPGfxCmd {
+    constexpr uint32_t LOAD_TA               = 1;
+    constexpr uint32_t UNLOAD_TA             = 2;
+    constexpr uint32_t INVOKE_CMD            = 3;
+    constexpr uint32_t LOAD_ASD              = 4;   // ASD = Authenticated Secure Display
     constexpr uint32_t SETUP_TMR             = 5;
     constexpr uint32_t LOAD_IP_FW            = 6;
     constexpr uint32_t LOAD_TOC              = 0x20;
@@ -381,7 +477,19 @@ namespace PSPGfxCmd {
 //
 kern_return_t psp_load_toc(DeviceContext &dev, PSPContext &psp,
                            const uint8_t *tocBin, uint32_t tocSize,
-                           uint32_t *outTmrSize);
+                           uint32_t *outTmrSize,
+                           uint32_t *outRespStatus = nullptr);
+
+// psp_load_toc_subbin — same submit as psp_load_toc, but takes the TOC
+// SUB-BINARY (already payload, no common_firmware_header) that lives
+// inside psp_<chip>_sos.bin. Mirrors what upstream psp_tmr_init does:
+// it parses the TOC out of the SOS package via parse_sos_bin_descriptor
+// (sets psp->toc.start_addr/size_bytes), then calls psp_load_toc which
+// just psp_copy_fw's those bytes verbatim.
+kern_return_t psp_load_toc_subbin(DeviceContext &dev, PSPContext &psp,
+                                  const uint8_t *subBin, uint32_t subSize,
+                                  uint32_t *outTmrSize,
+                                  uint32_t *outRespStatus = nullptr);
 
 //
 // psp_rlc_autoload_start — port of upstream `psp_rlc_autoload_start`
@@ -392,6 +500,75 @@ kern_return_t psp_load_toc(DeviceContext &dev, PSPContext &psp,
 // the RLC_G `psp_execute_ip_fw_load` returns success.
 //
 kern_return_t psp_rlc_autoload_start(DeviceContext &dev, PSPContext &psp);
+
+// psp_rl_load — port of upstream `psp_rl_load` (amdgpu_psp.c:1152).
+// Submits the PSP-embedded Register List firmware via LOAD_IP_FW with
+// fw_type=GFX_FW_TYPE_REG_LIST. Must be called AFTER psp_rlc_autoload_start
+// — PSP's GC autoload state machine waits for REG_LIST to arrive before
+// completing GC bringup.
+kern_return_t psp_rl_load(DeviceContext &dev, PSPContext &psp);
+
+//
+// psp_parse_ta_microcode — port of upstream `parse_ta_v2_microcode`
+// (amdgpu_psp.c:3947). Walks the v2.0 TA package header in `ta_data`
+// (raw bytes of `psp_<chip>_ta.bin`), iterates ta_fw_bin descriptors,
+// locates TA_FW_TYPE_PSP_ASD, BAR0-stages the ASD ucode into a
+// dedicated VRAM slot inside fw_buf, and populates psp.asd with the
+// staged ucode_mc_addr + size_bytes.
+//
+// The caller (LoadFirmware(kMacAMDGPUFwTypeTA)) provides the transient
+// bin pointer; this function copies the ASD slice into VRAM before
+// returning, so the bin pointer can be reused. psp.asd.parsed becomes
+// true on success.
+//
+// On v1.0 TA headers (legacy ASICs not on our path) this returns
+// kIOReturnUnsupported. R9700 ships v2.0 TA packages.
+//
+kern_return_t psp_parse_ta_microcode(DeviceContext &dev, PSPContext &psp,
+                                     const uint8_t *ta_data,
+                                     uint64_t ta_size);
+
+//
+// psp_asd_initialize — port of upstream `psp_asd_initialize`
+// (amdgpu_psp.c:1225) + `psp_ta_load` (amdgpu_psp.c:1380) for the
+// ASD case. Builds a GFX_CMD_ID_LOAD_ASD (0x4) cmd_buf pointing at
+// the VRAM-staged ASD ucode (populated by psp_parse_ta_microcode)
+// and submits via the PSP ring. PSP responds with the session_id
+// which we stash in psp.asd.session_id (not currently used post-load,
+// but kept for parity with upstream).
+//
+// PSP_ASD_SHARED_MEM_SIZE = 0 in upstream — ASD load does NOT allocate
+// a shared memory region (unlike other TAs). cmd_buf_phy_addr / len
+// are zero.
+//
+// Returns success ONLY if psp.asd.parsed && PSP resp_status == 0.
+// If psp.asd.parsed is false, returns kIOReturnSuccess as a no-op
+// (a missing TA bin shouldn't block bringup — log + skip).
+//
+// MUST be called AFTER psp_rlc_autoload_start and BEFORE psp_rl_load,
+// matching upstream's order in psp_load_fw (amdgpu_psp.c:3153).
+//
+kern_return_t psp_asd_initialize(DeviceContext &dev, PSPContext &psp);
+
+//
+// psp_load_non_psp_fw — port of upstream amdgpu_psp.c:3051
+//
+// Loads all non-PSP firmware (SMU, IMU, RLC, CP, SDMA, MES) through
+// the PSP ring in the correct upstream order. Mirrors the
+// psp_load_non_psp_fw function from Linux's amdgpu_psp.c.
+//
+// The caller provides firmware data via the FirmwareLoader callback.
+// Each callback receives a fw_type and returns (bus_addr, size) for
+// the firmware payload. The caller is responsible for staging the
+// firmware bytes into psp.fw_buf (VRAM) at the correct offset.
+//
+// Upstream order (AMDGPU_UCODE_ID_* enum):
+//   1. SMU → 2. IMU_I + IMU_D → 3. RLC sub-bins (tap_delays → restore_list
+//      → iram/dram → p/v → G) → 4. psp_rlc_autoload_start() →
+//      5. CP_RS64 (PFP+stacks, ME+stacks, MEC+stacks) → 6. SDMA → 7. MES
+//
+kern_return_t psp_load_non_psp_fw(DeviceContext &dev, PSPContext &psp,
+                                   const FirmwareLoader &loader);
 
 //
 // psp_query_fw_reservation — port of upstream `psp_update_fw_reservation`

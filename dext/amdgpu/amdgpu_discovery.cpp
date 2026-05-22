@@ -215,10 +215,12 @@ discovery_parse(const uint8_t *binary, uint64_t binarySize,
                 }
                 ips_recognised++;
                 DISC_LOG("  ip[%u] hw_id=%u %{public}s v%u.%u.%u "
-                         "bases=[%#010x %#010x %#010x %#010x %#010x] (n=%u)",
+                         "bases=[%#010x %#010x %#010x %#010x %#010x "
+                         "%#010x %#010x %#010x] (n=%u)",
                          i, ip->hw_id, block_name(blk),
                          ip->major, ip->minor, ip->revision,
-                         bases[0], bases[1], bases[2], bases[3], bases[4],
+                         bases[0], bases[1], bases[2], bases[3],
+                         bases[4], bases[5], bases[6], bases[7],
                          numBases);
 
                 // First time we see GC, capture its version too for
@@ -239,6 +241,16 @@ discovery_parse(const uint8_t *binary, uint64_t binarySize,
         outResult->num_dies      = ipds->num_dies;
         outResult->num_ips_total = ips_total;
     }
+
+    // Note: the on-die discovery binary DOES populate NBIO SEG5
+    // (0x04040000) — kMaxBaseSegments=5 was previously truncating it.
+    // Now that the array can hold it, isResolved(NBIO, 5) returns true.
+    // HOWEVER: SEG5 base 0x04040000 (dwords) = 16 MB byte offset, which
+    // is BEYOND Apple's 512 KB BAR5 mapping. NBIO SEG4 (0x0241B000) and
+    // SEG5 (0x04040000) registers can only be reached via SMN indirect
+    // (PCIE_INDEX2/PCIE_DATA2), not direct BAR5 MMIO. Callers that try
+    // to RREG32/WREG32 at those addresses will panic the dext.
+
     DISC_LOG("discovery parse complete: %u ips total, %u matched our IPBlock map",
              ips_total, ips_recognised);
     return kIOReturnSuccess;

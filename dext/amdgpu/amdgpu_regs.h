@@ -63,6 +63,11 @@ struct DeviceContext {
     bool         psoCAlive;
     bool         smuOnline;
     bool         gmcReady;
+    // Doorbell state — populated by doorbell_init().
+    // On Apple Silicon BAR2 is accessed via MemoryRead/Write, not
+    // as a linear mapping, so base=0. The doorbell_index map
+    // provides ASIC-specific doorbell offsets for each ring.
+    struct DoorbellState doorbell;
 };
 
 //============================================================
@@ -200,6 +205,61 @@ amdgpu_hdp_flush(const DeviceContext &ctx)
     ctx.pci->MemoryRead32(ctx.bar5MemIndex,
                           static_cast<uint64_t>(0x0DE3) * 4ULL,
                           &scratch);
+    (void)scratch;
+}
+
+// SMN indirect access via PCIE_INDEX2/PCIE_DATA2 — port of
+// amdgpu_device_indirect_rreg / amdgpu_device_indirect_wreg
+// (amdgpu_reg_access.c:584/752). The PCIE_INDEX2/PCIE_DATA2 pair
+// lives at NBIO BASE_IDX 0 (offsets 0x000e / 0x000f, well within
+// the 512 KB BAR5 mapping) and allows access to NBIO SEG4/SEG5
+// registers whose absolute BAR5 offsets are outside that window.
+//
+// Protocol:
+//   1. WREG32(PCIE_INDEX2, target_smn_dword_address)
+//   2. RREG32(PCIE_INDEX2)               -- readback flushes posted write
+//   3. RREG32(PCIE_DATA2) -or- WREG32(PCIE_DATA2, value)
+//   4. (write only) RREG32(PCIE_DATA2)   -- readback ensures completion
+//
+// `smn_reg_dword` is the upstream-resolved register address (the
+// same value SOC15_REG_OFFSET would produce on Linux). Linux uses a
+// spinlock here; in the dext we run init serially so no lock needed.
+//
+// IMPORTANT: PCIE_INDEX2 on R9700 / NBIO 7_11 takes a BYTE address,
+// not the dword offset Linux's writel() writes. v0.1.5 probe proved
+// this against MP0_C2PMSG_33: dword=0x16061 → data=0 (wrong);
+// byte=0x16061<<2=0x58184 → data=0x80000000 (matches direct read).
+// We shift smn_reg_dword left by 2 before writing PCIE_INDEX2.
+static inline uint32_t
+SMN_RREG32(const DeviceContext &ctx, uint32_t smn_reg_dword)
+{
+    const uint64_t idx_byte =
+        static_cast<uint64_t>(NBIORegs::BIF_BX1_PCIE_INDEX2) * 4ULL;
+    const uint64_t dat_byte =
+        static_cast<uint64_t>(NBIORegs::BIF_BX1_PCIE_DATA2) * 4ULL;
+    const uint32_t smn_addr_byte = smn_reg_dword << 2;
+    uint32_t scratch = 0;
+    ctx.pci->MemoryWrite32(ctx.bar5MemIndex, idx_byte, smn_addr_byte);
+    ctx.pci->MemoryRead32(ctx.bar5MemIndex, idx_byte, &scratch);
+    (void)scratch;
+    uint32_t value = 0;
+    ctx.pci->MemoryRead32(ctx.bar5MemIndex, dat_byte, &value);
+    return value;
+}
+
+static inline void
+SMN_WREG32(const DeviceContext &ctx, uint32_t smn_reg_dword, uint32_t value)
+{
+    const uint64_t idx_byte =
+        static_cast<uint64_t>(NBIORegs::BIF_BX1_PCIE_INDEX2) * 4ULL;
+    const uint64_t dat_byte =
+        static_cast<uint64_t>(NBIORegs::BIF_BX1_PCIE_DATA2) * 4ULL;
+    const uint32_t smn_addr_byte = smn_reg_dword << 2;
+    uint32_t scratch = 0;
+    ctx.pci->MemoryWrite32(ctx.bar5MemIndex, idx_byte, smn_addr_byte);
+    ctx.pci->MemoryRead32(ctx.bar5MemIndex, idx_byte, &scratch);
+    ctx.pci->MemoryWrite32(ctx.bar5MemIndex, dat_byte, value);
+    ctx.pci->MemoryRead32(ctx.bar5MemIndex, dat_byte, &scratch);
     (void)scratch;
 }
 #endif
