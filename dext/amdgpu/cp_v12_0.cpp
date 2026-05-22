@@ -19,6 +19,7 @@
 #include "amdgpu_cp.h"
 #include "amdgpu_gmc.h"
 #include "amdgpu_gfx.h"
+#include "amdgpu_mes.h"
 
 #define CP_LOG(fmt, ...) \
     os_log(OS_LOG_DEFAULT, "mac.amdgpu.cp: " fmt, ##__VA_ARGS__)
@@ -537,6 +538,187 @@ cp_submit_eop_test(const DeviceContext &dev, CPContext &cp,
         (void)kStep;
     }
     CP_LOG("EOP fence %u timeout (observed=%llu)", fence, *cp.fence_cpu);
+    return kIOReturnTimeout;
+}
+
+// ----- cp_kiq_smoke_test (v0.1.26) -----
+//
+// First-PM4 smoke test on the KIQ ring. Builds PACKET3_NOP +
+// PACKET3_RELEASE_MEM and verifies the CP MEC firmware writes
+// `expected_fence_value` to a VRAM-resident fence slot.
+//
+// "KIQ ring" in our uni-MES architecture is the CP GFX RB0 ring
+// stored in CPContext — that's the CP-managed kernel ring with a
+// PM4-fetching CP front-end. MES "owns" it via RLC_CP_SCHEDULERS
+// but the ring buffer + doorbell live in CPContext.
+//
+// PACKET3 macro:  0xC0000000 | (opcode << 8) | ((count & 0x3FFF) << 16)
+//
+// RELEASE_MEM body (6 dwords AFTER header, count=6):
+//   DW1: CACHE_FLUSH_AND_INV_TS_EVENT(20) | (EVENT_INDEX(5) << 8)
+//        = 0x14 | (0x5 << 8) = 0x514
+//   DW2: (DATA_SEL(1) << 29) | (INT_SEL(0) << 24) | (DST_SEL(0) << 16)
+//        = 0x20000000  (DST_SEL=0 selects memory_async; some upstream
+//        encodings use DST_SEL=0 for memory, 1 for TC_L2. We match the
+//        spec exactly: DST_SEL=1, INT_SEL=0, DATA_SEL=1.)
+//   DW3: fence_gpu_va & 0xFFFFFFFC  (dword-aligned)
+//   DW4: (fence_gpu_va >> 32) & 0xFFFF
+//   DW5: expected_fence_value (data_lo)
+//   DW6: 0 (data_hi)
+//
+kern_return_t
+cp_kiq_smoke_test(DeviceContext &dev,
+                  CPContext &cp,
+                  MESContext &mes,
+                  GMCContext &gmc,
+                  uint32_t expected_fence_value,
+                  uint32_t timeout_us,
+                  uint64_t *out_elapsed_us,
+                  uint64_t *out_fence_gpu_va,
+                  uint32_t *out_observed_fence)
+{
+    if (out_elapsed_us)     *out_elapsed_us     = 0;
+    if (out_fence_gpu_va)   *out_fence_gpu_va   = 0;
+    if (out_observed_fence) *out_observed_fence = 0;
+
+    // (1) Bail if CP/MES KIQ aren't initialized.
+    if (!cp.inited) {
+        CP_LOG("cp_kiq_smoke: CP storage not initialized");
+        return kIOReturnNotReady;
+    }
+    if (!mes.pipe[0].inited || !mes.pipe[0].enabled) {
+        // MES SCHED arms the KIQ via set_hw_resources; without it the
+        // CP firmware may not have a valid scheduler context.
+        CP_LOG("cp_kiq_smoke: MES SCHED pipe not enabled (KIQ not armed)");
+        return kIOReturnNotReady;
+    }
+    if (!dev.ip.isResolved(IPBlock::GC)) return kIOReturnNotReady;
+
+    CP_LOG("cp_kiq_smoke: starting (expected=%#x, timeout=%u us)",
+           expected_fence_value, timeout_us);
+
+    // (2) Allocate a 64-byte fence target in VRAM. The top-down bump
+    // allocator yields a gpu_va = vram_start + offset_in_window.
+    VRAMAllocation fence_alloc{};
+    if (!gmc.vram_alloc.alloc(64, kASPageSize, &fence_alloc)) {
+        CP_LOG("cp_kiq_smoke: VRAM fence alloc failed");
+        return kIOReturnNoMemory;
+    }
+    const uint64_t fence_gpu_va    = fence_alloc.gpu_va;
+    const uint64_t fence_vram_off  = fence_gpu_va - gmc.vram_start;
+    if (out_fence_gpu_va) *out_fence_gpu_va = fence_gpu_va;
+    CP_LOG("cp_kiq_smoke: fence_target @ gpu_va=%#llx vram_off=%#llx",
+           (unsigned long long)fence_gpu_va,
+           (unsigned long long)fence_vram_off);
+
+    // (3) Pre-fill the fence dword with 0xCAFEBABE so a "no write"
+    // outcome is distinguishable from accidental zero.
+    bar0_memset_vram(dev, fence_vram_off, 0xCAFEBABEu, 4);
+    // HDP flush so the GPU sees the pre-fill (paranoid — RELEASE_MEM
+    // overwrites it anyway, but keeps the readback clean).
+    amdgpu_hdp_flush(dev);
+
+    // (4) Build the PM4 packet sequence in a local CPU buffer.
+    //
+    // Header for NOP: PACKET3(opcode=0x00, count=0) = 0xC0001000.
+    // Header for RELEASE_MEM: PACKET3(opcode=0x49, count=6) = 0xC0064900.
+    // PACKET3 macro: 0xC0000000 | (op << 8) | ((count & 0x3FFF) << 16).
+    uint32_t pkt[16];
+    uint32_t n = 0;
+
+    // -- NOP --
+    pkt[n++] = 0xC0001000u;  // PACKET3(NOP=0x00, count=0)
+
+    // -- RELEASE_MEM (count=6 → 7 dwords total = header + 6 payload) --
+    pkt[n++] = 0xC0064900u;  // PACKET3(RELEASE_MEM=0x49, count=6)
+    // DW1: event_type=0x14 (CACHE_FLUSH_AND_INV_TS_EVENT)
+    //      event_index=5 (EOP) at bit 8
+    pkt[n++] = 0x00000514u;
+    // DW2: DATA_SEL=1 (immediate 32-bit) at bit 29
+    //      INT_SEL=0 (no interrupt) at bit 24
+    //      DST_SEL=1 (memory) at bit 16
+    pkt[n++] = (1u << 29) | (0u << 24) | (1u << 16);  // = 0x20010000
+    // DW3: fence_gpu_va lo, dword-aligned
+    pkt[n++] = static_cast<uint32_t>(fence_gpu_va & 0xFFFFFFFCu);
+    // DW4: fence_gpu_va hi, low 16 bits only (RELEASE_MEM addr_hi field
+    // is 16 bits per upstream IT_RELEASE_MEM encoding).
+    pkt[n++] = static_cast<uint32_t>((fence_gpu_va >> 32) & 0xFFFFu);
+    // DW5: data_lo = expected_fence_value
+    pkt[n++] = expected_fence_value;
+    // DW6: data_hi = 0
+    pkt[n++] = 0;
+
+    // (5) Determine where the KIQ ring lives + how to write. CPContext
+    // ring lives in DART-mapped sysmem (cp.ring_cpu is a CPU pointer to
+    // the kernel-VA backing for the IOBufferMemoryDescriptor that's
+    // also visible to the GPU via GART). Direct memcpy is correct.
+    if (cp.ring_cpu == nullptr || cp.ring_size_dwords == 0) {
+        CP_LOG("cp_kiq_smoke: CP ring CPU mapping unavailable");
+        return kIOReturnNotReady;
+    }
+    if (n > cp.ring_size_dwords / 2) {
+        CP_LOG("cp_kiq_smoke: %u dwords exceeds half-ring %u",
+               n, cp.ring_size_dwords / 2);
+        return kIOReturnNoSpace;
+    }
+
+    // (6) Write packets at the current software wptr; update wptr.
+    auto *ring = static_cast<uint32_t *>(cp.ring_cpu);
+    const uint32_t start_wptr = cp.wptr;
+    for (uint32_t i = 0; i < n; i++) {
+        ring[(cp.wptr + i) & cp.ring_ptr_mask] = pkt[i];
+    }
+    cp.wptr = (cp.wptr + n) & cp.ring_ptr_mask;
+    CP_LOG("cp_kiq_smoke: %u dwords written to KIQ ring @ wptr=%u "
+           "(start=%u, new=%u)",
+           n, start_wptr, start_wptr, cp.wptr);
+
+    // (7) HDP flush — write + readback per upstream amdgpu_hdp_flush.
+    // Drains posted writes so CP sees fresh ring contents.
+    amdgpu_hdp_flush(dev);
+
+    // (8) Update wptr shadow + ring the GFX ring's doorbell on BAR5.
+    // doorbell stride = 8 bytes on GFX12; CPContext owns the GFX RB0
+    // doorbell slot.
+    *cp.wptr_cpu = cp.wptr;
+    const uint64_t db_off = static_cast<uint64_t>(cp.doorbell_index) * 8;
+    if (dev.pci == nullptr) return kIOReturnNotAttached;
+    dev.pci->MemoryWrite32(dev.bar5MemIndex, db_off, cp.wptr);
+    CP_LOG("cp_kiq_smoke: doorbell rung (slot=%#x bar5_off=%#llx, "
+           "new_wptr=%u)",
+           cp.doorbell_index, (unsigned long long)db_off, cp.wptr);
+
+    // (9) Poll the fence slot up to timeout_us. 100 µs sleep between
+    // reads (IOSleep granularity in DriverKit is 1 ms; using 1).
+    const uint32_t step_us = 100;
+    uint32_t elapsed_us = 0;
+    uint32_t observed = 0;
+    while (elapsed_us < timeout_us) {
+        observed = RVRAM32_via_mm(dev, fence_vram_off);
+        if (observed == expected_fence_value) {
+            if (out_observed_fence) *out_observed_fence = observed;
+            if (out_elapsed_us)     *out_elapsed_us     = elapsed_us;
+            CP_LOG("cp_kiq_smoke: fence wait expected=%#x observed=%#x "
+                   "in %u us",
+                   expected_fence_value, observed, elapsed_us);
+            return kIOReturnSuccess;
+        }
+        // IOSleep is in milliseconds; we approximate 100 µs as a
+        // busy-wait dword-level read loop (which itself takes >>100 µs
+        // on AS due to MMIO cost) and only IOSleep(1) when the loop
+        // would otherwise spin too fast.
+        uint32_t scratch = 0;
+        for (int i = 0; i < 50; i++) scratch ^= observed;
+        (void)scratch;
+        if ((elapsed_us % 1000) == 0 && elapsed_us > 0) IOSleep(1);
+        elapsed_us += step_us;
+    }
+
+    if (out_observed_fence) *out_observed_fence = observed;
+    if (out_elapsed_us)     *out_elapsed_us     = elapsed_us;
+    CP_LOG("cp_kiq_smoke: fence wait TIMEOUT expected=%#x observed=%#x "
+           "after %u us",
+           expected_fence_value, observed, elapsed_us);
     return kIOReturnTimeout;
 }
 

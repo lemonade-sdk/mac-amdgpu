@@ -82,6 +82,10 @@ enum {
     // AS+TB5 (see feedback_mac_amdgpu_dart_tb5_pcie_reads), so we run
     // src+dst out of VRAM and verify via MM_INDEX/MM_DATA readback.
     kMacAMDGPUMethodSDMACopyVRAM      = 34,
+    // v0.1.26 — first PM4 packet on KIQ. PACKET3_NOP + PACKET3_RELEASE_MEM
+    // (fence write to a VRAM-resident slot). Confirms CP MEC firmware
+    // is processing PM4 packets from the KIQ ring.
+    kMacAMDGPUMethodCPKIQSmoke         = 35,
 };
 
 // QueryInfo "info type" tags — input scalarInput[0]. Output shape
@@ -2017,6 +2021,47 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             driver->ivars->bringup.cp,
             timeout_us, &fence);
         arguments->scalarOutput[0] = fence;
+        return r;
+    }
+
+    case kMacAMDGPUMethodCPKIQSmoke: {
+        // v0.1.26 — first PM4 packet on KIQ. Builds NOP +
+        // RELEASE_MEM(fence=0xDEADBEEF) targeting a VRAM-resident
+        // fence slot, kicks the doorbell, polls the slot.
+        //
+        // Out scalars:
+        //   [0] kIOReturn
+        //   [1] elapsed_us
+        //   [2] expected (0xDEADBEEF)
+        //   [3] observed_fence
+        //   [4] fence_gpu_va lo32
+        //   [5] fence_gpu_va hi32
+        if (arguments->scalarOutput == nullptr ||
+            arguments->scalarOutputCount < 6) {
+            return kIOReturnBadArgument;
+        }
+        if (!driver->ivars->pciOpen) return kIOReturnNotOpen;
+
+        const uint32_t expected   = 0xDEADBEEFu;
+        const uint32_t timeout_us = 100000;  // 100 ms
+        uint64_t elapsed_us       = 0;
+        uint64_t fence_gpu_va     = 0;
+        uint32_t observed         = 0;
+
+        kern_return_t r = amdgpu::cp_kiq_smoke_test(
+            driver->ivars->bringup.device,
+            driver->ivars->bringup.cp,
+            driver->ivars->bringup.mes,
+            driver->ivars->bringup.gmc,
+            expected, timeout_us,
+            &elapsed_us, &fence_gpu_va, &observed);
+
+        arguments->scalarOutput[0] = static_cast<uint64_t>(r);
+        arguments->scalarOutput[1] = elapsed_us;
+        arguments->scalarOutput[2] = expected;
+        arguments->scalarOutput[3] = observed;
+        arguments->scalarOutput[4] = fence_gpu_va & 0xFFFFFFFFull;
+        arguments->scalarOutput[5] = (fence_gpu_va >> 32) & 0xFFFFFFFFull;
         return r;
     }
 

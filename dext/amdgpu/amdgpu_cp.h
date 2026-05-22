@@ -262,6 +262,36 @@ kern_return_t cp_submit_eop_test(const DeviceContext &dev,
                                  uint64_t timeout_us,
                                  uint32_t *outFence);
 
+// Forward decls — defined in amdgpu_gmc.h / amdgpu_mes.h respectively.
+struct MESContext;
+
+// v0.1.26 — KIQ PM4 NOP + RELEASE_MEM smoke test.
+//
+// Builds a tiny PM4 packet sequence (PACKET3_NOP + PACKET3_RELEASE_MEM)
+// targeting a VRAM-resident 64-byte fence slot. CP MEC firmware should
+// process both and write `expected_fence_value` into the fence slot.
+//
+// Pre-fills the fence slot with 0xCAFEBABE so a "no write" outcome is
+// distinguishable from a transient zero.
+//
+// Returns kIOReturnSuccess if the fence write was observed within
+// `timeout_us`, kIOReturnTimeout otherwise. `kIOReturnNotReady` if
+// the CP / MES KIQ state isn't initialized.
+//
+// Out scalars:
+//   *out_elapsed_us     — wall-clock from kick to observed fence
+//   *out_fence_gpu_va   — GPU MC address of the fence dword
+//   *out_observed_fence — last value read from the fence slot
+kern_return_t cp_kiq_smoke_test(DeviceContext &dev,
+                                CPContext &cp,
+                                MESContext &mes,
+                                GMCContext &gmc,
+                                uint32_t expected_fence_value,
+                                uint32_t timeout_us,
+                                uint64_t *out_elapsed_us,
+                                uint64_t *out_fence_gpu_va,
+                                uint32_t *out_observed_fence);
+
 // Top-level CPInit stage entry — alloc storage + (if IP base is
 // resolved) program HQD + enable CP. Idempotent.
 kern_return_t cp_init_full(DeviceContext &dev,

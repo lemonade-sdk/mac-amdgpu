@@ -41,6 +41,8 @@ private let kSelLiveStatus:          UInt32 = 30
 private let kSelDisableSmuFeatures:  UInt32 = 33
 // v0.1.25 — VRAM->VRAM SDMA copy smoke test.
 private let kSelSDMACopyVRAM:        UInt32 = 34
+// v0.1.26 — KIQ PM4 NOP+fence smoke test.
+private let kSelCPKIQSmoke:          UInt32 = 35
 
 // v0.1.27 — BO management ABI. Selectors 16–18 existed pre-v0.1.27
 // (legacy: bump-allocate a sub-range of the client DMA buffer). They
@@ -251,6 +253,8 @@ struct ContentView: View {
                     .help("DisableAllSmuFeatures (PPSMC 0x7) — parks DPM so PMFW stops defaulting fan to MAX. Re-run Initialize GPU to undo.")
                 Button("SDMA Copy") { controller.testSDMACopyVRAM() }
                     .help("VRAM→VRAM 4 KB SDMA COPY_LINEAR smoke test. Proves the SDMA engine processes a packet end-to-end + writes its fence.")
+                Button("CP NOP") { controller.testCPKIQSmoke() }
+                    .help("v0.1.26 — first PM4 packet on KIQ: NOP + RELEASE_MEM(0xDEADBEEF). Verifies CP MEC firmware processes PM4.")
                 Button("Ping") { controller.testPing() }
                 Button("Identity") { controller.testGetIdentity() }
                 Button("BARs") { controller.testGetBARInfo() }
@@ -1121,6 +1125,8 @@ final class DriverController: NSObject, ObservableObject,
             append(String(format: "bo smoke: GTT  BOFree kr=%#x", kf2))
         }
         append("bo smoke: done")
+    }
+
     // v0.1.25 — VRAM->VRAM SDMA copy smoke test. Allocates src+dst
     // from the dext-side VRAM bump allocator, stages a known pattern
     // via BAR0, asks SDMA0 to COPY_LINEAR, and reads dst back via
@@ -1181,6 +1187,45 @@ final class DriverController: NSObject, ObservableObject,
                 firstBad, mismatched, bytes / 4))
         } else if status == 0 {
             append("  → SDMA engine alive, packet executed, fence written ✓")
+        }
+    }
+
+    // v0.1.26 — first PM4 packet on the KIQ ring. Builds NOP +
+    // RELEASE_MEM(0xDEADBEEF) targeting a VRAM-resident fence slot
+    // (pre-filled with 0xCAFEBABE), kicks the GFX RB0 doorbell,
+    // polls the fence slot for the expected value.
+    //
+    // Output scalars:
+    //   [0] kIOReturn
+    //   [1] elapsed_us
+    //   [2] expected (0xDEADBEEF)
+    //   [3] observed_fence
+    //   [4] fence_gpu_va lo32
+    //   [5] fence_gpu_va hi32
+    func testCPKIQSmoke() {
+        guard openUserClient() else { return }
+        let (kr, out) = callScalar(kSelCPKIQSmoke, outCount: 6)
+        if out.count < 6 {
+            append(String(format:
+                "CP KIQ Smoke: kr=%#x (no scalars returned)", kr))
+            return
+        }
+        let status   = UInt32(out[0] & 0xFFFFFFFF)
+        let elapsed  = out[1]
+        let expected = UInt32(out[2] & 0xFFFFFFFF)
+        let observed = UInt32(out[3] & 0xFFFFFFFF)
+        let lo       = out[4] & 0xFFFFFFFF
+        let hi       = out[5] & 0xFFFFFFFF
+        let gpuVa    = (hi << 32) | lo
+        let okLabel  = (status == 0) ? "OK" : "FAIL"
+        append(String(format:
+            "CP KIQ Smoke: status=%#x (%@) elapsed=%llu us",
+            status, okLabel, elapsed))
+        append(String(format:
+            "  fence expected=%#x observed=%#x @ gpu_va=%#llx",
+            expected, observed, gpuVa))
+        if kr != KERN_SUCCESS && status == 0 {
+            append(String(format: "  (kr=%#x)", kr))
         }
     }
 
