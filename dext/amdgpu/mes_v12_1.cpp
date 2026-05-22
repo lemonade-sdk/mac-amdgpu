@@ -558,19 +558,36 @@ mes_ring_write(MESInstance &inst, const uint32_t *src, uint32_t n_dw)
 }
 
 //------------------------------------------------------------------
-// mes_kick_doorbell — BAR5 write at (doorbell_index * 8). The
-// MES sees a new wptr value and dispatches packets up to it.
+// mes_kick_doorbell — BAR2 doorbell aperture write (upstream
+// WDOORBELL64). v0.1.49 fix: was writing 32-bit to BAR5 (the MMIO
+// register window), which is structurally wrong — doorbell aperture
+// is BAR2 with 64-bit qword stride per amdgpu_mm_wdoorbell64.
+//
+// MES does NOT expose a CPU-MMIO RB_WPTR register the way SDMA/CP do
+// (the MES MCU consumes API frames from its own ring and there's no
+// direct write of an engine-side RB_WPTR on the CPU side). So when
+// dev.doorbell_works is false (AS+TB5), MES submission will fail
+// until MES wires up an MMIO-equivalent path or until Apple gives us
+// working BAR2 doorbell delivery. Logged loudly so the failure mode
+// is visible.
 //------------------------------------------------------------------
 static kern_return_t
 mes_kick_doorbell(const DeviceContext &dev, const MESInstance &inst)
 {
     if (!inst.inited) return kIOReturnNotReady;
+    if (dev.pci == nullptr) return kIOReturnNotAttached;
     auto *wb_bytes = static_cast<volatile uint8_t *>(inst.wb_cpu);
     volatile uint32_t *sw_wptr = reinterpret_cast<volatile uint32_t *>(
         wb_bytes + 0x80);
-    const uint64_t offs = static_cast<uint64_t>(inst.doorbell_index) * 8ull;
-    const uint32_t v = *sw_wptr << 2;
-    dev.pci->MemoryWrite32(dev.bar5MemIndex, offs, v);
+    const uint64_t offs =
+        static_cast<uint64_t>(inst.doorbell_index) * 8ull;
+    const uint64_t v = static_cast<uint64_t>(*sw_wptr) << 2;
+    dev.pci->MemoryWrite64(dev.bar2MemIndex, offs, v);
+    if (!dev.doorbell_works) {
+        MES_LOG("kick_doorbell: BAR2 write done but dev.doorbell_works=false "
+                "— MES has no MMIO RB_WPTR fallback yet, submission will "
+                "likely hang on AS+TB5");
+    }
     return kIOReturnSuccess;
 }
 

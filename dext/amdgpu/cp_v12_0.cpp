@@ -492,20 +492,57 @@ cp_enable(const DeviceContext &dev, bool enable)
     return kIOReturnSuccess;
 }
 
-// ----- cp_kick_doorbell: write wptr to BAR5 doorbell slot -----
+// ----- cp_kick_doorbell -----
 //
-// On GFX12 the doorbell stride is 8 bytes (one u64 per slot). We
-// write the low 32 bits — the dext bypasses the userspace
-// IOConnectMapMemory64 BAR5 mapping and pokes the doorbell directly
-// through PCIDriverKit's MemoryWrite32 on bar5MemIndex.
+// Port of upstream gfx_v12_0_ring_set_wptr_gfx (gfx_v12_0.c:4376).
+// Two paths:
+//   use_doorbell=true  → atomic64_set(wptr_cpu_addr) + WDOORBELL64(BAR2)
+//   use_doorbell=false → WREG32(CP_RB0_WPTR{,_HI})
+//
+// We do BOTH paths gated on dev.doorbell_works:
+//   1. sysmem WPTR shadow + BAR2 doorbell write — upstream-shape, also
+//      effective on platforms where BAR2 delivery works.
+//   2. MMIO CP_RB0_WPTR/HI fallback — required on AS+TB5 because
+//      BAR2 doorbell writes don't reach the engine
+//      ([[feedback_mac_amdgpu_doorbell_mmio_mode_as_tb5]]).
+//
+// Note: CP's wptr is in DWORDS and written verbatim (NO `<< 2` shift —
+// unlike SDMA's wptr which is dwords shifted to bytes). GFX12 doorbell
+// stride is 8 bytes per qword slot.
+//
+// v0.1.48 fix: previous version wrote to dev.bar5MemIndex with a 32-bit
+// MemoryWrite32. The doorbell aperture is BAR2, not BAR5, and stride is
+// a 64-bit qword. Bug since v0.1.0.
 kern_return_t
 cp_kick_doorbell(const DeviceContext &dev, const CPContext &cp)
 {
     if (!cp.inited) return kIOReturnNotReady;
     if (dev.pci == nullptr) return kIOReturnNotAttached;
-    *cp.wptr_cpu = cp.wptr;
-    const uint64_t off = static_cast<uint64_t>(cp.doorbell_index) * 8;
-    dev.pci->MemoryWrite32(dev.bar5MemIndex, off, cp.wptr);
+    if (!dev.ip.isResolved(IPBlock::GC)) return kIOReturnNotReady;
+
+    // 1) sysmem WPTR shadow (upstream atomic64_set(ring->wptr_cpu_addr)).
+    if (cp.wptr_cpu) *cp.wptr_cpu = cp.wptr;
+
+    // 2) HDP flush so engine's sysmem read of wptr_poll drains.
+    amdgpu_hdp_flush(dev);
+
+    // 3) BAR2 doorbell aperture (upstream WDOORBELL64). Functional on
+    //    platforms where BAR2 delivery works; inert on AS+TB5.
+    const uint64_t db_off =
+        static_cast<uint64_t>(cp.doorbell_index) * 8ull;
+    const uint64_t v = static_cast<uint64_t>(cp.wptr);
+    dev.pci->MemoryWrite64(dev.bar2MemIndex, db_off, v);
+
+    // 4) MMIO RB_WPTR fallback — gated on platform health.
+    //    Required on AS+TB5; skipped when BAR2 delivery is known good.
+    if (!dev.doorbell_works) {
+        const uint32_t wptr_reg    = SOC15_REG_OFFSET(
+            dev, IPBlock::GC, CPRegs::CP_RB0_WPTR);
+        const uint32_t wptr_hi_reg = SOC15_REG_OFFSET(
+            dev, IPBlock::GC, CPRegs::CP_RB0_WPTR_HI);
+        WREG32(dev, wptr_reg,    static_cast<uint32_t>(v));
+        WREG32(dev, wptr_hi_reg, static_cast<uint32_t>(v >> 32));
+    }
     return kIOReturnSuccess;
 }
 
@@ -673,20 +710,20 @@ cp_kiq_smoke_test(DeviceContext &dev,
            "(start=%u, new=%u)",
            n, start_wptr, start_wptr, cp.wptr);
 
-    // (7) HDP flush — write + readback per upstream amdgpu_hdp_flush.
-    // Drains posted writes so CP sees fresh ring contents.
-    amdgpu_hdp_flush(dev);
-
-    // (8) Update wptr shadow + ring the GFX ring's doorbell on BAR5.
-    // doorbell stride = 8 bytes on GFX12; CPContext owns the GFX RB0
-    // doorbell slot.
-    *cp.wptr_cpu = cp.wptr;
-    const uint64_t db_off = static_cast<uint64_t>(cp.doorbell_index) * 8;
-    if (dev.pci == nullptr) return kIOReturnNotAttached;
-    dev.pci->MemoryWrite32(dev.bar5MemIndex, db_off, cp.wptr);
-    CP_LOG("cp_kiq_smoke: doorbell rung (slot=%#x bar5_off=%#llx, "
-           "new_wptr=%u)",
-           cp.doorbell_index, (unsigned long long)db_off, cp.wptr);
+    // (7-8) Kick via the proper helper — wptr shadow, HDP flush, BAR2
+    // doorbell, and (on AS+TB5) MMIO CP_RB0_WPTR fallback. Was previously
+    // an inline BAR5 32-bit write which never reached the engine; now
+    // routes through cp_kick_doorbell so the same platform health gate
+    // applies as the normal CP submission path.
+    {
+        kern_return_t kr = cp_kick_doorbell(dev, cp);
+        if (kr != kIOReturnSuccess) {
+            CP_LOG("cp_kiq_smoke: cp_kick_doorbell failed: %#x", kr);
+            return kr;
+        }
+    }
+    CP_LOG("cp_kiq_smoke: doorbell rung (slot=%#x new_wptr=%u doorbell_works=%d)",
+           cp.doorbell_index, cp.wptr, dev.doorbell_works ? 1 : 0);
 
     // (9) Poll the fence slot up to timeout_us. 100 µs sleep between
     // reads (IOSleep granularity in DriverKit is 1 ms; using 1).

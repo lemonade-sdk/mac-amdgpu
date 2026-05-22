@@ -68,6 +68,22 @@ struct DeviceContext {
     // as a linear mapping, so base=0. The doorbell_index map
     // provides ASIC-specific doorbell offsets for each ring.
     struct DoorbellState doorbell;
+
+    // **Platform health gate** — does the BAR2 doorbell aperture actually
+    // deliver writes to the chip on this platform? Defaults FALSE.
+    // On Apple Silicon + Thunderbolt 5 the answer is no:
+    // PCIDriverKit's MemoryWrite64 to the doorbell BAR2 does not
+    // reach the engine's MCU, verified v0.1.30-v0.1.46 with every
+    // routing/SELFRING/WC-flush combination. Engine ring kicks
+    // (SDMA, CP, MES) must fall back to MMIO RB_WPTR writes
+    // (upstream's use_doorbell=false branch) when this is false.
+    //
+    // Mirrored from gart.reads_supported in gart_init — same root
+    // cause (GPU-initiated PCIe path partially broken on this
+    // platform). When Apple exposes a working primitive, both flags
+    // flip together and the engine kicks use BAR2 doorbell as the
+    // sole path. [[feedback_mac_amdgpu_doorbell_mmio_mode_as_tb5]]
+    bool         doorbell_works;
 };
 
 //============================================================

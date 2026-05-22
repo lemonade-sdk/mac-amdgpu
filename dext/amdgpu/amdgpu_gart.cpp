@@ -35,7 +35,6 @@ namespace amdgpu {
 kern_return_t
 gart_init(DeviceContext &dev, const GMCContext &gmc, GARTContext &gart)
 {
-    (void)dev;
     if (gmc.gart_size == 0) {
         GART_LOG("init: gmc.gart_size == 0 (gart_enable hasn't run?)");
         return kIOReturnNotReady;
@@ -86,12 +85,22 @@ gart_init(DeviceContext &dev, const GMCContext &gmc, GARTContext &gart)
     // GTT allocations will start working immediately.
     gart.reads_supported = false;
 
+    // Mirror to DeviceContext for engine kick paths. Same root cause
+    // (GPU-initiated PCIe transactions partially broken on AS+TB5):
+    // both GART sysmem reads AND BAR2 doorbell delivery fail. When
+    // Apple exposes a working primitive, flipping reads_supported here
+    // also flips dev.doorbell_works, and engine kicks switch from the
+    // MMIO RB_WPTR fallback to the upstream-style BAR2 doorbell path.
+    dev.doorbell_works = gart.reads_supported;
+
     GART_LOG("init: gart aperture [%#llx..%#llx) size=%llu bytes, "
-             "%u PTEs, pt_bus=%#llx, reads_supported=%d "
-             "(AS+TB5 DART zeroes GPU-initiated reads — "
-             "GTT BOs will return kIOReturnUnsupported)",
+             "%u PTEs, pt_bus=%#llx, reads_supported=%d doorbell_works=%d "
+             "(AS+TB5: DART zeroes GPU reads, BAR2 doorbell delivery "
+             "broken — GTT BOs disabled, kicks use MMIO RB_WPTR)",
              gart.gartStart, gart.gartEnd + 1, gart.gartSize,
-             gart.numPTEs, gmc.gart_pt_bus, gart.reads_supported ? 1 : 0);
+             gart.numPTEs, gmc.gart_pt_bus,
+             gart.reads_supported ? 1 : 0,
+             dev.doorbell_works ? 1 : 0);
     return kIOReturnSuccess;
 }
 

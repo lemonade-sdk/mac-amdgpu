@@ -416,29 +416,35 @@ sdma_kick_doorbell(const DeviceContext &dev, const SDMAInstance &inst)
 
     // 3) BAR2 doorbell aperture write — port of upstream WDOORBELL64.
     //    On AS+TB5 the BAR2 write does NOT cause the SDMA MCU to update
-    //    its internal RB_WPTR — we keep the upstream-shape write for
-    //    portability but it's effectively a no-op on this platform.
-    //    Verified across v0.1.30-v0.1.46 with every plausible NBIF
-    //    routing, SELFRING base, WC-flush readback, and engine-side
-    //    DOORBELL_OFFSET configuration. The functional path is step 4.
-    //    [[feedback_mac_amdgpu_doorbell_mmio_mode_as_tb5]]
+    //    its internal RB_WPTR (see step 4). We keep the upstream-shape
+    //    write for portability — on a platform where doorbell delivery
+    //    works it's sufficient by itself and step 4 below is skipped.
     const uint64_t offs =
         static_cast<uint64_t>(inst.doorbell_index) * 8ull;
     dev.pci->MemoryWrite64(dev.bar2MemIndex, offs, v);
 
-    // 4) **AS+TB5 path that actually works** — MMIO RB_WPTR write.
-    //    Port of upstream sdma_v7_0_ring_set_wptr's else-branch (the
-    //    use_doorbell=false fallback, sdma_v7_0.c:233-241): write
-    //    lower<<2 to regSDMA0_QUEUE0_RB_WPTR and upper<<2 to _HI.
-    //    Even with engine-side QUEUE0_DOORBELL.ENABLE=1 (PSP default),
-    //    the MCU accepts this MMIO update and processes the ring.
-    //    v0.1.44 verified.
-    const uint32_t wptr_reg = sdma_reg_offset(
-        dev, inst.instance, sdma_regs(dev).QUEUE0_RB_WPTR);
-    const uint32_t wptr_hi_reg = sdma_reg_offset(
-        dev, inst.instance, sdma_regs(dev).QUEUE0_RB_WPTR_HI);
-    WREG32(dev, wptr_reg,    static_cast<uint32_t>(v));
-    WREG32(dev, wptr_hi_reg, static_cast<uint32_t>(v >> 32));
+    // 4) MMIO RB_WPTR fallback — gated on the platform health flag.
+    //    [[feedback_mac_amdgpu_doorbell_mmio_mode_as_tb5]]
+    //
+    //    When dev.doorbell_works == false (current AS+TB5 default per
+    //    gart_init): BAR2 doorbell delivery is silently broken, so we
+    //    write the engine's RB_WPTR registers directly. Direct port of
+    //    upstream's sdma_v7_0_ring_set_wptr use_doorbell=false branch
+    //    (sdma_v7_0.c:233-241).
+    //
+    //    When dev.doorbell_works == true (future Apple fix flips the
+    //    flag in gart_init): skip the MMIO write — the BAR2 doorbell
+    //    above is enough, matching upstream's use_doorbell=true branch
+    //    exactly. No double-write race because the MCU's WPTR snoop is
+    //    the same source-of-truth regardless of which path delivers.
+    if (!dev.doorbell_works) {
+        const uint32_t wptr_reg = sdma_reg_offset(
+            dev, inst.instance, sdma_regs(dev).QUEUE0_RB_WPTR);
+        const uint32_t wptr_hi_reg = sdma_reg_offset(
+            dev, inst.instance, sdma_regs(dev).QUEUE0_RB_WPTR_HI);
+        WREG32(dev, wptr_reg,    static_cast<uint32_t>(v));
+        WREG32(dev, wptr_hi_reg, static_cast<uint32_t>(v >> 32));
+    }
     return kIOReturnSuccess;
 }
 
