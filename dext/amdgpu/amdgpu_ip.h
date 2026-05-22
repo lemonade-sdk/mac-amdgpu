@@ -91,11 +91,22 @@ struct IPBaseTable {
     static constexpr int kMaxBaseSegments = 8;
     uint32_t base[(int)IPBlock::Count][kMaxBaseSegments];
 
-    constexpr IPBaseTable() : base{} {
+    // Discovered IP version per block (major.minor.rev). Populated by
+    // amdgpu_discovery.cpp during on-die discovery walk. Used by code
+    // that needs to switch register tables / function tables based on
+    // the chip's actual IP version (e.g. gc_12_0_0 vs gc_12_1_0 offsets,
+    // nbif_v6_3_1 vs nbio_v7_11 funcs, _nbif_4_10 variant for 7.11.4).
+    //
+    // [[feedback_mac_amdgpu_per_ip_version_offsets]] — selecting offsets
+    // at runtime is non-negotiable. Don't hardcode for one chip.
+    IPVersion version[(int)IPBlock::Count];
+
+    constexpr IPBaseTable() : base{}, version{} {
         for (int i = 0; i < (int)IPBlock::Count; i++) {
             for (int j = 0; j < kMaxBaseSegments; j++) {
                 base[i][j] = 0xFFFFFFFFu;
             }
+            version[i] = {0, 0, 0};
         }
     }
 
@@ -124,6 +135,30 @@ struct IPBaseTable {
     void setBase(IPBlock block, int baseIdx, uint32_t b) {
         if (baseIdx < 0 || baseIdx >= kMaxBaseSegments) return;
         base[(int)block][baseIdx] = b;
+    }
+
+    // IP version accessors. Discovery populates these from the on-die
+    // binary's major/minor/revision fields. A version of {0,0,0} means
+    // "unknown" (discovery hasn't run or block not present).
+    IPVersion getVersion(IPBlock block) const { return version[(int)block]; }
+    void setVersion(IPBlock block, IPVersion v) { version[(int)block] = v; }
+    bool isVersion(IPBlock block, uint8_t maj, uint8_t min, uint8_t rev) const {
+        const IPVersion &v = version[(int)block];
+        return v.major == maj && v.minor == min && v.rev == rev;
+    }
+    // Inclusive range check on (major, minor, rev) — useful for
+    // matching across a family of chip revisions.
+    bool isVersionRange(IPBlock block,
+                        uint8_t lo_maj, uint8_t lo_min, uint8_t lo_rev,
+                        uint8_t hi_maj, uint8_t hi_min, uint8_t hi_rev) const {
+        const IPVersion &v = version[(int)block];
+        const uint32_t pack = (uint32_t)v.major << 16 |
+                              (uint32_t)v.minor << 8 | v.rev;
+        const uint32_t lo = (uint32_t)lo_maj << 16 |
+                            (uint32_t)lo_min << 8 | lo_rev;
+        const uint32_t hi = (uint32_t)hi_maj << 16 |
+                            (uint32_t)hi_min << 8 | hi_rev;
+        return pack >= lo && pack <= hi;
     }
 };
 
@@ -454,17 +489,142 @@ namespace NBIORegs {
     constexpr uint32_t BIF_BX1_PCIE_INDEX2               = 0x000E;
     constexpr uint32_t BIF_BX1_PCIE_DATA2                = 0x000F;
 
-    // regRCC_DEV0_EPF0_0_RCC_DOORBELL_APER_EN — enables doorbell aperture.
-    // Bit 0 = BIF_DOORBELL_APER_EN. Port of nbio_v7_11_enable_doorbell_aperture
-    // (nbio_v7_11.c:136). Offset 0x00C0, BASE_IDX 2 per nbio_7_11_0_offset.h.
-    constexpr uint32_t RCC_DOORBELL_APER_EN              = 0x00C0;
+    // PCIe-PORT indirect-access register pair — port of
+    // nbif_v6_3_1_get_pcie_port_{index,data}_offset (nbif_v6_3_1.c:322/332)
+    // and nbio_v7_11_get_pcie_port_{index,data}_offset (nbio_v7_11.c:239/244).
+    // Both NBIF v6.3.1 and NBIO v7.11 resolve through the same RSMU_INDEX/
+    // DATA pair at NBIO BASE_IDX 1 (offset 0x0000/0x0001). The nbif_6_3_1
+    // header names it BX_PF0; the nbio_7_11 header names it BX_PF1 — same
+    // physical register, different SR-IOV "function" prefix.
+    //
+    // For IP_VERSION(7, 11, 4) chips, nbif_v6_3_1 switches to BIF_BX0_PCIE_
+    // INDEX/DATA (offset 0x000C/0x000D BASE_IDX 1). Add both so the runtime
+    // branch in nbif_v6_3_1_get_pcie_port_index_offset can pick correctly.
+    constexpr uint32_t BIF_BX_PF0_RSMU_INDEX             = 0x0000;
+    constexpr uint32_t BIF_BX_PF0_RSMU_DATA              = 0x0001;
+    constexpr uint32_t BIF_BX0_PCIE_INDEX                = 0x000C;
+    constexpr uint32_t BIF_BX0_PCIE_DATA                 = 0x000D;
+    // Legacy alias retained for prior call sites (PCIE_PORT_RREG32 helper).
+    constexpr uint32_t BIF_BX_PF1_RSMU_INDEX             = 0x0000;
+    constexpr uint32_t BIF_BX_PF1_RSMU_DATA              = 0x0001;
 
-    // regBIF_BX1_INTERRUPT_CNTL / _CNTL2 — IH dummy-page + interrupt cfg.
-    // Port of nbio_v7_11_ih_control (nbio_v7_11.c:196). BASE_IDX 2.
+    // ---- NBIF v6.3.1 S2A doorbell entry routing table ------------------
+    //
+    // NBIF v6.3.1 (used by R9700-class chips per discovery hw_id=108
+    // version 6.3.1) routes doorbell BAR2 traffic through eight "Slave-
+    // to-AXI" (S2A) entries, one per consumer block. Each entry packs
+    // ENABLE, AWID (the AXI write ID the consumer listens for), RANGE_
+    // OFFSET, RANGE_SIZE, FENCE_ENABLE, 64BIT_SUPPORT_DIS, DROP_EN, NEED_
+    // DEDUCT_RANGE_OFFSET, and AWADDR_31_28_VALUE (bits 31:28 of the
+    // generated AXI address). Layout per nbif_6_3_1_sh_mask.h:11313+.
+    //
+    // For IP_VERSION(7, 11, 4) the same fields live at the _nbif_4_10
+    // register variants (BASE_IDX 3, far outside Apple's 2 MB BAR5 — must
+    // be reached through PCIE_PORT_RREG/WREG indirect). For base
+    // 6.3.1 / 7.11.0-3, the entries live at BASE_IDX 2 and are reachable
+    // via direct MMIO.
+    //
+    // ENTRY purpose (from nbif_v6_3_1.c):
+    //   0 — GFX/HQD                  (gc_doorbell_init writes 0x30000007)
+    //   1 — IH (ih_doorbell_range, PORT1_AWID=0x0, AWADDR=0x0)
+    //   2 — SDMA  (sdma_doorbell_range, PORT2_AWID=0xe, AWADDR=0x3)
+    //   3 — MES/compute fence       (gc_doorbell_init writes 0x3000000d)
+    //   4 — VCN0  (vcn_doorbell_range)
+    //   5 — VCN1
+    //   6 — VPE (unused on R9700)
+    //   7 — JPEG (unused on R9700)
+    constexpr uint32_t GDC_S2A0_S2A_DOORBELL_ENTRY_0_CTRL = 0x01CB;
+    constexpr uint32_t GDC_S2A0_S2A_DOORBELL_ENTRY_1_CTRL = 0x01CC;
+    constexpr uint32_t GDC_S2A0_S2A_DOORBELL_ENTRY_2_CTRL = 0x01CD;
+    constexpr uint32_t GDC_S2A0_S2A_DOORBELL_ENTRY_3_CTRL = 0x01CE;
+    constexpr uint32_t GDC_S2A0_S2A_DOORBELL_ENTRY_4_CTRL = 0x01CF;
+    constexpr uint32_t GDC_S2A0_S2A_DOORBELL_ENTRY_5_CTRL = 0x01D0;
+    // _nbif_4_10 variants for IP_VERSION(7, 11, 4) at BASE_IDX 3.
+    constexpr uint32_t GDC_S2A0_S2A_DOORBELL_ENTRY_0_CTRL_nbif_4_10 = 0x4F0AEB;
+    constexpr uint32_t GDC_S2A0_S2A_DOORBELL_ENTRY_1_CTRL_nbif_4_10 = 0x4F0AED;
+    constexpr uint32_t GDC_S2A0_S2A_DOORBELL_ENTRY_2_CTRL_nbif_4_10 = 0x4F0AEF;
+    constexpr uint32_t GDC_S2A0_S2A_DOORBELL_ENTRY_3_CTRL_nbif_4_10 = 0x4F0AF1;
+    constexpr uint32_t GDC_S2A0_S2A_DOORBELL_ENTRY_4_CTRL_nbif_4_10 = 0x4F0AF3;
+    constexpr uint32_t GDC_S2A0_S2A_DOORBELL_ENTRY_5_CTRL_nbif_4_10 = 0x4F0AF5;
+
+    // S2A_DOORBELL_PORTn_* field layout (identical across all 8 ports).
+    // From nbif_6_3_1_sh_mask.h:11313-11330.
+    constexpr uint32_t kS2A_DOORBELL_PORT_ENABLE_SHIFT             = 0x0;
+    constexpr uint32_t kS2A_DOORBELL_PORT_ENABLE_MASK              = 0x00000001u;
+    constexpr uint32_t kS2A_DOORBELL_PORT_AWID_SHIFT               = 0x1;
+    constexpr uint32_t kS2A_DOORBELL_PORT_AWID_MASK                = 0x0000003Eu;
+    constexpr uint32_t kS2A_DOORBELL_PORT_FENCE_ENABLE_SHIFT       = 0x6;
+    constexpr uint32_t kS2A_DOORBELL_PORT_FENCE_ENABLE_MASK        = 0x00000040u;
+    constexpr uint32_t kS2A_DOORBELL_PORT_RANGE_OFFSET_SHIFT       = 0x7;
+    constexpr uint32_t kS2A_DOORBELL_PORT_RANGE_OFFSET_MASK        = 0x0001FF80u;
+    constexpr uint32_t kS2A_DOORBELL_PORT_RANGE_SIZE_SHIFT         = 0x11;
+    constexpr uint32_t kS2A_DOORBELL_PORT_RANGE_SIZE_MASK          = 0x01FE0000u;
+    constexpr uint32_t kS2A_DOORBELL_PORT_64BIT_SUPPORT_DIS_SHIFT  = 0x19;
+    constexpr uint32_t kS2A_DOORBELL_PORT_64BIT_SUPPORT_DIS_MASK   = 0x02000000u;
+    constexpr uint32_t kS2A_DOORBELL_PORT_NEED_DEDUCT_OFFSET_SHIFT = 0x1A;
+    constexpr uint32_t kS2A_DOORBELL_PORT_NEED_DEDUCT_OFFSET_MASK  = 0x04000000u;
+    constexpr uint32_t kS2A_DOORBELL_PORT_DROP_EN_SHIFT            = 0x1B;
+    constexpr uint32_t kS2A_DOORBELL_PORT_DROP_EN_MASK             = 0x08000000u;
+    constexpr uint32_t kS2A_DOORBELL_PORT_AWADDR_31_28_VALUE_SHIFT = 0x1C;
+    constexpr uint32_t kS2A_DOORBELL_PORT_AWADDR_31_28_VALUE_MASK  = 0xF0000000u;
+
+    // regRCC_DEV0_EPF0_RCC_DOORBELL_APER_EN — enables doorbell aperture.
+    // Bit 0 = BIF_DOORBELL_APER_EN. Port of nbif_v6_3_1_enable_doorbell_
+    // aperture (nbif_v6_3_1.c:203). NBIF 6.3.1 keeps the same offset
+    // (0x00C0) and BASE_IDX (2) as NBIO 7.11.
+    constexpr uint32_t RCC_DOORBELL_APER_EN              = 0x00C0;
+    constexpr uint32_t kRCC_DOORBELL_APER_EN_BIT         = 0x00000001u;
+
+    // regBIF_BX0_INTERRUPT_CNTL / _CNTL2 — IH dummy-page + interrupt cfg.
+    // Port of nbif_v6_3_1_ih_control (nbif_v6_3_1.c:272). NBIF uses BX0
+    // here (not BX1 like NBIO 7.11). Same offsets, BASE_IDX 2.
     constexpr uint32_t INTERRUPT_CNTL                    = 0x00F1;
     constexpr uint32_t INTERRUPT_CNTL2                   = 0x00F2;
     constexpr uint32_t kINTERRUPT_CNTL_DUMMY_RD_OVERRIDE_MASK = 0x00000001u;
     constexpr uint32_t kINTERRUPT_CNTL_REQ_NONSNOOP_EN_MASK   = 0x00000008u;
+
+    // Doorbell SELFRING aperture — port of nbif_v6_3_1_enable_doorbell_
+    // selfring_aperture (nbif_v6_3_1.c:210). soc24_common_hw_init enables
+    // this BEFORE the regular doorbell aperture. Without it, host->engine
+    // BAR2 doorbell traffic is decoded but never routed.
+    //
+    // NBIF v6.3.1 uses BX_PF0 prefix; NBIO 7.11 uses BX_PF1. Offsets and
+    // BASE_IDX 2 are identical between the two header families, so we
+    // keep the BX_PF1 alias for the v7.11 caller and add BX_PF0 names for
+    // the v6.3.1 caller.
+    constexpr uint32_t BIF_BX_PF0_DOORBELL_SELFRING_GPA_APER_BASE_HIGH = 0x00F3;
+    constexpr uint32_t BIF_BX_PF0_DOORBELL_SELFRING_GPA_APER_BASE_LOW  = 0x00F4;
+    constexpr uint32_t BIF_BX_PF0_DOORBELL_SELFRING_GPA_APER_CNTL      = 0x00F5;
+    // Aliases for the existing v7.11 helpers — same physical regs.
+    constexpr uint32_t BIF_BX_PF1_DOORBELL_SELFRING_GPA_APER_BASE_HIGH = 0x00F3;
+    constexpr uint32_t BIF_BX_PF1_DOORBELL_SELFRING_GPA_APER_BASE_LOW  = 0x00F4;
+    constexpr uint32_t BIF_BX_PF1_DOORBELL_SELFRING_GPA_APER_CNTL      = 0x00F5;
+    // CNTL field shifts/masks (nbif_6_3_1_sh_mask.h equivalent to
+    // nbio_7_11_0_sh_mask.h:55934-55939).
+    constexpr uint32_t kDOORBELL_SELFRING_GPA_APER_EN_SHIFT    = 0x0;
+    constexpr uint32_t kDOORBELL_SELFRING_GPA_APER_EN_MASK     = 0x00000001u;
+    constexpr uint32_t kDOORBELL_SELFRING_GPA_APER_MODE_SHIFT  = 0x1;
+    constexpr uint32_t kDOORBELL_SELFRING_GPA_APER_MODE_MASK   = 0x00000002u;
+    constexpr uint32_t kDOORBELL_SELFRING_GPA_APER_SIZE_SHIFT  = 0x8;
+    constexpr uint32_t kDOORBELL_SELFRING_GPA_APER_SIZE_MASK   = 0x000FFF00u;
+
+    // HDP remap regs — port of nbif_v6_3_1_remap_hdp_registers
+    // (nbif_v6_3_1.c:60). NBIF 6.3.1 places these at offset 0x012d/0x012e
+    // BASE_IDX 2 (within Apple's 2 MB BAR5 — direct MMIO), distinct from
+    // NBIO 7.11 which uses offset 0x8e4d/0x8e4e at BASE_IDX 5 (outside,
+    // requires SMN indirect). Keep the v7.11 constants here too for the
+    // alternate version branch.
+    constexpr uint32_t BIF_BX0_REMAP_HDP_MEM_FLUSH_CNTL  = 0x012D;
+    constexpr uint32_t BIF_BX0_REMAP_HDP_REG_FLUSH_CNTL  = 0x012E;
+    constexpr uint32_t v7_11_REMAP_HDP_MEM_FLUSH_CNTL    = 0x8E4D;
+    constexpr uint32_t v7_11_REMAP_HDP_REG_FLUSH_CNTL    = 0x8E4E;
+
+    // regRCC_DEV0_EPF2_STRAP2 — programmed by nbif_v6_3_1_init_registers
+    // (nbif_v6_3_1.c:355) to clear STRAP_NO_SOFT_RESET_DEV0_F2. This
+    // allows the F2 endpoint to take soft-reset signals; without the
+    // clear, certain RAS-triggered resets are silently masked.
+    constexpr uint32_t RCC_DEV0_EPF2_STRAP2              = 0x009A;
+    constexpr uint32_t kSTRAP_NO_SOFT_RESET_DEV0_F2_MASK = 0x00000002u;
 
     // regBIF_BIF256_CI256_RC3X4_USB4_PCIE_MST_CTRL_3 — PCIe master ctrl
     // for the GPU's PCIe root port. nbio_v7_11_init_registers sets the

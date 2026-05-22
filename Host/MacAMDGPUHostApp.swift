@@ -1025,13 +1025,13 @@ final class DriverController: NSObject, ObservableObject,
         let bootloadOk = (bootload & 0x80000000) != 0
         append("  GC: bringup_complete=\(sdmaReached ? "yes" : "no")  " +
                "BOOTLOAD bit31=\(bootloadOk ? "set" : "clear")")
-        // SDMA STATUS_REG decode — same bits as sdma_log_status in dext.
+        // SDMA STATUS_REG decode — bit positions per gc_12_0_0_sh_mask.h:142+.
         func sdmaDecode(_ s: UInt32) -> String {
             let idle      = (s >> 0)  & 1
-            let rb_empty  = (s >> 4)  & 1
-            let rb_full   = (s >> 9)  & 1
-            let ib_idle   = (s >> 12) & 1
-            let srbm_idle = (s >> 17) & 1
+            let rb_empty  = (s >> 2)  & 1
+            let rb_full   = (s >> 3)  & 1
+            let ib_idle   = (s >> 6)  & 1
+            let srbm_idle = (s >> 14) & 1
             return "idle=\(idle) rb_empty=\(rb_empty) rb_full=\(rb_full) " +
                    "ib_idle=\(ib_idle) srbm_idle=\(srbm_idle)"
         }

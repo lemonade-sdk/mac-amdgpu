@@ -18,11 +18,82 @@
 #include <PCIDriverKit/IOPCIDevice.h>
 
 #include "amdgpu_gart.h"
+#include "amdgpu_gmc.h"
 
 #define GART_LOG(fmt, ...) \
     os_log(OS_LOG_DEFAULT, "mac.amdgpu.gart: " fmt, ##__VA_ARGS__)
 
 namespace amdgpu {
+
+//============================================================
+// gart_init — populate GARTContext from a just-enabled GMC GART.
+//
+// Run AFTER gmc_gfxhub_gart_enable / gmc_mmhub_gart_enable so that
+// gmc.gart_start / gmc.gart_size are valid. Sets up the bump
+// allocator and the platform-gated `reads_supported` flag.
+//============================================================
+kern_return_t
+gart_init(DeviceContext &dev, const GMCContext &gmc, GARTContext &gart)
+{
+    (void)dev;
+    if (gmc.gart_size == 0) {
+        GART_LOG("init: gmc.gart_size == 0 (gart_enable hasn't run?)");
+        return kIOReturnNotReady;
+    }
+
+    // Derive PT VRAM offset from gmc.gart_pt_bus (= vram_start + offset
+    // per gmc_alloc_resources at gmc_v12_0.cpp:512). The constant
+    // kGMCGartPTVRAMOffset is file-local to gmc_v12_0.cpp and not
+    // exposed in the header — subtraction reconstructs it.
+    gart.enabled            = true;
+    gart.pageTableVRAMOffset = (gmc.gart_pt_bus > gmc.vram_start)
+        ? (gmc.gart_pt_bus - gmc.vram_start) : 0;
+    gart.pageTableSize       = gmc.gart_pt_size;
+    gart.numPTEs             = static_cast<uint32_t>(
+        gmc.gart_size / kAMDGPUGPUPageSize);
+    gart.gartStart           = gmc.gart_start;
+    gart.gartEnd             = gmc.gart_start + gmc.gart_size - 1;
+    gart.gartSize            = gmc.gart_size;
+    gart.nextFreeOffset      = 0;
+
+    // **Platform gate — GPU-initiated sysmem reads.**
+    //
+    // GART is fully functional from a software standpoint:
+    //   • Page table is allocated in VRAM and zero-initialised
+    //   • MMHUB / GFXHUB program the PT base, aperture start/end,
+    //     VMID0 cntl exactly per upstream
+    //   • gart_bind_sysmem / gart_bind_existing write PTEs correctly
+    //   • Engine MC resolution returns the right bus address
+    //
+    // What does NOT work today: DART silently zeros every GPU-initiated
+    // sysmem read on Apple Silicon + Thunderbolt 5. The PCIe transaction
+    // reaches DART, but the data returned is all zero. So even though
+    // the PTE points at the right host RAM, the engine receives zeros
+    // instead of the actual bytes. See
+    // [[feedback_mac_amdgpu_dart_tb5_pcie_reads]] for the test history.
+    //
+    // We default this flag FALSE on every platform we currently support.
+    // Higher layers (BOAlloc(kBODomainGTT) etc.) refuse GTT allocations
+    // when the flag is false, returning kIOReturnUnsupported so clients
+    // fail loud instead of allocating a BO that returns zero on every
+    // engine read.
+    //
+    // When Apple exposes a sysmem mapping primitive whose GPU-initiated
+    // reads return real bytes — a new IODMACommand option, a per-host-app
+    // entitlement, a non-DART path, whatever it ends up being — extend
+    // the platform-detect logic here to flip this to true under that
+    // condition. The rest of the GART stack is already operational, so
+    // GTT allocations will start working immediately.
+    gart.reads_supported = false;
+
+    GART_LOG("init: gart aperture [%#llx..%#llx) size=%llu bytes, "
+             "%u PTEs, pt_bus=%#llx, reads_supported=%d "
+             "(AS+TB5 DART zeroes GPU-initiated reads — "
+             "GTT BOs will return kIOReturnUnsupported)",
+             gart.gartStart, gart.gartEnd + 1, gart.gartSize,
+             gart.numPTEs, gmc.gart_pt_bus, gart.reads_supported ? 1 : 0);
+    return kIOReturnSuccess;
+}
 
 // GART aperture in MC space. Picked LOW (4 GB MC offset) — safely
 // below vram_start (= 512 GB for our R9700) and well within the

@@ -569,16 +569,33 @@ mac_amdgpu_ensure_open(IOService *opener, MacAMDGPU *driver,
                   (unsigned)cmd, bdev.bar0Size);
 
     // Read PCI config space + try to wake device to D0.
-    uint32_t bar0_cfg = 0, bar2_cfg = 0, bar5_cfg = 0;
+    uint32_t bar0_cfg = 0, bar2_cfg = 0, bar2_cfg_hi = 0, bar5_cfg = 0;
     uint16_t status = 0;
     pci->ConfigurationRead32(0x10, &bar0_cfg);
     pci->ConfigurationRead32(0x18, &bar2_cfg);
+    pci->ConfigurationRead32(0x1C, &bar2_cfg_hi);  // 64-bit BAR2 high dword
     pci->ConfigurationRead32(0x24, &bar5_cfg);
     pci->ConfigurationRead16(0x06, &status);
-    MACAMDGPU_LOG("ensure_open: config — BAR0=%#010x BAR2=%#010x "
+    MACAMDGPU_LOG("ensure_open: config — BAR0=%#010x BAR2=%#010x:%#010x "
                   "BAR5=%#010x status=%#06x cmd=%#06x",
-                  bar0_cfg, bar2_cfg, bar5_cfg, (unsigned)status,
+                  bar0_cfg, bar2_cfg_hi, bar2_cfg, bar5_cfg, (unsigned)status,
                   (unsigned)cmd);
+
+    // Cache BAR2's PCIe bus address — used by enable_doorbell_selfring_aperture
+    // (port of nbio_v7_11.c:149). BAR2 LOW carries flag bits in [3:0] for a
+    // 64-bit prefetchable memory BAR; mask them off. HIGH is the upper dword
+    // verbatim. If config reads are unreliable on AS (the BAR config-reg
+    // read quirk), the resulting base will be wrong but selfring's EN bit
+    // may still be enough — fall back to base=0 if BAR2 LOW reads as 0.
+    {
+        const uint64_t bar2_phys_lo =
+            static_cast<uint64_t>(bar2_cfg & 0xFFFFFFF0u);
+        const uint64_t bar2_phys_hi =
+            static_cast<uint64_t>(bar2_cfg_hi) << 32;
+        bdev.doorbell.base = bar2_phys_hi | bar2_phys_lo;
+        MACAMDGPU_LOG("ensure_open: doorbell.base (BAR2 bus addr) = %#llx",
+                      (unsigned long long)bdev.doorbell.base);
+    }
 
     // Look for the PM capability and force D0. The capability list
     // pointer is at config offset 0x34.
@@ -1536,20 +1553,20 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                 SOC15_REG_OFFSET_BIDX(bdev, amdgpu::IPBlock::GC, 1,
                                       amdgpu::GCRegs::RLC_RLCS_BOOTLOAD_STATUS));
             arguments->scalarOutput[3] = amdgpu::RREG32(bdev,
-                amdgpu::sdma_reg_offset(bdev, 0, amdgpu::SDMARegs::STATUS_REG));
+                amdgpu::sdma_reg_offset(bdev, 0, amdgpu::sdma_regs(bdev).STATUS_REG));
             arguments->scalarOutput[4] = amdgpu::RREG32(bdev,
-                amdgpu::sdma_reg_offset(bdev, 1, amdgpu::SDMARegs::STATUS_REG));
+                amdgpu::sdma_reg_offset(bdev, 1, amdgpu::sdma_regs(bdev).STATUS_REG));
             // v0.1.32 — SDMA0 RPTR/WPTR + MCU_CNTL so we can SEE whether
             // doorbell delivery is updating the engine's wptr (if rptr
             // is stuck at 0 after a submit, the doorbell isn't landing).
             arguments->scalarOutput[8] = amdgpu::RREG32(bdev,
-                amdgpu::sdma_reg_offset(bdev, 0, amdgpu::SDMARegs::QUEUE0_RB_RPTR));
+                amdgpu::sdma_reg_offset(bdev, 0, amdgpu::sdma_regs(bdev).QUEUE0_RB_RPTR));
             arguments->scalarOutput[9] = amdgpu::RREG32(bdev,
-                amdgpu::sdma_reg_offset(bdev, 0, amdgpu::SDMARegs::QUEUE0_RB_WPTR));
+                amdgpu::sdma_reg_offset(bdev, 0, amdgpu::sdma_regs(bdev).QUEUE0_RB_WPTR));
             arguments->scalarOutput[10] = amdgpu::RREG32(bdev,
-                amdgpu::sdma_reg_offset(bdev, 0, amdgpu::SDMARegs::QUEUE0_RB_CNTL));
+                amdgpu::sdma_reg_offset(bdev, 0, amdgpu::sdma_regs(bdev).QUEUE0_RB_CNTL));
             arguments->scalarOutput[11] = amdgpu::RREG32(bdev,
-                amdgpu::sdma_reg_offset(bdev, 0, amdgpu::SDMARegs::MCU_CNTL));
+                amdgpu::sdma_reg_offset(bdev, 0, amdgpu::sdma_regs(bdev).MCU_CNTL));
         }
         if (bdev.ip.isResolved(amdgpu::IPBlock::MP1, /*baseIdx=*/1) &&
             bdev.smuOnline) {
@@ -2610,7 +2627,27 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             // owned by this BO entry so BOFree releases it.
             auto &gart = driver->ivars->bringup.gart;
             if (gart.numPTEs == 0) {
-                allocRet = kIOReturnNotReady;  // GART not up yet
+                MACAMDGPU_LOG("BOAlloc(GTT): GART not yet initialized "
+                              "(gfxhub_gart_enable hasn't run) — "
+                              "returning kIOReturnNotReady");
+                allocRet = kIOReturnNotReady;
+                goto bo_alloc_fail;
+            }
+            // **Platform gate** — GPU-initiated DART sysmem reads return
+            // zero on AS+TB5 (see [[feedback_mac_amdgpu_dart_tb5_pcie_reads]]).
+            // GART itself is fully programmed, but engines reading through
+            // GART → DART → sysmem get all zeros. Fail loud here instead
+            // of handing out a BO that silently misbehaves on every read.
+            // When Apple exposes a working sysmem-mapping primitive,
+            // gart_init() flips reads_supported=true and this path lights
+            // up automatically. No client API changes.
+            if (!gart.reads_supported) {
+                MACAMDGPU_LOG("BOAlloc(GTT): refused — gart.reads_supported "
+                              "= false on this platform (AS+TB5 DART "
+                              "zeroes GPU-initiated sysmem reads). Use "
+                              "kBODomainVRAM instead. Returning "
+                              "kIOReturnUnsupported.");
+                allocRet = kIOReturnUnsupported;
                 goto bo_alloc_fail;
             }
             amdgpu::GARTBinding binding = {};

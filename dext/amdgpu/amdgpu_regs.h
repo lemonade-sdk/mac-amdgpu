@@ -264,6 +264,62 @@ SMN_WREG32(const DeviceContext &ctx, uint32_t smn_reg_dword, uint32_t value)
 }
 #endif
 
+// PCIe-PORT indirect access via BIF_BX_PF1_RSMU_INDEX/DATA — port of
+// amdgpu_device_pcie_port_rreg / amdgpu_device_pcie_port_wreg
+// (amdgpu_reg_access.c:899/915). DISTINCT from SMN_RREG/WREG above:
+//   - SMN path: PCIE_INDEX2/DATA2 (BIF_BX1, BASE_IDX 0) — used for
+//     NBIO BASE_IDX 4/5 registers (HDP remap, strap4, MST_CTRL_3).
+//   - PORT path: RSMU_INDEX/DATA (BIF_BX_PF1, BASE_IDX 1) — used for
+//     NBIO BASE_IDX 3 registers (the GDC0_BIF_*_DOORBELL_RANGE family).
+// They are independent indirect apertures with different routing.
+//
+// Per upstream amdgpu_device_pcie_port_rreg, the protocol writes
+// `reg * 4` (i.e. the dword-resolved address shifted to byte) to the
+// INDEX register, flushes via readback, then reads/writes DATA.
+//
+// The INDEX/DATA pair is resolved via NBIO BASE_IDX 1. Caller MUST
+// ensure ctx.ip.isResolved(NBIO, 1) is true; otherwise this writes to
+// the sentinel and corrupts the chip.
+#ifdef __APPLE__
+static inline uint32_t
+PCIE_PORT_RREG32(const DeviceContext &ctx, uint32_t pcie_port_reg_dword)
+{
+    const uint32_t idx_reg = SOC15_REG_OFFSET_BIDX(
+        ctx, IPBlock::NBIO, 1, NBIORegs::BIF_BX_PF1_RSMU_INDEX);
+    const uint32_t dat_reg = SOC15_REG_OFFSET_BIDX(
+        ctx, IPBlock::NBIO, 1, NBIORegs::BIF_BX_PF1_RSMU_DATA);
+    const uint64_t idx_byte = static_cast<uint64_t>(idx_reg) * 4ULL;
+    const uint64_t dat_byte = static_cast<uint64_t>(dat_reg) * 4ULL;
+    const uint32_t addr_byte = pcie_port_reg_dword << 2;
+    uint32_t scratch = 0;
+    ctx.pci->MemoryWrite32(ctx.bar5MemIndex, idx_byte, addr_byte);
+    ctx.pci->MemoryRead32(ctx.bar5MemIndex, idx_byte, &scratch);
+    (void)scratch;
+    uint32_t value = 0;
+    ctx.pci->MemoryRead32(ctx.bar5MemIndex, dat_byte, &value);
+    return value;
+}
+
+static inline void
+PCIE_PORT_WREG32(const DeviceContext &ctx, uint32_t pcie_port_reg_dword,
+                 uint32_t value)
+{
+    const uint32_t idx_reg = SOC15_REG_OFFSET_BIDX(
+        ctx, IPBlock::NBIO, 1, NBIORegs::BIF_BX_PF1_RSMU_INDEX);
+    const uint32_t dat_reg = SOC15_REG_OFFSET_BIDX(
+        ctx, IPBlock::NBIO, 1, NBIORegs::BIF_BX_PF1_RSMU_DATA);
+    const uint64_t idx_byte = static_cast<uint64_t>(idx_reg) * 4ULL;
+    const uint64_t dat_byte = static_cast<uint64_t>(dat_reg) * 4ULL;
+    const uint32_t addr_byte = pcie_port_reg_dword << 2;
+    uint32_t scratch = 0;
+    ctx.pci->MemoryWrite32(ctx.bar5MemIndex, idx_byte, addr_byte);
+    ctx.pci->MemoryRead32(ctx.bar5MemIndex, idx_byte, &scratch);
+    ctx.pci->MemoryWrite32(ctx.bar5MemIndex, dat_byte, value);
+    ctx.pci->MemoryRead32(ctx.bar5MemIndex, dat_byte, &scratch);
+    (void)scratch;
+}
+#endif
+
 // memcpy-equivalent for staging a buffer into VRAM via BAR0. Uses
 // MemoryWrite64 in the aligned-8-byte-stride region for ~2× fewer
 // MMIO calls vs all-32-bit writes (DMA-1 in docs/DMA_FIX_PLAN.md).

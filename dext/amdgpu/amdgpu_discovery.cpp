@@ -213,6 +213,12 @@ discovery_parse(const uint8_t *binary, uint64_t binarySize,
                 for (uint8_t b = 0; b < numBases; b++) {
                     dev.ip.setBase(blk, b, bases[b]);
                 }
+                // Capture the discovered IP version per block so runtime
+                // code can switch register-offset tables / function
+                // pointers based on the actual chip.
+                // [[feedback_mac_amdgpu_per_ip_version_offsets]]
+                dev.ip.setVersion(blk, IPVersion{
+                    ip->major, ip->minor, ip->revision});
                 ips_recognised++;
                 DISC_LOG("  ip[%u] hw_id=%u %{public}s v%u.%u.%u "
                          "bases=[%#010x %#010x %#010x %#010x %#010x "

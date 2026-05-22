@@ -149,7 +149,7 @@ sdma_engine_halt(const DeviceContext &dev, uint32_t instance, bool halt)
         SDMA_LOG("engine_halt: GC IP base not resolved");
         return kIOReturnNotReady;
     }
-    const uint32_t reg = sdma_reg_offset(dev, instance, SDMARegs::MCU_CNTL);
+    const uint32_t reg = sdma_reg_offset(dev, instance, sdma_regs(dev).MCU_CNTL);
     uint32_t v = RREG32(dev, reg);
     v = REG_SET_FIELD(v, SDMA0_SDMA_MCU_CNTL, HALT, halt ? 1u : 0u);
     v = REG_SET_FIELD(v, SDMA0_SDMA_MCU_CNTL, RESET, 0u);
@@ -166,9 +166,9 @@ sdma_gfx_stop_instance(const DeviceContext &dev, uint32_t instance)
 {
     if (!dev.ip.isResolved(IPBlock::GC)) return kIOReturnNotReady;
     const uint32_t rb_cntl_reg =
-        sdma_reg_offset(dev, instance, SDMARegs::QUEUE0_RB_CNTL);
+        sdma_reg_offset(dev, instance, sdma_regs(dev).QUEUE0_RB_CNTL);
     const uint32_t ib_cntl_reg =
-        sdma_reg_offset(dev, instance, SDMARegs::QUEUE0_IB_CNTL);
+        sdma_reg_offset(dev, instance, sdma_regs(dev).QUEUE0_IB_CNTL);
 
     uint32_t rb_cntl = RREG32(dev, rb_cntl_reg);
     rb_cntl = REG_SET_FIELD(rb_cntl, SDMA0_SDMA_QUEUE0_RB_CNTL, RB_ENABLE, 0);
@@ -225,47 +225,58 @@ sdma_gfx_resume_instance(const DeviceContext &dev, SDMAInstance &inst)
 
     // 1) Initial RB_CNTL — set RB_SIZE, set RB_PRIV.
     uint32_t rb_bufsz = order_base_2(inst.ring_size_dwords);
-    uint32_t rb_cntl = RREG32(dev, reg(SDMARegs::QUEUE0_RB_CNTL));
+    uint32_t rb_cntl = RREG32(dev, reg(sdma_regs(dev).QUEUE0_RB_CNTL));
     SDMA_LOG("SDMA%u  RB_CNTL initial = %#010x (programming RB_SIZE=%u, RB_PRIV=1)",
              i, rb_cntl, rb_bufsz);
     rb_cntl = REG_SET_FIELD(rb_cntl, SDMA0_SDMA_QUEUE0_RB_CNTL, RB_SIZE, rb_bufsz);
     rb_cntl = REG_SET_FIELD(rb_cntl, SDMA0_SDMA_QUEUE0_RB_CNTL, RB_PRIV, 1);
-    WREG32(dev, reg(SDMARegs::QUEUE0_RB_CNTL), rb_cntl);
+    WREG32(dev, reg(sdma_regs(dev).QUEUE0_RB_CNTL), rb_cntl);
 
     // 2) Reset RPTR/WPTR.
-    WREG32(dev, reg(SDMARegs::QUEUE0_RB_RPTR),    0);
-    WREG32(dev, reg(SDMARegs::QUEUE0_RB_RPTR_HI), 0);
-    WREG32(dev, reg(SDMARegs::QUEUE0_RB_WPTR),    0);
-    WREG32(dev, reg(SDMARegs::QUEUE0_RB_WPTR_HI), 0);
+    WREG32(dev, reg(sdma_regs(dev).QUEUE0_RB_RPTR),    0);
+    WREG32(dev, reg(sdma_regs(dev).QUEUE0_RB_RPTR_HI), 0);
+    WREG32(dev, reg(sdma_regs(dev).QUEUE0_RB_WPTR),    0);
+    WREG32(dev, reg(sdma_regs(dev).QUEUE0_RB_WPTR_HI), 0);
 
     // 3) WPTR poll address (shadow in WB page; engine doesn't use
     //    when WPTR_POLL_ENABLE=0, but we still program it).
-    WREG32(dev, reg(SDMARegs::QUEUE0_RB_WPTR_POLL_ADDR_LO),
+    WREG32(dev, reg(sdma_regs(dev).QUEUE0_RB_WPTR_POLL_ADDR_LO),
            static_cast<uint32_t>(inst.wptr_poll_gpu_addr));
-    WREG32(dev, reg(SDMARegs::QUEUE0_RB_WPTR_POLL_ADDR_HI),
+    WREG32(dev, reg(sdma_regs(dev).QUEUE0_RB_WPTR_POLL_ADDR_HI),
            static_cast<uint32_t>(inst.wptr_poll_gpu_addr >> 32));
 
     // 4) RPTR write-back address — engine deposits read-pointer here.
-    WREG32(dev, reg(SDMARegs::QUEUE0_RB_RPTR_ADDR_HI),
+    WREG32(dev, reg(sdma_regs(dev).QUEUE0_RB_RPTR_ADDR_HI),
            static_cast<uint32_t>(inst.rptr_gpu_addr >> 32));
-    WREG32(dev, reg(SDMARegs::QUEUE0_RB_RPTR_ADDR_LO),
+    WREG32(dev, reg(sdma_regs(dev).QUEUE0_RB_RPTR_ADDR_LO),
            static_cast<uint32_t>(inst.rptr_gpu_addr & 0xFFFFFFFC));
 
-    // 5) Enable RPTR writeback (engine WRITES to rptr_gpu_addr — sysmem
-    //    writes through DART work). Both WPTR_POLL paths OFF because
-    //    wptr_poll_addr is sysmem and GPU READS of DART sysmem return
-    //    zeros on AS+TB5. Engine wptr is updated via doorbell kick only.
+    // 5) Enable RPTR writeback + MCU_WPTR_POLL.
+    //
+    // WPTR_POLL_ENABLE — only enabled on SR-IOV (upstream line 526).
+    // It makes the engine poll sysmem at wptr_poll_gpu_addr; on AS+TB5
+    // GPU-initiated reads of DART-mapped sysmem return zeros, so we
+    // can't use this path anyway. Bare-metal sets it to 0 (matches us).
+    //
+    // MCU_WPTR_POLL_ENABLE — the SDMA microcontroller (MCU) uses this
+    // to watch for WPTR updates. Upstream sets this to 1 UNCONDITIONALLY
+    // (line 530), bare-metal AND SR-IOV. **Earlier we incorrectly set it
+    // to 0 thinking it was a sysmem-polling enable; it is not — it gates
+    // the MCU's ability to react to doorbell-delivered WPTR updates.**
+    // Without it, the doorbell aperture write arrives at the engine,
+    // but the MCU never picks up the new WPTR → RB_WPTR register stays
+    // at 0 and no packets are processed. (v0.1.33-v0.1.37 symptom.)
     rb_cntl = REG_SET_FIELD(rb_cntl, SDMA0_SDMA_QUEUE0_RB_CNTL,
                             RPTR_WRITEBACK_ENABLE, 1);
     rb_cntl = REG_SET_FIELD(rb_cntl, SDMA0_SDMA_QUEUE0_RB_CNTL,
                             WPTR_POLL_ENABLE, 0);
     rb_cntl = REG_SET_FIELD(rb_cntl, SDMA0_SDMA_QUEUE0_RB_CNTL,
-                            MCU_WPTR_POLL_ENABLE, 0);
+                            MCU_WPTR_POLL_ENABLE, 1);
 
     // 6) Ring base — RB_BASE is bus_addr >> 8, BASE_HI is >> 40.
-    WREG32(dev, reg(SDMARegs::QUEUE0_RB_BASE),
+    WREG32(dev, reg(sdma_regs(dev).QUEUE0_RB_BASE),
            static_cast<uint32_t>(inst.ring_gpu_va >> 8));
-    WREG32(dev, reg(SDMARegs::QUEUE0_RB_BASE_HI),
+    WREG32(dev, reg(sdma_regs(dev).QUEUE0_RB_BASE_HI),
            static_cast<uint32_t>(inst.ring_gpu_va >> 40));
     SDMA_LOG("SDMA%u  RB_BASE = %#010x:%#010x (ring_gpu_va >> 8 / >> 40)",
              i,
@@ -276,49 +287,49 @@ sdma_gfx_resume_instance(const DeviceContext &dev, SDMAInstance &inst)
 
     // 7) MINOR_PTR_UPDATE handshake — set 1 before writing WPTR,
     //    write WPTR, then clear MINOR_PTR_UPDATE.
-    WREG32(dev, reg(SDMARegs::QUEUE0_MINOR_PTR_UPDATE), 1);
-    WREG32(dev, reg(SDMARegs::QUEUE0_RB_WPTR),    inst.wptr << 2);
-    WREG32(dev, reg(SDMARegs::QUEUE0_RB_WPTR_HI), 0);
+    WREG32(dev, reg(sdma_regs(dev).QUEUE0_MINOR_PTR_UPDATE), 1);
+    WREG32(dev, reg(sdma_regs(dev).QUEUE0_RB_WPTR),    inst.wptr << 2);
+    WREG32(dev, reg(sdma_regs(dev).QUEUE0_RB_WPTR_HI), 0);
 
     // 8) Doorbell config — enable doorbell + offset = doorbell_index.
-    uint32_t doorbell        = RREG32(dev, reg(SDMARegs::QUEUE0_DOORBELL));
-    uint32_t doorbell_offset = RREG32(dev, reg(SDMARegs::QUEUE0_DOORBELL_OFFSET));
+    uint32_t doorbell        = RREG32(dev, reg(sdma_regs(dev).QUEUE0_DOORBELL));
+    uint32_t doorbell_offset = RREG32(dev, reg(sdma_regs(dev).QUEUE0_DOORBELL_OFFSET));
     doorbell        = REG_SET_FIELD(doorbell,
                                     SDMA0_SDMA_QUEUE0_DOORBELL, ENABLE, 1);
     doorbell_offset = REG_SET_FIELD(doorbell_offset,
                                     SDMA0_SDMA_QUEUE0_DOORBELL_OFFSET, OFFSET,
                                     inst.doorbell_index);
-    WREG32(dev, reg(SDMARegs::QUEUE0_DOORBELL),        doorbell);
-    WREG32(dev, reg(SDMARegs::QUEUE0_DOORBELL_OFFSET), doorbell_offset);
+    WREG32(dev, reg(sdma_regs(dev).QUEUE0_DOORBELL),        doorbell);
+    WREG32(dev, reg(sdma_regs(dev).QUEUE0_DOORBELL_OFFSET), doorbell_offset);
     SDMA_LOG("SDMA%u  DOORBELL=%#x DOORBELL_OFFSET=%#x",
              i, doorbell, doorbell_offset);
 
     // 9) Clear MINOR_PTR_UPDATE after wptr.
-    WREG32(dev, reg(SDMARegs::QUEUE0_MINOR_PTR_UPDATE), 0);
+    WREG32(dev, reg(sdma_regs(dev).QUEUE0_MINOR_PTR_UPDATE), 0);
 
     // 10) Watchdog: 100ms per unit, usec_timeout/100000 floored at 1.
     //     For now we just write 1 (we don't carry a usec_timeout var).
     {
-        uint32_t v = RREG32(dev, reg(SDMARegs::WATCHDOG_CNTL));
+        uint32_t v = RREG32(dev, reg(sdma_regs(dev).WATCHDOG_CNTL));
         v = REG_SET_FIELD(v, SDMA0_SDMA_WATCHDOG_CNTL, QUEUE_HANG_COUNT, 1);
-        WREG32(dev, reg(SDMARegs::WATCHDOG_CNTL), v);
+        WREG32(dev, reg(sdma_regs(dev).WATCHDOG_CNTL), v);
     }
 
     // 11) UTCL1 RESP_MODE=3, REDO_DELAY=9.
     {
-        uint32_t v = RREG32(dev, reg(SDMARegs::UTCL1_CNTL));
+        uint32_t v = RREG32(dev, reg(sdma_regs(dev).UTCL1_CNTL));
         v = REG_SET_FIELD(v, SDMA0_SDMA_UTCL1_CNTL, RESP_MODE,  3);
         v = REG_SET_FIELD(v, SDMA0_SDMA_UTCL1_CNTL, REDO_DELAY, 9);
-        WREG32(dev, reg(SDMARegs::UTCL1_CNTL), v);
+        WREG32(dev, reg(sdma_regs(dev).UTCL1_CNTL), v);
     }
 
     // 12) UTCL1_PAGE — clean read+write policy bits, set L2 defaults
     //     (CACHE_READ_POLICY_L2__DEFAULT = 0 → bits [13:12] = 0,
     //      CACHE_WRITE_POLICY_L2__DEFAULT = 0 → bits [15:14] = 0).
     {
-        uint32_t v = RREG32(dev, reg(SDMARegs::UTCL1_PAGE));
+        uint32_t v = RREG32(dev, reg(sdma_regs(dev).UTCL1_PAGE));
         v &= 0xFF0FFFu;
-        WREG32(dev, reg(SDMARegs::UTCL1_PAGE), v);
+        WREG32(dev, reg(sdma_regs(dev).UTCL1_PAGE), v);
     }
 
     // 13) Unhalt engine via MCU_CNTL.
@@ -327,11 +338,11 @@ sdma_gfx_resume_instance(const DeviceContext &dev, SDMAInstance &inst)
 
     // 14) Enable the ring + IB.
     rb_cntl = REG_SET_FIELD(rb_cntl, SDMA0_SDMA_QUEUE0_RB_CNTL, RB_ENABLE, 1);
-    WREG32(dev, reg(SDMARegs::QUEUE0_RB_CNTL), rb_cntl);
+    WREG32(dev, reg(sdma_regs(dev).QUEUE0_RB_CNTL), rb_cntl);
 
-    uint32_t ib_cntl = RREG32(dev, reg(SDMARegs::QUEUE0_IB_CNTL));
+    uint32_t ib_cntl = RREG32(dev, reg(sdma_regs(dev).QUEUE0_IB_CNTL));
     ib_cntl = REG_SET_FIELD(ib_cntl, SDMA0_SDMA_QUEUE0_IB_CNTL, IB_ENABLE, 1);
-    WREG32(dev, reg(SDMARegs::QUEUE0_IB_CNTL), ib_cntl);
+    WREG32(dev, reg(sdma_regs(dev).QUEUE0_IB_CNTL), ib_cntl);
 
     inst.enabled = true;
     SDMA_LOG("SDMA%u: gfx_resume done — RB_CNTL=%#010x IB_CNTL=%#010x "
@@ -384,10 +395,50 @@ kern_return_t
 sdma_kick_doorbell(const DeviceContext &dev, const SDMAInstance &inst)
 {
     if (!inst.inited) return kIOReturnNotReady;
+    if (!dev.ip.isResolved(IPBlock::GC)) return kIOReturnNotReady;
+    const uint64_t v = static_cast<uint64_t>(inst.wptr) << 2;
+
+    // 1) sysmem WPTR shadow — upstream sdma_v7_0_ring_set_wptr line 220
+    //    writes (ring->wptr << 2) to ring->wptr_cpu_addr. With MCU_WPTR
+    //    _POLL_ENABLE=1 the SDMA MCU polls this sysmem slot. Even on
+    //    AS+TB5 (where GPU-initiated DART sysmem reads return zero)
+    //    we still write this — upstream's contract is the contract.
+    if (inst.wb_cpu) {
+        volatile uint64_t *wptr_shadow =
+            reinterpret_cast<volatile uint64_t *>(
+                static_cast<uint8_t *>(inst.wb_cpu) + 0x40);
+        *wptr_shadow = v;
+    }
+
+    // 2) HDP flush so the engine's PCIe read of wptr_poll_addr drains
+    //    past our CPU write.
+    amdgpu_hdp_flush(dev);
+
+    // 3) BAR2 doorbell aperture write — port of upstream WDOORBELL64.
+    //    On AS+TB5 the BAR2 write does NOT cause the SDMA MCU to update
+    //    its internal RB_WPTR — we keep the upstream-shape write for
+    //    portability but it's effectively a no-op on this platform.
+    //    Verified across v0.1.30-v0.1.46 with every plausible NBIF
+    //    routing, SELFRING base, WC-flush readback, and engine-side
+    //    DOORBELL_OFFSET configuration. The functional path is step 4.
+    //    [[feedback_mac_amdgpu_doorbell_mmio_mode_as_tb5]]
     const uint64_t offs =
         static_cast<uint64_t>(inst.doorbell_index) * 8ull;
-    const uint64_t v = static_cast<uint64_t>(inst.wptr) << 2;
     dev.pci->MemoryWrite64(dev.bar2MemIndex, offs, v);
+
+    // 4) **AS+TB5 path that actually works** — MMIO RB_WPTR write.
+    //    Port of upstream sdma_v7_0_ring_set_wptr's else-branch (the
+    //    use_doorbell=false fallback, sdma_v7_0.c:233-241): write
+    //    lower<<2 to regSDMA0_QUEUE0_RB_WPTR and upper<<2 to _HI.
+    //    Even with engine-side QUEUE0_DOORBELL.ENABLE=1 (PSP default),
+    //    the MCU accepts this MMIO update and processes the ring.
+    //    v0.1.44 verified.
+    const uint32_t wptr_reg = sdma_reg_offset(
+        dev, inst.instance, sdma_regs(dev).QUEUE0_RB_WPTR);
+    const uint32_t wptr_hi_reg = sdma_reg_offset(
+        dev, inst.instance, sdma_regs(dev).QUEUE0_RB_WPTR_HI);
+    WREG32(dev, wptr_reg,    static_cast<uint32_t>(v));
+    WREG32(dev, wptr_hi_reg, static_cast<uint32_t>(v >> 32));
     return kIOReturnSuccess;
 }
 
@@ -573,22 +624,23 @@ sdma_log_status(const DeviceContext &dev, uint32_t inst)
         return;
     }
     uint32_t status = RREG32(dev,
-        sdma_reg_offset(dev, inst, SDMARegs::STATUS_REG));
+        sdma_reg_offset(dev, inst, sdma_regs(dev).STATUS_REG));
     uint32_t rb_rptr = RREG32(dev,
-        sdma_reg_offset(dev, inst, SDMARegs::QUEUE0_RB_RPTR));
+        sdma_reg_offset(dev, inst, sdma_regs(dev).QUEUE0_RB_RPTR));
     uint32_t rb_wptr = RREG32(dev,
-        sdma_reg_offset(dev, inst, SDMARegs::QUEUE0_RB_WPTR));
+        sdma_reg_offset(dev, inst, sdma_regs(dev).QUEUE0_RB_WPTR));
     uint32_t rb_cntl = RREG32(dev,
-        sdma_reg_offset(dev, inst, SDMARegs::QUEUE0_RB_CNTL));
+        sdma_reg_offset(dev, inst, sdma_regs(dev).QUEUE0_RB_CNTL));
+    // STATUS_REG bit positions per gc_12_0_0_sh_mask.h:142-161.
     SDMA_LOG("SDMA%u status: STATUS_REG=%#010x RB_CNTL=%#010x "
              "rptr=%#x wptr=%#x  "
              "(idle=%u rb_empty=%u rb_full=%u ib_idle=%u srbm_idle=%u)",
              inst, status, rb_cntl, rb_rptr, rb_wptr,
-             (status >> 0) & 1,    // IDLE
-             (status >> 4) & 1,    // RB_EMPTY
-             (status >> 9) & 1,    // RB_CMD_FULL
-             (status >> 12) & 1,   // IB_CMD_IDLE
-             (status >> 17) & 1);  // SRBM_IDLE
+             (status >> 0)  & 1,   // IDLE
+             (status >> 2)  & 1,   // RB_EMPTY
+             (status >> 3)  & 1,   // RB_FULL
+             (status >> 6)  & 1,   // IB_CMD_IDLE
+             (status >> 14) & 1);  // SRBM_IDLE
 }
 
 kern_return_t
@@ -608,13 +660,28 @@ sdma_init_full(DeviceContext &dev,
              "microcode_loaded=%d)",
              kSDMAInstanceCount, sdma.microcode_loaded);
 
-    // 1) Stop both queues defensively. Mirrors upstream sdma_v7_0_start
-    //    which calls sdma_v7_0_gfx_stop before gfx_resume.
-    SDMA_LOG("init_full: step 1/4 — defensive stop on all SDMA engines");
+    // 1) Bare-metal start path — port of sdma_v7_0_start (sdma_v7_0.c:837).
+    //    Upstream does NOT halt the MCU here in bare-metal mode; PSP
+    //    autoload has already loaded SDMA microcode and started the MCU,
+    //    so we'd be stomping a live engine. Just unhalt (idempotent if
+    //    already running) to mirror upstream line 862:
+    //        sdma_v7_0_enable(adev, true);   // unhalt the MEs
+    //
+    //    v0.1.40 fix uncovered this: when sdma_reg_offset was using the
+    //    wrong base for hyp-dec range, our previous "defensive stop"
+    //    silently failed (writing HALT=1 to a different register). After
+    //    fixing the base, the halt actually landed and tore down the
+    //    PSP-loaded MCU between unhalt → ring program → re-unhalt. Now
+    //    we follow upstream's bare-metal path and never halt.
+    //
+    //    Clearing RB_ENABLE+IB_ENABLE on QUEUE0 IS still safe: the queue
+    //    control bits are at GC[0] (regular range) and the MCU just sees
+    //    "queue disabled until ring is programmed", same as a fresh boot.
+    SDMA_LOG("init_full: step 1/4 — clear RB/IB enable, unhalt MCU "
+             "(bare-metal path, PSP-autoloaded MCU stays live)");
     for (uint32_t i = 0; i < kSDMAInstanceCount; i++) {
-        SDMA_LOG("SDMA%u: stopping queue + halting engine (warm-reset safe)", i);
         sdma_gfx_stop_instance(dev, i);
-        sdma_engine_halt(dev, i, true);
+        sdma_engine_halt(dev, i, /*halt=*/false);
         sdma_log_status(dev, i);
     }
 

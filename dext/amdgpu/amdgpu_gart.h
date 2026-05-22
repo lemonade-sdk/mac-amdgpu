@@ -63,6 +63,28 @@ struct GARTContext {
 
     // Bump-allocator state — next free GART offset (in bytes).
     uint64_t    nextFreeOffset;
+
+    // Platform gate: are GPU-initiated reads through GART → DART → sysmem
+    // actually returning real bytes? On Apple Silicon + TB5 the answer is
+    // currently NO — see [[feedback_mac_amdgpu_dart_tb5_pcie_reads]].
+    // GART itself is fully programmed (PTEs get written correctly, MC
+    // resolution works), but DART silently zeros every GPU-initiated read
+    // of mapped sysmem. The PTE points at the right host RAM, the engine
+    // just never receives the actual data.
+    //
+    // We keep this defaulting to FALSE on the dext's current platforms.
+    // Higher layers gate GTT BO allocations on this flag and return
+    // kIOReturnUnsupported when it's false, so clients fail fast instead
+    // of silently allocating a BO that returns zeros on every read.
+    //
+    // When Apple exposes a sysmem mapping primitive whose GPU-initiated
+    // reads return real data (a new IODMACommand option, an entitlement,
+    // a non-DART path — whatever it ends up being), the platform-detect
+    // code in gart_init / gart_post_enable can flip this to true and the
+    // GTT path automatically becomes a first-class allocation domain.
+    // No other driver changes needed; the rest of the GART stack is
+    // already operational.
+    bool        reads_supported;
 };
 
 //
@@ -103,5 +125,25 @@ void gart_unbind(GARTContext &gart, GARTBinding *binding);
 kern_return_t gart_bind_existing(DeviceContext &dev, GARTContext &gart,
                                  uint64_t busAddr, uint64_t sizeBytes,
                                  GARTBinding *binding);
+
+//
+// gart_init — populate GARTContext from the just-enabled GMC GART
+// aperture. Run AFTER gmc_gfxhub_gart_enable / gmc_mmhub_gart_enable
+// (so gmc.gart_start, gmc.gart_size, gmc.gart_pt_bus are valid). After
+// this returns, gart_bind_sysmem / gart_bind_existing / gart_unbind
+// are operational.
+//
+// Also sets `gart.reads_supported` based on platform detection. On
+// AS+TB5 today this stays false — DART zeros every GPU-initiated
+// sysmem read (see [[feedback_mac_amdgpu_dart_tb5_pcie_reads]]). Higher
+// layers gate GTT BO allocations on this flag and fail fast.
+//
+// Future: when Apple exposes a working sysmem-mapping primitive,
+// extend the platform-detect block here to set reads_supported=true
+// under that condition. No other GART code needs to change.
+//
+struct GMCContext;
+kern_return_t gart_init(DeviceContext &dev, const GMCContext &gmc,
+                        GARTContext &gart);
 
 } // namespace amdgpu

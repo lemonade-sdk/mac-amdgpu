@@ -16,6 +16,402 @@
 namespace amdgpu {
 
 //============================================================
+// NBIF v6.3.1 port — drivers/gpu/drm/amd/amdgpu/nbif_v6_3_1.c.
+//
+// Our R9700 (DID 0x7551 rev C0) reports NBIF v6.3.1 in discovery
+// (hw_id=108, major/minor/rev=6.3.1). nbif_v6_3_1.c's funcs table is
+// the one upstream wires into adev->nbio.funcs for this chip — NOT
+// nbio_v7_11. The two have completely different doorbell-routing
+// models: NBIO 7.11 uses regGDC0_BIF_CSDMA_DOORBELL_RANGE (PCIE_PORT
+// indirect at BASE_IDX 3); NBIF 6.3.1 uses S2A (Slave-to-AXI) doorbell
+// entries with explicit AWID/AWADDR fields, accessed via direct MMIO
+// at BASE_IDX 2.
+//
+// Functions ported below mirror the nbio_funcs struct in
+// nbif_v6_3_1.c:510. Each function has an IP_VERSION(7, 11, 4) branch
+// (the "nbif_4_10" register variant at BASE_IDX 3) and a base branch
+// (BASE_IDX 2). We use NBIORegs::IsIPVersion_7_11_4 — a runtime helper
+// driven by the discovered IP version — to pick.
+//
+// Skipped from the upstream funcs table (not needed for our path
+// today; each line is the reason):
+//   .program_aspm    — TB5 link is fixed by host; we don't tune ASPM.
+//   .program_ltr     — LTR negotiation is a host-bridge concern on AS.
+//   .get_rom_offset  — VBIOS already parsed by host before bringup.
+//   ras_err_event_*  — no IH/RAS handler chain wired up yet.
+//============================================================
+
+// Returns true if the chip is IP_VERSION(7, 11, 4) — the NBIO variant
+// that uses the _nbif_4_10 register addresses (at BASE_IDX 3 via
+// PCIE_PORT indirect). Other NBIF/NBIO versions use the base S2A
+// doorbell entry registers (BASE_IDX 2, direct MMIO).
+//
+// Discovery populates dev.ip.version[NBIO] from the on-die binary, so
+// this is a real runtime check now. Our R9700 reports NBIF 6.3.1 (the
+// 6.3.1 driver family also handles 7.11.0-3); only 7.11.4 takes the
+// alternate register path. [[feedback_mac_amdgpu_per_ip_version_offsets]]
+static inline bool nbif_is_ip_7_11_4(const DeviceContext &dev)
+{
+    return dev.ip.isVersion(IPBlock::NBIO, 7, 11, 4);
+}
+
+//------------------------------------------------------------------
+// nbif_v6_3_1_remap_hdp_registers — nbif_v6_3_1.c:60.
+//
+// Programs the two BIF_BX0_REMAP_HDP_*_FLUSH_CNTL registers so that
+// writes to the rmmio_remap.reg_offset window (default 0x44000 inside
+// BAR5) trigger an HDP flush. On NBIF 6.3.1 these regs live at offset
+// 0x012d/0x012e BASE_IDX 2 — within Apple's 2 MB BAR5 mapping, direct
+// MMIO. (NBIO 7.11 puts the same logical regs at 0x8E4D/0x8E4E
+// BASE_IDX 5, which on AS requires SMN indirect access.)
+//------------------------------------------------------------------
+static kern_return_t
+nbif_v6_3_1_remap_hdp_registers(DeviceContext &dev)
+{
+    if (!dev.ip.isResolved(IPBlock::NBIO, /*baseIdx=*/2)) {
+        INIT_LOG("remap_hdp: NBIO BASE_IDX 2 unresolved");
+        return kIOReturnNotReady;
+    }
+
+    constexpr uint32_t kRMMIORemapBase = 0x44000;
+    constexpr uint32_t kHDPMemFlush    = 0x0;
+    constexpr uint32_t kHDPRegFlush    = 0x4;
+
+    const uint32_t mem_reg = SOC15_REG_OFFSET_BIDX(
+        dev, IPBlock::NBIO, 2, NBIORegs::BIF_BX0_REMAP_HDP_MEM_FLUSH_CNTL);
+    const uint32_t reg_reg = SOC15_REG_OFFSET_BIDX(
+        dev, IPBlock::NBIO, 2, NBIORegs::BIF_BX0_REMAP_HDP_REG_FLUSH_CNTL);
+
+    WREG32(dev, mem_reg, kRMMIORemapBase + kHDPMemFlush);
+    WREG32(dev, reg_reg, kRMMIORemapBase + kHDPRegFlush);
+    INIT_LOG("remap_hdp: MEM_FLUSH @%#x = %#x, REG_FLUSH @%#x = %#x "
+             "(BASE_IDX 2, direct MMIO)",
+             mem_reg, kRMMIORemapBase + kHDPMemFlush,
+             reg_reg, kRMMIORemapBase + kHDPRegFlush);
+    return kIOReturnSuccess;
+}
+
+//------------------------------------------------------------------
+// nbif_v6_3_1_init_registers — nbif_v6_3_1.c:355.
+//
+// Clears RCC_DEV0_EPF2_STRAP2.STRAP_NO_SOFT_RESET_DEV0_F2 so the F2
+// endpoint can take soft-reset signals. Without it, RAS-triggered
+// resets get silently masked. BASE_IDX 2, direct MMIO.
+//------------------------------------------------------------------
+static kern_return_t
+nbif_v6_3_1_init_registers(DeviceContext &dev)
+{
+    if (!dev.ip.isResolved(IPBlock::NBIO, /*baseIdx=*/2)) {
+        INIT_LOG("nbif_init_registers: NBIO BASE_IDX 2 unresolved");
+        return kIOReturnNotReady;
+    }
+    const uint32_t reg = SOC15_REG_OFFSET_BIDX(
+        dev, IPBlock::NBIO, 2, NBIORegs::RCC_DEV0_EPF2_STRAP2);
+    const uint32_t old_val = RREG32(dev, reg);
+    const uint32_t new_val =
+        old_val & ~NBIORegs::kSTRAP_NO_SOFT_RESET_DEV0_F2_MASK;
+    if (old_val != new_val) {
+        WREG32(dev, reg, new_val);
+    }
+    INIT_LOG("nbif_init_registers: RCC_DEV0_EPF2_STRAP2 @%#x %#x -> %#x "
+             "(cleared NO_SOFT_RESET_F2)", reg, old_val, new_val);
+    return kIOReturnSuccess;
+}
+
+//------------------------------------------------------------------
+// nbif_v6_3_1_ih_control — nbif_v6_3_1.c:272.
+//
+// IH dummy-page + interrupt config. NBIF 6.3.1 uses BIF_BX0_INTERRUPT_
+// CNTL/_CNTL2 (BASE_IDX 2). Same offsets as the NBIO 7.11 BX1 variant
+// — only the BX0 vs BX1 naming differs in the header.
+//------------------------------------------------------------------
+static kern_return_t
+nbif_v6_3_1_ih_control(DeviceContext &dev)
+{
+    if (!dev.ip.isResolved(IPBlock::NBIO, /*baseIdx=*/2)) {
+        INIT_LOG("nbif_ih_control: NBIO BASE_IDX 2 unresolved");
+        return kIOReturnNotReady;
+    }
+    const uint32_t cntl2_reg = SOC15_REG_OFFSET_BIDX(
+        dev, IPBlock::NBIO, 2, NBIORegs::INTERRUPT_CNTL2);
+    const uint32_t cntl_reg  = SOC15_REG_OFFSET_BIDX(
+        dev, IPBlock::NBIO, 2, NBIORegs::INTERRUPT_CNTL);
+
+    // No dummy page yet — write 0.
+    WREG32(dev, cntl2_reg, 0);
+    const uint32_t cntl_old = RREG32(dev, cntl_reg);
+    uint32_t cntl_new = cntl_old
+        & ~NBIORegs::kINTERRUPT_CNTL_DUMMY_RD_OVERRIDE_MASK
+        & ~NBIORegs::kINTERRUPT_CNTL_REQ_NONSNOOP_EN_MASK;
+    WREG32(dev, cntl_reg, cntl_new);
+    INIT_LOG("nbif_ih_control: INTERRUPT_CNTL2@%#x=0, INTERRUPT_CNTL@%#x "
+             "%#x -> %#x", cntl2_reg, cntl_reg, cntl_old, cntl_new);
+    return kIOReturnSuccess;
+}
+
+//------------------------------------------------------------------
+// nbif_v6_3_1_enable_doorbell_aperture — nbif_v6_3_1.c:203.
+//------------------------------------------------------------------
+static kern_return_t
+nbif_v6_3_1_enable_doorbell_aperture(DeviceContext &dev, bool enable)
+{
+    if (!dev.ip.isResolved(IPBlock::NBIO, /*baseIdx=*/2)) {
+        INIT_LOG("doorbell_aperture: NBIO BASE_IDX 2 unresolved");
+        return kIOReturnNotReady;
+    }
+    const uint32_t reg = SOC15_REG_OFFSET_BIDX(
+        dev, IPBlock::NBIO, 2, NBIORegs::RCC_DOORBELL_APER_EN);
+    uint32_t v = RREG32(dev, reg);
+    if (enable) {
+        v |= NBIORegs::kRCC_DOORBELL_APER_EN_BIT;
+    } else {
+        v &= ~NBIORegs::kRCC_DOORBELL_APER_EN_BIT;
+    }
+    WREG32(dev, reg, v);
+    INIT_LOG("nbif_doorbell_aperture: APER_EN@%#x = %#x (enable=%d)",
+             reg, v, enable ? 1 : 0);
+    return kIOReturnSuccess;
+}
+
+//------------------------------------------------------------------
+// nbif_v6_3_1_enable_doorbell_selfring_aperture — nbif_v6_3_1.c:210.
+//
+// Programs the SELFRING aperture BASE/CNTL so the GPU's internal
+// blocks can target the BAR2 doorbell window via their own GPA
+// (Guest Physical Address) path. soc24_common_hw_init calls this
+// BEFORE the regular doorbell aperture. Skipping it leaves the
+// engine-side path gated even when APER_EN is set.
+//------------------------------------------------------------------
+static kern_return_t
+nbif_v6_3_1_enable_doorbell_selfring_aperture(DeviceContext &dev, bool enable)
+{
+    if (!dev.ip.isResolved(IPBlock::NBIO, /*baseIdx=*/2)) {
+        INIT_LOG("nbif_selfring_aperture: NBIO BASE_IDX 2 unresolved");
+        return kIOReturnNotReady;
+    }
+    const uint32_t cntl_reg = SOC15_REG_OFFSET_BIDX(
+        dev, IPBlock::NBIO, 2,
+        NBIORegs::BIF_BX_PF0_DOORBELL_SELFRING_GPA_APER_CNTL);
+    const uint32_t low_reg = SOC15_REG_OFFSET_BIDX(
+        dev, IPBlock::NBIO, 2,
+        NBIORegs::BIF_BX_PF0_DOORBELL_SELFRING_GPA_APER_BASE_LOW);
+    const uint32_t hi_reg = SOC15_REG_OFFSET_BIDX(
+        dev, IPBlock::NBIO, 2,
+        NBIORegs::BIF_BX_PF0_DOORBELL_SELFRING_GPA_APER_BASE_HIGH);
+
+    uint32_t tmp = 0;
+    if (enable) {
+        tmp |= (1u << NBIORegs::kDOORBELL_SELFRING_GPA_APER_EN_SHIFT)
+                & NBIORegs::kDOORBELL_SELFRING_GPA_APER_EN_MASK;
+        tmp |= (1u << NBIORegs::kDOORBELL_SELFRING_GPA_APER_MODE_SHIFT)
+                & NBIORegs::kDOORBELL_SELFRING_GPA_APER_MODE_MASK;
+        tmp |= (0u << NBIORegs::kDOORBELL_SELFRING_GPA_APER_SIZE_SHIFT)
+                & NBIORegs::kDOORBELL_SELFRING_GPA_APER_SIZE_MASK;
+
+        const uint32_t base_lo =
+            static_cast<uint32_t>(dev.doorbell.base & 0xFFFFFFFFull);
+        const uint32_t base_hi =
+            static_cast<uint32_t>((dev.doorbell.base >> 32) & 0xFFFFFFFFull);
+        WREG32(dev, low_reg, base_lo);
+        WREG32(dev, hi_reg,  base_hi);
+        INIT_LOG("nbif_selfring: BASE = %#010x:%#010x (doorbell.base=%#llx)",
+                 base_hi, base_lo, (unsigned long long)dev.doorbell.base);
+    }
+    WREG32(dev, cntl_reg, tmp);
+    INIT_LOG("nbif_selfring: CNTL @%#x = %#x (EN=%d MODE=1 SIZE=0)",
+             cntl_reg, tmp, enable ? 1 : 0);
+    return kIOReturnSuccess;
+}
+
+//------------------------------------------------------------------
+// Helper: write a single S2A_DOORBELL_ENTRY_n_CTRL register. Picks
+// the base or _nbif_4_10 variant based on IP version. The _nbif_4_10
+// path lives at BASE_IDX 3 (outside Apple's BAR5) and needs PCIE_PORT
+// indirect; the base path is direct MMIO at BASE_IDX 2.
+//------------------------------------------------------------------
+static uint32_t
+nbif_read_s2a_entry(DeviceContext &dev, int entry)
+{
+    static const uint32_t base_offsets[6] = {
+        NBIORegs::GDC_S2A0_S2A_DOORBELL_ENTRY_0_CTRL,
+        NBIORegs::GDC_S2A0_S2A_DOORBELL_ENTRY_1_CTRL,
+        NBIORegs::GDC_S2A0_S2A_DOORBELL_ENTRY_2_CTRL,
+        NBIORegs::GDC_S2A0_S2A_DOORBELL_ENTRY_3_CTRL,
+        NBIORegs::GDC_S2A0_S2A_DOORBELL_ENTRY_4_CTRL,
+        NBIORegs::GDC_S2A0_S2A_DOORBELL_ENTRY_5_CTRL,
+    };
+    static const uint32_t nbif_4_10_offsets[6] = {
+        NBIORegs::GDC_S2A0_S2A_DOORBELL_ENTRY_0_CTRL_nbif_4_10,
+        NBIORegs::GDC_S2A0_S2A_DOORBELL_ENTRY_1_CTRL_nbif_4_10,
+        NBIORegs::GDC_S2A0_S2A_DOORBELL_ENTRY_2_CTRL_nbif_4_10,
+        NBIORegs::GDC_S2A0_S2A_DOORBELL_ENTRY_3_CTRL_nbif_4_10,
+        NBIORegs::GDC_S2A0_S2A_DOORBELL_ENTRY_4_CTRL_nbif_4_10,
+        NBIORegs::GDC_S2A0_S2A_DOORBELL_ENTRY_5_CTRL_nbif_4_10,
+    };
+    if (entry < 0 || entry >= 6) return 0;
+
+    if (nbif_is_ip_7_11_4(dev)) {
+        const uint32_t reg = SOC15_REG_OFFSET_BIDX(
+            dev, IPBlock::NBIO, 3, nbif_4_10_offsets[entry]);
+        return PCIE_PORT_RREG32(dev, reg);
+    }
+    const uint32_t reg = SOC15_REG_OFFSET_BIDX(
+        dev, IPBlock::NBIO, 2, base_offsets[entry]);
+    return RREG32(dev, reg);
+}
+
+static void
+nbif_write_s2a_entry(DeviceContext &dev, int entry, uint32_t value)
+{
+    static const uint32_t base_offsets[6] = {
+        NBIORegs::GDC_S2A0_S2A_DOORBELL_ENTRY_0_CTRL,
+        NBIORegs::GDC_S2A0_S2A_DOORBELL_ENTRY_1_CTRL,
+        NBIORegs::GDC_S2A0_S2A_DOORBELL_ENTRY_2_CTRL,
+        NBIORegs::GDC_S2A0_S2A_DOORBELL_ENTRY_3_CTRL,
+        NBIORegs::GDC_S2A0_S2A_DOORBELL_ENTRY_4_CTRL,
+        NBIORegs::GDC_S2A0_S2A_DOORBELL_ENTRY_5_CTRL,
+    };
+    static const uint32_t nbif_4_10_offsets[6] = {
+        NBIORegs::GDC_S2A0_S2A_DOORBELL_ENTRY_0_CTRL_nbif_4_10,
+        NBIORegs::GDC_S2A0_S2A_DOORBELL_ENTRY_1_CTRL_nbif_4_10,
+        NBIORegs::GDC_S2A0_S2A_DOORBELL_ENTRY_2_CTRL_nbif_4_10,
+        NBIORegs::GDC_S2A0_S2A_DOORBELL_ENTRY_3_CTRL_nbif_4_10,
+        NBIORegs::GDC_S2A0_S2A_DOORBELL_ENTRY_4_CTRL_nbif_4_10,
+        NBIORegs::GDC_S2A0_S2A_DOORBELL_ENTRY_5_CTRL_nbif_4_10,
+    };
+    if (entry < 0 || entry >= 6) return;
+
+    if (nbif_is_ip_7_11_4(dev)) {
+        const uint32_t reg = SOC15_REG_OFFSET_BIDX(
+            dev, IPBlock::NBIO, 3, nbif_4_10_offsets[entry]);
+        PCIE_PORT_WREG32(dev, reg, value);
+        return;
+    }
+    const uint32_t reg = SOC15_REG_OFFSET_BIDX(
+        dev, IPBlock::NBIO, 2, base_offsets[entry]);
+    WREG32(dev, reg, value);
+}
+
+// Helper: bake an S2A_DOORBELL_PORTn_* field set into a u32. Identical
+// layout across all eight ports, so we just use the shared field
+// shifts/masks.
+static inline uint32_t
+nbif_build_s2a(uint32_t cur, bool enable, uint32_t awid,
+               uint32_t range_offset, uint32_t range_size,
+               uint32_t awaddr_31_28)
+{
+    uint32_t v = cur;
+    v = (v & ~NBIORegs::kS2A_DOORBELL_PORT_ENABLE_MASK)
+        | ((enable ? 1u : 0u) << NBIORegs::kS2A_DOORBELL_PORT_ENABLE_SHIFT);
+    v = (v & ~NBIORegs::kS2A_DOORBELL_PORT_AWID_MASK)
+        | ((awid << NBIORegs::kS2A_DOORBELL_PORT_AWID_SHIFT)
+           & NBIORegs::kS2A_DOORBELL_PORT_AWID_MASK);
+    v = (v & ~NBIORegs::kS2A_DOORBELL_PORT_RANGE_OFFSET_MASK)
+        | ((range_offset << NBIORegs::kS2A_DOORBELL_PORT_RANGE_OFFSET_SHIFT)
+           & NBIORegs::kS2A_DOORBELL_PORT_RANGE_OFFSET_MASK);
+    v = (v & ~NBIORegs::kS2A_DOORBELL_PORT_RANGE_SIZE_MASK)
+        | ((range_size << NBIORegs::kS2A_DOORBELL_PORT_RANGE_SIZE_SHIFT)
+           & NBIORegs::kS2A_DOORBELL_PORT_RANGE_SIZE_MASK);
+    v = (v & ~NBIORegs::kS2A_DOORBELL_PORT_AWADDR_31_28_VALUE_MASK)
+        | ((awaddr_31_28 << NBIORegs::kS2A_DOORBELL_PORT_AWADDR_31_28_VALUE_SHIFT)
+           & NBIORegs::kS2A_DOORBELL_PORT_AWADDR_31_28_VALUE_MASK);
+    return v;
+}
+
+//------------------------------------------------------------------
+// nbif_v6_3_1_sdma_doorbell_range — nbif_v6_3_1.c:98.
+//
+// Programs S2A_DOORBELL_ENTRY_2 (SDMA) with PORT2_AWID=0xe and
+// PORT2_AWADDR_31_28_VALUE=0x3 — the AXI ID + upper address bits the
+// SDMA cluster listens for. Only `instance == 0` actually writes the
+// register (the ENTRY covers all SDMA queues via RANGE_OFFSET/SIZE).
+//------------------------------------------------------------------
+static kern_return_t
+nbif_v6_3_1_sdma_doorbell_range(DeviceContext &dev,
+                                int instance,
+                                bool use_doorbell,
+                                int doorbell_index,
+                                int doorbell_size)
+{
+    if (instance != 0) return kIOReturnSuccess;
+
+    uint32_t v = nbif_read_s2a_entry(dev, /*entry=*/2);
+    const uint32_t old_value = v;
+
+    if (use_doorbell) {
+        v = nbif_build_s2a(v, /*enable=*/true, /*awid=*/0xe,
+                           static_cast<uint32_t>(doorbell_index),
+                           static_cast<uint32_t>(doorbell_size),
+                           /*awaddr_31_28=*/0x3);
+    } else {
+        v = (v & ~NBIORegs::kS2A_DOORBELL_PORT_RANGE_SIZE_MASK);
+    }
+
+    nbif_write_s2a_entry(dev, /*entry=*/2, v);
+
+    INIT_LOG("nbif_sdma_doorbell_range[%d]: ENTRY_2_CTRL "
+             "%#x -> %#x  (use=%d AWID=0xe AWADDR=0x3 OFFSET=%#x SIZE=%d)",
+             instance, old_value, v,
+             use_doorbell ? 1 : 0, doorbell_index, doorbell_size);
+    return kIOReturnSuccess;
+}
+
+//------------------------------------------------------------------
+// nbif_v6_3_1_ih_doorbell_range — nbif_v6_3_1.c:233.
+//
+// Programs S2A_DOORBELL_ENTRY_1 (IH) with PORT1_AWID=0x0,
+// PORT1_AWADDR=0x0, PORT1_RANGE_SIZE=2.
+//------------------------------------------------------------------
+static kern_return_t
+nbif_v6_3_1_ih_doorbell_range(DeviceContext &dev, bool use_doorbell,
+                              int doorbell_index)
+{
+    uint32_t v = nbif_read_s2a_entry(dev, /*entry=*/1);
+    const uint32_t old_value = v;
+
+    if (use_doorbell) {
+        v = nbif_build_s2a(v, /*enable=*/true, /*awid=*/0x0,
+                           static_cast<uint32_t>(doorbell_index),
+                           /*range_size=*/2,
+                           /*awaddr_31_28=*/0x0);
+    } else {
+        v = (v & ~NBIORegs::kS2A_DOORBELL_PORT_RANGE_SIZE_MASK);
+    }
+
+    nbif_write_s2a_entry(dev, /*entry=*/1, v);
+    INIT_LOG("nbif_ih_doorbell_range: ENTRY_1_CTRL %#x -> %#x "
+             "(use=%d AWID=0x0 OFFSET=%#x SIZE=2)",
+             old_value, v, use_doorbell ? 1 : 0, doorbell_index);
+    return kIOReturnSuccess;
+}
+
+//------------------------------------------------------------------
+// nbif_v6_3_1_gc_doorbell_init — nbif_v6_3_1.c:192.
+//
+// Writes magic constants to S2A_DOORBELL_ENTRY_0 (GFX/HQD) and
+// ENTRY_3 (MES/compute fence). Values are the upstream-baked ENABLE +
+// AWID + RANGE + AWADDR combo for these engines:
+//
+//   ENTRY_0 = 0x30000007  →  AWADDR=0x3, DROP_EN=0, NEED_DEDUCT=0,
+//                            64BIT_SUPPORT_DIS=0, RANGE_SIZE=0,
+//                            RANGE_OFFSET=0, FENCE=0, AWID=0x3, EN=1
+//   ENTRY_3 = 0x3000000d  →  AWADDR=0x3, AWID=0x6, EN=1, others 0
+//
+// These two ENTRIES define the routing for the GFX ring and the
+// compute/MES doorbells. Without them, CP doorbells go nowhere even
+// after enable_doorbell_aperture(true).
+//------------------------------------------------------------------
+static kern_return_t
+nbif_v6_3_1_gc_doorbell_init(DeviceContext &dev)
+{
+    nbif_write_s2a_entry(dev, /*entry=*/0, 0x30000007u);
+    nbif_write_s2a_entry(dev, /*entry=*/3, 0x3000000Du);
+    INIT_LOG("nbif_gc_doorbell_init: ENTRY_0=0x30000007 ENTRY_3=0x3000000d "
+             "(GFX/HQD + MES routing baked in)");
+    return kIOReturnSuccess;
+}
+
+//============================================================
 // IP discovery — hardcoded R9700 IP versions.
 //
 // IP **base addresses** are still 0xFFFFFFFFu sentinels until we
@@ -27,6 +423,25 @@ namespace amdgpu {
 kern_return_t
 bringup_ip_discovery(BringupContext &ctx)
 {
+    // doorbell_init populates dev.doorbell.index.sdma_engine[], gfx_ring0,
+    // etc. with the ASIC-specific doorbell indices. SDMA and the NBIO
+    // routing-range programming below both read from those — without this
+    // call they all read 0 (IIG IONewZero skips C++ ctors, so the
+    // DoorbellIndex member's in-class default initializers never run).
+    //
+    // v0.1.33: previously doorbell_init was defined but never invoked,
+    // which meant every doorbell-index lookup returned 0 and the engine
+    // was being programmed to listen at doorbell 0 while we were writing
+    // to BAR2 offset (0 * 8) — accidentally matching, but with no NBIO
+    // routing the writes still went into a black hole.
+    {
+        kern_return_t dr = doorbell_init(ctx.device, ctx.device.doorbell);
+        if (dr != kIOReturnSuccess) {
+            INIT_LOG("doorbell_init failed: %#x — continuing but doorbells "
+                     "will be misrouted", dr);
+        }
+    }
+
     INIT_LOG("IP discovery: pinning R9700 IP versions "
              "(GC=%u.%u.%u GMC=%u.%u.%u SDMA=%u.%u.%u "
              "PSP=%u.%u.%u SMU=%u.%u.%u MES=%u.%u.%u)",
@@ -52,12 +467,6 @@ bringup_ip_discovery(BringupContext &ctx)
     // Until step 3 is done, anything that depends on MP0/GC/SDMA0
     // base addresses returns kIOReturnNotReady.
 
-    // Helper: check whether a SOC15-resolved register dword offset is
-    // within Apple's 512 KB BAR5 mapping (= 0x20000 dword offsets).
-    auto reg_in_bar5 = [](uint32_t reg_dword) -> bool {
-        return reg_dword < 0x20000u;  // 0x20000 dwords = 512 KB
-    };
-
     // Sanity-check SMN indirect against a known register: read
     // MP0_C2PMSG_33 via SMN and compare to its direct BAR5 value.
     // Expected: both 0x80000000 (IFWI READY). If SMN returns 0 or
@@ -72,100 +481,69 @@ bringup_ip_discovery(BringupContext &ctx)
                  (direct == via_smn) ? "MATCH" : "MISMATCH");
     }
 
-    // Program NBIO's remap-HDP registers so writes to BAR5 byte 0x44000
-    // trigger HDP_MEM_FLUSH. Direct port of upstream
-    // `nbio_v7_11_remap_hdp_registers` (nbio_v7_11.c:30). Both target
-    // registers live at NBIO BASE_IDX 5 (regBIF_BX0_REMAP_HDP_*_FLUSH_CNTL
-    // = 0x8e4d / 0x8e4e). Their resolved BAR5 byte offsets are outside
-    // Apple's 512 KB BAR5 mapping so we go through PCIE_INDEX2/DATA2
-    // SMN indirect.
-    if (ctx.device.ip.isResolved(IPBlock::NBIO, /*baseIdx=*/5)) {
-        constexpr uint32_t kRegBIF_BX0_REMAP_HDP_MEM_FLUSH_CNTL = 0x8e4d;
-        constexpr uint32_t kRegBIF_BX0_REMAP_HDP_REG_FLUSH_CNTL = 0x8e4e;
-        constexpr uint32_t kRMMIORemap = 0x44000;
-        uint32_t regMem = SOC15_REG_OFFSET_BIDX(
-            ctx.device, IPBlock::NBIO, 5,
-            kRegBIF_BX0_REMAP_HDP_MEM_FLUSH_CNTL);
-        uint32_t regReg = SOC15_REG_OFFSET_BIDX(
-            ctx.device, IPBlock::NBIO, 5,
-            kRegBIF_BX0_REMAP_HDP_REG_FLUSH_CNTL);
-        if (reg_in_bar5(regMem) && reg_in_bar5(regReg)) {
-            WREG32(ctx.device, regMem, kRMMIORemap + 0);
-            WREG32(ctx.device, regReg, kRMMIORemap + 4);
-            INIT_LOG("nbio: remap_hdp programmed (direct) — "
-                     "MEM_FLUSH @%#x, REG_FLUSH @%#x", regMem, regReg);
-        } else {
-            SMN_WREG32(ctx.device, regMem, kRMMIORemap + 0);
-            SMN_WREG32(ctx.device, regReg, kRMMIORemap + 4);
-            INIT_LOG("nbio: remap_hdp programmed (SMN indirect) — "
-                     "MEM_FLUSH @SMN %#x = %#x, REG_FLUSH @SMN %#x = %#x",
-                     regMem, kRMMIORemap + 0, regReg, kRMMIORemap + 4);
-        }
-    } else {
-        INIT_LOG("nbio: BASE_IDX 5 unresolved — HDP flush will be a no-op");
+    // ---- NBIF v6.3.1 bringup sequence -----------------------------
+    // Mirrors upstream's actual ordering across soc24_common_hw_init
+    // (soc24.c:466) and soc24_common_late_init (soc24.c:436):
+    //
+    //   hw_init:
+    //     1. init_registers          (RCC_DEV0_EPF2_STRAP2)
+    //     2. remap_hdp_registers
+    //     3. enable_doorbell_aperture(true)
+    //
+    //   late_init (after GMC sw_init, in case BAR2 resize moves the
+    //   doorbell aperture):
+    //     4. enable_doorbell_selfring_aperture(true)
+    //
+    //   Additional NBIF setup that lives outside soc24:
+    //     5. ih_control               (BX0 INTERRUPT_CNTL clears, called
+    //                                  from amdgpu_irq.c during IH init)
+    //     6. gc_doorbell_init         (S2A ENTRY_0 + ENTRY_3, called from
+    //                                  gfx_v12_0_late_init)
+    //     7. sdma_doorbell_range      (S2A ENTRY_2, called from
+    //                                  sdma_v7_0_gfx_resume)
+    //
+    // We run all of this here at IPDiscovery time since we don't run a
+    // separate late_init phase — doorbell.base is already valid (BAR2
+    // PCIe addr captured in MacAMDGPU::ensure_open) and we don't resize
+    // BAR2 on AS, so the "late" reasoning doesn't apply.
+    //
+    // Order matters: SELFRING goes AFTER the doorbell aperture is up,
+    // per the upstream late_init comment "Enable selfring doorbell
+    // aperture late because doorbell BAR aperture will change if resize
+    // BAR successfully in gmc sw_init" (soc24.c:448).
+    //
+    // ih_doorbell_range (S2A ENTRY_1) is deferred — we don't process IH
+    // events yet; will wire it in alongside ih_v7_0_irq_init.
+    (void)nbif_v6_3_1_init_registers(ctx.device);
+    (void)nbif_v6_3_1_remap_hdp_registers(ctx.device);
+    (void)nbif_v6_3_1_enable_doorbell_aperture(ctx.device, /*enable=*/true);
+    (void)nbif_v6_3_1_ih_control(ctx.device);
+    (void)nbif_v6_3_1_gc_doorbell_init(ctx.device);
+    {
+        constexpr int kSdmaInstances = 2;
+        constexpr int kSdmaDoorbellRange = 20;
+        const int low_doorbell_index = static_cast<int>(
+            ctx.device.doorbell.index.sdma_engine[0] << 1);
+        const int total_size = kSdmaDoorbellRange * kSdmaInstances;
+        (void)nbif_v6_3_1_sdma_doorbell_range(
+            ctx.device, /*instance=*/0, /*use_doorbell=*/true,
+            low_doorbell_index, total_size);
     }
+    // SELFRING last — matches soc24_common_late_init.
+    (void)nbif_v6_3_1_enable_doorbell_selfring_aperture(
+        ctx.device, /*enable=*/true);
 
-    // Enable doorbell aperture — nbio_v7_11_enable_doorbell_aperture
-    // (nbio_v7_11.c:136). Programs regRCC_DEV0_EPF0_0_RCC_DOORBELL_APER_EN
-    // bit 0 = BIF_DOORBELL_APER_EN. Per nbio_7_11_0_offset.h the register
-    // lives at offset 0x00C0, BASE_IDX 2 (NBIO[2] = 0x0D20 from discovery).
-    if (ctx.device.ip.isResolved(IPBlock::NBIO, /*baseIdx=*/2)) {
-        uint32_t reg_addr = SOC15_REG_OFFSET_BIDX(
-            ctx.device, IPBlock::NBIO, 2, NBIORegs::RCC_DOORBELL_APER_EN);
-        uint32_t reg = RREG32(ctx.device, reg_addr);
-        reg |= (1u << 0);  // BIF_DOORBELL_APER_EN = 1
-        WREG32(ctx.device, reg_addr, reg);
-        INIT_LOG("nbio: doorbell aperture enabled (APER_EN@%#x = %#x)",
-                 reg_addr, reg);
+    // df_v4_15_hw_init: have_atomics_support=false on AS+TB5, no-op
+    // (matches upstream non-atomics path).
+    INIT_LOG("df_v4_15_hw_init: skipped (no PCIe atomics on AS/TB5)");
 
-        // nbio_v7_11_ih_control (nbio_v7_11.c:196): write dummy_page_addr
-        // to BIF_BX1_INTERRUPT_CNTL2 and clear IH_DUMMY_RD_OVERRIDE +
-        // IH_REQ_NONSNOOP_EN in BIF_BX1_INTERRUPT_CNTL. BASE_IDX 2 (same
-        // as doorbell APER_EN). We don't allocate a dummy_page yet so
-        // we write 0; the field clears do the meaningful part.
-        uint32_t cntl2_addr = SOC15_REG_OFFSET_BIDX(
-            ctx.device, IPBlock::NBIO, 2, NBIORegs::INTERRUPT_CNTL2);
-        uint32_t cntl_addr  = SOC15_REG_OFFSET_BIDX(
-            ctx.device, IPBlock::NBIO, 2, NBIORegs::INTERRUPT_CNTL);
-        WREG32(ctx.device, cntl2_addr, 0);  // no dummy page yet
-        uint32_t cntl = RREG32(ctx.device, cntl_addr);
-        uint32_t cntl_new = cntl
-            & ~NBIORegs::kINTERRUPT_CNTL_DUMMY_RD_OVERRIDE_MASK
-            & ~NBIORegs::kINTERRUPT_CNTL_REQ_NONSNOOP_EN_MASK;
-        WREG32(ctx.device, cntl_addr, cntl_new);
-        INIT_LOG("nbio: ih_control — INTERRUPT_CNTL2@%#x=0, "
-                 "INTERRUPT_CNTL@%#x %#x -> %#x",
-                 cntl2_addr, cntl_addr, cntl, cntl_new);
-    } else {
-        INIT_LOG("nbio: BASE_IDX 2 unresolved — doorbell aperture / ih_control "
-                 "not programmed");
-    }
-
-    // df_v4_15_hw_init (df_v4_15.c:29): writes NCSConfigurationRegister1
-    // with DisIntAtomicsLclProcessing fields set ONLY if
-    // adev->have_atomics_support is true. On Apple Silicon over TB5 we
-    // do not negotiate PCIe AtomicOps to the root complex, so
-    // have_atomics_support=false and df_v4_15_hw_init is a no-op. This
-    // matches upstream behavior on a system without PCIe atomic-ops
-    // support; the field clears in the register are unnecessary.
-    INIT_LOG("df_v4_15_hw_init: skipped (have_atomics_support=false on "
-             "Apple Silicon / TB5; matches upstream no-atomics behavior)");
-
-    // Port of nbio_v7_11_init_registers (nbio_v7_11.c:264) — programs
-    // two PCIe root-complex registers at NBIO BASE_IDX 5:
-    //
-    //   1. regBIF_BIF256_CI256_RC3X4_USB4_PCIE_MST_CTRL_3: set
-    //      MAX_READ_REQUEST_SIZE_MODE (bit 27) and _PRIV (bit 28) so
-    //      the GPU can issue 4 KB MRRs (default is 512 B).
-    //
-    //   2. regRCC_DEV0_EPF5_STRAP4: clear bit 23. Suspected gate for
-    //      the IMU/RLC autoload state machine — without the clear,
-    //      after psp_rlc_autoload_start the GC block stays in reset
-    //      and RLC_RLCS_BOOTLOAD_STATUS.BOOTLOAD_COMPLETE never goes
-    //      high.
-    //
-    // Both registers are outside Apple's 512 KB BAR5 — we reach them
-    // through PCIE_INDEX2/DATA2 SMN indirect.
+    // Legacy NBIO 7.11 init_registers compat block — programs PCIE_MST_
+    // CTRL_3 + RCC_DEV0_EPF5_STRAP4 via SMN. nbif_v6_3_1 has its own
+    // (smaller) init_registers above. These NBIO 7.11 writes at BASE_IDX 5
+    // are no-ops on a true NBIF 6.3.1 chip (the addresses don't exist),
+    // but the v0.1.0-0.1.22 bringup chain has empirically relied on them
+    // — keep them gated by NBIO BASE_IDX 5 resolution so they're silently
+    // skipped if discovery doesn't populate that slot.
     if (ctx.device.ip.isResolved(IPBlock::NBIO, /*baseIdx=*/5)) {
         uint32_t mst_reg = SOC15_REG_OFFSET_BIDX(
             ctx.device, IPBlock::NBIO, 5, NBIORegs::PCIE_MST_CTRL_3);
@@ -235,7 +613,11 @@ doorbell_init(DeviceContext &dev, DoorbellState &db)
     // doesn't expose the full BAR size via config space reads.
     constexpr uint64_t kRDNA4DoorbellSize = 2 * 1024 * 1024;  // 2 MB
 
-    db.base = 0;  // BAR2 accessed via MemoryRead/Write, not linear mapping
+    // db.base is set by MacAMDGPU::ensure_open from PCI config — preserve it
+    // here. (Apple's PCIDriverKit hides the BAR2 host VA, but the PCIe bus
+    // address comes from config space and is what NBIO SELFRING aperture
+    // needs.) If config reads failed, base stays 0 and SELFRING falls back
+    // to base=0 + EN bit only.
     db.size = kRDNA4DoorbellSize;
 
     // Populate doorbell_index map (ASIC-specific values for RDNA4/gfx1201).
@@ -479,6 +861,17 @@ run_stage(BringupContext &ctx, BringupStage s)
             gmc_hdp_flush(ctx.device);
             gmc_flush_gpu_tlb(ctx.device, ctx.gmc, ctx.gmc.gfxhub,
                               /*vmid*/ 0, /*type*/ 0);
+
+            // GART page table / aperture are programmed — now populate
+            // the GARTContext so the BO allocator can hand out GTT BOs
+            // (gated on gart.reads_supported, which is FALSE on AS+TB5
+            // until the platform fixes GPU-initiated DART sysmem reads).
+            kern_return_t gr = gart_init(ctx.device, ctx.gmc, ctx.gart);
+            if (gr != kIOReturnSuccess) {
+                INIT_LOG("GFXInit: gart_init failed: %#x — GTT BOs "
+                         "will return kIOReturnNotReady", gr);
+                // Non-fatal: VRAM BOs still work, only GTT path lost.
+            }
         } else {
             INIT_LOG("GFXInit: skipping gfxhub (GMC IP base unresolved)");
         }

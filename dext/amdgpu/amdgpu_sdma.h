@@ -68,29 +68,116 @@ constexpr uint32_t kSDMA0_SDMA_IDX_0_END         = 0x450;
 // (regSDMA0_SDMA_* names — note the extra "SDMA_" infix vs the
 // older 12_0_0 layout).
 //------------------------------------------------------------------
-namespace SDMARegs {
-    // gc_12_1_0_offset.h line numbers cited per register.
-    constexpr uint32_t STATUS_REG                  = 0x0024; // line 56  regSDMA0_SDMA_STATUS_REG
-    constexpr uint32_t WATCHDOG_CNTL               = 0x002b; // line 70  regSDMA0_SDMA_WATCHDOG_CNTL
-    constexpr uint32_t UTCL1_CNTL                  = 0x0037; // line 94  regSDMA0_SDMA_UTCL1_CNTL
-    constexpr uint32_t UTCL1_PAGE                  = 0x003a; // line 100 regSDMA0_SDMA_UTCL1_PAGE
-    constexpr uint32_t QUEUE0_RB_CNTL              = 0x0200; // line 194 regSDMA0_SDMA_QUEUE0_RB_CNTL
-    constexpr uint32_t QUEUE0_RB_BASE              = 0x0201; // line 196 regSDMA0_SDMA_QUEUE0_RB_BASE
-    constexpr uint32_t QUEUE0_RB_BASE_HI           = 0x0202; // line 198 regSDMA0_SDMA_QUEUE0_RB_BASE_HI
-    constexpr uint32_t QUEUE0_RB_RPTR              = 0x0203; // line 200 regSDMA0_SDMA_QUEUE0_RB_RPTR
-    constexpr uint32_t QUEUE0_RB_RPTR_HI           = 0x0204; // line 202 regSDMA0_SDMA_QUEUE0_RB_RPTR_HI
-    constexpr uint32_t QUEUE0_RB_WPTR              = 0x0205; // line 204 regSDMA0_SDMA_QUEUE0_RB_WPTR
-    constexpr uint32_t QUEUE0_RB_WPTR_HI           = 0x0206; // line 206 regSDMA0_SDMA_QUEUE0_RB_WPTR_HI
-    constexpr uint32_t QUEUE0_RB_RPTR_ADDR_LO      = 0x0207; // line 208 regSDMA0_SDMA_QUEUE0_RB_RPTR_ADDR_LO
-    constexpr uint32_t QUEUE0_RB_RPTR_ADDR_HI      = 0x0208; // line 210 regSDMA0_SDMA_QUEUE0_RB_RPTR_ADDR_HI
-    constexpr uint32_t QUEUE0_IB_CNTL              = 0x0209; // line 212 regSDMA0_SDMA_QUEUE0_IB_CNTL
-    constexpr uint32_t QUEUE0_DOORBELL             = 0x020f; // line 224 regSDMA0_SDMA_QUEUE0_DOORBELL
-    constexpr uint32_t QUEUE0_DOORBELL_OFFSET      = 0x0211; // line 228 regSDMA0_SDMA_QUEUE0_DOORBELL_OFFSET
-    constexpr uint32_t QUEUE0_RB_WPTR_POLL_ADDR_LO = 0x0218; // line 242 regSDMA0_SDMA_QUEUE0_RB_WPTR_POLL_ADDR_LO
-    constexpr uint32_t QUEUE0_RB_WPTR_POLL_ADDR_HI = 0x0219; // line 244 regSDMA0_SDMA_QUEUE0_RB_WPTR_POLL_ADDR_HI
-    constexpr uint32_t QUEUE0_MINOR_PTR_UPDATE     = 0x021b; // line 248 regSDMA0_SDMA_QUEUE0_MINOR_PTR_UPDATE
-    // Hyp-dec range (>= 0x450)
-    constexpr uint32_t MCU_CNTL                    = 0x588e; // line 1224 regSDMA0_SDMA_MCU_CNTL
+// SDMA register offsets — per-chip-family tables selected at runtime
+// from the discovered GC IP version (dev.ip.getVersion(IPBlock::GC)).
+//
+// [[feedback_mac_amdgpu_per_ip_version_offsets]] — same driver binary
+// must work for ANY supported AMD card, so register offsets cannot be
+// hardcoded for one chip family. Each supported (GC major, minor) gets
+// its own offset table; sdma_reg_offset() picks the right one based on
+// the chip discovery returned.
+//
+// Currently supported families:
+//   • gc_12_0_X — R9700 (gfx1201, GFX 12.0.1) and other GFX 12.0 chips.
+//     Source: upstream gc_12_0_0_offset.h.
+//   • gc_12_1_X — gfx1250 and the "SDMA0_SDMA_QUEUE0_*" naming family.
+//     Same registers, offsets are 0x180 higher. Source: upstream
+//     gc_12_1_0_offset.h.
+//
+// Adding a new family: define another SDMARegOffsets_gc_*_*_* struct,
+// add it to sdma_pick_reg_table()'s dispatch, link the relevant chips
+// to it. Don't fork sdma_v7_0.cpp — same code reads through the table.
+struct SDMARegOffsets {
+    uint32_t STATUS_REG;
+    uint32_t WATCHDOG_CNTL;
+    uint32_t UTCL1_CNTL;
+    uint32_t UTCL1_PAGE;
+    uint32_t QUEUE0_RB_CNTL;
+    uint32_t QUEUE0_RB_BASE;
+    uint32_t QUEUE0_RB_BASE_HI;
+    uint32_t QUEUE0_RB_RPTR;
+    uint32_t QUEUE0_RB_RPTR_HI;
+    uint32_t QUEUE0_RB_WPTR;
+    uint32_t QUEUE0_RB_WPTR_HI;
+    uint32_t QUEUE0_RB_RPTR_ADDR_LO;
+    uint32_t QUEUE0_RB_RPTR_ADDR_HI;
+    uint32_t QUEUE0_IB_CNTL;
+    uint32_t QUEUE0_DOORBELL;
+    uint32_t QUEUE0_DOORBELL_OFFSET;
+    uint32_t QUEUE0_RB_WPTR_POLL_ADDR_LO;
+    uint32_t QUEUE0_RB_WPTR_POLL_ADDR_HI;
+    uint32_t QUEUE0_MINOR_PTR_UPDATE;
+    uint32_t MCU_CNTL;  // hyp-dec range; uses GC BASE_IDX 1 not 0
+};
+
+// gc_12_0_0 — for GFX 12.0.x (R9700, etc.).
+inline constexpr SDMARegOffsets kSDMARegOffsets_gc_12_0_0 = {
+    /* STATUS_REG                  */ 0x0024,  // gc_12_0_0_offset.h:56
+    /* WATCHDOG_CNTL               */ 0x002b,  // gc_12_0_0_offset.h:70
+    /* UTCL1_CNTL                  */ 0x0035,  // gc_12_0_0_offset.h:90
+    /* UTCL1_PAGE                  */ 0x0038,  // gc_12_0_0_offset.h:96
+    /* QUEUE0_RB_CNTL              */ 0x0080,  // gc_12_0_0_offset.h:182
+    /* QUEUE0_RB_BASE              */ 0x0081,  // gc_12_0_0_offset.h:184
+    /* QUEUE0_RB_BASE_HI           */ 0x0082,  // gc_12_0_0_offset.h:186
+    /* QUEUE0_RB_RPTR              */ 0x0083,  // gc_12_0_0_offset.h:188
+    /* QUEUE0_RB_RPTR_HI           */ 0x0084,  // gc_12_0_0_offset.h:190
+    /* QUEUE0_RB_WPTR              */ 0x0085,  // gc_12_0_0_offset.h:192
+    /* QUEUE0_RB_WPTR_HI           */ 0x0086,  // gc_12_0_0_offset.h:194
+    /* QUEUE0_RB_RPTR_ADDR_LO      */ 0x0087,  // gc_12_0_0_offset.h:196
+    /* QUEUE0_RB_RPTR_ADDR_HI      */ 0x0088,  // gc_12_0_0_offset.h:198
+    /* QUEUE0_IB_CNTL              */ 0x0089,  // gc_12_0_0_offset.h:200
+    /* QUEUE0_DOORBELL             */ 0x008f,  // gc_12_0_0_offset.h:212
+    /* QUEUE0_DOORBELL_OFFSET      */ 0x0091,  // gc_12_0_0_offset.h:216
+    /* QUEUE0_RB_WPTR_POLL_ADDR_LO */ 0x0098,  // gc_12_0_0_offset.h:230
+    /* QUEUE0_RB_WPTR_POLL_ADDR_HI */ 0x0099,  // gc_12_0_0_offset.h:232
+    /* QUEUE0_MINOR_PTR_UPDATE     */ 0x009b,  // gc_12_0_0_offset.h:236
+    /* MCU_CNTL                    */ 0x588e,  // gc_12_0_0_offset.h:948
+};
+
+// gc_12_1_0 — for GFX 12.1.x (gfx1250 etc.). Offsets +0x180 vs 12.0.x.
+inline constexpr SDMARegOffsets kSDMARegOffsets_gc_12_1_0 = {
+    /* STATUS_REG                  */ 0x0024,  // gc_12_1_0_offset.h:56
+    /* WATCHDOG_CNTL               */ 0x002b,  // gc_12_1_0_offset.h:70
+    /* UTCL1_CNTL                  */ 0x0037,  // gc_12_1_0_offset.h:94
+    /* UTCL1_PAGE                  */ 0x003a,  // gc_12_1_0_offset.h:100
+    /* QUEUE0_RB_CNTL              */ 0x0200,  // gc_12_1_0_offset.h:194
+    /* QUEUE0_RB_BASE              */ 0x0201,  // gc_12_1_0_offset.h:196
+    /* QUEUE0_RB_BASE_HI           */ 0x0202,  // gc_12_1_0_offset.h:198
+    /* QUEUE0_RB_RPTR              */ 0x0203,  // gc_12_1_0_offset.h:200
+    /* QUEUE0_RB_RPTR_HI           */ 0x0204,  // gc_12_1_0_offset.h:202
+    /* QUEUE0_RB_WPTR              */ 0x0205,  // gc_12_1_0_offset.h:204
+    /* QUEUE0_RB_WPTR_HI           */ 0x0206,  // gc_12_1_0_offset.h:206
+    /* QUEUE0_RB_RPTR_ADDR_LO      */ 0x0207,  // gc_12_1_0_offset.h:208
+    /* QUEUE0_RB_RPTR_ADDR_HI      */ 0x0208,  // gc_12_1_0_offset.h:210
+    /* QUEUE0_IB_CNTL              */ 0x0209,  // gc_12_1_0_offset.h:212
+    /* QUEUE0_DOORBELL             */ 0x020f,  // gc_12_1_0_offset.h:224
+    /* QUEUE0_DOORBELL_OFFSET      */ 0x0211,  // gc_12_1_0_offset.h:228
+    /* QUEUE0_RB_WPTR_POLL_ADDR_LO */ 0x0218,  // gc_12_1_0_offset.h:242
+    /* QUEUE0_RB_WPTR_POLL_ADDR_HI */ 0x0219,  // gc_12_1_0_offset.h:244
+    /* QUEUE0_MINOR_PTR_UPDATE     */ 0x021b,  // gc_12_1_0_offset.h:248
+    /* MCU_CNTL                    */ 0x588e,  // gc_12_1_0_offset.h:1224
+};
+
+// Selector — pick the offset table by discovered GC IP version.
+// Falls back to gc_12_0_0 if the version is unknown so partial-discovery
+// runs (or older test traces) don't crash; logs a warning the first time
+// it falls back.
+inline const SDMARegOffsets &
+sdma_pick_reg_table(const DeviceContext &dev)
+{
+    const IPVersion gc = dev.ip.getVersion(IPBlock::GC);
+    // GFX 12.1.x family.
+    if (gc.major == 12 && gc.minor == 1) {
+        return kSDMARegOffsets_gc_12_1_0;
+    }
+    // GFX 12.0.x family (default — also catches {0,0,0} unresolved).
+    return kSDMARegOffsets_gc_12_0_0;
+}
+
+// Convenience accessor: sdma_regs(dev).QUEUE0_RB_CNTL etc. Returns the
+// selected per-chip table at runtime.
+inline const SDMARegOffsets &sdma_regs(const DeviceContext &dev) {
+    return sdma_pick_reg_table(dev);
 }
 
 //------------------------------------------------------------------
@@ -203,22 +290,35 @@ struct SDMAContext {
 //------------------------------------------------------------------
 
 // Compute the absolute BAR5 dword offset for an SDMA register on a
-// given instance. Mirrors sdma_v7_1_get_reg_offset() (sdma_v7_1.c:117).
-// Hyp-dec range is "internal_offset >= SDMA0_SDMA_IDX_0_END (0x450)"
-// and uses GC[1] base — for now we treat that as identical to GC[0]
-// since on R9700 they live in the same SMN window; refine when the
-// IP discovery walker grows multi-instance support.
+// given instance. Direct port of sdma_v7_0_get_reg_offset (sdma_v7_0.c:125).
+//
+// Two register regimes:
+//   Hyp-dec (HYPervisor DECoded) range [0x5880..0x589a] inclusive —
+//     resolves through GC BASE_IDX 1; instance increment is
+//     SDMA1_HYP_DEC_REG_OFFSET (0x30).
+//   Everything else — GC BASE_IDX 0; instance increment is
+//     SDMA1_REG_OFFSET (0x600) for instance==1.
+//
+// **v0.1.40 fix:** prior versions collapsed both regimes onto
+// GC BASE_IDX 0, which meant MCU_CNTL (0x588e, in hyp-dec range) was
+// being read/written at GC[0]+0x588e instead of GC[1]+0x588e. The
+// resulting register hit a completely unrelated location, returning
+// the apparently random 0x92929292 pattern and silently ignoring
+// HALT/RESET writes — so the SDMA MCU never actually unhalted, and
+// engine-side WPTR updates from the doorbell aperture never landed.
+constexpr uint32_t kSDMA0_HYP_DEC_REG_START = 0x5880;
+constexpr uint32_t kSDMA0_HYP_DEC_REG_END   = 0x589a;
+
 static inline uint32_t
 sdma_reg_offset(const DeviceContext &ctx, uint32_t instance, uint32_t reg)
 {
-    const uint32_t base = ctx.ip.get(IPBlock::GC);
-    if (reg >= kSDMA0_SDMA_IDX_0_END) {
-        // GC base[1] in upstream; collapsed to base[0] until IP
-        // discovery supplies a separate hyp-dec base.
-        return base + reg + (instance != 0
-                             ? kSDMA1_HYP_DEC_REG_OFFSET * instance
-                             : 0u);
+    if (reg >= kSDMA0_HYP_DEC_REG_START && reg <= kSDMA0_HYP_DEC_REG_END) {
+        const uint32_t base = ctx.ip.getBase(IPBlock::GC, /*baseIdx=*/1);
+        const uint32_t inst_add = (instance != 0)
+            ? (kSDMA1_HYP_DEC_REG_OFFSET * instance) : 0u;
+        return base + reg + inst_add;
     }
+    const uint32_t base = ctx.ip.get(IPBlock::GC);  // BASE_IDX 0
     return base + reg + (instance == 1 ? kSDMA1_REG_OFFSET : 0u);
 }
 
