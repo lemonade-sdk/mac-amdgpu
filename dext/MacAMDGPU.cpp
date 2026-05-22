@@ -1519,15 +1519,13 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         // re-running stages. Reads live engine status regs through
         // SOC15 + asks SMU which DPM features are currently running.
         if (arguments->scalarOutput == nullptr ||
-            arguments->scalarOutputCount < 8) {
+            arguments->scalarOutputCount < 12) {
             return kIOReturnBadArgument;
         }
         auto &bdev = driver->ivars->bringup.device;
         // Defaults: 0 means "unreadable".
-        for (uint32_t i = 0; i < 8; i++) arguments->scalarOutput[i] = 0;
+        for (uint32_t i = 0; i < 12; i++) arguments->scalarOutput[i] = 0;
         if (bdev.ip.isResolved(amdgpu::IPBlock::GC)) {
-            // GRBM_STATUS + CP_STAT live at GC BASE_IDX 0;
-            // RLC_RLCS_BOOTLOAD_STATUS at GC BASE_IDX 1.
             arguments->scalarOutput[0] = amdgpu::RREG32(bdev,
                 SOC15_REG_OFFSET_BIDX(bdev, amdgpu::IPBlock::GC, 0,
                                       0x0DA4));               // regGRBM_STATUS
@@ -1537,12 +1535,21 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             arguments->scalarOutput[2] = amdgpu::RREG32(bdev,
                 SOC15_REG_OFFSET_BIDX(bdev, amdgpu::IPBlock::GC, 1,
                                       amdgpu::GCRegs::RLC_RLCS_BOOTLOAD_STATUS));
-            // SDMA0/1 status regs use sdma_reg_offset which is also
-            // GC-relative on RDNA4.
             arguments->scalarOutput[3] = amdgpu::RREG32(bdev,
                 amdgpu::sdma_reg_offset(bdev, 0, amdgpu::SDMARegs::STATUS_REG));
             arguments->scalarOutput[4] = amdgpu::RREG32(bdev,
                 amdgpu::sdma_reg_offset(bdev, 1, amdgpu::SDMARegs::STATUS_REG));
+            // v0.1.32 — SDMA0 RPTR/WPTR + MCU_CNTL so we can SEE whether
+            // doorbell delivery is updating the engine's wptr (if rptr
+            // is stuck at 0 after a submit, the doorbell isn't landing).
+            arguments->scalarOutput[8] = amdgpu::RREG32(bdev,
+                amdgpu::sdma_reg_offset(bdev, 0, amdgpu::SDMARegs::QUEUE0_RB_RPTR));
+            arguments->scalarOutput[9] = amdgpu::RREG32(bdev,
+                amdgpu::sdma_reg_offset(bdev, 0, amdgpu::SDMARegs::QUEUE0_RB_WPTR));
+            arguments->scalarOutput[10] = amdgpu::RREG32(bdev,
+                amdgpu::sdma_reg_offset(bdev, 0, amdgpu::SDMARegs::QUEUE0_RB_CNTL));
+            arguments->scalarOutput[11] = amdgpu::RREG32(bdev,
+                amdgpu::sdma_reg_offset(bdev, 0, amdgpu::SDMARegs::MCU_CNTL));
         }
         if (bdev.ip.isResolved(amdgpu::IPBlock::MP1, /*baseIdx=*/1) &&
             bdev.smuOnline) {
@@ -2828,7 +2835,7 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                 const uint32_t fence_value = 0xC50000u | (cs->generation & 0xFFFFu);
 
                 uint32_t wrote = amdgpu::sdma_ring_write(
-                    inst, cs->cpu_buffer, cs->written_dw);
+                    b.device, inst, cs->cpu_buffer, cs->written_dw);
                 if (wrote != cs->written_dw) return kIOReturnNoSpace;
 
                 uint32_t pkt[4];
@@ -2836,7 +2843,7 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                 pkt[1] = static_cast<uint32_t>(fence_gpu);
                 pkt[2] = static_cast<uint32_t>(fence_gpu >> 32);
                 pkt[3] = fence_value;
-                if (amdgpu::sdma_ring_write(inst, pkt, 4) != 4) {
+                if (amdgpu::sdma_ring_write(b.device, inst, pkt, 4) != 4) {
                     return kIOReturnNoSpace;
                 }
                 kern_return_t r = amdgpu::sdma_kick_doorbell(b.device, inst);

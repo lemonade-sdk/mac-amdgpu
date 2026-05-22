@@ -75,31 +75,40 @@ sdma_alloc_dma_block(DeviceContext &dev, uint64_t size,
 // sdma_alloc_storage — ring + WB page for one instance.
 //------------------------------------------------------------------
 kern_return_t
-sdma_alloc_storage(DeviceContext &dev, SDMAInstance &inst)
+sdma_alloc_storage(DeviceContext &dev, SDMAInstance &inst, GMCContext &gmc)
 {
     if (inst.inited) return kIOReturnSuccess;
+    if (!gmc.vram_alloc.is_inited()) {
+        SDMA_LOG("instance %u: vram_alloc not ready", inst.instance);
+        return kIOReturnNotReady;
+    }
     void *cpu = nullptr;
 
-    kern_return_t r = sdma_alloc_dma_block(dev, kSDMARingDefaultBytes,
-                                           &inst.ring_buf, &inst.ring_dma,
-                                           &inst.ring_bus, &cpu);
-    if (r != kIOReturnSuccess) {
-        SDMA_LOG("instance %u: ring alloc failed: %#x", inst.instance, r);
-        return r;
+    // Ring goes in VRAM. On AS+TB5, GPU-initiated reads of DART-mapped
+    // sysmem return zeros, so a sysmem ring (DART-pinned) would be
+    // fetched as all-zero NOPs and never reach the FENCE packet. The
+    // FB aperture (BAR0) is GMC-routable and the engine can fetch from
+    // it directly. See feedback_mac_amdgpu_dart_tb5_pcie_reads.
+    VRAMAllocation ring_alloc{};
+    if (!gmc.vram_alloc.alloc(kSDMARingDefaultBytes, kASPageSize, &ring_alloc)) {
+        SDMA_LOG("instance %u: ring VRAM alloc failed (need %u, free=%llu)",
+                 inst.instance, kSDMARingDefaultBytes,
+                 (unsigned long long)gmc.vram_alloc.bytes_free());
+        return kIOReturnNoMemory;
     }
-    memset(cpu, 0, kSDMARingDefaultBytes);
-    inst.ring_cpu         = cpu;
+    inst.ring_gpu_va     = ring_alloc.gpu_va;
+    inst.ring_vram_off   = ring_alloc.gpu_va - gmc.vram_start;  // BAR0 offset
     inst.ring_size_dwords = kSDMARingDefaultBytes / 4;
-    inst.ring_ptr_mask    = inst.ring_size_dwords - 1;
+    inst.ring_ptr_mask   = inst.ring_size_dwords - 1;
+    // Zero the ring in VRAM via BAR0.
+    bar0_memset_vram(dev, inst.ring_vram_off, 0, kSDMARingDefaultBytes);
 
-    r = sdma_alloc_dma_block(dev, kSDMAWBPageBytes,
+    kern_return_t r = sdma_alloc_dma_block(dev, kSDMAWBPageBytes,
                              &inst.wb_buf, &inst.wb_dma,
                              &inst.wb_bus, &cpu);
     if (r != kIOReturnSuccess) {
         SDMA_LOG("instance %u: WB page alloc failed: %#x",
                  inst.instance, r);
-        inst.ring_dma->release(); inst.ring_buf->release();
-        inst.ring_dma = nullptr; inst.ring_buf = nullptr;
         return r;
     }
     memset(cpu, 0, kSDMAWBPageBytes);
@@ -124,7 +133,7 @@ sdma_alloc_storage(DeviceContext &dev, SDMAInstance &inst)
     SDMA_LOG("instance %u: ring %u dwords @ bus %#llx, "
              "wb @ bus %#llx, doorbell slot %#x",
              inst.instance, inst.ring_size_dwords,
-             (unsigned long long)inst.ring_bus,
+             (unsigned long long)inst.ring_gpu_va,
              (unsigned long long)inst.wb_bus,
              inst.doorbell_index);
     return kIOReturnSuccess;
@@ -207,9 +216,9 @@ sdma_gfx_resume_instance(const DeviceContext &dev, SDMAInstance &inst)
     // Mirrors upstream sdma_v7_0_gfx_resume_instance (sdma_v7_1.c:456-604).
     // Each step logs the register name + value so the dext log reads
     // like Linux dyndbg=+p amdgpu when bringup runs.
-    SDMA_LOG("SDMA%u gfx_resume: starting (ring_bus=%#llx, rb_size=%u dwords, "
+    SDMA_LOG("SDMA%u gfx_resume: starting (ring_gpu_va=%#llx, rb_size=%u dwords, "
              "rptr_addr=%#llx, doorbell_slot=%#x)",
-             i, (unsigned long long)inst.ring_bus,
+             i, (unsigned long long)inst.ring_gpu_va,
              inst.ring_size_dwords,
              (unsigned long long)inst.rptr_gpu_addr,
              inst.doorbell_index);
@@ -242,24 +251,26 @@ sdma_gfx_resume_instance(const DeviceContext &dev, SDMAInstance &inst)
     WREG32(dev, reg(SDMARegs::QUEUE0_RB_RPTR_ADDR_LO),
            static_cast<uint32_t>(inst.rptr_gpu_addr & 0xFFFFFFFC));
 
-    // 5) Enable RPTR writeback. MCU_WPTR_POLL_ENABLE on per upstream
-    //    bare-metal path; WPTR_POLL_ENABLE off (driver kicks doorbell).
+    // 5) Enable RPTR writeback (engine WRITES to rptr_gpu_addr — sysmem
+    //    writes through DART work). Both WPTR_POLL paths OFF because
+    //    wptr_poll_addr is sysmem and GPU READS of DART sysmem return
+    //    zeros on AS+TB5. Engine wptr is updated via doorbell kick only.
     rb_cntl = REG_SET_FIELD(rb_cntl, SDMA0_SDMA_QUEUE0_RB_CNTL,
                             RPTR_WRITEBACK_ENABLE, 1);
     rb_cntl = REG_SET_FIELD(rb_cntl, SDMA0_SDMA_QUEUE0_RB_CNTL,
                             WPTR_POLL_ENABLE, 0);
     rb_cntl = REG_SET_FIELD(rb_cntl, SDMA0_SDMA_QUEUE0_RB_CNTL,
-                            MCU_WPTR_POLL_ENABLE, 1);
+                            MCU_WPTR_POLL_ENABLE, 0);
 
     // 6) Ring base — RB_BASE is bus_addr >> 8, BASE_HI is >> 40.
     WREG32(dev, reg(SDMARegs::QUEUE0_RB_BASE),
-           static_cast<uint32_t>(inst.ring_bus >> 8));
+           static_cast<uint32_t>(inst.ring_gpu_va >> 8));
     WREG32(dev, reg(SDMARegs::QUEUE0_RB_BASE_HI),
-           static_cast<uint32_t>(inst.ring_bus >> 40));
-    SDMA_LOG("SDMA%u  RB_BASE = %#010x:%#010x (ring_bus >> 8 / >> 40)",
+           static_cast<uint32_t>(inst.ring_gpu_va >> 40));
+    SDMA_LOG("SDMA%u  RB_BASE = %#010x:%#010x (ring_gpu_va >> 8 / >> 40)",
              i,
-             static_cast<uint32_t>(inst.ring_bus >> 40),
-             static_cast<uint32_t>(inst.ring_bus >> 8));
+             static_cast<uint32_t>(inst.ring_gpu_va >> 40),
+             static_cast<uint32_t>(inst.ring_gpu_va >> 8));
 
     inst.wptr = 0;
 
@@ -330,42 +341,53 @@ sdma_gfx_resume_instance(const DeviceContext &dev, SDMAInstance &inst)
 }
 
 //------------------------------------------------------------------
-// sdma_ring_write — same shape as cp_ring_write.
+// sdma_ring_write — stage dwords into the VRAM-resident ring via
+// the BAR0 framebuffer aperture. Engine fetches them from the same
+// addresses via the FB aperture (GMC-routable).
 //------------------------------------------------------------------
 uint32_t
-sdma_ring_write(SDMAInstance &inst, const uint32_t *src, uint32_t dwords)
+sdma_ring_write(const DeviceContext &dev, SDMAInstance &inst,
+                const uint32_t *src, uint32_t dwords)
 {
     if (!inst.inited || dwords == 0) return 0;
     if (dwords > inst.ring_size_dwords) return 0;
-    auto *ring = static_cast<uint32_t *>(inst.ring_cpu);
     for (uint32_t i = 0; i < dwords; i++) {
-        ring[(inst.wptr + i) & inst.ring_ptr_mask] = src[i];
+        uint32_t slot = (inst.wptr + i) & inst.ring_ptr_mask;
+        WBAR0_32(dev, inst.ring_vram_off + slot * 4u, src[i]);
     }
+    // Ensure HDP write buffers drain so the engine sees the new
+    // packets when it processes the doorbell.
+    amdgpu_hdp_flush(dev);
     inst.wptr = (inst.wptr + dwords) & inst.ring_ptr_mask;
     return dwords;
 }
 
 //------------------------------------------------------------------
-// sdma_kick_doorbell — write into the doorbell aperture (BAR2).
+// sdma_kick_doorbell — write the new wptr into the BAR2 doorbell
+// aperture.
 //
-// Upstream amdgpu_mm_wdoorbell (amdgpu_doorbell_mgr.c:59-68) is
-// effectively `writel(v, doorbell.cpu_addr + index)` where cpu_addr
-// is `u32 *` mapped onto BAR2; that is a stride of sizeof(u32) = 4
-// bytes per index. doorbell_index here is the per-engine DWORD
-// offset programmed into SDMA_QUEUE0_DOORBELL_OFFSET (e.g. 0x200
-// for SDMA0, 0x214 for SDMA1).
+// Upstream (sdma_v7_0_ring_set_wptr → WDOORBELL64) does a 64-bit
+// write to the doorbell at:
+//     BAR2 + ring->doorbell_index * 8
 //
-// The value written is the new wptr in bytes (sdma_v7_1_ring_set_wptr
-// writes ring->wptr << 2 i.e. dword_wptr * 4).
+// where `ring->doorbell_index = sdma_engine[i] << 1` (already in
+// qword-index units, e.g. 0x200 for SDMA0). The PCIe write must be
+// 64-bit (WDOORBELL64, not WDOORBELL32) — the doorbell controller
+// distinguishes; a 32-bit write may be silently dropped on RDNA4.
+//
+// Linux uses BAR2 via pci_resource_start(pdev, 2) in
+// amdgpu_doorbell_mgr.c. BAR5 holds MMIO registers, NOT doorbells.
+//
+// Value: `wptr << 2` (byte_wptr); high 32 bits zero.
 //------------------------------------------------------------------
 kern_return_t
 sdma_kick_doorbell(const DeviceContext &dev, const SDMAInstance &inst)
 {
     if (!inst.inited) return kIOReturnNotReady;
     const uint64_t offs =
-        static_cast<uint64_t>(inst.doorbell_index) * 4ull;
-    const uint32_t v = inst.wptr << 2;
-    dev.pci->MemoryWrite32(dev.bar2MemIndex, offs, v);
+        static_cast<uint64_t>(inst.doorbell_index) * 8ull;
+    const uint64_t v = static_cast<uint64_t>(inst.wptr) << 2;
+    dev.pci->MemoryWrite64(dev.bar2MemIndex, offs, v);
     return kIOReturnSuccess;
 }
 
@@ -401,7 +423,7 @@ sdma_ring_test(const DeviceContext &dev, SDMAInstance &inst,
     pkt[2] = static_cast<uint32_t>(fence_gpu >> 32);
     pkt[3] = fence_value;
 
-    if (sdma_ring_write(inst, pkt, 4) != 4) {
+    if (sdma_ring_write(dev, inst, pkt, 4) != 4) {
         SDMA_LOG("instance %u: ring_test ring_write failed",
                  inst.instance);
         return kIOReturnNoSpace;
@@ -481,7 +503,7 @@ sdma_copy_linear_test(const DeviceContext &dev, SDMAInstance &inst,
     pkt[n++] = static_cast<uint32_t>(fence_gpu >> 32);
     pkt[n++] = fence_value;
 
-    if (sdma_ring_write(inst, pkt, n) != n) {
+    if (sdma_ring_write(dev, inst, pkt, n) != n) {
         SDMA_LOG("copy_linear_test: ring_write failed");
         return kIOReturnNoSpace;
     }
@@ -600,7 +622,7 @@ sdma_init_full(DeviceContext &dev,
     SDMA_LOG("init_full: step 2/4 — allocate ring + WB per instance");
     for (uint32_t i = 0; i < kSDMAInstanceCount; i++) {
         sdma.instance[i].instance = i;
-        kern_return_t r = sdma_alloc_storage(dev, sdma.instance[i]);
+        kern_return_t r = sdma_alloc_storage(dev, sdma.instance[i], gmc);
         if (r != kIOReturnSuccess) {
             SDMA_LOG("SDMA%u init_full: storage alloc failed: %#x", i, r);
             return r;

@@ -178,6 +178,19 @@ struct MacAMDGPUHostApp: App {
 
 // MARK: - View
 
+/// Small caption-styled label that prefixes each grouped row of
+/// control buttons (Identity / Diagnostics / Engines / Power).
+struct GroupLabel: View {
+    let text: String
+    init(_ text: String) { self.text = text }
+    var body: some View {
+        Text(text)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .frame(width: 80, alignment: .leading)
+    }
+}
+
 struct ContentView: View {
     @EnvironmentObject var controller: DriverController
 
@@ -247,47 +260,73 @@ struct ContentView: View {
             // ICD; the dext's allow-any-userclient-access entitlement
             // makes external clients work too once Apple grants the
             // matching capability to a separate tool.
-            HStack(spacing: 6) {
-                Button("Initialize GPU") {
-                    controller.initializeGPU()
+            // Grouped control panel. Each row is one category; the
+            // big "Initialize GPU" sits above all the test buttons.
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Button("Initialize GPU") { controller.initializeGPU() }
+                        .help("Run every bringup stage in order, printing each as it completes.")
+                    Spacer()
                 }
-                .help("Run every bringup stage in order, printing each as it completes.")
-                Spacer()
-                Button("Diagnostics") { controller.testGetDiagnostics() }
-                    .help("PCI config + PM cap + IFWI + BAR0/2/5 MMIO probes.")
-                Button("Dump TMR") { controller.testDumpTMR() }
-                    .help("Read 16 dwords from VRAM at (vram_size - 64 KB) via MM_INDEX/DATA.")
-                Button("Dump PSP") { controller.testDumpPSP() }
-                    .help("Read SOC15-resolved MP0 C2PMSG_33/35/36/64/81 registers.")
-                Button("Dump Cmd") { controller.testDumpCmdBuf() }
-                    .help("Read VRAM cmd_buf + fence + ring after a submit attempt.")
-                Button("Live Status") { controller.testLiveStatus() }
-                    .help("Snapshot GRBM/CP/RLC/SDMA0/1/SMU running features — proves the dext+GPU are still responsive.")
-                Button("Quiet Fan") { controller.testDisableSmuFeatures() }
-                    .help("DisableAllSmuFeatures (PPSMC 0x7) — parks DPM so PMFW stops defaulting fan to MAX. Re-run Initialize GPU to undo.")
-                Button("SDMA Copy") { controller.testSDMACopyVRAM() }
-                    .help("VRAM→VRAM 4 KB SDMA COPY_LINEAR smoke test. Proves the SDMA engine processes a packet end-to-end + writes its fence.")
-                Button("CP NOP") { controller.testCPKIQSmoke() }
-                    .help("v0.1.26 — first PM4 packet on KIQ: NOP + RELEASE_MEM(0xDEADBEEF). Verifies CP MEC firmware processes PM4.")
-                Button("Power: Auto") { controller.testSetPowerState(0) }
-                    .help("v0.1.29 — clear GFXCLK soft-clamp (PMFW picks).")
-                Button("Power: Low") { controller.testSetPowerState(1) }
-                    .help("v0.1.29 — cap GFXCLK at 200 MHz.")
-                Button("Power: Nominal") { controller.testSetPowerState(2) }
-                    .help("v0.1.29 — same as Auto: no GFXCLK clamp.")
-                Button("Power: High") { controller.testSetPowerState(3) }
-                    .help("v0.1.29 — floor GFXCLK at 1500 MHz.")
-                Button("Power: Peak") { controller.testSetPowerState(4) }
-                    .help("v0.1.29 — pin GFXCLK to 2400 MHz (compute).")
-                Button("Ping") { controller.testPing() }
-                Button("Identity") { controller.testGetIdentity() }
-                Button("BARs") { controller.testGetBARInfo() }
-                Button("Query") { controller.testQueryInfo() }
-                Button("CS Smoke") { controller.testCSSmokeSDMA() }
-                    .help("v0.1.28 — Drive the new CS submission ABI: CSCreate(SDMA) → CSWriteDwords(4×NOP) → SubmitIB → WaitFence(1s) → CSDestroy.")
-                Button("BO Smoke") { controller.testBOSmoke() }
-                    .help("v0.1.27 BO ABI smoke test: alloc VRAM + GTT BOs, "
-                          + "round-trip GetInfo, map GTT BO, write pattern, free.")
+
+                // Row 1 — Identity / discovery.
+                HStack(spacing: 6) {
+                    GroupLabel("Identity")
+                    Button("Ping") { controller.testPing() }
+                    Button("Identity") { controller.testGetIdentity() }
+                    Button("BARs") { controller.testGetBARInfo() }
+                    Button("Query") { controller.testQueryInfo() }
+                    Spacer()
+                }
+
+                // Row 2 — Diagnostics + memory dumps.
+                HStack(spacing: 6) {
+                    GroupLabel("Diagnostics")
+                    Button("Diagnostics") { controller.testGetDiagnostics() }
+                        .help("PCI config + PM cap + IFWI + BAR0/2/5 MMIO probes.")
+                    Button("Live Status") { controller.testLiveStatus() }
+                        .help("Snapshot GRBM/CP/RLC/SDMA0/1/SMU running features — proves the dext+GPU are still responsive.")
+                    Button("Dump TMR") { controller.testDumpTMR() }
+                        .help("Read 16 dwords from VRAM at (vram_size - 64 KB) via MM_INDEX/DATA.")
+                    Button("Dump PSP") { controller.testDumpPSP() }
+                        .help("Read SOC15-resolved MP0 C2PMSG_33/35/36/64/81 registers.")
+                    Button("Dump Cmd") { controller.testDumpCmdBuf() }
+                        .help("Read VRAM cmd_buf + fence + ring after a submit attempt.")
+                    Spacer()
+                }
+
+                // Row 3 — Engine smoke tests.
+                HStack(spacing: 6) {
+                    GroupLabel("Engines")
+                    Button("BO Smoke") { controller.testBOSmoke() }
+                        .help("v0.1.27 BO ABI smoke test: alloc VRAM + GTT BOs, round-trip GetInfo, map GTT BO, write pattern, free.")
+                    Button("SDMA Copy") { controller.testSDMACopyVRAM() }
+                        .help("VRAM→VRAM 4 KB SDMA COPY_LINEAR smoke test. Proves the SDMA engine processes a packet end-to-end + writes its fence.")
+                    Button("CP NOP") { controller.testCPKIQSmoke() }
+                        .help("v0.1.26 — first PM4 packet on KIQ: NOP + RELEASE_MEM(0xDEADBEEF). Verifies CP MEC firmware processes PM4.")
+                    Button("CS Smoke") { controller.testCSSmokeSDMA() }
+                        .help("v0.1.28 — Drive the new CS submission ABI: CSCreate(SDMA) → CSWriteDwords(4×NOP) → SubmitIB → WaitFence(1s) → CSDestroy.")
+                    Spacer()
+                }
+
+                // Row 4 — Power state / fan control.
+                HStack(spacing: 6) {
+                    GroupLabel("Power")
+                    Button("Auto") { controller.testSetPowerState(0) }
+                        .help("v0.1.29 — clear GFXCLK soft-clamp (PMFW picks).")
+                    Button("Low") { controller.testSetPowerState(1) }
+                        .help("v0.1.29 — cap GFXCLK at 200 MHz.")
+                    Button("Nominal") { controller.testSetPowerState(2) }
+                        .help("v0.1.29 — same as Auto: no GFXCLK clamp.")
+                    Button("High") { controller.testSetPowerState(3) }
+                        .help("v0.1.29 — floor GFXCLK at 1500 MHz.")
+                    Button("Peak") { controller.testSetPowerState(4) }
+                        .help("v0.1.29 — pin GFXCLK to 2400 MHz (compute).")
+                    Divider().frame(height: 16)
+                    Button("Quiet Fan") { controller.testDisableSmuFeatures() }
+                        .help("DisableAllSmuFeatures (PPSMC 0x7) — parks DPM so PMFW stops defaulting fan to MAX. Re-run Initialize GPU to undo.")
+                    Spacer()
+                }
             }
             .font(.caption)
             .padding(.vertical, 4)
@@ -957,7 +996,7 @@ final class DriverController: NSObject, ObservableObject,
     // which engines are alive.
     func testLiveStatus() {
         guard openUserClient() else { return }
-        let (kr, out) = callScalar(kSelLiveStatus, outCount: 8)
+        let (kr, out) = callScalar(kSelLiveStatus, outCount: 12)
         if kr != KERN_SUCCESS {
             append(String(format: "LiveStatus: kr=%#x (dext may have died)", kr))
             return
@@ -974,6 +1013,10 @@ final class DriverController: NSObject, ObservableObject,
         let feat_lo  = UInt32(out[5] & 0xFFFFFFFF)
         let feat_hi  = UInt32(out[6] & 0xFFFFFFFF)
         let sdmaReached = (out[7] & 1) != 0
+        let sdma0_rptr   = out.count > 8  ? UInt32(out[8] & 0xFFFFFFFF) : 0
+        let sdma0_wptr   = out.count > 9  ? UInt32(out[9] & 0xFFFFFFFF) : 0
+        let sdma0_cntl   = out.count > 10 ? UInt32(out[10] & 0xFFFFFFFF) : 0
+        let sdma0_mcu    = out.count > 11 ? UInt32(out[11] & 0xFFFFFFFF) : 0
 
         append("── Live Status ──")
         append(String(format:
@@ -994,6 +1037,12 @@ final class DriverController: NSObject, ObservableObject,
         }
         append(String(format: "SDMA0 STATUS_REG=%#010x (%@)",
                       sdma0, sdmaDecode(sdma0)))
+        append(String(format: "SDMA0 RPTR=%#x WPTR=%#x  RB_CNTL=%#010x  MCU_CNTL=%#010x",
+                      sdma0_rptr, sdma0_wptr, sdma0_cntl, sdma0_mcu))
+        let mcuHalt   = (sdma0_mcu >> 0) & 1
+        let rbEnable  = (sdma0_cntl >> 0) & 1
+        append("  → MCU_HALT=\(mcuHalt) RB_ENABLE=\(rbEnable) " +
+               "(if WPTR stays 0 after SDMA Copy, doorbell isn't reaching engine)")
         append(String(format: "SDMA1 STATUS_REG=%#010x (%@)",
                       sdma1, sdmaDecode(sdma1)))
         append(String(format:

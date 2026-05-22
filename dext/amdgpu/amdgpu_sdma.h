@@ -166,15 +166,17 @@ struct SDMAInstance {
     bool      enabled;
 
 #ifdef __APPLE__
-    // Ring buffer — sysmem, 16 KB-aligned, GART-fetched.
-    IOBufferMemoryDescriptor *ring_buf;
-    IODMACommand             *ring_dma;
-    // Write-back page (rptr/fence shadow).
+    // WB page only — stays in sysmem because GPU WRITES through DART
+    // work (only reads are broken on AS+TB5). Ring is now VRAM.
     IOBufferMemoryDescriptor *wb_buf;
     IODMACommand             *wb_dma;
 #endif
-    uint64_t  ring_bus;
-    void     *ring_cpu;
+    // Ring buffer — VRAM-resident on AS+TB5 (sysmem reads return zero
+    // for GPU-initiated fetches; see feedback_mac_amdgpu_dart_tb5_
+    // pcie_reads). Engine reads packets through the FB aperture using
+    // ring_gpu_va; CPU writes go through BAR0 at ring_vram_off.
+    uint64_t  ring_gpu_va;       // MC address (= ring_bus equivalent)
+    uint64_t  ring_vram_off;     // BAR0-relative byte offset for CPU writes
     uint32_t  ring_size_dwords;
     uint32_t  ring_ptr_mask;
 
@@ -221,7 +223,9 @@ sdma_reg_offset(const DeviceContext &ctx, uint32_t instance, uint32_t reg)
 }
 
 // Allocate ring + WB page for one instance. Idempotent.
-kern_return_t sdma_alloc_storage(DeviceContext &dev, SDMAInstance &inst);
+struct GMCContext;
+kern_return_t sdma_alloc_storage(DeviceContext &dev, SDMAInstance &inst,
+                                 GMCContext &gmc);
 
 // Halt/unhalt one engine via SDMA0_MCU_CNTL.HALT.
 kern_return_t sdma_engine_halt(const DeviceContext &dev,
@@ -245,7 +249,7 @@ kern_return_t sdma_kick_doorbell(const DeviceContext &dev,
 
 // Append dwords to the ring at the current software wptr; wraps.
 // Returns the number of dwords actually written (0 on overflow).
-uint32_t sdma_ring_write(SDMAInstance &inst,
+uint32_t sdma_ring_write(const DeviceContext &dev, SDMAInstance &inst,
                          const uint32_t *src, uint32_t dwords);
 
 // Submit an SDMA COPY_LINEAR + FENCE pair, kick doorbell, poll fence.
