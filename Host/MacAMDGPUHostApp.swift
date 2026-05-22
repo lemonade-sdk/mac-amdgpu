@@ -40,6 +40,27 @@ private let kSelDumpCmdBuf:      UInt32 = 26
 private let kSelLiveStatus:          UInt32 = 30
 private let kSelDisableSmuFeatures:  UInt32 = 33
 
+// v0.1.27 — BO management ABI. Selectors 16–18 existed pre-v0.1.27
+// (legacy: bump-allocate a sub-range of the client DMA buffer). They
+// now also accept the new (size, domain, alignment, flags) shape for
+// real VRAM / GTT BOs. Selector 36 is the new BOMap.
+private let kSelBOAlloc:   UInt32 = 16
+private let kSelBOFree:    UInt32 = 17
+private let kSelBOGetInfo: UInt32 = 18
+private let kSelBOMap:     UInt32 = 36
+
+// BO domains — must match dext/MacAMDGPU.cpp:kBODomain*.
+private let kBODomainGTTLegacy: UInt64 = 0
+private let kBODomainVRAM:      UInt64 = 1
+private let kBODomainGTT:       UInt64 = 2
+
+// Memory type IDs for IOConnectMapMemory64. The high range
+// (kMacAMDGPUMemoryTypeBOBase = 0x10000 onward) is per-BO mappings as
+// returned by BOMap.
+private let kMemTypeDMABuffer: UInt32 = 6
+private let kMemTypeIRQState:  UInt32 = 7
+private let kMemTypeBOBase:    UInt32 = 0x10000
+
 // Firmware type tags — match MacAMDGPU.cpp enum.
 private let kFwSOS:         UInt64 = 0
 private let kFwKDB:         UInt64 = 1
@@ -230,6 +251,9 @@ struct ContentView: View {
                 Button("Identity") { controller.testGetIdentity() }
                 Button("BARs") { controller.testGetBARInfo() }
                 Button("Query") { controller.testQueryInfo() }
+                Button("BO Smoke") { controller.testBOSmoke() }
+                    .help("v0.1.27 BO ABI smoke test: alloc VRAM + GTT BOs, "
+                          + "round-trip GetInfo, map GTT BO, write pattern, free.")
             }
             .font(.caption)
             .padding(.vertical, 4)
@@ -964,6 +988,135 @@ final class DriverController: NSObject, ObservableObject,
                 "DisableSmuFeatures: PMFW resp=%#x (non-zero — message may not be supported on this PMFW build)",
                 resp))
         }
+    }
+
+    // v0.1.27 — exercise the per-BO ABI end-to-end:
+    //   1. BOAlloc VRAM(64 KB, align 4 KB)  → records handle, gpu_va
+    //   2. BOGetInfo → verifies the metadata round-trips
+    //   3. BOAlloc GTT(4 KB, align 4 KB)    → records second handle
+    //   4. BOMap (GTT) → IOConnectMapMemory64 → write 0xAB pattern
+    //   5. BOFree on both → table slots reclaimed
+    //
+    // Notes:
+    //   - Each call goes through the v0.1.27 4-input shape so the dext
+    //     takes the new free-list path (not the legacy bump-into-DMA-
+    //     buffer carve-out).
+    //   - The smoke test deliberately doesn't drive Initialize GPU —
+    //     VRAM/GTT alloc need gmc.vram_alloc + gart up. The dext returns
+    //     kIOReturnNotReady (0xE00002D8) for either domain if you click
+    //     this without running Initialize GPU first; the log line below
+    //     surfaces that explicitly.
+    func testBOSmoke() {
+        guard openUserClient() else { return }
+        append("bo smoke: starting (need Initialize GPU run first for VRAM/GTT)")
+
+        // Step 1 — BOAlloc VRAM(64 KB, align 4 KB).
+        let vramSize: UInt64 = 64 * 1024
+        let vramAlign: UInt64 = 4 * 1024
+        let (k1, o1) = callScalar(kSelBOAlloc,
+                                  input: [vramSize, kBODomainVRAM,
+                                          vramAlign, /* flags */ 0],
+                                  outCount: 3)
+        guard k1 == KERN_SUCCESS, o1.count >= 3 else {
+            append(String(format: "bo smoke: VRAM BOAlloc failed kr=%#x", k1))
+            return
+        }
+        let vramHandle = o1[0]
+        let vramGpuVa  = o1[1]
+        append(String(format:
+            "bo smoke: VRAM bo handle=%#llx gpu_va=%#llx",
+            vramHandle, vramGpuVa))
+
+        // Step 2 — BOGetInfo on the VRAM BO.
+        let (k2, o2) = callScalar(kSelBOGetInfo,
+                                  input: [vramHandle], outCount: 5)
+        if k2 == KERN_SUCCESS && o2.count >= 5 {
+            let gpu = o2[0]
+            let size = o2[2]
+            let align = o2[3]
+            let dom = o2[4] & 0xFF
+            let mapped = (o2[4] >> 8) & 1
+            let ok = (gpu == vramGpuVa) && (size >= vramSize)
+            append(String(format:
+                "bo smoke: VRAM info gpu=%#llx size=%llu align=%llu " +
+                "domain=%llu mapped=%llu %@",
+                gpu, size, align, dom, mapped,
+                ok ? "[round-trip OK]" : "[mismatch]"))
+        } else {
+            append(String(format: "bo smoke: VRAM BOGetInfo kr=%#x", k2))
+        }
+
+        // Step 3 — BOAlloc GTT(4 KB, align 4 KB).
+        let gttSize: UInt64 = 4 * 1024
+        let gttAlign: UInt64 = 4 * 1024
+        let (k3, o3) = callScalar(kSelBOAlloc,
+                                  input: [gttSize, kBODomainGTT,
+                                          gttAlign, /* flags */ 0],
+                                  outCount: 3)
+        var gttHandle: UInt64 = 0
+        var gttCanMap = false
+        if k3 == KERN_SUCCESS && o3.count >= 3 {
+            gttHandle = o3[0]
+            let gpuVa = o3[1]
+            append(String(format:
+                "bo smoke: GTT bo handle=%#llx gpu_va=%#llx",
+                gttHandle, gpuVa))
+            gttCanMap = true
+        } else {
+            // GTT requires GART up; on AS+TB5 the GART path is
+            // structurally fragile so this can return Unsupported /
+            // NotReady before bringup is fully driven.
+            append(String(format:
+                "bo smoke: GTT BOAlloc kr=%#x (need GART; skipping map step)",
+                k3))
+        }
+
+        // Step 4 — BOMap the GTT BO; then map it into this process via
+        // IOConnectMapMemory64 and write a pattern.
+        if gttCanMap {
+            let (km, om) = callScalar(kSelBOMap,
+                                      input: [gttHandle], outCount: 2)
+            if km == KERN_SUCCESS && om.count >= 2 {
+                let memType = UInt32(om[0] & 0xFFFFFFFF)
+                let size    = om[1]
+                var atAddr: mach_vm_address_t = 0
+                var atSize: mach_vm_size_t    = 0
+                let kr4 = IOConnectMapMemory64(ucConn, memType,
+                                               mach_task_self_,
+                                               &atAddr, &atSize, 0)
+                if kr4 == KERN_SUCCESS && atAddr != 0 {
+                    let ptr = UnsafeMutableRawPointer(bitPattern: UInt(atAddr))
+                    if let ptr = ptr {
+                        memset(ptr, 0xAB, Int(min(size, UInt64(atSize))))
+                        // Read back one byte to confirm the write landed.
+                        let first = ptr.assumingMemoryBound(to: UInt8.self)[0]
+                        append(String(format:
+                            "bo smoke: GTT map ok cpu=%#llx size=%llu " +
+                            "first=%#x [%@]",
+                            UInt64(atAddr), UInt64(atSize), first,
+                            first == 0xAB ? "pattern OK" : "MISMATCH"))
+                    }
+                    _ = IOConnectUnmapMemory64(ucConn, memType,
+                                               mach_task_self_, atAddr)
+                } else {
+                    append(String(format:
+                        "bo smoke: IOConnectMapMemory64 kr=%#x type=%#x",
+                        kr4, memType))
+                }
+            } else {
+                append(String(format: "bo smoke: BOMap kr=%#x", km))
+            }
+        }
+
+        // Step 5 — BOFree both BOs.
+        let (kf1, _) = callScalar(kSelBOFree, input: [vramHandle], outCount: 0)
+        append(String(format: "bo smoke: VRAM BOFree kr=%#x", kf1))
+        if gttCanMap {
+            let (kf2, _) = callScalar(kSelBOFree,
+                                      input: [gttHandle], outCount: 0)
+            append(String(format: "bo smoke: GTT  BOFree kr=%#x", kf2))
+        }
+        append("bo smoke: done")
     }
 
     // Returns true if the stage succeeded so initializeGPU can bail

@@ -75,6 +75,8 @@ enum {
     // v0.1.24 — runtime engine health snapshot + DPM toggle.
     kMacAMDGPUMethodLiveStatus        = 30,
     kMacAMDGPUMethodDisableSmuFeatures = 33,
+    // v0.1.27: per-BO map.
+    kMacAMDGPUMethodBOMap             = 36,
 };
 
 // QueryInfo "info type" tags — input scalarInput[0]. Output shape
@@ -146,6 +148,12 @@ enum {
     kMacAMDGPUMemoryTypeBAR5      = 5,
     kMacAMDGPUMemoryTypeDMABuffer = 6,
     kMacAMDGPUMemoryTypeIRQState  = 7,
+    // v0.1.27: per-BO mappings. A successful BOMap(handle) returns a
+    // memory_type value of (kMacAMDGPUMemoryTypeBOBase + bo_index);
+    // userspace then calls IOConnectMapMemory64(conn, type, …) to
+    // obtain the cpu_va. Using a high base keeps these distinct from
+    // BAR / DMA / IRQ memory types.
+    kMacAMDGPUMemoryTypeBOBase    = 0x10000,
 };
 
 #define MACAMDGPU_MAX_IRQ_VECTORS    256
@@ -155,19 +163,59 @@ enum {
 #define MACAMDGPU_MAX_BO             64
 #define MACAMDGPU_BO_ALIGN           amdgpu::kASPageSize  // 16 KB
 
-// Per-client BO sub-range allocator.
-// Each BO is a [byte_offset, byte_offset+size) window inside the
-// client's single DMABuffer. Userspace owns the mmap of the
-// DMABuffer (Path A) so it can fill / read BOs directly via memcpy;
-// the dext only validates the range and translates byte_offset →
-// GPU bus address when stitching submissions. Allocation is bump-
-// only for now; BOFree marks the entry free but doesn't reclaim
-// space (free-list is a Phase 2 follow-up).
+// Per-client BO table entry.
+//
+// v0.1.27 upgrade: BOs now have an explicit `domain` (VRAM vs GTT) and
+// own their underlying storage. Pre-v0.1.27 every BO was just a
+// [byte_offset, byte_offset+size) carve-out of the client's single
+// pre-allocated DMA buffer (a "sysmem"-only path). That still works —
+// `kBODomainGTTLegacy` keeps the old semantics for SubmitIB /
+// MESAddQueue which read `byte_offset` directly off the entry — but
+// new BOs can also be backed by:
+//
+//   - kBODomainVRAM: an allocation from GMCContext::vram_alloc; the BO
+//     lives inside the BAR0-LOW window (24 MB..256 MB) so userspace can
+//     map it via BAR0. `vram_offset` is the offset from gmc.vram_start.
+//
+//   - kBODomainGTT:  a fresh IOBufferMemoryDescriptor + IODMACommand
+//     allocated *per BO* and bound into the global GART. `gtt_buf`
+//     holds the buffer, `gtt_dma` the DART mapping, `gtt_bus_addr` the
+//     DART bus address, and `gpu_va` the GART MC address. This is the
+//     domain that maps cleanly to Mesa's BUFFER_DOMAIN_GTT.
+//
+// `bo_handle` returned to userspace encodes (generation << 32) | index
+// so stale handles from a closed BO can't reach a fresh allocation in
+// the same slot.
+enum {
+    kBODomainGTTLegacy = 0,   // pre-v0.1.27: subrange of client DMA buffer
+    kBODomainVRAM      = 1,   // VRAM-resident, BAR0-LOW mapped
+    kBODomainGTT       = 2,   // sysmem, DART-pinned, GART-bound
+};
+
 struct BOEntry {
     bool      in_use;
-    uint64_t  byte_offset;
-    uint64_t  size;
+    uint32_t  domain;          // kBODomain*
+    uint64_t  size;            // user-visible size in bytes
+    uint64_t  alignment;
     uint32_t  generation;
+
+    // GTT-legacy: only byte_offset is used; gpu_va == 0.
+    // VRAM:       gpu_va = gmc.vram_start + vram_offset; vram_offset
+    //             is the offset from vram_start.
+    // GTT (new):  gpu_va = GART MC address; gtt_bus_addr is the raw
+    //             DART bus address; gtt_buf/gtt_dma own the storage.
+    uint64_t  byte_offset;     // legacy: offset into client DMA buffer
+    uint64_t  vram_offset;     // VRAM: offset from gmc.vram_start
+    uint64_t  gpu_va;          // unified GPU MC address (or 0 for legacy)
+
+    IOBufferMemoryDescriptor *gtt_buf;
+    IODMACommand             *gtt_dma;
+    uint64_t  gtt_bus_addr;
+
+    // Cached cpu pointer for in-dext access (e.g. CP_DMA / IB staging).
+    // Userspace gets its own mapping via IOConnectMapMemory64 against
+    // the per-BO memory type id returned by BOMap.
+    void     *cpu_addr;
 };
 
 // Bits 0..127 of irqPending track raw MSI-X vector firings (one bit
@@ -261,6 +309,12 @@ mac_amdgpu_bo_make_handle(uint32_t generation, uint32_t index)
            (static_cast<uint64_t>(index) & 0xFFFFFFFFull);
 }
 
+static inline uint32_t
+mac_amdgpu_bo_handle_index(uint64_t handle)
+{
+    return static_cast<uint32_t>(handle & 0xFFFFFFFFull);
+}
+
 static BOEntry *
 mac_amdgpu_bo_lookup(MacAMDGPUUserClient_IVars *ivars, uint64_t handle)
 {
@@ -272,6 +326,55 @@ mac_amdgpu_bo_lookup(MacAMDGPUUserClient_IVars *ivars, uint64_t handle)
     if (!e->in_use || e->generation != gen) return nullptr;
     return e;
 }
+
+//
+// Resolve a BO's GPU MC address regardless of domain. Legacy
+// (GTTLegacy) BOs return the bus address of their slice within the
+// client DMA buffer; new VRAM/GTT BOs return their pre-computed gpu_va.
+//
+static uint64_t
+mac_amdgpu_bo_gpu_addr(MacAMDGPUUserClient_IVars *ivars, BOEntry *e)
+{
+    if (ivars == nullptr || e == nullptr) return 0;
+    if (e->domain == kBODomainGTTLegacy) {
+        if (ivars->dmaSegmentsCount < 1) return 0;
+        return ivars->dmaSegments[0].address + e->byte_offset;
+    }
+    return e->gpu_va;
+}
+
+//
+// Resolve a BO's CPU address for in-dext readback (e.g. SubmitIB
+// staging the IB into the CP ring). Returns nullptr if the BO has
+// no CPU mapping handy (e.g. a VRAM BO with no live BAR0 mapping).
+//
+static void *
+mac_amdgpu_bo_cpu_addr(MacAMDGPUUserClient_IVars *ivars, BOEntry *e)
+{
+    if (ivars == nullptr || e == nullptr) return nullptr;
+    if (e->domain == kBODomainGTTLegacy) {
+        if (ivars->dmaBuffer == nullptr) return nullptr;
+        IOAddressSegment seg = {};
+        if (ivars->dmaBuffer->GetAddressRange(&seg) != kIOReturnSuccess) {
+            return nullptr;
+        }
+        return reinterpret_cast<void *>(seg.address + e->byte_offset);
+    }
+    return e->cpu_addr;
+}
+
+//
+// Release the storage owned by a single BO entry, then mark it free.
+// VRAM BOs return their range to gmc.vram_alloc; GTT BOs release the
+// per-BO IOBuffer + IODMACommand (and leak the GART PTE slot — bump
+// allocator inside gart.cpp doesn't reclaim, which is fine for Phase
+// 1B's BO churn pattern: gart_init re-zeros the table on reset).
+//
+// Forward decl only — implementation lives below the driver class
+// definitions where bringup context fields are visible.
+static void
+mac_amdgpu_bo_release_all(MacAMDGPUUserClient_IVars *ivars,
+                          IOService *driverService);
 
 //============================================================
 // Helpers.
@@ -871,13 +974,59 @@ IMPL(MacAMDGPUUserClient, Start)
 }
 
 //============================================================
+// Release every BO owned by this user client. Used at UserClient
+// Stop so that VRAM allocations return to gmc.vram_alloc and GTT
+// IOBufferMemoryDescriptors release their DART pin. Safe to call on
+// a partially-initialised ivars (skips entries with in_use == false).
+//============================================================
+static void
+mac_amdgpu_bo_release_all(MacAMDGPUUserClient_IVars *ivars,
+                          IOService *driverService)
+{
+    if (ivars == nullptr) return;
+    MacAMDGPU *driver = OSDynamicCast(MacAMDGPU, driverService);
+    for (uint32_t i = 0; i < MACAMDGPU_MAX_BO; i++) {
+        BOEntry &e = ivars->bos[i];
+        if (!e.in_use) continue;
+        if (e.domain == kBODomainVRAM && driver != nullptr &&
+            driver->ivars != nullptr) {
+            amdgpu::VRAMAllocation va = {};
+            va.gpu_va    = e.gpu_va;
+            va.size      = e.size;
+            va.alignment = e.alignment;
+            va.cpu_ptr   = nullptr;
+            driver->ivars->bringup.gmc.vram_alloc.free(va);
+        }
+        else if (e.domain == kBODomainGTT) {
+            if (e.gtt_dma != nullptr) {
+                e.gtt_dma->CompleteDMA(kIODMACommandCompleteDMANoOptions);
+                e.gtt_dma->release();
+            }
+            if (e.gtt_buf != nullptr) {
+                e.gtt_buf->release();
+            }
+        }
+        e.in_use   = false;
+        e.gtt_buf  = nullptr;
+        e.gtt_dma  = nullptr;
+        e.cpu_addr = nullptr;
+    }
+    ivars->boBumpOffset = 0;
+}
+
+//============================================================
 // MacAMDGPUUserClient::Stop
 //============================================================
 kern_return_t
 IMPL(MacAMDGPUUserClient, Stop)
 {
     // Order matters: release interrupts and DMA before closing PCI so
-    // any outstanding kernel state has somewhere to drain to.
+    // any outstanding kernel state has somewhere to drain to. BO
+    // release happens BEFORE DMA-buffer release because GTT-legacy BOs
+    // point into the DMA buffer; while VRAM/GTT BOs are independent,
+    // staying consistent on order keeps any future per-BO sysmem fixup
+    // simple.
+    mac_amdgpu_bo_release_all(ivars, GetProvider());
     mac_amdgpu_release_all_interrupts(this);
     mac_amdgpu_release_dma_buffer(this);
 
@@ -1945,31 +2094,52 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
     }
 
     case kMacAMDGPUMethodBOAlloc: {
-        // scalarInput[0] = size in bytes
-        // scalarOutput[0] = handle (or 0 on failure)
-        // scalarOutput[1] = bus address of the BO's first byte
-        // scalarOutput[2] = byte offset within the client DMABuffer
+        // Dual ABI for back-compat with the pre-v0.1.27 single-input
+        // callers (scripts/macamdgpu_ping.swift):
+        //
+        //   Legacy:  scalarInputCount == 1
+        //     in[0] = size in bytes
+        //     out[0] = handle, out[1] = bus address (DART) within client
+        //              DMA buffer, out[2] = byte offset within DMA buffer
+        //     Domain forced to kBODomainGTTLegacy.
+        //
+        //   v0.1.27: scalarInputCount >= 4
+        //     in[0] = size, in[1] = domain (1=VRAM, 2=GTT),
+        //     in[2] = alignment, in[3] = flags (reserved, must be 0)
+        //     out[0] = handle, out[1] = gpu_va, out[2] = cpu_addr (or 0
+        //              if not in-dext-mapped).
         if (arguments->scalarInput == nullptr ||
             arguments->scalarInputCount < 1 ||
             arguments->scalarOutput == nullptr ||
             arguments->scalarOutputCount < 3) {
             return kIOReturnBadArgument;
         }
-        if (ivars == nullptr || ivars->dmaBuffer == nullptr ||
-            ivars->dmaSegmentsCount < 1) {
-            return kIOReturnNotReady;
-        }
-        uint64_t size = arguments->scalarInput[0];
+        if (ivars == nullptr) return kIOReturnNotReady;
+
+        const bool legacy = (arguments->scalarInputCount < 4);
+        uint64_t size      = arguments->scalarInput[0];
+        uint32_t domain    = legacy
+                              ? (uint32_t)kBODomainGTTLegacy
+                              : (uint32_t)arguments->scalarInput[1];
+        uint64_t alignment = legacy ? (uint64_t)MACAMDGPU_BO_ALIGN
+                                    : arguments->scalarInput[2];
+        uint64_t flags     = legacy ? 0ULL : arguments->scalarInput[3];
         if (size == 0) return kIOReturnBadArgument;
-        // Round size up to a 16 KB multiple (AS DART page granularity).
-        size = (size + MACAMDGPU_BO_ALIGN - 1) & ~(MACAMDGPU_BO_ALIGN - 1);
-        // Bump-align the cursor too.
-        ivars->boBumpOffset = (ivars->boBumpOffset + MACAMDGPU_BO_ALIGN - 1)
-                            & ~(MACAMDGPU_BO_ALIGN - 1);
-        if (ivars->boBumpOffset + size > ivars->dmaBufferSize) {
-            return kIOReturnNoSpace;
+        if (flags != 0) return kIOReturnUnsupported;
+        if (alignment < MACAMDGPU_BO_ALIGN) alignment = MACAMDGPU_BO_ALIGN;
+        // Coerce alignment up to next power of two if user passed a
+        // non-pow2 value.
+        if ((alignment & (alignment - 1)) != 0) {
+            uint64_t pow2 = MACAMDGPU_BO_ALIGN;
+            while (pow2 < alignment) pow2 <<= 1;
+            alignment = pow2;
         }
-        // Find a free slot.
+        // Round size up to alignment so successive allocations stay
+        // aligned in the underlying allocator.
+        const uint64_t rounded_size = (size + alignment - 1) &
+                                      ~(alignment - 1);
+
+        // Find a free slot in the table.
         uint32_t idx = MACAMDGPU_MAX_BO;
         for (uint32_t i = 0; i < MACAMDGPU_MAX_BO; i++) {
             if (!ivars->bos[i].in_use) { idx = i; break; }
@@ -1977,20 +2147,106 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         if (idx == MACAMDGPU_MAX_BO) return kIOReturnNoResources;
 
         BOEntry &e = ivars->bos[idx];
-        e.in_use      = true;
-        e.byte_offset = ivars->boBumpOffset;
-        e.size        = size;
-        e.generation  = ++ivars->boGenCounter;
-        ivars->boBumpOffset += size;
+        // Zero everything except the generation counter (preserved across
+        // the freed slot to detect stale handles).
+        e.in_use       = true;
+        e.domain       = domain;
+        e.size         = rounded_size;
+        e.alignment    = alignment;
+        e.byte_offset  = 0;
+        e.vram_offset  = 0;
+        e.gpu_va       = 0;
+        e.gtt_buf      = nullptr;
+        e.gtt_dma      = nullptr;
+        e.gtt_bus_addr = 0;
+        e.cpu_addr     = nullptr;
+        e.generation   = ++ivars->boGenCounter;
 
-        const uint64_t handle = mac_amdgpu_bo_make_handle(e.generation, idx);
-        arguments->scalarOutput[0] = handle;
-        arguments->scalarOutput[1] =
-            ivars->dmaSegments[0].address + e.byte_offset;
-        arguments->scalarOutput[2] = e.byte_offset;
-        MACAMDGPU_LOG("BOAlloc: handle=%#llx off=%#llx size=%llu",
-                      handle, e.byte_offset, size);
-        return kIOReturnSuccess;
+        kern_return_t allocRet = kIOReturnSuccess;
+
+        if (domain == kBODomainGTTLegacy) {
+            if (ivars->dmaBuffer == nullptr || ivars->dmaSegmentsCount < 1) {
+                allocRet = kIOReturnNotReady;
+                goto bo_alloc_fail;
+            }
+            // Bump-align the legacy cursor.
+            ivars->boBumpOffset = (ivars->boBumpOffset + alignment - 1)
+                                & ~(alignment - 1);
+            if (ivars->boBumpOffset + rounded_size > ivars->dmaBufferSize) {
+                allocRet = kIOReturnNoSpace;
+                goto bo_alloc_fail;
+            }
+            e.byte_offset = ivars->boBumpOffset;
+            ivars->boBumpOffset += rounded_size;
+        }
+        else if (domain == kBODomainVRAM) {
+            auto &gmc = driver->ivars->bringup.gmc;
+            if (!gmc.vram_alloc.is_inited()) {
+                allocRet = kIOReturnNotReady;
+                goto bo_alloc_fail;
+            }
+            amdgpu::VRAMAllocation va = {};
+            if (!gmc.vram_alloc.alloc(rounded_size, alignment, &va)) {
+                allocRet = kIOReturnNoSpace;
+                goto bo_alloc_fail;
+            }
+            e.gpu_va      = va.gpu_va;
+            e.vram_offset = va.gpu_va - gmc.vram_start;
+            e.size        = va.size;
+            e.alignment   = va.alignment;
+            // CPU pointer left null; userspace maps via BAR0 + BOMap.
+        }
+        else if (domain == kBODomainGTT) {
+            // Allocate per-BO sysmem + DART-pin + bind into GART. Mirrors
+            // amdgpu::gart_bind_sysmem but keeps the IOBufferMemoryDescriptor
+            // owned by this BO entry so BOFree releases it.
+            auto &gart = driver->ivars->bringup.gart;
+            if (gart.numPTEs == 0) {
+                allocRet = kIOReturnNotReady;  // GART not up yet
+                goto bo_alloc_fail;
+            }
+            amdgpu::GARTBinding binding = {};
+            kern_return_t r = amdgpu::gart_bind_sysmem(
+                driver->ivars->bringup.device, gart,
+                rounded_size, alignment, &binding);
+            if (r != kIOReturnSuccess) {
+                allocRet = r;
+                goto bo_alloc_fail;
+            }
+            e.gtt_buf      = binding.sysmemBuffer;
+            e.gtt_dma      = binding.dmaCommand;
+            e.gtt_bus_addr = binding.busAddr;
+            e.gpu_va       = binding.gartMCAddr;
+            e.cpu_addr     = binding.cpuAddr;
+            e.size         = binding.sizeBytes;
+        }
+        else {
+            allocRet = kIOReturnBadArgument;
+            goto bo_alloc_fail;
+        }
+
+        {
+            const uint64_t handle = mac_amdgpu_bo_make_handle(e.generation, idx);
+            arguments->scalarOutput[0] = handle;
+            if (legacy) {
+                arguments->scalarOutput[1] =
+                    ivars->dmaSegments[0].address + e.byte_offset;
+                arguments->scalarOutput[2] = e.byte_offset;
+            } else {
+                arguments->scalarOutput[1] = mac_amdgpu_bo_gpu_addr(ivars, &e);
+                arguments->scalarOutput[2] =
+                    reinterpret_cast<uint64_t>(e.cpu_addr);
+            }
+            MACAMDGPU_LOG("BOAlloc: handle=%#llx domain=%u size=%llu "
+                          "gpu_va=%#llx",
+                          handle, domain, e.size,
+                          mac_amdgpu_bo_gpu_addr(ivars, &e));
+            return kIOReturnSuccess;
+        }
+
+    bo_alloc_fail:
+        e.in_use = false;
+        return allocRet;
     }
 
     case kMacAMDGPUMethodBOFree: {
@@ -1999,18 +2255,52 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             arguments->scalarInputCount < 1) {
             return kIOReturnBadArgument;
         }
-        BOEntry *e = mac_amdgpu_bo_lookup(ivars, arguments->scalarInput[0]);
+        uint64_t handle = arguments->scalarInput[0];
+        BOEntry *e = mac_amdgpu_bo_lookup(ivars, handle);
         if (e == nullptr) return kIOReturnBadArgument;
-        e->in_use = false;
-        // size + byte_offset stay set so a stale handle keeps failing.
+
+        // Release domain-specific storage.
+        if (e->domain == kBODomainVRAM) {
+            auto &gmc = driver->ivars->bringup.gmc;
+            amdgpu::VRAMAllocation va = {};
+            va.gpu_va    = e->gpu_va;
+            va.size      = e->size;
+            va.alignment = e->alignment;
+            va.cpu_ptr   = nullptr;
+            gmc.vram_alloc.free(va);
+        }
+        else if (e->domain == kBODomainGTT) {
+            if (e->gtt_dma != nullptr) {
+                e->gtt_dma->CompleteDMA(kIODMACommandCompleteDMANoOptions);
+                e->gtt_dma->release();
+            }
+            if (e->gtt_buf != nullptr) {
+                e->gtt_buf->release();
+            }
+            // GART PTEs leak until GART reset — gart.cpp bump allocator
+            // doesn't reclaim individual slots. Phase 2 task: per-PTE
+            // free-list when we revisit GART scheduling.
+        }
+        // kBODomainGTTLegacy: bump cursor stays where it is so existing
+        // submits in flight don't get clobbered; the table slot is freed.
+
+        e->in_use      = false;
+        e->gtt_buf     = nullptr;
+        e->gtt_dma     = nullptr;
+        e->cpu_addr    = nullptr;
+        // size / offset / gpu_va stay set so a stale handle keeps failing
+        // until the slot is re-allocated (generation bump).
         return kIOReturnSuccess;
     }
 
     case kMacAMDGPUMethodBOGetInfo: {
         // scalarInput[0] = handle
-        // scalarOutput[0] = bus address
-        // scalarOutput[1] = byte offset within the DMABuffer
-        // scalarOutput[2] = size
+        // Outputs (5 fields, but only 3 required by pre-v0.1.27 callers):
+        //   out[0] = gpu_va  (legacy: bus address within client DMA buffer)
+        //   out[1] = legacy byte_offset (0 for VRAM/GTT)
+        //   out[2] = size
+        //   out[3] = alignment  (only filled if scalarOutputCount >= 5)
+        //   out[4] = domain | (is_mapped << 8)
         if (arguments->scalarInput == nullptr ||
             arguments->scalarInputCount < 1 ||
             arguments->scalarOutput == nullptr ||
@@ -2018,13 +2308,70 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             return kIOReturnBadArgument;
         }
         BOEntry *e = mac_amdgpu_bo_lookup(ivars, arguments->scalarInput[0]);
-        if (e == nullptr || ivars->dmaSegmentsCount < 1) {
-            return kIOReturnBadArgument;
-        }
-        arguments->scalarOutput[0] =
-            ivars->dmaSegments[0].address + e->byte_offset;
+        if (e == nullptr) return kIOReturnBadArgument;
+
+        arguments->scalarOutput[0] = mac_amdgpu_bo_gpu_addr(ivars, e);
         arguments->scalarOutput[1] = e->byte_offset;
         arguments->scalarOutput[2] = e->size;
+        if (arguments->scalarOutputCount >= 4) {
+            arguments->scalarOutput[3] = e->alignment;
+        }
+        if (arguments->scalarOutputCount >= 5) {
+            uint64_t is_mapped = (e->cpu_addr != nullptr) ? 1ULL : 0ULL;
+            arguments->scalarOutput[4] =
+                static_cast<uint64_t>(e->domain) | (is_mapped << 8);
+        }
+        return kIOReturnSuccess;
+    }
+
+    case kMacAMDGPUMethodBOMap: {
+        // scalarInput[0]  = handle
+        // scalarOutput[0] = memory_type to pass to IOConnectMapMemory64
+        // scalarOutput[1] = size (for caller's convenience)
+        //
+        // DriverKit can't synthesise a userspace VA from inside the dext;
+        // the canonical pattern is to vend an IOMemoryDescriptor through
+        // CopyClientMemoryForType and let userspace call
+        // IOConnectMapMemory64(conn, memory_type) to obtain the cpu_va.
+        // BOMap therefore returns a memory_type encoding the BO's table
+        // index; CopyClientMemoryForType below decodes it and hands back
+        // the underlying descriptor.
+        //
+        // Today only kBODomainGTT BOs can be mapped (they own an
+        // IOBufferMemoryDescriptor we can return). kBODomainVRAM would
+        // need a BAR0-aperture descriptor — out of scope for v0.1.27
+        // until we re-export a BAR0 subrange descriptor per BO. Returns
+        // kIOReturnUnsupported for those.
+        if (arguments->scalarInput == nullptr ||
+            arguments->scalarInputCount < 1 ||
+            arguments->scalarOutput == nullptr ||
+            arguments->scalarOutputCount < 1) {
+            return kIOReturnBadArgument;
+        }
+        uint64_t handle = arguments->scalarInput[0];
+        BOEntry *e = mac_amdgpu_bo_lookup(ivars, handle);
+        if (e == nullptr) return kIOReturnBadArgument;
+        if (e->domain == kBODomainGTTLegacy) {
+            // Legacy BOs are already mapped via the client DMABuffer
+            // memory type — caller should map kMacAMDGPUMemoryTypeDMABuffer
+            // and use byte_offset. Surface that contract explicitly.
+            arguments->scalarOutput[0] = kMacAMDGPUMemoryTypeDMABuffer;
+            if (arguments->scalarOutputCount >= 2) {
+                arguments->scalarOutput[1] = e->size;
+            }
+            return kIOReturnSuccess;
+        }
+        if (e->domain != kBODomainGTT) {
+            // VRAM domain mapping needs BAR0-aperture re-export — not
+            // wired up for v0.1.27.
+            return kIOReturnUnsupported;
+        }
+        if (e->gtt_buf == nullptr) return kIOReturnNotReady;
+        uint32_t idx = mac_amdgpu_bo_handle_index(handle);
+        arguments->scalarOutput[0] = kMacAMDGPUMemoryTypeBOBase + idx;
+        if (arguments->scalarOutputCount >= 2) {
+            arguments->scalarOutput[1] = e->size;
+        }
         return kIOReturnSuccess;
     }
 
@@ -2231,6 +2578,24 @@ IMPL(MacAMDGPUUserClient, CopyClientMemoryForType)
         ivars->irqSharedBuffer->retain();
         *options = 0;
         *memory  = ivars->irqSharedBuffer;
+        return kIOReturnSuccess;
+    }
+
+    // v0.1.27 — per-BO mapping. BOMap returns (kMacAMDGPUMemoryTypeBOBase
+    // + bo_index); userspace then calls IOConnectMapMemory64(type) which
+    // routes here.
+    if (type >= kMacAMDGPUMemoryTypeBOBase &&
+        type <  kMacAMDGPUMemoryTypeBOBase + MACAMDGPU_MAX_BO) {
+        if (ivars == nullptr) return kIOReturnNotReady;
+        uint32_t idx = static_cast<uint32_t>(type - kMacAMDGPUMemoryTypeBOBase);
+        BOEntry &e = ivars->bos[idx];
+        if (!e.in_use || e.domain != kBODomainGTT ||
+            e.gtt_buf == nullptr) {
+            return kIOReturnBadArgument;
+        }
+        e.gtt_buf->retain();
+        *options = 0;
+        *memory  = e.gtt_buf;
         return kIOReturnSuccess;
     }
 
