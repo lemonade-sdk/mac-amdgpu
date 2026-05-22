@@ -204,9 +204,21 @@ sdma_gfx_resume_instance(const DeviceContext &dev, SDMAInstance &inst)
     const uint32_t i = inst.instance;
     auto reg = [&](uint32_t r) { return sdma_reg_offset(dev, i, r); };
 
+    // Mirrors upstream sdma_v7_0_gfx_resume_instance (sdma_v7_1.c:456-604).
+    // Each step logs the register name + value so the dext log reads
+    // like Linux dyndbg=+p amdgpu when bringup runs.
+    SDMA_LOG("SDMA%u gfx_resume: starting (ring_bus=%#llx, rb_size=%u dwords, "
+             "rptr_addr=%#llx, doorbell_slot=%#x)",
+             i, (unsigned long long)inst.ring_bus,
+             inst.ring_size_dwords,
+             (unsigned long long)inst.rptr_gpu_addr,
+             inst.doorbell_index);
+
     // 1) Initial RB_CNTL — set RB_SIZE, set RB_PRIV.
     uint32_t rb_bufsz = order_base_2(inst.ring_size_dwords);
     uint32_t rb_cntl = RREG32(dev, reg(SDMARegs::QUEUE0_RB_CNTL));
+    SDMA_LOG("SDMA%u  RB_CNTL initial = %#010x (programming RB_SIZE=%u, RB_PRIV=1)",
+             i, rb_cntl, rb_bufsz);
     rb_cntl = REG_SET_FIELD(rb_cntl, SDMA0_SDMA_QUEUE0_RB_CNTL, RB_SIZE, rb_bufsz);
     rb_cntl = REG_SET_FIELD(rb_cntl, SDMA0_SDMA_QUEUE0_RB_CNTL, RB_PRIV, 1);
     WREG32(dev, reg(SDMARegs::QUEUE0_RB_CNTL), rb_cntl);
@@ -244,6 +256,10 @@ sdma_gfx_resume_instance(const DeviceContext &dev, SDMAInstance &inst)
            static_cast<uint32_t>(inst.ring_bus >> 8));
     WREG32(dev, reg(SDMARegs::QUEUE0_RB_BASE_HI),
            static_cast<uint32_t>(inst.ring_bus >> 40));
+    SDMA_LOG("SDMA%u  RB_BASE = %#010x:%#010x (ring_bus >> 8 / >> 40)",
+             i,
+             static_cast<uint32_t>(inst.ring_bus >> 40),
+             static_cast<uint32_t>(inst.ring_bus >> 8));
 
     inst.wptr = 0;
 
@@ -263,6 +279,8 @@ sdma_gfx_resume_instance(const DeviceContext &dev, SDMAInstance &inst)
                                     inst.doorbell_index);
     WREG32(dev, reg(SDMARegs::QUEUE0_DOORBELL),        doorbell);
     WREG32(dev, reg(SDMARegs::QUEUE0_DOORBELL_OFFSET), doorbell_offset);
+    SDMA_LOG("SDMA%u  DOORBELL=%#x DOORBELL_OFFSET=%#x",
+             i, doorbell, doorbell_offset);
 
     // 9) Clear MINOR_PTR_UPDATE after wptr.
     WREG32(dev, reg(SDMARegs::QUEUE0_MINOR_PTR_UPDATE), 0);
@@ -293,6 +311,7 @@ sdma_gfx_resume_instance(const DeviceContext &dev, SDMAInstance &inst)
     }
 
     // 13) Unhalt engine via MCU_CNTL.
+    SDMA_LOG("SDMA%u  unhalting MCU (writing MCU_CNTL.HALT=0, RESET=0)", i);
     sdma_engine_halt(dev, i, false);
 
     // 14) Enable the ring + IB.
@@ -304,7 +323,8 @@ sdma_gfx_resume_instance(const DeviceContext &dev, SDMAInstance &inst)
     WREG32(dev, reg(SDMARegs::QUEUE0_IB_CNTL), ib_cntl);
 
     inst.enabled = true;
-    SDMA_LOG("instance %u: gfx_resume done (rb_cntl=%#x, ib_cntl=%#x)",
+    SDMA_LOG("SDMA%u: gfx_resume done — RB_CNTL=%#010x IB_CNTL=%#010x "
+             "(RB_ENABLED on QUEUE 0, IB_ENABLED, engine running)",
              i, rb_cntl, ib_cntl);
     return kIOReturnSuccess;
 }
@@ -505,6 +525,50 @@ sdma_copy_linear_test(const DeviceContext &dev, SDMAInstance &inst,
 //   4) gfx_resume_instance on each.
 //   5) sdma_ring_test on each.
 //------------------------------------------------------------------
+// sdma_log_status — read and log per-instance SDMA_STATUS_REG.
+// Mirrors what `sdma_v7_0_wait_for_idle` reads in upstream
+// (sdma_v7_0.c:1478). Use this as a quick "is this engine alive"
+// check from any diagnostic path. Bits of interest:
+//   [0]   IDLE         — engine is idle
+//   [1]   REG_IDLE     — register interface idle
+//   [4]   RB_EMPTY     — queue 0 ring buffer empty
+//   [8]   RB_CMD_IDLE  — ring command unit idle
+//   [9]   RB_CMD_FULL  — ring command unit full (back-pressure)
+//   [12]  IB_CMD_IDLE  — IB command unit idle
+//   [16]  MC_WR_IDLE   — memory controller writes idle
+//   [17]  SRBM_IDLE    — SRBM idle
+//   [18]  CONTEXT_EMPTY
+//   [19]  DELTA_RPTR_FULL
+//   [24]  PREV_CMD_IDLE
+//   [25]  PREV_HASHTAG_VALID
+//   [29]  REG_CG_REQ
+//   [30]  REG_CG_GRANT
+void
+sdma_log_status(const DeviceContext &dev, uint32_t inst)
+{
+    if (!dev.ip.isResolved(IPBlock::GC)) {
+        SDMA_LOG("status[%u]: GC IP not resolved", inst);
+        return;
+    }
+    uint32_t status = RREG32(dev,
+        sdma_reg_offset(dev, inst, SDMARegs::STATUS_REG));
+    uint32_t rb_rptr = RREG32(dev,
+        sdma_reg_offset(dev, inst, SDMARegs::QUEUE0_RB_RPTR));
+    uint32_t rb_wptr = RREG32(dev,
+        sdma_reg_offset(dev, inst, SDMARegs::QUEUE0_RB_WPTR));
+    uint32_t rb_cntl = RREG32(dev,
+        sdma_reg_offset(dev, inst, SDMARegs::QUEUE0_RB_CNTL));
+    SDMA_LOG("SDMA%u status: STATUS_REG=%#010x RB_CNTL=%#010x "
+             "rptr=%#x wptr=%#x  "
+             "(idle=%u rb_empty=%u rb_full=%u ib_idle=%u srbm_idle=%u)",
+             inst, status, rb_cntl, rb_rptr, rb_wptr,
+             (status >> 0) & 1,    // IDLE
+             (status >> 4) & 1,    // RB_EMPTY
+             (status >> 9) & 1,    // RB_CMD_FULL
+             (status >> 12) & 1,   // IB_CMD_IDLE
+             (status >> 17) & 1);  // SRBM_IDLE
+}
+
 kern_return_t
 sdma_init_full(DeviceContext &dev,
                PSPContext &psp,
@@ -518,44 +582,68 @@ sdma_init_full(DeviceContext &dev,
         SDMA_LOG("init_full: GC IP base not resolved");
         return kIOReturnNotReady;
     }
+    SDMA_LOG("init_full: starting SDMA bringup (instances=%u, "
+             "microcode_loaded=%d)",
+             kSDMAInstanceCount, sdma.microcode_loaded);
 
-    // 1) Stop both queues defensively.
-    sdma_gfx_stop_instance(dev, 0);
-    sdma_gfx_stop_instance(dev, 1);
-    sdma_engine_halt(dev, 0, true);
-    sdma_engine_halt(dev, 1, true);
+    // 1) Stop both queues defensively. Mirrors upstream sdma_v7_0_start
+    //    which calls sdma_v7_0_gfx_stop before gfx_resume.
+    SDMA_LOG("init_full: step 1/4 — defensive stop on all SDMA engines");
+    for (uint32_t i = 0; i < kSDMAInstanceCount; i++) {
+        SDMA_LOG("SDMA%u: stopping queue + halting engine (warm-reset safe)", i);
+        sdma_gfx_stop_instance(dev, i);
+        sdma_engine_halt(dev, i, true);
+        sdma_log_status(dev, i);
+    }
 
     // 2) Allocate storage.
+    SDMA_LOG("init_full: step 2/4 — allocate ring + WB per instance");
     for (uint32_t i = 0; i < kSDMAInstanceCount; i++) {
         sdma.instance[i].instance = i;
         kern_return_t r = sdma_alloc_storage(dev, sdma.instance[i]);
         if (r != kIOReturnSuccess) {
-            SDMA_LOG("init_full: instance %u alloc failed: %#x", i, r);
+            SDMA_LOG("SDMA%u init_full: storage alloc failed: %#x", i, r);
             return r;
         }
     }
 
     if (!sdma.microcode_loaded) {
-        SDMA_LOG("init_full: microcode not yet loaded; storage allocated, "
-                 "deferring gfx_resume until LoadFirmware(SDMA0/SDMA1)");
+        SDMA_LOG("init_full: microcode_loaded=false — storage allocated, "
+                 "deferring gfx_resume + ring_test until "
+                 "LoadFirmware(SDMA0/SDMA1) completes");
         return kIOReturnSuccess;
     }
 
-    // 3) gfx_resume each.
+    // 3) gfx_resume each. Mirrors upstream sdma_v7_0_gfx_resume.
+    SDMA_LOG("init_full: step 3/4 — gfx_resume each instance "
+             "(program RB_BASE/CNTL/WPTR/RPTR, doorbell, watchdog, "
+             "unhalt MCU, enable RB+IB)");
     for (uint32_t i = 0; i < kSDMAInstanceCount; i++) {
         kern_return_t r = sdma_gfx_resume_instance(dev, sdma.instance[i]);
         if (r != kIOReturnSuccess) {
-            SDMA_LOG("init_full: instance %u resume failed: %#x", i, r);
+            SDMA_LOG("SDMA%u init_full: gfx_resume failed: %#x", i, r);
+            sdma_log_status(dev, i);
             return r;
         }
+        // Linux dyndbg pattern: "SDMA %d use_doorbell being set to: [yes]"
+        SDMA_LOG("SDMA%u: use_doorbell=yes (slot %#x), engine unhalted",
+                 i, sdma.instance[i].doorbell_index);
+        sdma_log_status(dev, i);
     }
 
     // 4) Ring test on each. Failure is logged but doesn't kill the
-    //    init — userspace can re-run via a selector.
+    //    init — userspace can re-run via a selector. Mirrors upstream
+    //    sdma_v7_0_ring_test_ring (sdma_v7_0.c:934).
+    SDMA_LOG("init_full: step 4/4 — sdma_ring_test on each instance "
+             "(submit FENCE pkt, watch WB write)");
     for (uint32_t i = 0; i < kSDMAInstanceCount; i++) {
         sdma_ring_test(dev, sdma.instance[i], /*timeout_us=*/100000);
     }
 
+    SDMA_LOG("init_full: done — final per-instance status:");
+    for (uint32_t i = 0; i < kSDMAInstanceCount; i++) {
+        sdma_log_status(dev, i);
+    }
     return kIOReturnSuccess;
 }
 
