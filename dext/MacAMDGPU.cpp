@@ -324,7 +324,7 @@ struct MacAMDGPU_IVars {
     bool       shutdownBlocked;  // failed shutdown: only status/retry allowed
     bool       shutdownInProgress; // atomic admission barrier for new clients
     uint32_t   connectedClients; // atomic, decremented only after Stop drains
-    IOService *openerUserClient;  // tracked so Open/Close entities match
+    amdgpu::ClientSessions sessions; // PCI opener is always this driver
     IOPCIDevice *retainedPCI;     // outlives superclass Stop until final free
     MacAMDGPUUserClient_IVars *quarantinedClient; // backing retained after failed reset
     amdgpu::ClientSubmission submission;
@@ -346,7 +346,8 @@ struct MacAMDGPU_IVars {
 // each userspace process gets isolated resources.
 //
 struct MacAMDGPUUserClient_IVars {
-    bool claimed;
+    bool claimed; // attached hardware participant, distinct from observer connection
+    MacAMDGPUUserClient_IVars *quarantineNext;
     bool mappedBAR; // direct MMIO mappings cannot be revoked by this selector
     bool stopping;                 // atomic: also read by the IRQ queue
     uint32_t stopPendingSources;   // atomic cancellation countdown + submission sentinel
@@ -589,21 +590,24 @@ mac_amdgpu_ensure_open(IOService *opener, MacAMDGPU *driver,
         return kIOReturnNotReady;
     }
     if (driver->ivars->shutdownBlocked) return kIOReturnNotReady;
-    if (driver->ivars->pciOpen)
-        return driver->ivars->openerUserClient == opener ? kIOReturnSuccess : kIOReturnBusy;
-
-    // Closing the opener releases client DMA mappings. Re-enabling bus
-    // mastering on retained rings could expose those stale addresses.
-    if (driver->ivars->bringup.reached != amdgpu::BringupStage::None)
+    auto *client = OSDynamicCast(MacAMDGPUUserClient, opener);
+    if (!client || !client->ivars) return kIOReturnNotAttached;
+    auto *state = driver->ivars;
+    const bool ready = state->bringup.reached == amdgpu::BringupStage::SDMAInit;
+    if (!state->pciOpen && state->bringup.reached != amdgpu::BringupStage::None)
         return kIOReturnNotReady;
+    const bool alreadyAttached = client->ivars->claimed;
+    if (!state->sessions.attach(client, client->ivars->claimed, ready)) return kIOReturnBusy;
+    if (state->pciOpen) return kIOReturnSuccess;
 
-    kern_return_t ret = pci->Open(opener, 0);
+    kern_return_t ret = pci->Open(driver, 0);
     if (ret != kIOReturnSuccess) {
         MACAMDGPU_LOG("ensure_open: PCI Open failed: %#x", ret);
+        if (!alreadyAttached) state->sessions.detach(client, client->ivars->claimed);
         return ret;
     }
     driver->ivars->pciOpen = true;
-    __atomic_store_n(&driver->ivars->openerUserClient, opener, __ATOMIC_RELEASE);
+
 
     uint16_t cmd = 0;
     pci->ConfigurationRead16(0x04, &cmd);
@@ -715,9 +719,9 @@ mac_amdgpu_admit_external(IOService *client, MacAMDGPU *driver,
 {
     if (selector == kMacAMDGPUMethodMESAddQueue) return kIOReturnUnsupported;
     if (selector == kMacAMDGPUMethodCollectMetrics) {
-        // Sampling cannot acquire a new hardware session. It belongs to the
-        // client that already initialized the GPU, not a monitoring observer.
-        if (!driver->ivars->pciOpen || driver->ivars->openerUserClient != client)
+        // Sampling does not turn an observer into an active participant.
+        auto *user = OSDynamicCast(MacAMDGPUUserClient, client);
+        if (!user || !user->ivars || !user->ivars->claimed || !driver->ivars->pciOpen)
             return kIOReturnNotOpen;
         return driver->ivars->submission.poll() ? kIOReturnSuccess : kIOReturnBusy;
     }
@@ -728,6 +732,15 @@ mac_amdgpu_admit_external(IOService *client, MacAMDGPU *driver,
     if (!observer && selector != kMacAMDGPUMethodShutdownGPU) {
         kern_return_t ownerRet = mac_amdgpu_ensure_open(client, driver, pci);
         if (ownerRet != kIOReturnSuccess) return ownerRet;
+        auto *user = OSDynamicCast(MacAMDGPUUserClient, client);
+        const bool ready = driver->ivars->bringup.reached == amdgpu::BringupStage::SDMAInit;
+        if (ready && (selector == kMacAMDGPUMethodLoadFirmware ||
+                      selector == kMacAMDGPUMethodSetIPBase ||
+                      selector == kMacAMDGPUMethodLoadDiscoveryBin ||
+                      selector == kMacAMDGPUMethodResetDevice)) return kIOReturnBusy;
+        if ((selector == kMacAMDGPUMethodSubmitIB || selector == kMacAMDGPUMethodSetupInterrupts) &&
+            !driver->ivars->sessions.claimExclusive(user, user->ivars->claimed))
+            return kIOReturnBusy;
         // Raw packets have no BO list. Until a scheduler owns their references,
         // all other mutation/resource recycling waits for the one live fence.
         if (!driver->ivars->submission.poll() &&
@@ -1071,7 +1084,8 @@ mac_amdgpu_reset_device(MacAMDGPUUserClient *client)
     IOPCIDevice *pci = mac_amdgpu_pci(driver);
     if (pci == nullptr) return kIOReturnUnsupported;
 
-    if (driver->ivars->openerUserClient != client ||
+    if (driver->ivars->sessions.initializationClient != client ||
+        !driver->ivars->sessions.canReset(client, client->ivars->claimed) ||
         client->ivars->mappedBAR || client->ivars->irqQueue != nullptr)
         return kIOReturnBusy;
 
@@ -1183,13 +1197,12 @@ IMPL(MacAMDGPU, Stop)
     if (ivars != nullptr) {
         __atomic_store_n(&ivars->stopping, true, __ATOMIC_RELEASE);
         amdgpu::smu_metrics_invalidate(ivars->bringup.metrics, kIOReturnNotAttached);
-        if (ivars->pciOpen && ivars->openerUserClient != nullptr) {
+        if (ivars->pciOpen) {
             // PCIDriverKit Close disables Bus Lead Enable and Memory Space
             // Enable. Do this before any DMA descriptors can be completed.
-            ivars->retainedPCI->Close(ivars->openerUserClient, 0);
+            ivars->retainedPCI->Close(this, 0);
             ivars->pciOpen = false;
-            __atomic_store_n(&ivars->openerUserClient, (IOService *)nullptr,
-                             __ATOMIC_RELEASE);
+
             MACAMDGPU_LOG("driver Stop: PCI closed; shared storage retained until clients drain");
         }
     }
@@ -1343,13 +1356,33 @@ mac_amdgpu_release_client_storage(MacAMDGPUUserClient_IVars *state, MacAMDGPU *d
         if (cs.in_use) mac_amdgpu_cs_free_slot(&cs);
 }
 
+// Called only with no pending/failed work on the shared serial queue.
+// GTT mappings need live page-table removal; bulk release is reset-only.
+static bool
+mac_amdgpu_retire_client_storage(MacAMDGPUUserClient_IVars *state, MacAMDGPU *driver)
+{
+    for (auto &bo : state->bos) {
+        if (!bo.in_use || bo.domain != kBODomainGTT) continue;
+        const auto status = amdgpu::gart_unbind(driver->ivars->bringup.device,
+            driver->ivars->bringup.gart, &bo.gttBinding);
+        if (status != kIOReturnSuccess) return false;
+        bo.in_use = false;
+        bo.gtt_buf = nullptr;
+        bo.gtt_dma = nullptr;
+        bo.cpu_addr = nullptr;
+    }
+    mac_amdgpu_release_client_storage(state, driver);
+    return true;
+}
+
 static void
 mac_amdgpu_release_quarantine(MacAMDGPU *driver)
 {
-    auto *state = driver->ivars->quarantinedClient;
-    if (!state) return;
-    mac_amdgpu_release_client_storage(state, driver);
-    IOSafeDeleteNULL(driver->ivars->quarantinedClient, MacAMDGPUUserClient_IVars, 1);
+    while (auto *state = driver->ivars->quarantinedClient) {
+        driver->ivars->quarantinedClient = state->quarantineNext;
+        mac_amdgpu_release_client_storage(state, driver);
+        IOSafeDeleteNULL(state, MacAMDGPUUserClient_IVars, 1);
+    }
 }
 
 // Keep all DMA backing pinned until FLR has completed and bus mastering is
@@ -1423,22 +1456,26 @@ mac_amdgpu_shutdown_gpu(MacAMDGPUUserClient *client, uint64_t &phase)
 
     // Other clients may own DMA or access BAR mappings outside our RPC queue.
     // IRQ owners must close and let the existing cancellation barrier drain.
-    if (__atomic_load_n(&state->connectedClients, __ATOMIC_ACQUIRE) != 1 ||
-        (state->pciOpen && state->openerUserClient != client) ||
+    if (!state->sessions.canReset(client, client->ivars->claimed) ||
         client->ivars->mappedBAR || client->ivars->pendingInterruptNotify != nullptr)
         return kIOReturnBusy;
     for (auto *source : client->ivars->interruptSources)
         if (source != nullptr) return kIOReturnBusy;
 
-    // A previous owner may have closed with shared rings retained. Reopen
-    // exclusively for reset, without ensure_open (which enables bus mastering).
+    // Recovery from a previously detached participant may be initiated by an
+    // observer only when no participant remains. Track this reset caller too,
+    // so its close can isolate a failed reset attempt.
+    if (!state->sessions.attach(client, client->ivars->claimed,
+                                state->bringup.reached == amdgpu::BringupStage::SDMAInit))
+        return kIOReturnBusy;
+    // Reopen only for reset, without ensure_open enabling bus mastering.
     state->shutdownBlocked = true;
     amdgpu::smu_metrics_invalidate(state->bringup.metrics, kIOReturnNotReady);
     if (!state->pciOpen) {
-        kern_return_t ret = pci->Open(client, 0);
+        kern_return_t ret = pci->Open(driver, 0);
         if (ret != kIOReturnSuccess) return ret;
         state->pciOpen = true;
-        __atomic_store_n(&state->openerUserClient, (IOService *)client, __ATOMIC_RELEASE);
+
     }
     kern_return_t ret = mac_amdgpu_quiesce_for_shutdown(pci, phase);
     if (ret != kIOReturnSuccess) {
@@ -1448,9 +1485,9 @@ mac_amdgpu_shutdown_gpu(MacAMDGPUUserClient *client, uint64_t &phase)
     }
     // SDK Close is void; its documented contract disables BM and MEM. BM was
     // also explicitly verified off above while configuration access was open.
-    pci->Close(client, 0);
+    pci->Close(driver, 0);
     state->pciOpen = false;
-    __atomic_store_n(&state->openerUserClient, (IOService *)nullptr, __ATOMIC_RELEASE);
+    state->sessions.detach(client, client->ivars->claimed);
     state->submission = {};
     mac_amdgpu_release_quarantine(driver);
     mac_amdgpu_bo_release_all(client->ivars, driver);
@@ -1481,10 +1518,6 @@ IMPL(MacAMDGPUUserClient, Stop)
         return ret != kIOReturnSuccess ? ret : kIOReturnNoResources;
     }
     __atomic_store_n(&ivars->stopping, true, __ATOMIC_RELEASE);
-    if (ivars->ownerDriver && ivars->ownerDriver->ivars &&
-        ivars->ownerDriver->ivars->openerUserClient == this)
-        amdgpu::smu_metrics_invalidate(ivars->ownerDriver->ivars->bringup.metrics,
-                                     kIOReturnNotReady);
     retain();
     provider->retain();
     ivars->stopProvider = provider;
@@ -1529,41 +1562,48 @@ MacAMDGPUUserClient::FinishStop(IOService *provider)
     mac_amdgpu_release_all_interrupts(this);
 
     MacAMDGPU *driver = OSDynamicCast(MacAMDGPU, provider);
+    auto *state = driver->ivars;
+    const bool participant = ivars->claimed;
+    state->sessions.detach(this, ivars->claimed);
     bool quarantine = false;
     bool resetComplete = false;
-    if (driver != nullptr && driver->ivars != nullptr &&
-        driver->ivars->pciOpen && driver->ivars->openerUserClient == this) {
-        auto *state = driver->ivars;
+    bool storageReleased = false;
+    if (participant && state->pciOpen && state->sessions.participants == 0) {
         uint64_t phase = 0;
         amdgpu::smu_metrics_invalidate(state->bringup.metrics, kIOReturnNotReady);
-        // Root Stop already isolates an unplugged/terminated provider. For a
-        // live client close, flush engine work before recycling VRAM or DMA.
-        kern_return_t stopped = mac_amdgpu_quiesce_for_shutdown(state->retainedPCI, phase);
+        const auto stopped = mac_amdgpu_quiesce_for_shutdown(state->retainedPCI, phase);
         resetComplete = stopped == kIOReturnSuccess;
-        state->retainedPCI->Close(this, 0);
+        state->retainedPCI->Close(driver, 0);
         state->pciOpen = false;
-        __atomic_store_n(&state->openerUserClient, (IOService *)nullptr, __ATOMIC_RELEASE);
         if (!resetComplete) {
             state->shutdownBlocked = true;
-            // A retry client cannot own new storage while shutdownBlocked.
-            quarantine = state->quarantinedClient == nullptr;
-            MACAMDGPU_LOG("client close: reset failed at phase %llu (%#x); PCI closed, backing quarantined", phase, stopped);
+            quarantine = true;
+            MACAMDGPU_LOG("last participant close: reset failed at phase %llu (%#x); backing quarantined", phase, stopped);
         } else {
             state->submission = {};
             mac_amdgpu_release_quarantine(driver);
         }
+    } else if (participant && state->pciOpen) {
+        // Synchronous RPC completion precedes this callback on the same queue.
+        // Do not reset another application's session or release uncertain DMA.
+        quarantine = state->shutdownBlocked || !state->submission.poll();
+        if (!quarantine) {
+            storageReleased = mac_amdgpu_retire_client_storage(ivars, driver);
+            quarantine = !storageReleased;
+        }
+        if (quarantine) state->shutdownBlocked = true;
     }
-
-    if (!quarantine) mac_amdgpu_release_client_storage(ivars, driver);
+    if (!quarantine && !storageReleased) mac_amdgpu_release_client_storage(ivars, driver);
     if (resetComplete) {
-        amdgpu::bringup_release_resources(driver->ivars->bringup);
-        driver->ivars->shutdownBlocked = false;
+        amdgpu::bringup_release_resources(state->bringup);
+        state->shutdownBlocked = false;
     }
 
     IODispatchQueue *completionQueue = ivars->stopQueue;
     MacAMDGPU *ownerDriver = ivars->ownerDriver;
     __atomic_sub_fetch(&ownerDriver->ivars->connectedClients, 1, __ATOMIC_ACQ_REL);
     if (quarantine) {
+        ivars->quarantineNext = ownerDriver->ivars->quarantinedClient;
         ownerDriver->ivars->quarantinedClient = ivars;
         ivars->ownerDriver = nullptr;
         ivars->stopQueue = nullptr;
@@ -2349,8 +2389,9 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             driver->ivars->shutdownBlocked = true;
             MACAMDGPU_LOG("initialization failed after possible submission; Stop GPU required before retry");
         }
-        arguments->scalarOutput[0] =
-            (uint64_t)driver->ivars->bringup.reached;
+        if (ret == kIOReturnSuccess && bringup.reached == amdgpu::BringupStage::SDMAInit)
+            driver->ivars->sessions.initializationClient = nullptr;
+        arguments->scalarOutput[0] = (uint64_t)bringup.reached;
         return ret;
     }
 
@@ -4033,7 +4074,7 @@ IMPL(MacAMDGPUUserClient, CopyClientMemoryForType)
     }
 
     auto *ownerState = ivars->ownerDriver->ivars;
-    if (ownerState->pciOpen && ownerState->openerUserClient != this) return kIOReturnBusy;
+    if (!ivars->claimed && type > kMacAMDGPUMemoryTypeBAR5) return kIOReturnNotOpen;
     if (!ownerState->submission.poll()) return kIOReturnBusy;
 
     // Non-BAR memory types — DMA buffer and IRQ shared page.
@@ -4092,6 +4133,7 @@ IMPL(MacAMDGPUUserClient, CopyClientMemoryForType)
     kern_return_t openRet = mac_amdgpu_ensure_open(this, driver, pci);
     if (openRet != kIOReturnSuccess) return openRet;
 
+    if (!driver->ivars->sessions.claimExclusive(this, ivars->claimed)) return kIOReturnBusy;
     uint8_t barIndex = (uint8_t)type;
     uint8_t  memoryIndex = 0;
     uint64_t barSize = 0;
@@ -4105,9 +4147,9 @@ IMPL(MacAMDGPUUserClient, CopyClientMemoryForType)
     }
 
     IOMemoryDescriptor *barMem = nullptr;
-    // opener must be the IOService that called Open()
+    // PCI Open belongs to the root driver, independent of application lifetime.
     ret = pci->_CopyDeviceMemoryWithIndex(memoryIndex, &barMem,
-                                          driver->ivars->openerUserClient);
+                                          driver);
     if (ret != kIOReturnSuccess || barMem == nullptr) {
         MACAMDGPU_LOG("_CopyDeviceMemoryWithIndex BAR%u failed: %#x",
                       (unsigned)barIndex, ret);
@@ -4132,9 +4174,9 @@ IMPL(MacAMDGPUUserClient, CopyClientMemoryForType)
 // WaitInterrupt and then read irqPending to find out *what* event
 // fired, not just *that one* fired.
 //
-// Routes only to the primary client (driver->openerUserClient).
-// Phase 1B keeps a single client per device — multi-client fan-out
-// is a Phase 2+ concern.
+// Routes only to the exclusive interrupt client.
+// Legacy interrupt ownership excludes other hardware participants; observer
+// clients remain allowed. Shared buffer/dispatch clients use synchronous RPCs.
 //============================================================
 struct IHDispatchCtx {
     MacAMDGPUUserClient_IVars *ivars;   // primary client's IVars
@@ -4215,17 +4257,17 @@ IMPL(MacAMDGPUUserClient, InterruptOccurred)
     __atomic_fetch_or(&ivars->irqPending[word], bit, __ATOMIC_RELEASE);
 
     // Drain IH ring if active. The ring is per-device (lives on the
-    // driver) so we route only to the primary opener client.
+    // driver) so we route only to the exclusive legacy IRQ client.
     MacAMDGPU *driver = OSDynamicCast(MacAMDGPU, GetProvider());
     if (driver != nullptr && driver->ivars != nullptr) {
         if (__atomic_load_n(&driver->ivars->stopping, __ATOMIC_ACQUIRE)) return;
         auto &bringup = driver->ivars->bringup;
         if (bringup.ih.enabled && bringup.ih.inited) {
-            // Only the opener client receives IH events for now.
+            // Only the exclusive legacy IRQ client receives IH events.
             // Never borrow another client's ivars: its Stop barrier only
             // drains its own sources, not this client's IRQ queue.
-            if (__atomic_load_n(&driver->ivars->openerUserClient,
-                                __ATOMIC_ACQUIRE) == (IOService *)this) {
+            if (__atomic_load_n(&driver->ivars->sessions.exclusiveClient,
+                                __ATOMIC_ACQUIRE) == this) {
                 IHDispatchCtx dctx{ ivars };
                 uint32_t n = amdgpu::ih_drain(bringup.device, bringup.ih,
                                               &mac_amdgpu_ih_dispatch,

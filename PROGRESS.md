@@ -1671,3 +1671,38 @@ initialization failure, plus production transport staging and owner conflicts.
 GPU-visible atomics, hardware AQL queues, executable loading and HRX/LSE
 inference remain unfinished. The next lifecycle change must let multiple
 clients share one driver-owned GPU session without resetting each other's work.
+
+
+## Build 180: shared sessions and HSA executable loading — 2026-09-23
+
+PCI ownership moved to the root driver. Per-client participant references
+separate initialization, shared ready sessions, and legacy exclusive mappings.
+Firmware upload/reset require the initialization or sole-client lease. Closing
+one healthy client retires only its resources while peers remain. Last-client
+close performs verified quiesce/reset before global release. Faulted closes
+retain a list of quarantined clients until a successful reset; observer clients
+neither block teardown nor take initialization ownership.
+
+All 27 existing regression scripts and the signed Debug app build passed before
+installation. RuntimeBuild verified 180 on the live device. Two HSA processes
+shared the GPU: the second completed its full memory test and exited, after
+which the first verified all 12,003 payload bytes and 4,381 guards. The device
+remained at stage 15 between client exits and returned to stage 0 after the last.
+A second two-client test terminated the first with SIGINT without HSA cleanup;
+the remaining client still verified all data/guards and shut down normally.
+This covers abrupt idle-process exit, not hung in-flight GPU execution.
+
+HSA gained gfx1201 ISA enumeration and nine executable APIs backed by a bounded
+ELF64/MessagePack parser, kernel descriptor checks, supported relocation
+processing and GPU BO upload. The pinned HRX symbol audit is now 90/119, with
+29 missing. Parser checks include every fixture truncation, 1,000 mutations,
+invalid layouts, overflow and descriptor-changing relocations. Six runtime
+ASan/UBSan suites pass, including backend failure cleanup and reentrant release.
+A hardware executable test uploaded the linked LLVM kernel, froze the executable
+and resolved vector_add.kd at 0x8010000580 with 12-byte kernargs. No HSA kernel
+was dispatched; GPU-visible signals, AQL queues and loader extensions remain.
+
+Installing the ELF linker also upgraded Homebrew's default LLVM. Regression
+shader generation now selects the retained LLVM 21.1.8 keg and its compatible
+versioned Z3 library through a local environment helper, preserving the tested
+instruction bytes without changing global library symlinks.

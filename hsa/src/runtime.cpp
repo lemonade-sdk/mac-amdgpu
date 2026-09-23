@@ -116,6 +116,7 @@ hsa_status_t hsa_shut_down() {
     std::vector<Agent> retiredAgents;
     std::vector<std::unique_ptr<CopyJob>> retiredJobs;
     std::map<uintptr_t, std::shared_ptr<Allocation>> retiredAllocations;
+    std::unordered_map<uint64_t, std::shared_ptr<Executable>> retiredExecutables;
     {
         std::lock_guard lock(runtimeMutex);
         if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
@@ -127,6 +128,9 @@ hsa_status_t hsa_shut_down() {
             }
             for (auto &job : copyJobs) job->worker.request_stop();
             retiredJobs.swap(copyJobs);
+            retiredExecutables.swap(executables);
+            executableSymbols.clear();
+            codeReaders.clear();
             clearQueues();
             signals.clear();
             pools.clear();

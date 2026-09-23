@@ -2,6 +2,44 @@
 #include <stdint.h>
 
 namespace amdgpu {
+// Protected by the driver's serial lifecycle queue. PCI belongs to the driver;
+// clients hold participant references and, during bootstrap, one initialization
+// lease. Legacy raw access remains exclusive until reset or client retirement.
+struct ClientSessions {
+    void *initializationClient = nullptr;
+    void *exclusiveClient = nullptr;
+    uint32_t participants = 0;
+
+    bool attach(void *client, bool &attached, bool ready) {
+        const auto exclusive = __atomic_load_n(&exclusiveClient, __ATOMIC_ACQUIRE);
+        if (exclusive && exclusive != client) return false;
+        if (!ready && initializationClient && initializationClient != client) return false;
+        if (ready) initializationClient = nullptr;
+        if (attached) return true;
+        if (participants == UINT32_MAX) return false;
+        if (!ready) initializationClient = client;
+        ++participants;
+        attached = true;
+        return true;
+    }
+    bool claimExclusive(void *client, bool attached) {
+        const auto exclusive = __atomic_load_n(&exclusiveClient, __ATOMIC_ACQUIRE);
+        if (!attached || participants != 1 || (exclusive && exclusive != client)) return false;
+        __atomic_store_n(&exclusiveClient, client, __ATOMIC_RELEASE);
+        return true;
+    }
+    bool canReset(void *client, bool attached) const {
+        const auto exclusive = __atomic_load_n(&exclusiveClient, __ATOMIC_ACQUIRE);
+        return participants == (attached ? 1u : 0u) && (!exclusive || exclusive == client);
+    }
+    void detach(void *client, bool &attached) {
+        if (attached) { if (participants) --participants; attached = false; }
+        if (initializationClient == client) initializationClient = nullptr;
+        if (__atomic_load_n(&exclusiveClient, __ATOMIC_ACQUIRE) == client)
+            __atomic_store_n(&exclusiveClient, (void *)nullptr, __ATOMIC_RELEASE);
+    }
+};
+
 // RPC inputs must not overflow or keep the serial lifecycle queue spinning.
 inline bool client_allocation_shape(uint64_t size, uint64_t requestedAlignment,
                                     uint64_t minimumAlignment,

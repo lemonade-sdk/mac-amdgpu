@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p build/tests
-llvm_bin="${AMDGPU_LLVM_BIN:-/opt/homebrew/opt/llvm/bin}"
+source scripts/amdgpu-llvm-env.sh
 "$llvm_bin/llvm-mc" -triple=amdgcn-amd-amdhsa -mcpu=gfx1201 -mattr=+wavefrontsize32 \
   -filetype=obj tests/shaders/dispatch_gfx1201.s -o build/tests/dispatch.o
 "$llvm_bin/llvm-objcopy" --dump-section .text=build/tests/dispatch.bin build/tests/dispatch.o

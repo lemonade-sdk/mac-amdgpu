@@ -1,5 +1,13 @@
 # Status
 
+**v0.1.80 — shared GPU sessions (hardware passed).**
+The driver owns the PCI connection; each client owns its buffers and command
+resources. An initialized GPU accepts additional clients without reset or
+firmware reload. A departing client releases only its own resources; the last
+client quiesces and resets the GPU. Two simultaneous HSA clients passed full
+data/guard checks, including continued operation after a peer exited abruptly.
+Global Stop/Reset remains blocked while another participating client is active.
+
 **v0.1.79 — compiler-verified dispatch shader (hardware passed).**
 The multi-workgroup test now matches LLVM gfx1201 output byte-for-byte,
 including ttmp9 workgroup IDs and instruction dependencies. It reports the
@@ -18,15 +26,6 @@ work retains storage until reset. Scratch, wave64, AQL queues and executable
 loading remain unfinished. `amdgpu_mtop` now reports visible and GPU-only
 allocator usage, free space and fragmentation separately from firmware load. Live accounting verified the retained test allocations.
 
-**v0.1.77 — GPU-only buffers and bounded transfers.**
-A separate allocator covers usable VRAM above BAR0, keeping firmware and visible
-staging storage separate. Owner-only buffer upload/readback and SDMA copy APIs
-validate handles, ranges and transfer limits. Large VRAM Test reserves 22 GiB
-and checks 4 KiB transfers at three offsets, including its end; it does not
-validate every byte. All 25 regression suites and the Debug build pass.
-Verified build 177 initialized and passed all three sampled regions in the
-22 GiB allocation, released its buffers, then passed Compute Smoke again.
-
 The native [amdgpu_mtop monitor](amdgpu_mtop/README.md) enumerates attached
 MacAMDGPU devices with GPU switching and JSON output. Live discovery and VRAM
 capacity queries work; dynamic firmware metrics require a verified interface-0x33 layout.
@@ -34,10 +33,11 @@ capacity queries work; dynamic firmware metrics require a verified interface-0x3
 The current target is AI compute and model inference. The initial [HSA runtime](hsa/README.md)
 now initializes the GPU and provides data-verified device allocations, copies,
 asynchronous completion, host pools, CPU signals and software queues.
-It exports 79 of the 119 functions resolved by LSE’s pinned HRX; 40 are missing.
-GPU-visible signals, HSA dispatch, queues, executable loading and HRX/LSE inference
-remain required. The HSA memory test passed on the GPU, but HRX inference has
-not run. Shared-client lifecycle support is in progress.
+It exports 90 of the 119 functions resolved by LSE’s pinned HRX; 29 are missing.
+A bounded gfx1201 ELF loader now uploads linked kernels and exposes their
+descriptors; a compiler-produced kernel passed hardware loading and symbol
+resolution. GPU-visible signals, HSA queue dispatch, loader extensions and
+HRX/LSE inference remain required. HRX inference has not run.
 
 Older release history and detailed hardware results are in [PROGRESS.md](PROGRESS.md).
 

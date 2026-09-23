@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
+bash scripts/test-hsa-code-objects.sh
 cmake -S hsa -B build/hsa -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
 cmake --build build/hsa --parallel 4
 ctest --test-dir build/hsa --output-on-failure
@@ -18,6 +19,12 @@ for suffix in ['relaxed', 'scacquire', 'screlease', 'scacq_screl']:
     required.update('hsa_signal_' + op + '_' + suffix
                     for op in ['add', 'subtract', 'and', 'or', 'xor', 'exchange', 'cas'])
 required.update({
+    'hsa_code_object_reader_create_from_memory', 'hsa_code_object_reader_destroy',
+    'hsa_executable_create_alt', 'hsa_executable_destroy',
+    'hsa_executable_load_agent_code_object', 'hsa_executable_freeze',
+    'hsa_executable_validate_alt', 'hsa_executable_get_symbol_by_name',
+    'hsa_executable_symbol_get_info',
+    'hsa_agent_iterate_isas', 'hsa_isa_get_info_alt',
     'hsa_agent_iterate_regions', 'hsa_region_get_info', 'hsa_memory_allocate',
     'hsa_memory_free', 'hsa_memory_copy', 'hsa_amd_agent_iterate_memory_pools',
     'hsa_amd_memory_pool_get_info', 'hsa_amd_agent_memory_pool_get_info',
@@ -33,5 +40,5 @@ for suffix in ['relaxed', 'screlease']:
 for suffix in ['relaxed', 'scacquire', 'screlease', 'scacq_screl']:
     required.update('hsa_queue_' + op + '_write_index_' + suffix for op in ['add', 'cas'])
 assert not required - exported, f'Missing implemented exports: {required - exported}'
-print(f'{len(required)} signal, memory and software queue entry points exported from the built dylib')
+print(f'{len(required)} signal, memory, queue, ISA and executable entry points exported from the built dylib')
 PY

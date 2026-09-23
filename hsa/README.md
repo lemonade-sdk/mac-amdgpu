@@ -73,7 +73,7 @@ completion signals or successful no-op dispatches.
 
 LSE commit `b5637a7109d409c21f75586edb75e7631277bce8` pins HRX System to
 `5927b0e0fafdefb5c8b41aa71bca8fd28791ad7c`. This revision requires 119 dynamic
-HSA symbols; the current library supplies 79 of them, leaving 40 missing. Symbol presence
+HSA symbols; the current library supplies 90 of them, leaving 29 missing. Symbol presence
 is not equivalent to full behavior: queue creation still rejects requests, and
 signals currently require CPU-only consumers. It
 creates hardware queues through `hsa_queue_create`, then casts those queues to
@@ -82,7 +82,7 @@ requires the AMD loader extension, memory pools, signals and code objects.
 The existing driver command/fence tests do not satisfy those contracts.
 
 The separately reviewed HRX main revision
-`437e789eaea207a036c197cf3398a6ca473d6534` requires 121 symbols (79 exported, 42 missing) and uses
+`437e789eaea207a036c197cf3398a6ca473d6534` requires 121 symbols (90 exported, 31 missing) and uses
 `hsa_amd_queue_create`. Keep these baselines distinct; LSE's pinned revision
 and its patches are the initial integration target.
 
@@ -234,9 +234,10 @@ and follows the tested R9700 firmware sequence. All firmware files are read
 before reset. The default firmware directory is the installed host app's
 `Contents/Resources/firmware`; `MAC_AMDGPU_FIRMWARE_DIR` overrides it. C0 and C8
 firmware selection is explicit. Every stage and firmware RPC must acknowledge
-success before the next is issued. Readiness is not inferred from another
-client's cached stage. The current build-179 driver requires exclusive ownership;
-shared-client lifecycle support is being implemented.
+success before the next is issued. Build 180 can join an already initialized
+session after GetIdentity acquires a participant reference and live IP and
+allocator queries succeed; this path performs no reset or firmware upload.
+Build 179 still requires exclusive ownership.
 
 After Stop GPU in the host app, run:
 
@@ -256,3 +257,41 @@ every initialization failure point, and the production IOKit transport with
 mocked calls. They check temporary observer closure, single concurrent
 initialization, firmware map/unmap, staged transfer guards and failure retention.
 The export test checks the built dylib, not just unit-test linkage.
+
+
+## Shared sessions and executable loading (build 180)
+
+On 2026-09-23, two separate HSA processes shared the actual GPU. The first
+held live buffers while the second allocated, copied, verified every byte,
+and exited. The first then passed the same 12,003 payload and 4,381 guard-byte
+checks. A separate run terminated the first process with SIGINT, bypassing HSA
+cleanup; the second still passed. The final client exit returned the device to
+stage 0. These runs validate idle-client departure, not recovery from a hung
+in-flight kernel or process isolation for arbitrary trusted-VMID0 code.
+
+To reproduce, run `build/hsa/mac-hsa-memory-test --hold` in one terminal, run
+`--run` in another, then press Enter in the first. Build 180 needs no Host Stop
+before attaching to an initialized shared session.
+
+ISA enumeration reports gfx1201. Nine executable APIs provide copied code-object
+readers, executable creation/destruction, agent loading, freeze, validation and
+kernel symbol lookup/info. The loader accepts bounded ELF64 AMDHSA ET_DYN images
+for gfx1201, checks load segments, MessagePack metadata and kernel descriptors,
+then applies ABS64/RELATIVE64 relocations and uploads into owned GPU storage.
+Unresolved imports, TLS, other relocation types and descriptor-changing
+relocations are rejected. AMD loader extension tables and general global-symbol
+linking remain unfinished. Symbol coverage does not establish HSA conformance.
+
+`bash scripts/test-hsa-runtime.sh` builds a linked fixture using LLVM/LLD and
+runs six ASan/UBSan suites plus parser truncation/mutation checks. The shader
+fixture remains pinned to the available LLVM 21.1.8 compiler; an explicit
+`AMDGPU_LLVM_BIN` overrides that selection.
+
+```sh
+build/hsa/mac-hsa-executable-test build/tests/hsa-code-object.hsaco vector_add.kd
+```
+
+This hardware test passed loading/freeze and resolved `vector_add.kd` at
+`0x8010000580`, with 12-byte kernargs. It did not execute the kernel. Native
+compute dispatch has a separate hardware result; HSA queue dispatch is not yet
+connected to it.

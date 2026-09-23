@@ -32,6 +32,7 @@ struct IOPCIDevice {
     uint64_t pendingUntil = 0;
     bool resetDone = false, closed = false;
     unsigned resets = 0;
+    IOService *expectedOwner = nullptr;
     void ConfigurationRead16(uint32_t reg, uint16_t *out) {
         if (absent) { *out = 0xFFFF; return; }
         if (reg == 0) *out = 0x1002;
@@ -60,15 +61,29 @@ struct IOPCIDevice {
         if (reenabledBM) command |= 4;
         return 0;
     }
-    int Open(IOService *, int) { events.push_back("open"); return 0; }
-    void Close(IOService *, int) {
+    int Open(IOService *client, int) { assert(client == expectedOwner); events.push_back("open"); return 0; }
+    void Close(IOService *client, int) {
+        assert(client == expectedOwner);
         assert(metricsInvalidated);
         command &= ~6; closed = true; events.push_back("close");
     }
 };
 struct CS { bool in_use = true; };
+constexpr uint32_t kBODomainGTT = 2;
+struct TestBinding { bool mapped = true; };
+static bool retireSucceeds = true;
+struct BO { bool in_use = false; uint32_t domain = kBODomainGTT; TestBinding gttBinding;
+    void *gtt_buf = nullptr, *gtt_dma = nullptr, *cpu_addr = nullptr; };
 namespace amdgpu {
-struct Bringup { bool initialized = true, metrics = true; };
+enum class BringupStage { None, SDMAInit };
+struct Bringup { bool initialized = true, metrics = true; BringupStage reached = BringupStage::SDMAInit;
+    int device = 0, gart = 0; };
+static int gart_unbind(int &, int &, TestBinding *binding) {
+    events.push_back("unbind");
+    if (!retireSucceeds) return kIOReturnNotReady;
+    binding->mapped = false;
+    return 0;
+}
 static void smu_metrics_invalidate(bool &valid, int status) {
     assert(status == kIOReturnNotReady);
     valid = false;
@@ -79,7 +94,7 @@ struct ClientState;
 struct DriverState {
     bool shutdownInProgress = false, shutdownBlocked = false, pciOpen = true;
     uint32_t connectedClients = 1;
-    IOService *openerUserClient = nullptr;
+    amdgpu::ClientSessions sessions;
     IOPCIDevice *retainedPCI = nullptr;
     amdgpu::Bringup bringup;
     amdgpu::ClientSubmission submission;
@@ -88,13 +103,17 @@ struct DriverState {
 struct MacAMDGPU : IOService { DriverState *ivars; };
 struct ClientState {
     MacAMDGPU *ownerDriver;
+    bool claimed = false;
+    ClientState *quarantineNext = nullptr;
     bool mappedBAR = false;
     void *pendingInterruptNotify = nullptr;
     void *interruptSources[2] = {};
     CS cs[2];
+    BO bos[2];
     IODispatchQueue *stopQueue = nullptr;
     IOService *stopProvider = nullptr;
 };
+using MacAMDGPUUserClient_IVars = ClientState;
 struct MacAMDGPUUserClient : IOService {
     ClientState *ivars;
     void FinishStop(IOService *provider);
@@ -114,19 +133,13 @@ static void bringup_release_resources(Bringup &ctx) {
     ctx.initialized = false; events.push_back("free shared");
 }
 }
-static void mac_amdgpu_release_quarantine(MacAMDGPU *driver) {
-    if (driver->ivars->quarantinedClient) {
-        assert(driver->ivars->retainedPCI->closed);
-        events.push_back("free quarantine");
-        delete driver->ivars->quarantinedClient;
-        driver->ivars->quarantinedClient = nullptr;
-    }
-}
 static void mac_amdgpu_release_all_interrupts(MacAMDGPUUserClient *) { events.push_back("drain IRQ"); }
 static void mac_amdgpu_release_client_storage(ClientState *, MacAMDGPU *driver) {
-    assert(driver->ivars->retainedPCI->closed || !driver->ivars->pciOpen);
+    (void)driver;
     events.push_back("free client");
 }
+#include "retire_client_under_test.inc"
+#include "release_quarantine_under_test.inc"
 #include "shutdown_under_test.inc"
 #include "finish_stop_under_test.inc"
 struct Fixture {
@@ -141,7 +154,9 @@ struct Fixture {
         metricsInvalidated = false;
         driver.ivars = &state; client.ivars = &clientState;
         clientState.ownerDriver = &driver;
-        state.retainedPCI = &pci; state.openerUserClient = &client;
+        state.retainedPCI = &pci; pci.expectedOwner = &driver;
+        assert(state.sessions.attach(&client, clientState.claimed, true));
+        retireSucceeds = true;
     }
     int stop() { return mac_amdgpu_shutdown_gpu(&client, phase); }
     void retained() {
@@ -151,12 +166,86 @@ struct Fixture {
     }
 };
 int main() {
+    {
+        // Observers do not count as reset-blocking application participants.
+        Fixture f; f.state.connectedClients = 20;
+        assert(f.stop() == 0 && f.state.sessions.participants == 0);
+    }
+    for (int retirementMode : {0, 1, 2, 3}) {
+        const bool healthy = retirementMode == 0;
+        Fixture f; IODispatchQueue queue;
+        f.client.ivars = new ClientState(f.clientState);
+        f.client.ivars->stopQueue = &queue;
+        MacAMDGPUUserClient peer;
+        auto *peerState = new ClientState(f.clientState);
+        peerState->claimed = false; peerState->stopQueue = &queue;
+        peer.ivars = peerState;
+        assert(f.state.sessions.attach(&peer, peerState->claimed, true));
+        f.state.connectedClients = 2;
+        f.state.shutdownBlocked = retirementMode == 1;
+        f.state.submission.pending = retirementMode == 2;
+        f.client.ivars->bos[0].in_use = true; // exercise real live GTT unbind
+        retireSucceeds = retirementMode != 3;
+        f.client.FinishStop(&f.driver);
+        assert(f.state.sessions.participants == 1 && f.state.connectedClients == 1);
+        assert(f.pci.resets == 0 && !f.pci.closed && f.state.bringup.initialized);
+        assert(!metricsInvalidated); // closing one peer does not invalidate live telemetry
+        if (healthy) {
+            assert(!f.state.quarantinedClient);
+            assert(std::count(events.begin(), events.end(), "free client") == 1);
+            assert(std::find(events.begin(), events.end(), "unbind") <
+                   std::find(events.begin(), events.end(), "free client"));
+            peer.FinishStop(&f.driver);
+            assert(f.pci.resets == 1 && f.pci.closed && !f.state.bringup.initialized);
+        } else {
+            assert(f.state.quarantinedClient && !f.state.quarantinedClient->quarantineNext);
+            f.pci.failsReset = true;
+            peer.FinishStop(&f.driver);
+            assert(f.pci.closed && f.state.sessions.participants == 0);
+            assert(f.state.quarantinedClient && f.state.quarantinedClient->quarantineNext);
+            assert(std::count(events.begin(), events.end(), "free client") == 0);
+            // A later observer recovers only after all application peers retired.
+            f.client.ivars = &f.clientState; f.clientState.claimed = false;
+            f.pci.failsReset = false; f.pci.closed = false;
+            assert(f.stop() == 0 && !f.state.quarantinedClient);
+            assert(std::count(events.begin(), events.end(), "free client") == 2);
+        }
+    }
+
+    for (bool closeBootstrapFirst : {false, true}) {
+        Fixture f; IODispatchQueue queue;
+        f.client.ivars = new ClientState(f.clientState);
+        f.client.ivars->stopQueue = &queue;
+        MacAMDGPUUserClient observer;
+        observer.ivars = new ClientState(f.clientState);
+        observer.ivars->claimed = false; observer.ivars->stopQueue = &queue;
+        f.state.connectedClients = 2;
+        if (closeBootstrapFirst) {
+            f.state.bringup.reached = amdgpu::BringupStage::None;
+            f.state.sessions.initializationClient = &f.client;
+            f.client.FinishStop(&f.driver);
+            assert(f.pci.resets == 1 && f.pci.closed);
+            assert(!f.state.sessions.initializationClient && f.state.sessions.participants == 0);
+            observer.FinishStop(&f.driver);
+            assert(f.pci.resets == 1);
+        } else {
+            observer.FinishStop(&f.driver);
+            assert(f.state.sessions.participants == 1 && f.state.pciOpen);
+            assert(f.pci.resets == 0 && f.state.bringup.initialized && !metricsInvalidated);
+            f.client.FinishStop(&f.driver);
+            assert(f.pci.resets == 1);
+        }
+        assert(f.state.connectedClients == 0);
+    }
+
     // Ordinary owner exit uses the reset barrier before freeing its storage.
     for (bool resetFails : {false, true}) {
         Fixture f; IODispatchQueue queue;
         f.client.ivars = new ClientState(f.clientState);
         f.client.ivars->stopQueue = &queue;
         f.pci.failsReset = resetFails;
+        assert(f.state.sessions.claimExclusive(&f.client, f.client.ivars->claimed));
+        f.state.submission.pending = true;
         f.client.FinishStop(&f.driver);
         assert(f.client.ivars == nullptr && f.state.connectedClients == 0);
         assert(f.pci.closed && !f.state.pciOpen);
@@ -164,7 +253,7 @@ int main() {
             assert(f.state.shutdownBlocked && f.state.quarantinedClient);
             assert(std::find(events.begin(), events.end(), "free client") == events.end());
             // A fresh client can retry reset; only then is old backing released.
-            f.client.ivars = &f.clientState; f.state.connectedClients = 1;
+            f.client.ivars = &f.clientState; f.clientState.claimed = false; f.state.connectedClients = 1;
             f.pci.failsReset = false; f.pci.closed = false;
             assert(f.stop() == 0 && !f.state.quarantinedClient);
         } else {
@@ -179,16 +268,16 @@ int main() {
         Fixture f; f.pci.pendingUntil = 5000000;
         assert(f.stop() == 0 && f.phase == 6 && timeNS == 5000000);
         assert(!f.state.pciOpen && !f.state.shutdownBlocked && !f.state.shutdownInProgress);
-        assert(!f.state.bringup.initialized && f.state.openerUserClient == nullptr);
+        assert(!f.state.bringup.initialized && f.state.sessions.participants == 0);
         assert((events == std::vector<std::string>{"disable BM", "reset", "close", "free BO", "free DMA", "free shared"}));
     }
     for (int reason = 0; reason < 5; ++reason) {
         Fixture f;
-        if (reason == 0) f.state.connectedClients = 2;
+        if (reason == 0) f.state.sessions.participants = 2;
         if (reason == 1) f.clientState.mappedBAR = true;
         if (reason == 2) f.clientState.interruptSources[1] = &f;
         if (reason == 3) f.clientState.pendingInterruptNotify = &f;
-        if (reason == 4) f.state.openerUserClient = &f.driver;
+        if (reason == 4) f.state.sessions.exclusiveClient = &f.driver;
         assert(f.stop() == kIOReturnBusy && f.phase == 0);
         assert(f.state.bringup.metrics && !metricsInvalidated);
         assert(events.empty() && !f.state.shutdownBlocked); f.retained();
@@ -226,7 +315,7 @@ int main() {
         assert(f.stop() == kIOReturnNotReady && f.phase == 5); f.retained();
     }
     {
-        Fixture f; f.state.pciOpen = false; f.state.openerUserClient = nullptr;
+        Fixture f; f.state.pciOpen = false;
         f.pci.command = 0; // SDK Close disabled DMA when the previous client exited
         assert(f.stop() == 0 && events.front() == "open");
     }

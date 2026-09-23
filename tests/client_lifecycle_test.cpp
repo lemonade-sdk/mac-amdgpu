@@ -5,14 +5,24 @@
 
 using kern_return_t = int;
 constexpr int kIOReturnSuccess = 0, kIOReturnBusy = 1,
-              kIOReturnBadArgument = 2, kIOReturnUnsupported = 3, kIOReturnNotOpen = 4;
+              kIOReturnBadArgument = 2, kIOReturnUnsupported = 3, kIOReturnNotOpen = 4,
+              kIOReturnNotReady = 5, kIOReturnNotAttached = 6;
 enum { kMacAMDGPUMethodRuntimeBuild, kMacAMDGPUMethodPing,
        kMacAMDGPUMethodQueryInfo, kMacAMDGPUMethodShutdownGPU,
        kMacAMDGPUMethodWaitFence, kMacAMDGPUMethodBOGetInfo,
        kMacAMDGPUMethodBOFree, kMacAMDGPUMethodSubmitIB, kMacAMDGPUMethodMESAddQueue,
-       kMacAMDGPUMethodCollectMetrics, kMacAMDGPUMethodMetricsSnapshot };
+       kMacAMDGPUMethodCollectMetrics, kMacAMDGPUMethodMetricsSnapshot,
+       kMacAMDGPUMethodLoadFirmware, kMacAMDGPUMethodSetIPBase,
+       kMacAMDGPUMethodLoadDiscoveryBin, kMacAMDGPUMethodResetDevice,
+       kMacAMDGPUMethodSetupInterrupts };
 struct IOService {};
+static unsigned openCalls;
+#define OSDynamicCast(type, pointer) static_cast<type *>(pointer)
+#define MACAMDGPU_LOG(...) do {} while (0)
 struct IOPCIDevice {
+    IOService *openedBy = nullptr;
+    int openResult = 0;
+    int Open(IOService *client, int) { ++openCalls; openedBy = client; return openResult; }
     uint8_t head = 0;
     uint16_t headers[256] = {};
     unsigned reads = 0;
@@ -22,21 +32,17 @@ struct IOPCIDevice {
     }
 };
 #include "client_pm_cap_under_test.inc"
+namespace amdgpu { enum class BringupStage { None, SDMAInit }; }
 struct State {
-    IOService *owner = nullptr, *openerUserClient = nullptr;
-    bool pciOpen = false;
+    bool pciOpen = false, shutdownBlocked = false;
+    struct { amdgpu::BringupStage reached = amdgpu::BringupStage::None; } bringup;
+    amdgpu::ClientSessions sessions;
     amdgpu::ClientSubmission submission;
 };
-struct MacAMDGPU { State *ivars; };
-static unsigned openCalls;
-static int mac_amdgpu_ensure_open(IOService *client, MacAMDGPU *driver, IOPCIDevice *) {
-    ++openCalls;
-    if (driver->ivars->owner && driver->ivars->owner != client) return kIOReturnBusy;
-    driver->ivars->owner = client;
-    driver->ivars->openerUserClient = client;
-    driver->ivars->pciOpen = true;
-    return 0;
-}
+struct ClientState { bool claimed = false; };
+struct MacAMDGPUUserClient : IOService { ClientState *ivars; };
+struct MacAMDGPU : IOService { State *ivars; };
+#include "client_open_under_test.inc"
 #include "client_admission_under_test.inc"
 constexpr uint32_t kBODomainGTTLegacy = 0;
 struct BOEntry { uint32_t domain = 0; uint64_t size = 4096, byte_offset = 0; };
@@ -99,8 +105,10 @@ int main() {
     legacyArgs.scalarInput[1] = 4; legacy.bo.byte_offset = UINT64_MAX - 15;
     assert(validate_legacy(&legacy, &legacyArgs) == kIOReturnBadArgument);
 
-    State state; MacAMDGPU driver{&state}; IOPCIDevice pci;
-    IOService owner, observer;
+    State state; MacAMDGPU driver; driver.ivars = &state; IOPCIDevice pci;
+    ClientState ownerState, observerState;
+    MacAMDGPUUserClient owner, observer;
+    owner.ivars = &ownerState; observer.ivars = &observerState;
     auto call = [&](IOService &client, uint64_t selector) {
         return mac_amdgpu_admit_external(&client, &driver, &pci, selector);
     };
@@ -108,7 +116,7 @@ int main() {
     assert(call(observer, kMacAMDGPUMethodRuntimeBuild) == 0 && openCalls == 0);
     assert(call(observer, kMacAMDGPUMethodMetricsSnapshot) == 0 && openCalls == 0);
     assert(call(owner, kMacAMDGPUMethodCollectMetrics) == kIOReturnNotOpen && openCalls == 0);
-    assert(call(owner, kMacAMDGPUMethodBOFree) == 0 && state.owner == &owner);
+    assert(call(owner, kMacAMDGPUMethodBOFree) == 0 && state.sessions.initializationClient == &owner && pci.openedBy == &driver);
     assert(call(observer, kMacAMDGPUMethodSubmitIB) == kIOReturnBusy);
     unsigned before = openCalls;
     assert(call(owner, kMacAMDGPUMethodCollectMetrics) == 0 && openCalls == before);
@@ -146,5 +154,33 @@ int main() {
     assert(!state.submission.poll());
     cpFence = 8;
     assert(state.submission.poll());
+    {
+        State shared; MacAMDGPU root; root.ivars = &shared; IOPCIDevice endpoint;
+        ClientState aState, bState; MacAMDGPUUserClient a, b;
+        a.ivars = &aState; b.ivars = &bState;
+        assert(mac_amdgpu_ensure_open(&a, &root, &endpoint) == 0);
+        assert(endpoint.openedBy == &root && shared.sessions.participants == 1);
+        assert(mac_amdgpu_ensure_open(&b, &root, &endpoint) == kIOReturnBusy);
+        shared.bringup.reached = amdgpu::BringupStage::SDMAInit;
+        assert(mac_amdgpu_ensure_open(&b, &root, &endpoint) == 0);
+        assert(shared.sessions.participants == 2 && !shared.sessions.initializationClient);
+        assert(mac_amdgpu_admit_external(&a, &root, &endpoint, kMacAMDGPUMethodBOFree) == 0);
+        assert(mac_amdgpu_admit_external(&b, &root, &endpoint, kMacAMDGPUMethodBOFree) == 0);
+        assert(mac_amdgpu_admit_external(&a, &root, &endpoint, kMacAMDGPUMethodSubmitIB) == kIOReturnBusy);
+        assert(mac_amdgpu_admit_external(&a, &root, &endpoint, kMacAMDGPUMethodSetupInterrupts) == kIOReturnBusy);
+        assert(mac_amdgpu_admit_external(&a, &root, &endpoint, kMacAMDGPUMethodLoadFirmware) == kIOReturnBusy);
+        assert(!shared.sessions.canReset(&a, aState.claimed));
+        shared.sessions.detach(&b, bState.claimed);
+        assert(mac_amdgpu_admit_external(&a, &root, &endpoint, kMacAMDGPUMethodSubmitIB) == 0);
+        assert(shared.sessions.exclusiveClient == &a);
+        assert(mac_amdgpu_ensure_open(&b, &root, &endpoint) == kIOReturnBusy);
+        assert(mac_amdgpu_admit_external(&b, &root, &endpoint, kMacAMDGPUMethodMetricsSnapshot) == 0);
+        shared.sessions.detach(&a, aState.claimed);
+        assert(shared.sessions.participants == 0 && !shared.sessions.exclusiveClient);
+        shared.pciOpen = false; shared.bringup.reached = amdgpu::BringupStage::None;
+        endpoint.openResult = kIOReturnNotOpen;
+        assert(mac_amdgpu_ensure_open(&b, &root, &endpoint) == kIOReturnNotOpen);
+        assert(!bState.claimed && shared.sessions.participants == 0 && !shared.sessions.initializationClient);
+    }
     puts("Client lifecycle: checked allocation, timeout cap, observer/owner admission, pending-work gate and unique latched fences pass");
 }

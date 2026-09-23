@@ -19,6 +19,29 @@ hsa_status_t initializeDevice(InitializationRPC &rpc, bool &claimed, uint64_t &c
     uint64_t tag = 4, stage = UINT64_MAX;
     status = rpc.scalar(21, {&tag, 1}, {&stage, 1});
     if (status != HSA_STATUS_SUCCESS) return status;
+    if (stage == 15 && build[2] >= 180) {
+        // Build 180 attaches this client to the driver-owned ready session in
+        // GetIdentity. Older drivers only permit the original owning client.
+        // Never reset or reload firmware when joining an initialized peer.
+        tag = 3;
+        std::array<uint64_t, 4> ips{};
+        status = rpc.scalar(21, {&tag, 1}, ips);
+        if (status != HSA_STATUS_SUCCESS) return status;
+        if (ips[1] != 0x070001 || ips[2] != 0x0e0003 || ips[3] != 0x0e0003)
+            return HSA_STATUS_ERROR_INCOMPATIBLE_ARGUMENTS;
+        tag = 1;
+        std::array<uint64_t, 3> gfx{};
+        status = rpc.scalar(21, {&tag, 1}, gfx);
+        if (status != HSA_STATUS_SUCCESS) return status;
+        if (gfx != std::array<uint64_t, 3>{12, 0, 1}) return HSA_STATUS_ERROR_INCOMPATIBLE_ARGUMENTS;
+        tag = 5;
+        std::array<uint64_t, 15> accounting{};
+        status = rpc.scalar(21, {&tag, 1}, accounting);
+        if (status != HSA_STATUS_SUCCESS) return status;
+        if (accounting[0] != 1 || !(accounting[1] & 1) || !accounting[10]) return HSA_STATUS_ERROR;
+        capacity = accounting[10];
+        return HSA_STATUS_SUCCESS;
+    }
     if (stage != 0) return HSA_STATUS_ERROR_INCOMPATIBLE_ARGUMENTS;
 
     const std::string suffix = identity[6] == 0xc8 ? "_kicker.bin" : ".bin";

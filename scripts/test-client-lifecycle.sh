@@ -11,6 +11,9 @@ Path('build/tests/client_admission_under_test.inc').write_text(source[start:end]
 start = source.index('static uint8_t\nmac_amdgpu_find_pm_capability(')
 end = source.index('// Open the PCI device (idempotent)', start)
 Path('build/tests/client_pm_cap_under_test.inc').write_text(source[start:end])
+start = source.index('static kern_return_t\nmac_amdgpu_ensure_open(')
+end = source.index('    uint16_t cmd = 0;', start)
+Path('build/tests/client_open_under_test.inc').write_text(source[start:end] + '    return kIOReturnSuccess;\n}\n')
 sections = []
 for name, next_name in [('WaitInterrupt', 'SetIRQMask'), ('WaitFence', 'CSCreate'),
                         ('SubmitTestPM4', 'CPKIQSmoke'), ('CPKIQSmoke', 'SDMACopyTest'),

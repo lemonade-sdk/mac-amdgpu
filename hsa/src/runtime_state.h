@@ -49,6 +49,12 @@ extern std::unordered_map<uint64_t, std::shared_ptr<Signal>> signals;
 extern std::vector<Pool> pools;
 extern std::map<uintptr_t, std::shared_ptr<Allocation>> allocations;
 extern std::vector<std::unique_ptr<CopyJob>> copyJobs;
+struct Executable;
+struct ExecutableSymbol;
+struct CodeReader;
+extern std::unordered_map<uint64_t, std::shared_ptr<Executable>> executables;
+extern std::unordered_map<uint64_t, std::shared_ptr<ExecutableSymbol>> executableSymbols;
+extern std::unordered_map<uint64_t, std::shared_ptr<CodeReader>> codeReaders;
 
 // Caller holds runtimeMutex. IDs are never reused across runtime sessions.
 Agent *findAgent(hsa_agent_t handle);

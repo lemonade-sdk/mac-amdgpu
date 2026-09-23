@@ -11,6 +11,12 @@ Path('build/tests/shutdown_under_test.inc').write_text(source[start:end])
 start = source.index('void\nMacAMDGPUUserClient::FinishStop(')
 end = source.index('//============================================================', start)
 Path('build/tests/finish_stop_under_test.inc').write_text(source[start:end])
+start = source.index('static void\nmac_amdgpu_release_quarantine(')
+end = source.index('// Keep all DMA backing pinned', start)
+Path('build/tests/release_quarantine_under_test.inc').write_text(source[start:end])
+start = source.index('static bool\nmac_amdgpu_retire_client_storage(')
+end = source.index('static void\nmac_amdgpu_release_quarantine(', start)
+Path('build/tests/retire_client_under_test.inc').write_text(source[start:end])
 PY
 xcrun clang++ -std=c++20 -Wall -Wextra -Werror -fsanitize=address,undefined \
   -I build/tests tests/shutdown_lifecycle_test.cpp -o build/tests/shutdown-lifecycle-test

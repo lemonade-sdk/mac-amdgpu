@@ -23,8 +23,8 @@ static int check(hsa_status_t status, const char *step) {
     fprintf(stderr, "%s failed: HSA status 0x%x\n", step, (unsigned)status); return 0;
 }
 int main(int argc, char **argv) {
-    if (argc != 2 || strcmp(argv[1], "--run")) {
-        fprintf(stderr, "Usage: %s --run\nStop GPU in the host app first. This test owns, initializes and closes the GPU.\n", argv[0]);
+    if (argc != 2 || (strcmp(argv[1], "--run") && strcmp(argv[1], "--hold"))) {
+        fprintf(stderr, "Usage: %s --run|--hold\nBuild179 requires Host Stop first. Build180 can share an initialized GPU.\n", argv[0]);
         return 2;
     }
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -37,15 +37,19 @@ int main(int argc, char **argv) {
     if (!check(hsa_iterate_agents(agent, NULL), "enumerate agents") || !cpu.handle || !gpu.handle) goto cleanup;
     hsa_status_t status = hsa_amd_agent_iterate_memory_pools(gpu, pool, NULL);
     if (status != HSA_STATUS_INFO_BREAK || !device_pool.handle) goto cleanup;
-    puts("Acquiring GPU and loading firmware through the HSA runtime...");
+    puts("Joining GPU session (initializing firmware only if needed)...");
     size_t capacity = 0;
     if (!check(hsa_amd_memory_pool_get_info(device_pool, HSA_AMD_MEMORY_POOL_INFO_SIZE, &capacity), "GPU pool capacity")) goto cleanup;
     printf("GPU session ready; device pool capacity=%zu bytes\n", capacity);
     if (!check(hsa_amd_memory_pool_allocate(device_pool, sizeof(output), 0, &a), "allocate A") ||
         !check(hsa_amd_memory_pool_allocate(device_pool, sizeof(output), 0, &b), "allocate B")) goto cleanup;
     if (!check(hsa_amd_memory_fill(a, 0x91919191, sizeof(output) / 4), "fill GPU guards")) goto cleanup;
-    if (!check(hsa_memory_copy((void *)((uintptr_t)a + 3), input, sizeof(input)), "unaligned upload") ||
-        !check(hsa_memory_copy(b, a, sizeof(output)), "device copy")) goto cleanup;
+    if (!check(hsa_memory_copy((void *)((uintptr_t)a + 3), input, sizeof(input)), "unaligned upload")) goto cleanup;
+    if (!strcmp(argv[1], "--hold")) {
+        printf("READY: GPU buffers A=%p B=%p hold verified input; run another client, then press Enter to verify survival\n", a, b);
+        if (getchar() == EOF) goto cleanup;
+    }
+    if (!check(hsa_memory_copy(b, a, sizeof(output)), "device copy")) goto cleanup;
     if (!check(hsa_signal_create(1, 1, &cpu, &completed), "CPU completion signal")) goto cleanup;
     if (!check(hsa_amd_memory_async_copy(output, cpu, b, gpu, sizeof(output), 0, NULL, completed), "async download")) goto cleanup;
     hsa_signal_value_t value = hsa_signal_wait_scacquire(completed, HSA_SIGNAL_CONDITION_LT, 1,

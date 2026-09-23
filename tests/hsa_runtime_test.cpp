@@ -62,6 +62,21 @@ int main() {
     assert(hsa_agent_get_info(gpu, HSA_AGENT_INFO_NAME, name) == HSA_STATUS_SUCCESS && !std::strcmp(name, "gfx1201"));
     assert(hsa_agent_get_info({UINT64_MAX}, HSA_AGENT_INFO_NAME, name) == HSA_STATUS_ERROR_INVALID_AGENT);
     assert(hsa_agent_get_info(cpu, HSA_AGENT_INFO_NAME, nullptr) == HSA_STATUS_ERROR_INVALID_ARGUMENT);
+    hsa_isa_t isa{};
+    assert(hsa_agent_iterate_isas(cpu, [](hsa_isa_t, void *) { assert(false); return HSA_STATUS_ERROR; }, nullptr) == 0);
+    assert(hsa_agent_iterate_isas(gpu, [](hsa_isa_t value, void *out) {
+        *static_cast<hsa_isa_t *>(out) = value;
+        uint32_t length = 0;
+        assert(hsa_isa_get_info_alt(value, HSA_ISA_INFO_NAME_LENGTH, &length) == 0);
+        std::vector<char> name(length + 1, '!');
+        assert(hsa_isa_get_info_alt(value, HSA_ISA_INFO_NAME, name.data()) == 0);
+        assert(std::strcmp(name.data(), "amdgcn-amd-amdhsa--gfx1201") == 0 && name.back() == '!');
+        return HSA_STATUS_INFO_BREAK;
+    }, &isa) == HSA_STATUS_INFO_BREAK);
+    uint16_t dimensions[4] = {0, 0, 0, 0xabcd};
+    assert(hsa_isa_get_info_alt(isa, HSA_ISA_INFO_WORKGROUP_MAX_DIM, dimensions) == 0);
+    assert(dimensions[0] == 1024 && dimensions[1] == 1024 && dimensions[2] == 1024 && dimensions[3] == 0xabcd);
+    assert(hsa_isa_get_info_alt({cpu.handle}, HSA_ISA_INFO_NAME, name) == HSA_STATUS_ERROR_INVALID_ISA);
     mac_hsa_device_info_t info{};
     assert(mac_hsa_agent_get_driver_info(gpu, &info, sizeof(info) - 1) == HSA_STATUS_ERROR_INVALID_ARGUMENT);
     assert(mac_hsa_agent_get_driver_info(cpu, &info, sizeof(info)) == HSA_STATUS_ERROR_INVALID_AGENT);
@@ -103,6 +118,7 @@ int main() {
     assert(hsa_shut_down() == HSA_STATUS_SUCCESS && closed == 2);
     assert(hsa_init() == HSA_STATUS_SUCCESS);
     assert(hsa_agent_get_info(gpu, HSA_AGENT_INFO_NAME, name) == HSA_STATUS_ERROR_INVALID_AGENT);
+    assert(hsa_isa_get_info_alt(isa, HSA_ISA_INFO_NAME, name) == HSA_STATUS_ERROR_INVALID_ISA);
     assert(hsa_shut_down() == HSA_STATUS_SUCCESS);
     present = false; observed.clear();
     assert(hsa_init() == HSA_STATUS_SUCCESS);

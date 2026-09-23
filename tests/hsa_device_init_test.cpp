@@ -6,6 +6,7 @@
 struct RPC final : mac_hsa::InitializationRPC {
     std::vector<std::string> events;
     size_t failAt = SIZE_MAX;
+    uint64_t build = 179;
     bool busy = false, kicker = false, stale = false, wrongIP = false, shortStage = false;
     hsa_status_t event(const std::string &name) {
         events.push_back(name);
@@ -17,7 +18,7 @@ struct RPC final : mac_hsa::InitializationRPC {
         const auto status = event(name);
         if (status != HSA_STATUS_SUCCESS) return status;
         switch (selector) {
-        case 43: assert(out.size() == 3); out[0] = 0x414d444750554142ull; out[1] = 1; out[2] = 179; break;
+        case 43: assert(out.size() == 3); out[0] = 0x414d444750554142ull; out[1] = 1; out[2] = build; break;
         case 1:
             if (busy) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
             assert(out.size() == 7); out[3] = 0x1002; out[4] = 0x7551; out[6] = kicker ? 0xc8 : 0xc0; break;
@@ -63,6 +64,15 @@ int main() {
     assert((busy.events == std::vector<std::string>{"43", "1"}));
     RPC stale; stale.stale = true;
     assert(mac_hsa::initializeDevice(stale, claimed, capacity) != 0 && claimed && stale.events.size() == 3);
+    RPC shared; shared.build = 180; shared.stale = true;
+    assert(mac_hsa::initializeDevice(shared, claimed, capacity) == 0 && claimed && capacity == 31ull << 30);
+    const std::vector<std::string> sharedExpected{"43", "1", "21:4", "21:3", "21:1", "21:5"};
+    assert(shared.events == sharedExpected);
+    for (size_t i = 1; i <= sharedExpected.size(); ++i) {
+        RPC failure; failure.build = 180; failure.stale = true; failure.failAt = i;
+        assert(mac_hsa::initializeDevice(failure, claimed, capacity) != 0 && !capacity);
+        assert(failure.events.size() == i);
+    }
     RPC kicker; kicker.kicker = true;
     assert(mac_hsa::initializeDevice(kicker, claimed, capacity) == 0);
     RPC wrong; wrong.wrongIP = true;
