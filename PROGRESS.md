@@ -2106,3 +2106,11 @@ successfully after cleanup. No hardware AQL queue or HRX inference is claimed.
   endpoint requester alone did not fix concurrent RMW under this configuration.
   Cleanup returned to stage 0; amdgpu_mtop detects build 192. Detailed timing
   and limitations are in docs/PCIE_ATOMIC_TEST_POLICY.md.
+- A separate SYSTEM-scope release/acquire ownership fixture passed 1,000 smoke
+  rounds then 1,000,000 full CPU→GPU→CPU rounds in one persistent dispatch.
+  Both directions validated all 64 words per payload, with zero errors, intact
+  data/kernarg guards, turn 2,000,000, retired completion and no timeout.
+  Elapsed exchange time was 222.591321 s (4,492.5 round trips/s including
+  validation/polling). No config changes; Requester Enable remained off.
+  Driver returned to stage 0. This supports the tested ownership-transfer
+  path, without advertising fine-grained pools or concurrent native RMW.

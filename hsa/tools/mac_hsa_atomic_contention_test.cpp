@@ -295,17 +295,138 @@ bool handoff(uint64_t rounds,unsigned timeoutSeconds,uint64_t *data,void *argume
         retired ? "retired" : "pending");
     return passed;
 }
+bool pingPong(uint64_t rounds,unsigned timeoutSeconds,uint64_t *data,void *arguments,
+              hsa_queue_t *queue,hsa_signal_t done,uint64_t kernel) {
+    constexpr size_t turn=0,readyWord=16,abort=32,gpuState=48,progress=64,errors=80,
+        firstRound=96,firstWord=97,firstExpected=98,firstObserved=99,payloadBegin=128,payloadWords=64;
+    constexpr uint64_t cpuTag=0x13579bdf2468ace0ull,gpuTag=0xfedcba9876543210ull,
+        mix=0x9e3779b97f4a7c15ull,wordMix=0x0101010101010101ull;
+    auto mutableCell=[&](size_t index) {
+        return index==turn || index==readyWord || index==abort || index==gpuState || index==progress ||
+            index==errors || (index>=firstRound && index<=firstObserved) ||
+            (index>=payloadBegin && index<payloadBegin+payloadWords);
+    };
+    std::fill(data,data+words,guard);
+    for (size_t i=0;i<words;++i) if (mutableCell(i)) data[i]=0;
+    // Kernarg padding is also guarded and checked after retirement.
+    std::fill(static_cast<uint64_t *>(arguments),static_cast<uint64_t *>(arguments)+words,guard);
+    const uint64_t address=reinterpret_cast<uintptr_t>(data),maxAttempts=100000000;
+    std::memcpy(arguments,&address,8);std::memcpy(static_cast<char *>(arguments)+8,&rounds,8);
+    std::memcpy(static_cast<char *>(arguments)+16,&maxAttempts,8);
+    hsa_signal_store_screlease(done,1);
+    hsa_kernel_dispatch_packet_t packet{};
+    packet.header=HSA_PACKET_TYPE_KERNEL_DISPATCH |
+        (HSA_FENCE_SCOPE_SYSTEM<<HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE) |
+        (HSA_FENCE_SCOPE_SYSTEM<<HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE);
+    packet.setup=1<<HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS;
+    packet.workgroup_size_x=packet.grid_size_x=32;
+    packet.workgroup_size_y=packet.workgroup_size_z=packet.grid_size_y=packet.grid_size_z=1;
+    packet.kernel_object=kernel;packet.kernarg_address=arguments;packet.completion_signal=done;
+    std::puts("Ownership ping-pong: one persistent dispatch; CPU/GPU alternate release/acquire of a 64-bit sequence on its own 128-byte region. Abort and 512-byte payload occupy separate regions.");
+    std::puts("Payload accesses are relaxed atomic loads/stores under ownership; no fetch-add/CAS or contended RMW. This probes ownership visibility on the existing coarse mapping; it does not establish fine-grained allocation semantics.");
+    const auto start=Clock::now(),deadline=start+std::chrono::seconds(timeoutSeconds);
+    auto nextReport=start+std::chrono::seconds(1),exchangeStart=start,exchangeEnd=start;
+    uint64_t completed=0,cpuErrors=0,polls=0;
+    bool interrupted=false,timedOut=false;
+    auto healthy=[&] {
+        const auto now=Clock::now();
+        if (now>=nextReport) {
+            std::printf("ping-pong CPU-rounds=%llu GPU-rounds=%llu turn=%llu state=%llu elapsed=%.3fs\n",
+                (unsigned long long)completed,(unsigned long long)load(data,progress),
+                (unsigned long long)load(data,turn),(unsigned long long)load(data,gpuState),
+                std::chrono::duration<double>(now-start).count());
+            nextReport=now+std::chrono::seconds(1);
+        }
+        timedOut=now>=deadline;
+        if (timedOut || queueErrors || load(data,gpuState)>=2) {interrupted=true;return false;}
+        return true;
+    };
+    auto await=[&](size_t index,uint64_t expected) {
+        for (;;) {
+            const auto observed=load(data,index);
+            if (observed==expected) return true;
+            if (index==turn && observed>expected) {
+                std::fprintf(stderr,"ping-pong sequence advanced unexpectedly: expected=%llu observed=%llu\n",
+                    (unsigned long long)expected,(unsigned long long)observed);
+                ++cpuErrors;interrupted=true;return false;
+            }
+            if (!(++polls&255) && !healthy()) return false;
+            if (!(polls&4095)) std::this_thread::yield();
+        }
+    };
+    publish(queue,packet);
+    if (await(readyWord,1)) {
+        exchangeStart=Clock::now();
+        for (uint64_t round=0;round<rounds;++round) {
+            if (!(round&255) && !healthy()) break;
+            // Initial turn=0 belongs to CPU; thereafter the preceding acquire
+            // of the even turn grants ownership before these relaxed stores.
+            for (size_t word=0;word<payloadWords;++word)
+                std::atomic_ref<uint64_t>(data[payloadBegin+word]).store(
+                    cpuTag^((round+1)*mix)^(word*wordMix),std::memory_order_relaxed);
+            store(data,turn,round*2+1);
+            if (!await(turn,round*2+2)) break;
+            for (size_t word=0;word<payloadWords;++word) {
+                const auto expected=gpuTag^((round+1)*mix)^(word*wordMix);
+                const auto observed=std::atomic_ref<uint64_t>(data[payloadBegin+word]).load(std::memory_order_relaxed);
+                if (observed!=expected) {
+                    std::fprintf(stderr,"CPU payload mismatch round=%llu word=%zu expected=%#llx observed=%#llx\n",
+                        (unsigned long long)(round+1),word,(unsigned long long)expected,(unsigned long long)observed);
+                    ++cpuErrors;interrupted=true;break;
+                }
+            }
+            if (interrupted) break;
+            completed=round+1;
+        }
+        exchangeEnd=Clock::now();
+    }
+    if (completed!=rounds || interrupted) store(data,abort,1);
+    while (hsa_signal_load_scacquire(done)!=0 && !interrupted) {
+        if (!healthy()) {store(data,abort,1);break;}
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const auto grace=Clock::now()+std::chrono::seconds(3);
+    while (hsa_signal_load_scacquire(done)!=0 && Clock::now()<grace && !queueErrors)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const bool retired=hsa_signal_load_scacquire(done)==0;
+    bool guards=true,argsIntact=true;
+    if (retired) {
+        for (size_t i=0;i<words;++i) if (!mutableCell(i) && data[i]!=guard) guards=false;
+        const auto *args=static_cast<const uint64_t *>(arguments);
+        argsIntact=args[0]==address && args[1]==rounds && args[2]==maxAttempts;
+        for (size_t i=3;i<words;++i) if (args[i]!=guard) argsIntact=false;
+    }
+    const auto gpuErrors=load(data,errors),gpuCompleted=load(data,progress),lastTurn=load(data,turn);
+    const bool passed=retired && !interrupted && !queueErrors && completed==rounds && gpuCompleted==rounds &&
+        lastTurn==rounds*2 && load(data,gpuState)==1 && !cpuErrors && !gpuErrors && guards && argsIntact;
+    if (gpuErrors) std::fprintf(stderr,"GPU payload mismatch round=%llu word=%llu expected=%#llx observed=%#llx\n",
+        (unsigned long long)load(data,firstRound),(unsigned long long)load(data,firstWord),
+        (unsigned long long)load(data,firstExpected),(unsigned long long)load(data,firstObserved));
+    const double exchangeSeconds=std::chrono::duration<double>(exchangeEnd-exchangeStart).count();
+    std::printf("%s ownership-ping-pong requested-rounds=%llu CPU=%llu GPU=%llu turn=%llu/%llu payload-errors=%llu/%llu data-guards=%s kernarg-guards=%s completion=%s timeout=%s\n",
+        passed ? "PASS" : "FAIL/INCOMPLETE",(unsigned long long)rounds,(unsigned long long)completed,
+        (unsigned long long)gpuCompleted,(unsigned long long)lastTurn,(unsigned long long)(rounds*2),
+        (unsigned long long)cpuErrors,(unsigned long long)gpuErrors,retired ? (guards ? "intact" : "changed") : "unverified",
+        retired ? (argsIntact ? "intact" : "changed") : "unverified",retired ? "retired" : "pending",timedOut ? "yes" : "no");
+    std::printf("Host steady-clock: exchange-start=%.6fs exchange-end=%.6fs elapsed=%.6fs rounds/s=%.1f ownership-transfers/s=%.1f (two transfers per full round; includes validation/polling; no GPU clock correlation)\n",
+        std::chrono::duration<double>(exchangeStart-start).count(),std::chrono::duration<double>(exchangeEnd-start).count(),exchangeSeconds,
+        exchangeSeconds>0 ? completed/exchangeSeconds : 0,exchangeSeconds>0 ? completed*2/exchangeSeconds : 0);
+    return passed;
+}
+
 }
 
 int main(int argc,char **argv) {
     if (argc<3 || std::strcmp(argv[1],"--run")) {
-        std::fprintf(stderr,"Usage: %s --run shader.hsaco [--requester-ab] [--return-add] [--handoff] [--add-only] [--stagger] [--trials N] [--iterations N | --cpu-iterations N --gpu-iterations N] [--lock-iterations N] [--timeout-seconds N]\n",argv[0]);return 2;
+        std::fprintf(stderr,"Usage: %s --run shader.hsaco [--ping-pong --rounds N] [--requester-ab] [--return-add] [--handoff] [--add-only] [--stagger] [--trials N] [--iterations N | --cpu-iterations N --gpu-iterations N] [--lock-iterations N] [--timeout-seconds N]\n",argv[0]);return 2;
     }
     uint64_t cpuIncrements=10000000,gpuIncrements=10000000,lockIterations=1000000;unsigned trials=3,timeout=60;
-    bool returnAdd=false,handoffOnly=false,addOnly=false,stagger=false,requesterAB=false;
-    bool countOption=false,trialOption=false;
+    bool returnAdd=false,handoffOnly=false,addOnly=false,stagger=false,requesterAB=false,pingPongOnly=false;
+    uint64_t pingPongRounds=1000000;bool roundsOption=false,timeoutOption=false;
+    bool countOption=false,trialOption=false,lockOption=false;
     try {
         for (int i=3;i<argc;) {
+            if (!std::strcmp(argv[i],"--ping-pong")) {pingPongOnly=true;++i;continue;}
             if (!std::strcmp(argv[i],"--requester-ab")) {requesterAB=true;++i;continue;}
             if (!std::strcmp(argv[i],"--return-add")) {returnAdd=true;++i;continue;}
             if (!std::strcmp(argv[i],"--handoff")) {handoffOnly=true;++i;continue;}
@@ -316,14 +437,23 @@ int main(int argc,char **argv) {
             if (used!=std::strlen(argv[i+1]) || !value || value>100000000) throw std::runtime_error("invalid option value");
             if (!std::strcmp(argv[i],"--iterations") || !std::strcmp(argv[i],"--cpu-iterations") || !std::strcmp(argv[i],"--gpu-iterations")) countOption=true;
             if (!std::strcmp(argv[i],"--trials")) trialOption=true;
+            if (!std::strcmp(argv[i],"--timeout-seconds")) timeoutOption=true;
             if (!std::strcmp(argv[i],"--iterations")) cpuIncrements=gpuIncrements=value;
             else if (!std::strcmp(argv[i],"--cpu-iterations")) cpuIncrements=value;
             else if (!std::strcmp(argv[i],"--gpu-iterations")) gpuIncrements=value;
-            else if (!std::strcmp(argv[i],"--lock-iterations")) lockIterations=value;
+            else if (!std::strcmp(argv[i],"--lock-iterations")) {lockIterations=value;lockOption=true;}
+            else if (!std::strcmp(argv[i],"--rounds")) {pingPongRounds=value;roundsOption=true;}
             else if (!std::strcmp(argv[i],"--trials") && value<=20) trials=static_cast<unsigned>(value);
-            else if (!std::strcmp(argv[i],"--timeout-seconds") && value<=300) timeout=static_cast<unsigned>(value);
+            else if (!std::strcmp(argv[i],"--timeout-seconds") && value<=1200) timeout=static_cast<unsigned>(value);
             else throw std::runtime_error("invalid option");
             i+=2;
+        }
+        if (timeout>300 && !pingPongOnly) throw std::runtime_error("timeouts above 300 seconds require --ping-pong");
+        if (roundsOption && !pingPongOnly) throw std::runtime_error("--rounds requires --ping-pong");
+        if (pingPongOnly) {
+            if (requesterAB || handoffOnly || returnAdd || addOnly || stagger || countOption || trialOption || lockOption)
+                throw std::runtime_error("--ping-pong is a separate ownership experiment; use --rounds and --timeout-seconds");
+            if (!timeoutOption) timeout=300;
         }
         if (requesterAB) {
             if (handoffOnly || returnAdd) throw std::runtime_error("--requester-ab requires the unchanged non-returning add shader path");
@@ -357,13 +487,14 @@ int main(int argc,char **argv) {
         check(hsa_executable_load_agent_code_object(executable,gpu,reader,nullptr,nullptr),"load");
         check(hsa_executable_freeze(executable,nullptr),"freeze");
         hsa_executable_symbol_t symbol{};uint64_t kernel=0;uint32_t privateSize=0,groupSize=0,kernargSize=0;
-        check(hsa_executable_get_symbol_by_name(executable,handoffOnly ? "atomic_handoff.kd" : "atomic_contention.kd",&gpu,&symbol),"kernel");
+        check(hsa_executable_get_symbol_by_name(executable,pingPongOnly ? "ownership_ping_pong.kd" : handoffOnly ? "atomic_handoff.kd" : "atomic_contention.kd",&gpu,&symbol),"kernel");
         check(hsa_executable_symbol_get_info(symbol,HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT,&kernel),"descriptor");
         check(hsa_executable_symbol_get_info(symbol,HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_PRIVATE_SEGMENT_SIZE,&privateSize),"private size");
         check(hsa_executable_symbol_get_info(symbol,HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_GROUP_SEGMENT_SIZE,&groupSize),"group size");
         check(hsa_executable_symbol_get_info(symbol,HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_KERNARG_SEGMENT_SIZE,&kernargSize),"kernarg size");
-        require(kernargSize>=28 && kernargSize<=bytes,"unexpected kernarg layout");
-        require(handoffOnly || kernargSize>=48,"contention fixture lacks CPU iteration and overlap-floor arguments");
+        require(kernargSize>=(pingPongOnly ? 24u : 28u) && kernargSize<=bytes,"unexpected kernarg layout");
+        require(!pingPongOnly || kernargSize==24,"unexpected ownership fixture kernarg layout");
+        require(pingPongOnly || handoffOnly || kernargSize>=48,"contention fixture lacks CPU iteration and overlap-floor arguments");
         require(!privateSize && !groupSize,"atomic diagnostic must not require scratch or LDS");
         check(mac_hsa_memory_allocate_shared(gpu,bytes,&data),"DMA allocation");
         check(mac_hsa_memory_allocate_shared(gpu,bytes,&arguments),"kernarg allocation");
@@ -413,7 +544,8 @@ int main(int argc,char **argv) {
         std::puts("Policy reference: docs/PCIE_ATOMIC_TEST_POLICY.md; AMD CPFW patch https://www.spinics.net/lists/amd-gfx/msg90787.html");
         std::puts("Experimental access exceeds the coarse allocation's promised semantics. Native CPU atomic_ref and GPU system-scope instructions touch the same words; HSA only controls queue completion.");
         std::puts("Record scripts/check-pcie-atomics.py output alongside this log; missing cached bits do not replace this measured result.");
-        if (handoffOnly) passed=handoff(32,timeout,static_cast<uint64_t *>(data),arguments,queue,done,kernel);
+        if (pingPongOnly) passed=pingPong(pingPongRounds,timeout,static_cast<uint64_t *>(data),arguments,queue,done,kernel);
+        else if (handoffOnly) passed=handoff(32,timeout,static_cast<uint64_t *>(data),arguments,queue,done,kernel);
         else {
         auto runTrials=[&](unsigned abIndex) {
         if (requesterAB) std::printf("REQUESTER-A/B phase=%s begin; identical allocation, shader, arguments, CPU ordering and trial algorithm\n",abIndex ? "ON" : "OFF");
@@ -510,7 +642,7 @@ int main(int argc,char **argv) {
     if (requesterAB) std::printf("REQUESTER-A/B experiment=%s OFF-exact=%s OFF-overlap=%s ON-exact=%s ON-overlap=%s; completed experiment does not imply atomic interoperability passed\n",
         experimentCompleted && safe ? "completed" : "incomplete",abExact[0] ? "yes" : "no",abOverlap[0] ? "yes" : "no",
         abExact[1] ? "yes" : "no",abOverlap[1] ? "yes" : "no");
-    std::puts(passed ? (handoffOnly ? "PASS: serialized native atomic usage only; contended interoperability remains untested." : "PASS: selected CPU-only/GPU-only controls and mixed-agent trials completed with exact results and intact guards; mixed trials had overlap. This tests this mapping and path only.") :
+    std::puts(passed ? (pingPongOnly ? "PASS: selected ownership rounds validated both directions with release/acquire and intact guards on this experimental coarse mapping; no contended RMW or fine-grained capability claim." : handoffOnly ? "PASS: serialized native atomic usage only; contended interoperability remains untested." : "PASS: selected CPU-only/GPU-only controls and mixed-agent trials completed with exact results and intact guards; mixed trials had overlap. This tests this mapping and path only.") :
         "FAIL/INCONCLUSIVE under current queue/mapping policy: inspect completion, overlap, counters and guards. This does not prove hardware impossibility; no general atomic capability enabled.");
     return passed ? 0 : 1;
 }

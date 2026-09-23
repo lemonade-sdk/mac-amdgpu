@@ -3,6 +3,7 @@
 ## Working
 
 - GPU discovery, firmware loading and initialization on the Radeon AI PRO R9700 (`gfx1201`) over Thunderbolt.
+- PCI identity reported through HSA: device `0x7551`, revision `0xc0`, verified after opening the PCI device.
 - Verified SDMA transfers, VRAM allocations and cross-process GPU-buffer sharing.
 - Loading linked gfx1201 HSA code objects, freezing executables and resolving kernel descriptors.
 - Actual HRX initialization, streams, 64 KiB copy/fill, 4,093-result FP32 vector compute and 16×16 FP32 matrix multiplication, with exact results and full input/output guards.
@@ -11,14 +12,15 @@
 - Persistent HSA compute queues: all seven slots, ring wraparound, four CPU producers, shared completion/barrier signals and two processes sharing the GPU passed hardware tests. One process can exit while the other continues on its existing queues.
 - Scratch/LDS compute on gfx1201: two independent queues passed full data/guard checks through initial scratch allocation, growth and reuse.
 - Public CPU-owned coarse/kernarg HSA pools with GPU access and identical CPU/GPU addresses. CPU access is allowed between completed GPU operations.
+- Experimental CPU↔GPU release/acquire ownership transfer: **1,000,000 round trips / 2,000,000 transfers** passed with every 512-byte payload checked both ways, no errors, intact guards and completed dispatch. This validates the tested mapping; it does not advertise general fine-grained atomic support.
 - GPU-backed HSA signal operations: stores, arithmetic, bitwise operations, exchange, compare-and-swap and waits passed hardware checks. CPU HSA updates execute GPU atomics; earlier native CPU/GPU contention tests lost updates, so that interoperability is not advertised.
 - HSA host services, CPU signals and software queues. All 119 entry points required by LSE’s pinned HRX resolve; the [behavior status](hsa/API_STATUS.md) explains their limits.
-- [amdgpu_mtop](amdgpu_mtop/README.md) device enumeration, GPU selection, capacity queries and JSON output.
+- [amdgpu_mtop](amdgpu_mtop/README.md) terminal dashboard, device enumeration/switching, driver status, VRAM allocator accounting and JSON output. It detects the installed driver; memory accounting requires an initialized GPU.
 - Stop/Restart GPU through transaction draining and verified reset; recovery still depends on a responsive device and link.
 
 ## Not working yet
 
-- General fine-grained CPU/GPU atomic interoperability; native contention loses updates even with endpoint AtomicOp Requester Enable verified on. Sustained ownership-transfer synchronization is the next separate test.
+- General fine-grained CPU/GPU atomic interoperability. The controlled staggered test returned **6,131,574 with Requester Enable OFF** and **6,133,395 with it ON**, versus **11,000,000 expected**. Single-agent controls passed, the bit change was read back and the original value was restored. This result applies to the tested mapping and queue configuration; see the [experiment details](docs/PCIE_ATOMIC_TEST_POLICY.md).
 - HRX/LSE model inference. No end-to-end AI workload has run.
 - Full HSA conformance and general executable linking. The gfx12-generic HRX helper loader passes software tests. Hardware profiling and some platform-specific APIs explicitly return errors.
 - Live firmware telemetry in amdgpu_mtop: usage, clocks, temperature and power need a verified firmware metrics layout.
@@ -26,7 +28,9 @@
 
 ## Upcoming
 
-- Run the [combined HRX validation suite](docs/HRX_MACOS_VALIDATION.md): public pools, discovered topology, scratch/LDS, real HRX operations and native CPU/GPU addition/CAS contention.
+- Build on the verified ownership-transfer path while keeping concurrent cross-agent RMW unsupported.
+- Add driver-side activity counters and history graphs to amdgpu_mtop, with `h` toggling Fast (0.1 s) and Slow (0.5 s).
+- Extend the [combined HRX validation suite](docs/HRX_MACOS_VALIDATION.md) beyond the verified small compute workloads.
 - Validate LSE model execution through the tested HRX compute path, then verify a real inference workload.
 - Finish the firmware telemetry path for amdgpu_mtop.
 
@@ -46,8 +50,8 @@ but no public PCI resource-resizing operation was found in its headers. A
 ReBAR capability ID alone cannot allocate larger Thunderbolt bridge windows.
 The driver does not write ReBAR size controls.
 
-The next milestones are general compute dispatch, the HSA interface for HRX,
-and data-verified inference workloads. Mesa winsys integration remains unimplemented.
+The next inference milestone is end-to-end LSE model execution through HRX,
+building on the verified compute and HSA paths. Mesa winsys integration remains unimplemented.
 
 Software checks and the non-submitting status probe:
 

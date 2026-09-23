@@ -236,3 +236,36 @@ the actual transactions, prove a cache-domain mechanism, or rule out other
 mapping/coherency configurations. The next experiment is sustained ownership
 transfer with release/acquire publication, separate from concurrent RMW.
 Log: `build/tests/driver192-hardware/requester-ab.log`.
+
+### Sustained ownership-transfer result
+
+The separate `ownership_ping_pong` fixture leaves the measured atomic A/B
+shader unchanged. It uses one persistent dispatch and a 64-bit sequence flag
+on its own 128-byte region. CPU and GPU alternately acquire ownership, check
+64 payload words tagged with the round and word index, replace that 512-byte
+payload and release ownership. Abort and diagnostic fields occupy separate
+regions. Payload accesses use relaxed atomic loads/stores; the ownership flag
+uses CPU acquire/release and GPU SYSTEM-scope acquire/release, with no RMW.
+Compiled gfx1201 ISA was checked for the corresponding cache/wait sequences.
+
+On driver 192, both the 1,000-round smoke and **1,000,000-round** sustained test
+passed. CPU/GPU round counts were both 1,000,000; the final ownership sequence
+was 2,000,000. Both directions reported zero payload errors, data and kernarg
+guards were intact, completion retired and no timeout occurred. The session
+returned to stage 0. The existing PTE, mapping and queue policy remained in use;
+Requester Enable was OFF and no configuration register was changed.
+
+The million-round exchange lasted 222.591321 seconds: 4,492.5 round trips/s or
+8,985.1 ownership transfers/s, including payload validation and polling. This
+is not a bulk DMA bandwidth benchmark or a measurement of bare interconnect
+latency. It establishes repeatable ownership-transfer visibility for the tested
+path, not full HSA fine-grained semantics or concurrent RMW serialization.
+
+```sh
+bash scripts/build-ping-pong-test.sh
+build/hsa/mac-hsa-atomic-contention-test --run build/tests/hsa-ownership-ping-pong.hsaco --ping-pong --rounds 1000000 --timeout-seconds 600
+```
+
+Logs: `build/tests/driver192-hardware/ownership-ping-pong-{1k,1m}.log`.
+Host protocol regressions cover success, either side's payload errors, skipped
+sequence, data/kernarg guard corruption and bounded timeout/abort.

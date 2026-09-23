@@ -150,3 +150,13 @@ endif()
 add_executable(mac-hsa-atomic-contention-test tools/mac_hsa_atomic_contention_test.cpp)
 target_link_libraries(mac-hsa-atomic-contention-test PRIVATE hsa-runtime64)
 target_compile_options(mac-hsa-atomic-contention-test PRIVATE -Wall -Wextra -Werror)
+
+if(BUILD_TESTING)
+  add_executable(hsa-ping-pong-protocol-test ../tests/hsa_ping_pong_protocol_test.cpp)
+  target_link_libraries(hsa-ping-pong-protocol-test PRIVATE hsa-runtime64)
+  target_compile_options(hsa-ping-pong-protocol-test PRIVATE -Wall -Wextra -Werror -UNDEBUG
+    -fsanitize=address,undefined -fno-sanitize-recover=all)
+  target_link_options(hsa-ping-pong-protocol-test PRIVATE -fsanitize=address,undefined)
+  add_test(NAME hsa-ping-pong-protocol COMMAND hsa-ping-pong-protocol-test)
+  set_tests_properties(hsa-ping-pong-protocol PROPERTIES TIMEOUT 15)
+endif()
