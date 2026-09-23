@@ -1,12 +1,15 @@
 # Status
 
-**v0.1.82 — AMD loader extension and shared-memory transport (installation pending).**
+**v0.1.82 — AMD loader extension and shared-memory transfers (hardware passed).**
 AMD loader extension 1.03 now returns real descriptor translations, loaded-code
 metadata and object/executable enumeration. The loader passed on the actual GPU,
 including descriptor lookup after reader destruction. The new driver enables
 GTT buffers only after bidirectional DMA/direct-CPU verification, and can place
-its GART window at CPU-mappable addresses. A fixed-address host/GPU transfer test
-is ready; that new hardware path still needs installation and validation.
+its GART window at CPU-mappable addresses. The hardware test verified identical
+CPU/GPU addresses, 64,003 unaligned bytes each way, all 128 KiB of shared memory
+and VRAM guards. Separate GPU atomic decrement/carry tests passed, but concurrent
+CPU/GPU additions lost updates and eventually timed out. The PCIe path lacks
+advertised host AtomicOp completion/routing; coherent signals remain blocked.
 GPU-visible signals, hardware HSA queues and HRX inference remain unfinished.
 
 **v0.1.81 — HSA host services and shared GPU buffers (IPC hardware passed).**
@@ -38,7 +41,7 @@ All 119 functions resolved by LSE’s pinned HRX are exported; seven platform
 paths explicitly fail, and several other families are currently host-only.
 A bounded gfx1201 ELF loader now uploads linked kernels and exposes their
 descriptors; a compiler-produced kernel passed hardware loading and symbol
-resolution. GPU-visible signals, HSA queue dispatch, shared-memory hardware validation and
+resolution. GPU-visible signals, HSA queue dispatch, shared HSA pool integration and
 HRX/LSE inference remain required. HRX inference has not run.
 
 Older release history and detailed hardware results are in [PROGRESS.md](PROGRESS.md).

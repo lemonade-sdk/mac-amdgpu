@@ -1770,11 +1770,42 @@ GART address window per GPU session, refuses live reservations, verifies both
 hubs and retains a failed register update for reset recovery. The transport maps
 GTT at the exact GPU address and refuses CPU address collisions without replacing
 existing memory. Its diagnostic checks 64,003 unaligned bytes each way plus all
-128 KiB shared bytes and device guard bytes. New hardware behavior awaits user
-installation of 0.1.82; shared HSA pools, GPU-visible atomic signals and hardware
+128 KiB shared bytes and device guard bytes. Hardware acceptance is recorded
+below; shared HSA pools, GPU-visible atomic signals and hardware
 AQL queues are not advertised yet. HRX inference has not run.
 
 The app/dext build and strict signature verification passed with unchanged
 installer code and entitlements. Eight HSA sanitizer suites and 29 driver
 regression scripts pass, including window programming/fault retention, direct
 DMA data verification, mapping collision cleanup and loader lifetimes.
+
+### Build 182 installed: shared transfers pass, concurrent atomics fail
+
+The live observer reported driver 182 and stage 0 before testing. The shared
+transport then initialized the GPU itself and allocated 131,072 bytes at
+CPU/GPU address `0x110000000`. Both unaligned 64,003-byte transfers, every shared
+byte and the VRAM guards passed; mappings were released successfully.
+
+Added a bounded raw-SDMA atomic diagnostic using ROCr's GFX12.0.1 BlitSdmaV5
+ADD64 packet (operation 47, no GFX12.5 scope fields). It validates owned shared
+storage, alignment, bounds and a maximum of 64 packets per batch, waits for the
+driver's real VRAM fence and retains backing on uncertain submission/timeout.
+It uses the existing exclusive raw-command API and needs no driver reinstall.
+Regression coverage checks packet fields, signed decrement, carry, invalid
+arguments, forged buffers and timeout retention.
+
+On hardware, GPU-only decrement 1 to 0 and carry `0xffffffff` to `0x100000000`
+passed. Concurrent CPU/GPU updates failed: CPU reported 245,885,253 increments,
+seven completed SDMA batches accounted for 448 increments, the eighth batch
+timed out, and the observed word was 245,716,216. No HSA GPU-signal capability
+was enabled. Cleanup subsequently returned the driver to stage 0; the user
+then initialized it again in the app. No further GPU submissions were made.
+
+Added a read-only IORegistry ancestry diagnostic. The tested root port
+DeviceCapabilities2 is `0xc1f`, without host AtomicOp 32/64 completion; both
+Intel bridge ports are `0x10800`, without routing support. AMD bridge ports
+are `0x330840`, with routing. These cached capabilities fail Linux's normal
+AtomicOp path checks. They do not prove the precise timeout mechanism, nor
+rule out other communication protocols. Shared DMA transfer success must not
+be advertised as concurrent HSA signal atomicity. The diagnostic tests cover
+missing capabilities, endpoint/root distinctions and multiple GPU paths.

@@ -33,6 +33,11 @@ target_include_directories(mac-hsa-shared-test PRIVATE src third_party/hsa/inclu
 target_compile_options(mac-hsa-shared-test PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(mac-hsa-shared-test PRIVATE "-framework IOKit" "-framework CoreFoundation")
 
+add_executable(mac-hsa-atomic-test tools/mac_hsa_atomic_test.cpp src/transport_iokit.cpp src/device_init.cpp)
+target_include_directories(mac-hsa-atomic-test PRIVATE src third_party/hsa/include)
+target_compile_options(mac-hsa-atomic-test PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(mac-hsa-atomic-test PRIVATE "-framework IOKit" "-framework CoreFoundation")
+
 include(CTest)
 if(BUILD_TESTING)
   add_executable(hsa-extensions-test ../tests/hsa_extensions_test.cpp ${HSA_RUNTIME_SOURCES})

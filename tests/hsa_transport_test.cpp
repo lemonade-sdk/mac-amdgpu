@@ -6,6 +6,8 @@
 #include <vector>
 #include <cstring>
 #include <thread>
+#include <atomic>
+#include <algorithm>
 
 namespace {
 struct Buffer { std::vector<uint8_t> bytes; uint64_t domain; };
@@ -19,12 +21,41 @@ alignas(16384) uint8_t sharedStorage[65536];
 bool sharedMapFailure = false;
 uint64_t sharedBase = reinterpret_cast<uintptr_t>(sharedStorage) & ~uint64_t((1ull << 28) - 1);
 unsigned hostChecks = 0, sharedMaps = 0, sharedUnmaps = 0;
+std::vector<std::array<uint64_t, 10>> atomicPackets;
+bool atomicTimeout = false, streamLive = false;
+unsigned submittedStreams = 0;
 kern_return_t mockOpen(io_service_t, task_port_t, uint32_t, io_connect_t *port) { *port = ++opens; return KERN_SUCCESS; }
 kern_return_t mockClose(io_connect_t) { ++closes; return KERN_SUCCESS; }
 kern_return_t mockRelease(io_object_t) { return KERN_SUCCESS; }
 kern_return_t mockScalar(mach_port_t, uint32_t selector, const uint64_t *in, uint32_t count,
                          uint64_t *out, uint32_t *outCount) {
     switch (selector) {
+    case 37:
+        assert(count == 2 && *outCount == 1 && in[0] == 0 && in[1] == 0 && !streamLive);
+        streamLive = true; atomicPackets.clear(); out[0] = 77; break;
+    case 38: {
+        assert(streamLive && count == 10 && *outCount == 0 && in[0] == 77 && in[9] == 8);
+        std::array<uint64_t, 10> packet; std::copy_n(in, 10, packet.begin());
+        assert(packet[1] == 0x5e00000a && !packet[6] && !packet[7] && !packet[8]);
+        atomicPackets.push_back(packet); break;
+    }
+    case 19:
+        assert(streamLive && count == 1 && in[0] == 77 && *outCount == 1);
+        ++submittedStreams; out[0] = 77;
+        for (const auto &packet : atomicPackets) {
+            const uint64_t address = packet[2] | (packet[3] << 32);
+            assert(address >= reinterpret_cast<uintptr_t>(sharedStorage) &&
+                address <= reinterpret_cast<uintptr_t>(sharedStorage) + sizeof(sharedStorage) - 8);
+            std::atomic_ref<int64_t>(*reinterpret_cast<int64_t *>(address)).fetch_add(
+                static_cast<int64_t>(packet[4] | (packet[5] << 32)));
+        }
+        break;
+    case 20:
+        assert(streamLive && count == 2 && in[0] == 77 && in[1] == 1000000000 && *outCount == 1);
+        out[0] = atomicTimeout; break;
+    case 39:
+        assert(streamLive && count == 1 && in[0] == 77 && *outCount == 0);
+        streamLive = false; break;
     case 43: assert(*outCount == 3); out[0] = 0x414d444750554142ull; out[1] = 1; out[2] = driverBuild; break;
     case 1:
         if (busy) return kIOReturnBusy;
@@ -177,6 +208,19 @@ int main() {
         assert(connection.allocateSharedBuffer(16384, shared) == 0 && hostChecks == 1);
         assert(shared.host == sharedStorage && shared.device.address == reinterpret_cast<uintptr_t>(shared.host));
         for (size_t i = 0; i < shared.device.size; ++i) assert(sharedStorage[i] == 0);
+        auto &signalWord = *reinterpret_cast<int64_t *>(sharedStorage + 64);
+        signalWord = 1;
+        assert(connection.testSharedAtomicAdd(shared, 64, -1, 1) == 0 && signalWord == 0 && !streamLive);
+        signalWord = 0xffffffffll;
+        assert(connection.testSharedAtomicAdd(shared, 64, 1, 64) == 0 && signalWord == 0x10000003fll);
+        const auto beforeInvalid = submittedStreams;
+        assert(connection.testSharedAtomicAdd(shared, 3, 1, 1) == HSA_STATUS_ERROR_INVALID_ARGUMENT);
+        assert(connection.testSharedAtomicAdd(shared, shared.device.size, 1, 1) == HSA_STATUS_ERROR_INVALID_ARGUMENT);
+        assert(connection.testSharedAtomicAdd(shared, 0, 1, 0) == HSA_STATUS_ERROR_INVALID_ARGUMENT);
+        assert(connection.testSharedAtomicAdd(shared, 0, 1, 65) == HSA_STATUS_ERROR_INVALID_ARGUMENT);
+        auto forged = shared; forged.device.address += 8;
+        assert(connection.testSharedAtomicAdd(forged, 0, 1, 1) == HSA_STATUS_ERROR_INVALID_ALLOCATION);
+        assert(submittedStreams == beforeInvalid);
         std::memset(sharedStorage, 0x79, shared.device.size);
         assert(connection.copyBuffers(shared.device, 0, device, 0, shared.device.size) == 0);
         assert(buffers.at(device.handle).bytes[16383] == 0x79);
@@ -212,5 +256,17 @@ int main() {
         assert(connection.memoryCapacity(capacity) != 0 && resets == 1);
     }
     assert(opens == closes);
+    {
+        driverBuild = 182;
+        mac_hsa::IOKitConnection connection; connection.service = 123; connection.registryID = 456;
+        mac_hsa::SharedBuffer shared;
+        assert(connection.allocateSharedBuffer(16384, shared) == 0);
+        atomicTimeout = true;
+        assert(connection.testSharedAtomicAdd(shared, 64, -1, 1) == HSA_STATUS_ERROR && streamLive);
+        const auto retained = buffers.size();
+        assert(connection.freeSharedBuffer(shared) == HSA_STATUS_ERROR && buffers.size() == retained);
+        assert(connection.testSharedAtomicAdd(shared, 64, 1, 1) == HSA_STATUS_ERROR);
+    }
+    assert(opens == closes && sharedMaps == sharedUnmaps);
     puts("HSA: transient observers, owner Busy without reset, single concurrent initialization, firmware mapping, unaligned SDMA staging/guards and fault retention pass");
 }

@@ -26,6 +26,7 @@ int main(int argc, char **argv) {
     bool passed = false;
     constexpr size_t capacity = 128 * 1024, payload = 64003, offset = 3, destination = 65539;
     std::vector<uint8_t> expected(capacity, 0xa9), observed(capacity), gpuExpected(capacity, 0x5c);
+    std::puts("Allocating shared memory: automatically initialize the GPU or join its ready session.");
     if (!check(connection.allocateSharedBuffer(capacity, shared), "allocate equal-address host/GPU memory")) return 1;
     std::printf("Shared allocation: CPU=%p GPU=%#llx size=%llu\n", shared.host,
         (unsigned long long)shared.device.address, (unsigned long long)shared.device.size);
@@ -59,5 +60,6 @@ cleanup:
     if (!check(connection.freeSharedBuffer(shared), "unmap and free shared memory")) passed = false;
     if (passed) std::puts("PASS: equal CPU/GPU addresses, 64003 unaligned bytes each way, all 131072 shared bytes and VRAM guards verified; mappings released");
     std::puts("This tests shared-memory copies, not concurrent system atomics or hardware AQL queues.");
+    std::puts("Closing the test session; the driver resets the GPU if this was its last participating client.");
     return passed ? 0 : 1;
 }

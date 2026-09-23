@@ -361,6 +361,35 @@ build/hsa/mac-hsa-shared-test --run
 This requires build 182 installed. It initializes/joins the GPU, verifies equal
 CPU/GPU pointers, transfers two independent 64,003-byte patterns at unaligned
 offsets, checks every shared byte and VRAM guard, and releases the mappings.
-Hardware validation of this new path is pending. It is not yet exposed as an
-HSA fine-grained pool or GPU signal: concurrent CPU/GPU system atomics and
-hardware AQL queues still require implementation and verification.
+On installed build 182, this passed with CPU and GPU address `0x110000000`,
+all 131,072 shared bytes and VRAM guards verified, and successful mapping cleanup.
+Allocation automatically initializes the device or joins its ready session;
+closing the last participating test client resets it to stage 0. These actions
+occur in the test process and are not entries in the host app's own log.
+
+It is not yet exposed as an HSA fine-grained pool or GPU signal. A separate
+`mac-hsa-atomic-test --run` diagnostic matches ROCr's GFX12.0.1 `BlitSdmaV5`
+ADD64 encoding, without GFX12.5 scope fields. Single GPU decrement and 32-to-64-bit
+carry passed. Concurrent ARM64 CPU/SDMA increments lost updates; seven 64-packet
+batches completed, and the eighth timed out. The transport refused to free
+potentially active backing and the last-client cleanup returned the driver to
+stage 0. This is a failed coherence test, not evidence of working HSA signals.
+The raw diagnostic requires an exclusive client lease; it is not a production
+multi-client signal implementation. Do not rerun it as a routine health check.
+
+Read the cached PCIe capability path without initializing or mutating the GPU:
+
+```sh
+python3 scripts/check-pcie-atomics.py
+```
+
+The tested Mac root port reports DeviceCapabilities2 `0x00000c1f` (neither
+32-bit nor 64-bit AtomicOp completion); both Intel bridge ports report
+`0x00010800` (no AtomicOp routing). AMD bridge ports report routing support.
+Linux's [AtomicOp enable helper](https://kernel.org/doc/html/latest/driver-api/pci/pci.html#c.pci_enable_atomic_ops_to_root)
+checks upstream routing and root completion before enabling requests. Endpoint
+completion bits alone do not establish host atomic support. The diagnostic
+uses cached properties, not live requester/egress-control registers; these
+results do not isolate every cause of the SDMA timeout or establish shader
+atomic behavior. Shared transfers remain usable, but concurrent system atomics,
+payload publication ordering and hardware AQL queues remain unverified.

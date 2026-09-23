@@ -142,6 +142,57 @@ public:
         if (status != HSA_STATUS_SUCCESS) state = State::Faulted;
         return status;
     }
+    hsa_status_t testSharedAtomicAdd(const SharedBuffer &buffer, uint64_t offset,
+                                    int64_t increment, uint32_t repetitions) override {
+        std::lock_guard lock(sessionMutex);
+        if (state != State::Ready) return HSA_STATUS_ERROR;
+        const auto found = sharedBuffers.find(buffer.device.handle);
+        if (found == sharedBuffers.end() || found->second.host != buffer.host ||
+            found->second.device.address != buffer.device.address ||
+            found->second.device.size != buffer.device.size || found->second.memoryType != buffer.memoryType)
+            return HSA_STATUS_ERROR_INVALID_ALLOCATION;
+        if (offset % 8 || offset > buffer.device.size || buffer.device.size - offset < 8 ||
+            !repetitions || repetitions > 64) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        std::array<uint64_t, 3> gfx{};
+        const uint64_t tag = 1;
+        auto status = scalar(21, {&tag, 1}, gfx);
+        if (status != HSA_STATUS_SUCCESS) return status;
+        // Match ROCr's BlitSdmaV5 for GFX12.0.1: no GFX12.5 scope fields.
+        if (gfx != std::array<uint64_t, 3>{12, 0, 1}) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+        const std::array<uint64_t, 2> create{0, 0};
+        uint64_t stream = 0;
+        status = scalar(37, create, {&stream, 1});
+        if (status != HSA_STATUS_SUCCESS) return status;
+        const auto address = buffer.device.address + offset;
+        const auto value = static_cast<uint64_t>(increment);
+        // SDMA_PKT_ATOMIC / ADD64, as emitted by BuildAtomicDecrementCommand.
+        const std::array<uint64_t, 10> packet{stream, 10u | (47u << 25),
+            uint32_t(address), uint32_t(address >> 32), uint32_t(value), uint32_t(value >> 32), 0, 0, 0, 8};
+        for (uint32_t i = 0; i < repetitions && status == HSA_STATUS_SUCCESS; ++i)
+            status = scalar(38, packet, {});
+        if (status != HSA_STATUS_SUCCESS) {
+            if (scalar(39, {&stream, 1}, {}) != HSA_STATUS_SUCCESS) state = State::Faulted;
+            return status;
+        }
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        uint64_t fence = 0;
+        status = scalar(19, {&stream, 1}, {&fence, 1});
+        if (status != HSA_STATUS_SUCCESS) {
+            // Submission may have partially reached hardware; retain all backing.
+            state = State::Faulted; return status;
+        }
+        const std::array<uint64_t, 2> wait{fence, 1000000000};
+        uint64_t timedOut = 1;
+        status = scalar(20, wait, {&timedOut, 1});
+        if (status != HSA_STATUS_SUCCESS || timedOut) {
+            state = State::Faulted;
+            return status == HSA_STATUS_SUCCESS ? HSA_STATUS_ERROR : status;
+        }
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        status = scalar(39, {&stream, 1}, {});
+        if (status != HSA_STATUS_SUCCESS) state = State::Faulted;
+        return status;
+    }
     hsa_status_t copyBuffers(const DeviceBuffer &source, uint64_t sourceOffset,
         const DeviceBuffer &destination, uint64_t destinationOffset, size_t bytes) override {
         std::lock_guard lock(sessionMutex);
