@@ -10,8 +10,9 @@ passes the two-way host-memory test with zero mismatches, and completes GFX
 command submission. Non-trailing reuse is covered offline; general GTT
 allocation is still gated.
 
-The current target is AI compute and model inference. HRX integration is under
-investigation; shader dispatch and a working inference runtime remain required.
+The current target is AI compute and model inference. The initial [HSA runtime](hsa/README.md)
+discovers the live GPU through IOKit and passes lifecycle tests. HRX integration,
+shader dispatch and a working inference runtime remain required.
 
 **v0.1.72 — checked GART teardown and two-way host-memory diagnostic.**
 The new Host Memory Copy button verifies distinct 16 KiB patterns from host
@@ -336,6 +337,7 @@ These four surprises eat most of an afternoon if you don't know about them.
 
 - `Host/` — SwiftUI host app that drives the dext.
 - `dext/` — the DriverKit system extension (C++ inside an IOService).
+- `hsa/` — userspace HSA runtime, IOKit transport, discovery probe and HRX API audit.
 - `project.yml` — xcodegen spec; regenerates `MacAMDGPU.xcodeproj`.
 - `scripts/` — build, install, and ping/test helpers.
 - `docs/` — local bringup audits and porting plans. Gitignored.

@@ -1343,3 +1343,34 @@ two-way transfer tests. The build/gart-allocator Debug app and dext both report
 The requested product scope is AI compute and model inference. Display output
 and desktop graphics are not required for that target. HRX integration is now
 being investigated; no claim of working shader dispatch or inference is made.
+
+## v0.1.73 hardware acceptance and initial HSA discovery
+
+The responding runtime was verified as 173 at 05:30:00 UTC on September 23.
+Initialization completed at 05:30:19–20; the two-way 16 KiB Host Memory Copy
+passed at 05:30:30 with zero mismatches and successful unbind. GFX CS passed
+at 05:31:02. These runs exercise the new allocator's normal mapping/teardown
+path; non-trailing reuse and stale reservation rejection are validated offline.
+The user selected Low power at 05:30:52.
+
+The new hsa/ library implements a core HSA C ABI discovery/lifecycle foundation
+using the public header revision pinned by reviewed HRX System commit
+437e789eaea207a036c197cf3398a6ca473d6534. It opens observer clients and calls only
+RuntimeBuild and QueryInfo. It does not reset, claim or submit to the device.
+Runtime references, agent lifetime, reentrant callbacks, live query failures,
+initialization failure cleanup and parallel reference users are covered by an
+address/undefined-sanitized test. A C program links the built dylib to verify
+the public ABI and inspect the installed driver.
+
+The live probe discovered gfx1201, driver 173, bringup stage 15, visible VRAM
+268435456 bytes and reported total VRAM 34208743424 bytes. It returned success
+and closed its observer connection. GFX CS then passed at 05:40:10, demonstrating
+that observer shutdown did not end the app-owned GPU session in this run.
+
+HRX's dynamic table currently requires 121 symbols. The library exports 8 of
+those; the symbol audit reports 113 missing and exits nonzero. HSA queue creation
+is explicitly rejected, dispatch feature flags remain zero and no extensions
+are advertised. This is not HSA conformance, an HRX-loadable backend or shader
+execution. General memory allocation/copy, compute dispatch, signals, AQL,
+executable/code-object handling and AMD loader tables remain required for the
+requested HRX/LSE inference target. The user intends compute-only operation.
