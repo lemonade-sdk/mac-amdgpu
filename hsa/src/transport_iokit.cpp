@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
 #include <fstream>
 #include <map>
 #include <mutex>
@@ -51,7 +52,7 @@ public:
         const uint64_t tag=6;std::array<uint64_t,10> values{};
         status=scalar(21,{&tag,1},values);
         if (status!=HSA_STATUS_SUCCESS) return status;
-        if (values[0]>UINT16_MAX || values[1]>UINT8_MAX || values[2]>UINT16_MAX ||
+        if (!values[0] || values[0]>=UINT16_MAX || values[1]>UINT8_MAX || values[2]>UINT16_MAX ||
             values[3]>UINT32_MAX || !values[4] || values[4]>128 ||
             !values[5] || values[5]>8 || !values[6] || values[6]>2 || values[7]>400000000 ||
             !values[8] || values[8]>64 || (values[9]!=32 && values[9]!=64))
@@ -76,6 +77,9 @@ public:
         uint32_t count = outputs;
         const auto result = IOConnectCallScalarMethod(port, selector, input, inputs,
                                                       output, &count);
+        if (selector == 60 && (result != KERN_SUCCESS || count != outputs))
+            std::fprintf(stderr, "AtomicOp requester RPC: IOReturn=%#x output-count=%u expected=%u\n",
+                         unsigned(result), count, outputs);
         if (result == kIOReturnNoDevice || result == kIOReturnNotAttached ||
             result == MACH_SEND_INVALID_DEST) return HSA_STATUS_ERROR_INVALID_AGENT;
         if (result == kIOReturnBusy || result == kIOReturnNoMemory || result == kIOReturnNoSpace || result == kIOReturnNoResources)

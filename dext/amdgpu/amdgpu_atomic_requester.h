@@ -28,14 +28,19 @@ struct Experiment {
         s.values[Active]=owner!=nullptr;s.values[RestorePending]=pending;
         return s;
     }
-    template<class PCI> static bool locate(PCI &pci,uint64_t &cap) {
+    template<class PCI> static bool locate(PCI &pci,uint64_t &cap,const char **reason=nullptr) {
+        auto fail=[&](const char *why) {if(reason) *reason=why;return false;};
         uint32_t identity=UINT32_MAX;pci.ConfigurationRead32(0,&identity);
-        if(identity!=0x75511002u || pci.FindPCICapability(0x10,0,&cap)!=0 ||
-           cap<0x40 || cap>0xd4 || (cap&3)) return false;
+        if(identity!=0x75511002u) return fail("live-identity-not-1002-7551");
+        if(pci.FindPCICapability(0x10,0,&cap)!=0 || cap<0x40 || cap>0xd4 || (cap&3))
+            return fail("pcie-capability-unavailable-or-invalid");
         uint16_t header=UINT16_MAX,flags=UINT16_MAX;
         pci.ConfigurationRead16(cap,&header);pci.ConfigurationRead16(cap+2,&flags);
         const unsigned type=(flags>>4)&15;
-        return (header&255)==0x10 && flags!=UINT16_MAX && (flags&15)==2 && (type==0 || type==1);
+        if((header&255)!=0x10 || flags==UINT16_MAX) return fail("pcie-capability-read-invalid");
+        if((flags&15)!=2) return fail("pcie-capability-version-not-2");
+        if(type!=0 && type!=1) return fail("pcie-device-not-endpoint");
+        return true;
     }
     template<class PCI> bool begin(PCI &pci,void *client,Snapshot &out) {
         out=snapshot();uint64_t cap=0;

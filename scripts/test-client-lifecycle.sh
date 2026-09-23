@@ -5,6 +5,11 @@ mkdir -p build/tests
 python3 - <<'PY'
 from pathlib import Path
 source = Path('dext/MacAMDGPU.cpp').read_text()
+start_body = source[source.index('IMPL(MacAMDGPU, Start)'):source.index('// MacAMDGPU::Stop')]
+assert 'ConfigurationRead' not in start_body, 'Start must not read configuration before Open'
+identity_query = source[source.index('        case 6: { // Owned initialized session'):source.index('        case 7: { // Owned shared-memory')]
+assert '!driver->ivars->deviceID || driver->ivars->deviceID==UINT16_MAX' in identity_query, 'Topology query must reject invalid cached identity'
+
 start = source.index('static kern_return_t\nmac_amdgpu_admit_external(')
 end = source.index('static void\nmac_amdgpu_release_dma_state(', start)
 Path('build/tests/client_admission_under_test.inc').write_text(source[start:end])

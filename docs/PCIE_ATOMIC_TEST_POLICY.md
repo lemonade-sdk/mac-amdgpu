@@ -199,5 +199,40 @@ build/hsa/mac-hsa-atomic-contention-test --run build/tests/hsa-atomic-contention
 ```
 
 Use a 700-second outer deadline. Completion of the A/B procedure is reported
-separately from exact-count success. No Requester Enable ON hardware result has
-yet been recorded; installation of driver 191 is required.
+separately from exact-count success. Driver 191 completed the OFF baseline, but
+the begin RPC returned NotReady before the configuration write. A subsequent
+HSA query confirmed its cached chip/revision were 0xffff/0xff: identity had been
+read before PCI Open. Build 192 corrects that ordering.
+
+### Driver 192 measured OFF/ON comparison
+
+Live HSA identity now reports chip `0x7551`, revision `0xc0`. The complete A/B
+procedure ran on 2026-09-23 with the same allocation and shader. Device Control 2
+changed from `0x0000` to `0x0040`, with matching readback and a second policy
+snapshot confirming Requester Enable ON. Both settings passed CPU-only
+10,000,000 and GPU-only 1,000,000 addition controls.
+
+| Staggered phase | Expected | Requester OFF | Requester ON |
+| --- | ---: | ---: | ---: |
+| CPU prefix | 2,500,000 | 2,500,000 | 2,500,000 |
+| Middle counter delta | 6,000,000 | 1,131,574 | 1,133,395 |
+| CPU tail | 2,500,000 | 2,500,000 | 2,500,000 |
+| Final counter | 11,000,000 | 6,131,574 | 6,133,395 |
+
+Both CPU/GPU operation counts completed, progress overlap was observed,
+completion retired and guards remained intact. CPU start/end timestamps were
+0.000207/2.631148 seconds OFF and 0.000199/2.633825 seconds ON. Host-observed GPU
+markers were 0.012615/2.585227 OFF and 0.015155/2.589551 ON, relative to each
+dispatch; these include host observation lag.
+
+PTE `0x8080000082058077`, DART `0x82058000`, VA `0x110000000`, MQD HQ_STATUS0
+`0x4000`, GFXHUB root `0x700001` and context `0x03fffc01` matched between phases.
+The requester bit was restored with `DEVCTL2=0x0000`, no active experiment and
+no pending restoration. Post-test discovery reported stage 0.
+
+Thus enabling endpoint Requester Enable alone did not restore concurrent
+CPU/GPU RMW correctness under this tested configuration. This does not identify
+the actual transactions, prove a cache-domain mechanism, or rule out other
+mapping/coherency configurations. The next experiment is sustained ownership
+transfer with release/acquire publication, separate from concurrent RMW.
+Log: `build/tests/driver192-hardware/requester-ab.log`.

@@ -22,6 +22,13 @@ static unsigned openCalls;
 struct IOPCIDevice {
     IOService *openedBy = nullptr;
     int openResult = 0;
+    uint32_t identity=0x75511002,classRev=0x030000c0;
+    unsigned identityReads=0,closes=0;
+    void Close(IOService *client,int) {assert(client==openedBy);openedBy=nullptr;++closes;}
+    void ConfigurationRead32(uint32_t reg,uint32_t *out) {
+        assert(openedBy && openResult==0); // identity may never be read before successful Open
+        assert(reg==0 || reg==8);++identityReads;*out=reg==0 ? identity : classRev;
+    }
     int Open(IOService *client, int) { ++openCalls; openedBy = client; return openResult; }
     uint8_t head = 0;
     uint16_t headers[256] = {};
@@ -35,6 +42,7 @@ struct IOPCIDevice {
 namespace amdgpu { enum class BringupStage { None, SDMAInit }; }
 struct State {
     bool pciOpen = false, shutdownBlocked = false;
+    uint16_t deviceID=0;uint8_t revision=0;
     struct { amdgpu::BringupStage reached = amdgpu::BringupStage::None; } bringup;
     amdgpu::ClientSessions sessions;
     amdgpu::ClientSubmission submission;
@@ -181,6 +189,33 @@ int main() {
         endpoint.openResult = kIOReturnNotOpen;
         assert(mac_amdgpu_ensure_open(&b, &root, &endpoint) == kIOReturnNotOpen);
         assert(!bState.claimed && shared.sessions.participants == 0 && !shared.sessions.initializationClient);
+    }
+    // Access-denied sentinels and wrong devices must close PCI and unwind a
+    // newly attached client; they must never become a successful cached ID.
+    for(unsigned invalid=0;invalid<5;++invalid) {
+        State checked;checked.deviceID=UINT16_MAX;checked.revision=UINT8_MAX;
+        MacAMDGPU root;root.ivars=&checked;IOPCIDevice endpoint;
+        ClientState clientState;MacAMDGPUUserClient client;client.ivars=&clientState;
+        if(invalid==0) endpoint.identity=UINT32_MAX;
+        if(invalid==1) endpoint.identity=0x00001002;
+        if(invalid==2) endpoint.identity=0x75511234;
+        if(invalid==3) endpoint.classRev=UINT32_MAX;
+        if(invalid==4) endpoint.identity=0xffff1002;
+        const auto status=mac_amdgpu_ensure_open(&client,&root,&endpoint);
+        assert(status==(invalid==0 || invalid==3 || invalid==4 ? kIOReturnNotAttached : kIOReturnUnsupported));
+        assert(!checked.pciOpen && !checked.deviceID && !checked.revision && endpoint.closes==1);
+        assert(!endpoint.openedBy && !clientState.claimed && checked.sessions.participants==0 && !checked.sessions.initializationClient);
+        assert(endpoint.identityReads==2);
+        endpoint.identity=0x75511002;endpoint.classRev=0x030000c0;
+        assert(mac_amdgpu_ensure_open(&client,&root,&endpoint)==0);
+        assert(checked.pciOpen && checked.deviceID==0x7551 && checked.revision==0xc0 && endpoint.identityReads==4);
+        assert(mac_amdgpu_ensure_open(&client,&root,&endpoint)==0 && endpoint.identityReads==4);
+    }
+    {
+        State checked;MacAMDGPU root;root.ivars=&checked;IOPCIDevice endpoint;
+        ClientState clientState;MacAMDGPUUserClient client;client.ivars=&clientState;
+        endpoint.identity=0x744c1002; // general PCI admission is not an R9700-only policy
+        assert(mac_amdgpu_ensure_open(&client,&root,&endpoint)==0 && checked.deviceID==0x744c);
     }
     puts("Client lifecycle: checked allocation, timeout cap, observer/owner admission, pending-work gate and unique latched fences pass");
 }

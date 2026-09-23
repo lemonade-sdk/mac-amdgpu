@@ -629,6 +629,22 @@ mac_amdgpu_ensure_open(IOService *opener, MacAMDGPU *driver,
     }
     driver->ivars->pciOpen = true;
 
+    // DriverKit configuration access is valid only after Open. Start must not
+    // cache its all-ones access-denied sentinel as the hardware identity.
+    uint32_t identity=UINT32_MAX,classRev=UINT32_MAX;
+    pci->ConfigurationRead32(0x00,&identity);
+    pci->ConfigurationRead32(0x08,&classRev);
+    const uint16_t vendor=uint16_t(identity),device=uint16_t(identity>>16);
+    if (vendor!=0x1002 || !device || device==UINT16_MAX || classRev==UINT32_MAX) {
+        MACAMDGPU_LOG("ensure_open: invalid live identity=%#x class/revision=%#x; closing PCI",identity,classRev);
+        pci->Close(driver,0);
+        state->pciOpen=false;state->deviceID=0;state->revision=0;
+        if (!alreadyAttached) state->sessions.detach(client,client->ivars->claimed);
+        return vendor==UINT16_MAX || device==UINT16_MAX || classRev==UINT32_MAX ? kIOReturnNotAttached : kIOReturnUnsupported;
+    }
+    state->deviceID=uint16_t(identity>>16);state->revision=uint8_t(classRev);
+    MACAMDGPU_LOG("ensure_open: validated vendor=%04x device=%04x class=%06x rev=%02x",
+        unsigned(identity&0xffff),unsigned(state->deviceID),unsigned(classRev>>8),unsigned(state->revision));
 
     uint16_t cmd = 0;
     pci->ConfigurationRead16(0x04, &cmd);
@@ -1170,28 +1186,10 @@ IMPL(MacAMDGPU, Start)
     ivars->retainedPCI = pci;
 
     uint8_t bus = 0, device = 0, function = 0;
-    uint16_t vendorID = 0xFFFF, deviceID = 0xFFFF;
-    uint32_t classRev = 0;
-    pci->GetBusDeviceFunction(&bus, &device, &function);
-    pci->ConfigurationRead16(kIOPCIConfigurationOffsetVendorID, &vendorID);
-    pci->ConfigurationRead16(kIOPCIConfigurationOffsetDeviceID, &deviceID);
-    pci->ConfigurationRead32(kIOPCIConfigurationOffsetRevisionID, &classRev);
-    ivars->deviceID=deviceID;ivars->revision=uint8_t(classRev);
+    const auto bdfStatus=pci->GetBusDeviceFunction(&bus,&device,&function);
     ivars->pciBDF=(uint16_t(bus)<<8)|(uint16_t(device)<<3)|function;
-
-    uint16_t cmd = 0, status = 0;
-    uint8_t  headerType = 0;
-    pci->ConfigurationRead16(kIOPCIConfigurationOffsetCommand, &cmd);
-    pci->ConfigurationRead16(kIOPCIConfigurationOffsetStatus, &status);
-    pci->ConfigurationRead8(kIOPCIConfigurationOffsetHeaderType, &headerType);
-
-    MACAMDGPU_LOG("matched %02x:%02x.%u vendor=%04x device=%04x "
-                  "class=%06x rev=%02x cmd=%04x status=%04x header=%02x",
-                  (unsigned)bus, (unsigned)device, (unsigned)function,
-                  (unsigned)vendorID, (unsigned)deviceID,
-                  (unsigned)(classRev >> 8) & 0xFFFFFFu,
-                  (unsigned)(classRev & 0xFFu),
-                  (unsigned)cmd, (unsigned)status, (unsigned)headerType);
+    MACAMDGPU_LOG("matched PCI provider %02x:%02x.%u BDF_status=%#x; configuration identity deferred until Open",
+        unsigned(bus),unsigned(device),unsigned(function),bdfStatus);
 
     for (uint8_t bar = 0; bar < 6; bar++) {
         uint8_t  memoryIndex = 0;
@@ -1741,24 +1739,35 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             arguments->structureOutputMaximumSize) return kIOReturnBadArgument;
         auto &state=*driver->ivars;auto &experiment=state.atomicRequester;
         const bool enable=arguments->scalarInput[0]!=0;
-        if (!ivars->claimed || !state.pciOpen || state.shutdownInProgress ||
-            state.retainedPCI!=pci || state.bringup.device.pci!=pci ||
-            state.bringup.reached!=amdgpu::BringupStage::SDMAInit ||
-            state.deviceID!=0x7551 || !state.bringup.device.ip.isVersion(amdgpu::IPBlock::GC,12,0,1))
-            return kIOReturnNotReady;
-        if (enable && state.shutdownBlocked) return kIOReturnNotReady;
-        if (!state.sessions.canReset(this,ivars->claimed) || ivars->mappedBAR || ivars->irqQueue ||
-            ivars->pendingInterruptNotify || !state.submission.poll()) return kIOReturnBusy;
-        for (auto *source:ivars->interruptSources) if (source) return kIOReturnBusy;
+        auto reject=[&](kern_return_t status,const char *reason) {
+            (void)reason;
+            MACAMDGPU_LOG("EXPERIMENT requester preflight rejected: enable=%u reason=%{public}s status=%#x",
+                unsigned(enable),reason,status);
+            return status;
+        };
+        if (!ivars->claimed) return reject(kIOReturnNotReady,"client-not-claimed");
+        if (!state.pciOpen) return reject(kIOReturnNotReady,"pci-not-open");
+        if (state.shutdownInProgress) return reject(kIOReturnNotReady,"shutdown-in-progress");
+        if (state.retainedPCI!=pci) return reject(kIOReturnNotReady,"retained-provider-mismatch");
+        if (state.bringup.device.pci!=pci) return reject(kIOReturnNotReady,"bringup-provider-mismatch");
+        if (state.bringup.reached!=amdgpu::BringupStage::SDMAInit) return reject(kIOReturnNotReady,"initialization-incomplete");
+        if (state.deviceID!=0x7551) return reject(kIOReturnNotReady,"cached-identity-invalid");
+        if (!state.bringup.device.ip.isVersion(amdgpu::IPBlock::GC,12,0,1)) return reject(kIOReturnNotReady,"discovered-gc-not-gfx1201");
+        if (enable && state.shutdownBlocked) return reject(kIOReturnNotReady,"session-requires-recovery");
+        if (!state.sessions.canReset(this,ivars->claimed)) return reject(kIOReturnBusy,"other-participant-or-exclusive-owner");
+        if (ivars->mappedBAR) return reject(kIOReturnBusy,"mapped-bar");
+        if (ivars->irqQueue || ivars->pendingInterruptNotify) return reject(kIOReturnBusy,"irq-owner");
+        if (!state.submission.poll()) return reject(kIOReturnBusy,"submission-pending");
+        for (auto *source:ivars->interruptSources) if (source) return reject(kIOReturnBusy,"interrupt-source");
         for (const auto &q:state.bringup.aqlQueues)
-            if (q.owner || q.handle || q.mapped || q.retained) return kIOReturnBusy;
-        if ((enable && experiment.owner) || (!enable && experiment.owner!=this)) return kIOReturnBadArgument;
-        uint64_t capability=0;
-        if (!Experiment::locate(*pci,capability)) return kIOReturnNotReady;
+            if (q.owner || q.handle || q.mapped || q.retained) return reject(kIOReturnBusy,"aql-queue-remains");
+        if ((enable && experiment.owner) || (!enable && experiment.owner!=this)) return reject(kIOReturnBadArgument,"experiment-owner");
+        uint64_t capability=0;const char *locateFailure=nullptr;
+        if (!Experiment::locate(*pci,capability,&locateFailure)) return reject(kIOReturnNotReady,locateFailure);
         uint16_t transactionStatus=UINT16_MAX;
         pci->ConfigurationRead16(capability+0x0a,&transactionStatus);
-        if (transactionStatus==UINT16_MAX) return kIOReturnNotAttached;
-        if (transactionStatus&(1u<<5)) return kIOReturnBusy; // no policy change until nonposted requests drain
+        if (transactionStatus==UINT16_MAX) return reject(kIOReturnNotAttached,"transaction-status-inaccessible");
+        if (transactionStatus&(1u<<5)) return reject(kIOReturnBusy,"pcie-transactions-pending");
         Snapshot snapshot{};bool succeeded=false;
         if (enable) {
             const bool wasExclusive=state.sessions.exclusiveClient==this;
@@ -4156,7 +4165,8 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             if (arguments->scalarOutputCount<10) return kIOReturnBadArgument;
             if (!ivars->claimed || !driver->ivars->pciOpen || driver->ivars->shutdownBlocked ||
                 driver->ivars->shutdownInProgress ||
-                b.reached!=amdgpu::BringupStage::SDMAInit || !b.gfx.inited)
+                b.reached!=amdgpu::BringupStage::SDMAInit || !b.gfx.inited ||
+                !driver->ivars->deviceID || driver->ivars->deviceID==UINT16_MAX)
                 return kIOReturnNotReady;
             if (!driver->ivars->timestampFrequency)
                 amdgpu::gfx1201_timestamp_frequency_hz(b.device,driver->ivars->timestampFrequency);

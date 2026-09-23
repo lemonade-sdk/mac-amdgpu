@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+using kern_return_t=int;
 constexpr int kIOReturnSuccess=0,kIOReturnBadArgument=1,kIOReturnNotReady=2,kIOReturnBusy=3,kIOReturnNotAttached=4;
 constexpr unsigned kMacAMDGPUMethodAtomicRequesterExperiment=60;
 #define MACAMDGPU_LOG(...) ((void)0)

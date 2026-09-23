@@ -18,7 +18,7 @@
 
 ## Not working yet
 
-- General fine-grained CPU/GPU atomic interoperability; native add/CAS contention is being tested separately.
+- General fine-grained CPU/GPU atomic interoperability; native contention loses updates even with endpoint AtomicOp Requester Enable verified on. Sustained ownership-transfer synchronization is the next separate test.
 - HRX/LSE model inference. No end-to-end AI workload has run.
 - Full HSA conformance and general executable linking. The gfx12-generic HRX helper loader passes software tests. Hardware profiling and some platform-specific APIs explicitly return errors.
 - Live firmware telemetry in amdgpu_mtop: usage, clocks, temperature and power need a verified firmware metrics layout.

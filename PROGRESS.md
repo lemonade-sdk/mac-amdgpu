@@ -2073,5 +2073,36 @@ successfully after cleanup. No hardware AQL queue or HRX inference is claimed.
 - Validation: 36 driver/ABI scripts and 12 HSA ASan/UBSan suites pass. The metrics
   regression harness needed the new selector enum to compile its extracted
   admission code. Xcode build and strict app/dext signature checks pass.
-- Build 0.1.91 (191) awaits installation; the Requester Enable ON experiment has
-  not run. Build 190 completed all prior tests and returned to stage 0.
+- Build 0.1.91 (191) was installed and verified through the live driver query.
+  OFF trials completed, but the begin RPC returned NotReady (0xe00002d8)
+  before reaching the register write; there is no ON result. The diagnostic
+  retry measured 6,133,742 / 11,000,000, with exact single-agent controls,
+  prefix and tail, retired GPU completion and intact guards. The driver
+  returned to stage 0 after cleanup.
+
+## Driver 192 PCI identity correction
+
+- A direct HSA identity query on driver 191 returned chip 0xffff and revision
+  0xff with success, although live configuration reads identified 1002:7551.
+  Start had cached identity before opening the PCI device; the new requester
+  experiment gate rejected that stale value. Identity must be read and
+  validated after successful PCI Open before publishing it to HSA.
+- Added raw IOReturn reporting for failed requester RPCs so transport failures
+  cannot be mistaken for register readback or experiment results.
+- Atomic shader, allocation, PTE, cache, CPU ordering and trial algorithm remain
+  unchanged.
+- Validation: client admission/open, requester, shutdown and atomic diagnostics
+  regression scripts pass, including invalid-read close/unwind and another AMD
+  device ID. All 12 HSA ASan/UBSan suites pass with host Mach API access; the
+  virtual-memory suite is blocked inside the restricted sandbox. Xcode build
+  and strict signed host/dext verification pass. Build 192 was opened.
+- Installed driver 192 reports corrected HSA chip 0x7551 and revision 0xc0.
+  The complete staggered A/B experiment confirmed DEVCTL2 0x0000 → 0x0040
+  readback, unchanged mapping/queue policy and restoration to 0x0000.
+  OFF returned 6,131,574 / 11,000,000; ON returned 6,133,395 / 11,000,000.
+  Both single-agent controls, 2.5M prefix and 2.5M tail were exact; the middle
+  counter deltas were 1,131,574 and 1,133,395 / 6,000,000. Both workloads
+  completed with overlap, retired completion and intact guards. Enabling the
+  endpoint requester alone did not fix concurrent RMW under this configuration.
+  Cleanup returned to stage 0; amdgpu_mtop detects build 192. Detailed timing
+  and limitations are in docs/PCIE_ATOMIC_TEST_POLICY.md.
