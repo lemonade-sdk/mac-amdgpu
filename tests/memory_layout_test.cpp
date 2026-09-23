@@ -1,6 +1,7 @@
 #include "amdgpu_gmc_address.h"
 #include "amdgpu_vram.h"
 #include "amdgpu_pci_rebar.h"
+#include "amdgpu_buffer_io.h"
 #include <array>
 #include <cassert>
 #include <cstdio>
@@ -26,6 +27,22 @@ int main()
     assert(allocator.alloc(1<<20,16384,&first)); // both ranges coalesced
     allocator.init(UINT64_MAX-10,100); assert(!allocator.is_inited());
     constexpr uint64_t GiB = 1ULL << 30;
+    uint64_t highBase = 0, highBytes = 0;
+    assert(buffer_device_pool(512 * GiB, GiB / 4, 32 * GiB, highBase, highBytes));
+    assert(highBase == 512 * GiB + GiB / 4);
+    assert(highBytes == 32 * GiB - GiB / 4 - 1024 * 1024);
+    VRAMBumpAllocator high;
+    high.init(highBase, highBytes);
+    VRAMAllocation model{}, staging{};
+    assert(high.alloc(22 * GiB, 65536, &model) && model.cpu_ptr == nullptr);
+    assert(high.alloc(16384, 16384, &staging));
+    assert(staging.gpu_va >= model.gpu_va + model.size);
+    assert(!high.alloc(16 * GiB, 16384, &bad));
+    high.free(model); high.free(staging);
+    assert(high.bytes_used() == 0 && high.bytes_free() == highBytes);
+    assert(buffer_device_pool(512 * GiB, 32 * GiB, 32 * GiB, highBase, highBytes) && !highBytes);
+    assert(!buffer_device_pool(UINT64_MAX - GiB, GiB / 4, 32 * GiB, highBase, highBytes));
+    assert(!buffer_device_pool(512 * GiB, 33 * GiB, 32 * GiB, highBase, highBytes));
     uint64_t start = ~0ULL;
     // R9700 framebuffer at 512 GiB: LOW places GART at zero, a valid VA.
     assert(gfx12_gart_location_low(512 * GiB, 544 * GiB - 1, GiB / 4, start));

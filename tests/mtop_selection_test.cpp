@@ -35,6 +35,7 @@ int main() {
     a.metrics.flags = amdgpu::kSMUMetricsValid;
     a.metrics.validFields = 1;
     a.metrics.collectedAtNs = 100;
+    a.metrics.driverInterface = amdgpu::metrics::kDriverInterface;
     assert(mtop::validSnapshot(a.metrics) && mtop::fresh(a, 101));
     assert(!mtop::fresh(a, 99));
     assert(!mtop::fresh(a, 101 + amdgpu::kSMUMetricsStaleAfterNs));
@@ -49,4 +50,11 @@ int main() {
     a.metrics.flags = amdgpu::kSMUMetricsFaulted;
     a.metrics.validFields = 0;
     assert(mtop::validSnapshot(a.metrics) && !mtop::fresh(a, 101));
+    a.metrics.driverInterface = 0x33;
+    assert(mtop::interfaceMismatch(a) && !mtop::fresh(a, 101));
+    a.metrics.flags = amdgpu::kSMUMetricsValid;
+    a.metrics.validFields = 1;
+    assert(mtop::interfaceMismatch(a) && !mtop::fresh(a, 101));
+    a.metrics.driverInterface = 0;
+    assert(!mtop::interfaceMismatch(a) && !mtop::fresh(a, 101));
 }

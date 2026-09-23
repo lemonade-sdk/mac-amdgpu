@@ -1492,3 +1492,53 @@ The HSA integration target is LSE's pinned HRX revision
 exported), rather than the separately reviewed newer main revision. The chosen
 approach is our own focused HSA-compatible interface backed by DriverKit,
 using Linux KFD and ROCr as references. No full ROCr port is being integrated.
+
+
+## v0.1.76 hardware compute acceptance
+
+Responding build 176 was verified at 06:30:39 UTC on September 23. Initialization
+completed at 06:31:02. The user selected Low power at 06:31:04. Compute Smoke
+passed at 06:31:40 (seed 0xaf40545f, fence 3) and 06:32:04 (seed 0x1ba92b2c,
+fence 6). Both reached complete with zero mismatches across all 32 outputs,
+unchanged inputs and all surrounding guard words. Both used data VA
+0x8001879000 and released their allocation, verifying sequential reuse.
+The first run's three fences completed in about 1.14 ms each. Log:
+/tmp/mac-amdgpu-176-hardware.log. This establishes fixed shader execution;
+it does not establish HSA AQL queues, arbitrary kernels or inference.
+
+Sample Metrics returned Unsupported at 06:31:26, before any table transfer.
+SMU setup reports interface 0x33; the verified Linux table schema is 0x2e.
+The monitor now labels this unsupported_firmware_interface and reports both
+versions. No verified 0x33 schema was found in the reviewed AMD/Linux sources.
+The mismatch is not evidence of a firmware crash.
+
+## v0.1.77 GPU-only model buffers
+
+Added a separate GPU-only VRAM allocator above the CPU-visible BAR0 window,
+limited by the firmware-reported usable VRAM size and retaining a final 1 MiB
+reservation. The existing visible allocator continues to own bootstrap and
+staging storage above the low 24 MiB firmware reservation. BO domain 3 selects
+the GPU-only pool; all releases return storage to its original allocator.
+
+Owner selector 48 copies between owned VRAM BO subranges through SDMA, capped
+at 4 MiB and a 100 ms completion wait. Overlapping and overflowing ranges are
+rejected. A failure after ring publication blocks mutation and retains backing
+until reset. Selectors 49/50 upload/read at most 4 KiB of dword-aligned data in
+owned visible staging BOs. They never address GPU-only memory through BAR0.
+The public interface exposes no raw CPU pointer for these buffers.
+
+The host's Large VRAM Test allocates 22 GiB plus two visible staging BOs and
+checks round-trip transfers at offsets 0, 1 GiB and 22 GiB minus 4 KiB using
+changing data and poisoned destination words. This samples addressability and
+copy correctness; it does not touch every byte or verify model execution.
+All 25 regression suites and the Debug build pass. Hardware acceptance remains
+pending. Installer behavior is unchanged.
+
+
+The live amdgpu_mtop observer reported build 176/stage15 and explicitly identified
+firmware IF0x33 versus verified0x2e, with dynamic values unavailable. Stop GPU
+then succeeded at 06:40:20 UTC: FLR, PCI close and all session resources released.
+
+Version 177 host and extension passed independent strict signature validation.
+The signed candidate opened at 06:41:15 UTC with bundled177/installed176;
+installation and hardware validation remain pending.

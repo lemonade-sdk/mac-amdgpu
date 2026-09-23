@@ -102,6 +102,13 @@ int main() {
     dev.smuMessagePending = false;
     ctx = ready(); ctx.driverInterface = 0x2f;
     assert(smu_collect_metrics(dev, ctx, true) == kIOReturnUnsupported && !commands);
+    assert(!ctx.faulted && ctx.snapshot.flags == 0 && !reads);
+    ctx = ready(); ctx.driverInterface = 0x33; // Installed 104.76.0 firmware.
+    assert(smu_collect_metrics(dev, ctx, true) == kIOReturnUnsupported && !commands && !reads);
+    smu_metrics_snapshot(ctx, true, snap);
+    assert(snap.driverInterface == 0x33 && snap.status == kIOReturnUnsupported && !snap.flags);
+    assert(snap.attemptedAtNs == 0 && snap.sequence == 0 && !snap.validFields);
+    assert(smu_collect_metrics(dev, ctx, true) == kIOReturnUnsupported && !commands && !reads);
     ctx = ready(); ctx.vramBacked = false;
     assert(smu_collect_metrics(dev, ctx, true) == kIOReturnUnsupported && !commands);
     ctx = ready(); ctx.addressProgrammed = false;

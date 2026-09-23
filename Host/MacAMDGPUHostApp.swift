@@ -68,6 +68,9 @@ private let kSelDumpCmdBuf:      UInt32 = 26
 private let kSelLiveStatus:          UInt32 = 30
 private let kSelSampleMetrics:       UInt32 = 46
 private let kSelMetricsSnapshot:     UInt32 = 47
+private let kSelBOCopy:              UInt32 = 48
+private let kSelBOWrite:             UInt32 = 49
+private let kSelBORead:              UInt32 = 50
 private let kSelDisableSmuFeatures:  UInt32 = 33
 // v0.1.25 — VRAM->VRAM SDMA copy smoke test.
 private let kSelSDMACopyVRAM:        UInt32 = 34
@@ -370,6 +373,8 @@ struct ContentView: View {
                         .help("Run a 32-thread shader that reads, adds and writes values; verify every result and surrounding guard words.")
                     Button("Sample Metrics") { controller.sampleMetrics() }
                         .help("Request one firmware telemetry snapshot for amdgpu_mtop. Requires an initialized GPU; stale samples are marked unavailable.")
+                    Button("Large VRAM Test") { controller.testLargeVRAM() }
+                        .help("Allocate a 22 GiB GPU-only buffer and verify 4 KiB transfers at its beginning, 1 GiB offset and end. Does not fill or validate the entire allocation.")
                     Spacer()
                 }
 
@@ -1692,6 +1697,79 @@ final class DriverController: NSObject, ObservableObject,
         }
     }
 
+    func testLargeVRAM() {
+        guard openUserClient() else { return }
+        let modelBytes: UInt64 = 22 << 30
+        let chunk: UInt64 = 4096
+        var handles: [UInt64] = []
+        var releaseStorage = true
+        defer {
+            if releaseStorage {
+                for handle in handles.reversed() {
+                    let (kr, _) = callScalar(kSelBOFree, input: [handle], outCount: 0)
+                    if kr != KERN_SUCCESS { append(String(format: "Large VRAM: free failed kr=%#x", kr)) }
+                }
+            } else {
+                append("Large VRAM: buffers retained — Stop GPU before retry")
+            }
+        }
+        for (size, domain) in [(chunk, UInt64(1)), (chunk, UInt64(1)), (modelBytes, UInt64(3))] {
+            let (kr, out) = callScalar(kSelBOAlloc, input: [size, domain, 16384, 0], outCount: 3)
+            guard kr == KERN_SUCCESS, out.count == 3 else {
+                append(String(format: "Large VRAM: allocation domain=%llu failed kr=%#x", domain, kr))
+                return
+            }
+            handles.append(out[0])
+            append(String(format: "Large VRAM: domain=%llu size=%llu GPU VA=%#llx", domain, size, out[1]))
+        }
+        func write(_ handle: UInt64, _ words: [UInt32]) -> kern_return_t {
+            let inputs = [handle, UInt64(0), chunk]
+            return inputs.withUnsafeBufferPointer { scalars in
+                words.withUnsafeBytes { bytes in
+                    IOConnectCallMethod(ucConn, kSelBOWrite, scalars.baseAddress, 3,
+                                        bytes.baseAddress, bytes.count, nil, nil, nil, nil)
+                }
+            }
+        }
+        let seed = UInt32(truncatingIfNeeded: DispatchTime.now().uptimeNanoseconds)
+        for offset in [UInt64(0), UInt64(1) << 30, modelBytes - chunk] {
+            let words = (0..<1024).map { (UInt32($0) &* 0x9e3779b9) ^ seed ^ UInt32(truncatingIfNeeded: offset >> 12) }
+            let upload = write(handles[0], words)
+            let poison = write(handles[1], words.map { ~$0 })
+            guard upload == KERN_SUCCESS, poison == KERN_SUCCESS else {
+                append(String(format: "Large VRAM: staging failed upload=%#x poison=%#x", upload, poison))
+                return
+            }
+            releaseStorage = false
+            for inputs in [[handles[0], 0, handles[2], offset, chunk],
+                           [handles[2], offset, handles[1], 0, chunk]] {
+                let (kr, out) = callScalar(kSelBOCopy, input: inputs, outCount: 1)
+                guard kr == KERN_SUCCESS, out.count == 1, out[0] == 0 else {
+                    append(String(format: "Large VRAM: copy failed kr=%#x status=%#llx", kr, out.first ?? UInt64.max))
+                    return
+                }
+            }
+            var readback = [UInt32](repeating: 0, count: 1024)
+            var length = Int(chunk)
+            let inputs = [handles[1], UInt64(0), chunk]
+            let readKR = inputs.withUnsafeBufferPointer { scalars in
+                readback.withUnsafeMutableBytes { bytes in
+                    IOConnectCallMethod(ucConn, kSelBORead, scalars.baseAddress, 3,
+                                        nil, 0, nil, nil, bytes.baseAddress, &length)
+                }
+            }
+            guard readKR == KERN_SUCCESS, length == Int(chunk), readback == words else {
+                let mismatches = zip(readback, words).filter { $0 != $1 }.count
+                append(String(format: "Large VRAM: readback failed kr=%#x size=%llu mismatches=%llu",
+                              readKR, UInt64(length), UInt64(mismatches)))
+                return
+            }
+            releaseStorage = true
+            append(String(format: "Large VRAM: verified 4096 bytes at offset=%#llx", offset))
+        }
+        append("Large VRAM: all three sampled regions passed; releasing 22 GiB allocation and staging buffers")
+    }
+
     func sampleMetrics() {
         guard openUserClient() else { return }
         let (kr, out) = callScalar(kSelSampleMetrics, outCount: 3)
@@ -1740,6 +1818,8 @@ final class DriverController: NSObject, ObservableObject,
                 }
             }
             append("Sample Metrics: snapshot recorded above; monitor samples expire after 2.5 seconds")
+        } else if out[0] == UInt64(UInt32(bitPattern: kIOReturnUnsupported)) {
+            append("Sample Metrics: this firmware interface has no verified decoder; no telemetry transfer was issued")
         } else {
             append("Sample Metrics: unavailable; a failed firmware transfer requires Stop GPU before collection can resume")
         }

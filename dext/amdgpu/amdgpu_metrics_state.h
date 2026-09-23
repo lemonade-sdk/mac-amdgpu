@@ -21,7 +21,7 @@ struct SMUMetricsSnapshot {
     uint64_t sequence;
     uint64_t collectedAtNs; // CLOCK_UPTIME_RAW, last successful complete sample.
     uint64_t attemptedAtNs;
-    uint32_t driverInterface;
+    uint32_t driverInterface; // Firmware's GetDriverIfVersion reply, not our decoder version.
     uint32_t firmwareCounter;
     uint64_t validFields;
     uint64_t values[metrics::Count];

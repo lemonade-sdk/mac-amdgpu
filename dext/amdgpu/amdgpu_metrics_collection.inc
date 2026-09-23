@@ -52,9 +52,11 @@ kern_return_t smu_collect_metrics(const DeviceContext &dev,
         !ctx.addressProgrammed || !dev.smuOnline || !dev.gmcReady)
         return fail(kIOReturnNotReady, false);
     if (!dev.pci) return fail(kIOReturnNotAttached, true);
-    if (!ctx.vramBacked || ctx.driverInterface != metrics::kDriverInterface ||
+    if (!ctx.vramBacked || !metrics::verified_interface(ctx.driverInterface) ||
         kIP_SMU.major != 14 || kIP_SMU.minor != 0 || kIP_SMU.rev != 3)
-        return fail(kIOReturnUnsupported, true);
+        // A layout/address-domain mismatch is a host compatibility limitation,
+        // not a failed firmware transaction. Reject before any mailbox access.
+        return fail(kIOReturnUnsupported, false);
     if (ctx.tableBytes < metrics::kTableBytes ||
         !vram_io_range(dev, ctx.tableVRAMOffset, ctx.tableBytes))
         return fail(kIOReturnBadArgument, true);

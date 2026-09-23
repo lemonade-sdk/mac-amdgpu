@@ -101,4 +101,31 @@ The required milestones are:
    LSE inference with reference output comparisons.
 
 Do not report kernel-dispatch support merely to pass HRX device enumeration.
-No shader execution, HRX workload or model inference has passed yet.
+Driver build 176 passed two fixed wave32 load/add/store shader tests with
+complete result/guard verification and storage reuse. General HSA dispatch,
+an HRX workload and model inference have not passed yet.
+
+
+## Driver buffer ABI (build 177)
+
+This is the native transport foundation, not yet wired to HSA memory pools.
+Calls require the existing owning driver connection; observers cannot acquire
+that initialized session simply by requesting a copy.
+
+| Selector | Inputs | Result / constraints |
+| --- | --- | --- |
+| 16 BOAlloc | size, domain, alignment, flags=0 | handle, GPU address, CPU address=0 for VRAM |
+| 17 BOFree | handle | Returns storage only when no submission is pending |
+| 18 BOGetInfo | handle | GPU address, offset, size, alignment, domain |
+| 48 BOCopy | source handle, source offset, destination handle, destination offset, bytes | One scalar operation status; at most 4 MiB and 100 ms; overlap rejected |
+| 49 BOWrite | handle, offset, bytes plus input structure | Verified upload into domain-1 staging; 4-byte alignment, at most 4096 bytes |
+| 50 BORead | handle, offset, bytes | Output structure from domain-1 staging; same alignment/size limit |
+
+Domain 1 uses CPU-visible VRAM above the fixed firmware reservation. Domain 3
+uses a separate GPU-only range above BAR0, excluding the final MiB of reported
+usable VRAM. Domain 3 cannot be mapped or accessed by BOWrite/BORead. To upload
+larger device buffers, write a visible staging BO and copy its contents to a
+subrange of the device BO; reverse the sequence to download. Keep staging alive
+until completion. A published transfer failure retains allocations and blocks
+normal mutation until Stop/reset. Calls are serialized and synchronous; this is
+not yet an asynchronous HSA copy implementation. Hardware acceptance is pending.

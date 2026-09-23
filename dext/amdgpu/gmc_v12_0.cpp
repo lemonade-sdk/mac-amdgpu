@@ -9,6 +9,7 @@
 #include "amdgpu_gmc.h"
 #include "amdgpu_gmc_address.h"
 #include "amdgpu_field_defs.h"
+#include "amdgpu_buffer_io.h"
 
 #define GMC_LOG(fmt, ...) \
     os_log(OS_LOG_DEFAULT, "mac.amdgpu.gmc: " fmt, ##__VA_ARGS__)
@@ -146,6 +147,9 @@ gmc_vram_alloc_init(DeviceContext &dev, GMCContext &gmc)
     constexpr uint64_t kPspReservedTopBytes = 0x01800000;  // 24 MB (above fwBuf)
     uint64_t visible_base = gmc.vram_start;
     uint64_t aperture_size = gmc.visible_vram_size;
+    uint64_t deviceBase = 0, deviceBytes = 0;
+    if (!buffer_device_pool(gmc.vram_start, aperture_size, gmc.real_vram_size,
+                            deviceBase, deviceBytes)) return kIOReturnBadArgument;
     if (aperture_size <= kPspReservedTopBytes) {
         GMC_LOG("vram_alloc: visible_vram_size %llu MB <= PSP reservation, "
                 "can't allocate", aperture_size >> 20);
@@ -157,6 +161,7 @@ gmc_vram_alloc_init(DeviceContext &dev, GMCContext &gmc)
     gmc.vram_alloc.init(visible_base + kPspReservedTopBytes,
                         aperture_size - kPspReservedTopBytes,
                         nullptr);
+    gmc.device_vram_alloc.init(deviceBase, deviceBytes, nullptr);
     GMC_LOG("vram_alloc: range [%#llx..%#llx) size=%llu MB "
             "(BAR0-mapped LOW VRAM, PSP-reserved 0..%lluMB skipped)",
             visible_base + kPspReservedTopBytes,

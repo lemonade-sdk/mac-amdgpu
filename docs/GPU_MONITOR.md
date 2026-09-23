@@ -12,6 +12,12 @@ interfaces, sysfs and process fdinfo. The new backend enumerates every
 Build 176 integrates one-shot firmware collection and cached observer reads.
 Live firmware validation is pending; no periodic collection is enabled.
 
+The first build-176 hardware request returned unsupported before issuing a
+metrics command: the installed SMU firmware is **104.76.0, interface 0x33**,
+while the verified table layout is associated with driver interface **0x2e**.
+This is a compatibility gate, not evidence that firmware crashed. Dynamic
+statistics on this card remain unavailable until that layout is established.
+
 | Statistic | Current monitor | Required source |
 | --- | --- | --- |
 | Device list and selection | Implemented for MacAMDGPU-bound cards | IOKit registry IDs |
@@ -56,6 +62,32 @@ The local Linux mapping is:
   firmware table ID **5**, `SmuMetrics_t`, and `SmuMetricsExternal_t`.
 - `drivers/gpu/drm/amd/pm/swsmu/smu_cmn.c` sends `TransferTableSmu2Dram`, waits
   for acknowledgement, invalidates the HDP read path and copies the table.
+
+### Interface 0x33 investigation
+
+The local Linux reference and the reviewed primary sources in both
+[AMD's ROCm/amdgpu implementation](https://raw.githubusercontent.com/ROCm/amdgpu/master/drivers/gpu/drm/amd/pm/swsmu/smu14/smu_v14_0_2_ppt.c)
+and [upstream Linux](https://raw.githubusercontent.com/torvalds/linux/master/drivers/gpu/drm/amd/pm/swsmu/smu14/smu_v14_0_2_ppt.c)
+still declare `SMU14_DRIVER_IF_VERSION_SMU_V14_0_2` as 0x2e and use
+`smu14_driver_if_v14_0.h`. AMD's corresponding public firmware-interface header
+contains the same metrics fields used by this decoder. The reviewed interface
+history advances 0x26 to 0x2e; it does not establish a separate 0x33 layout.
+
+Linux's `smu_cmn_check_fw_version` reads and logs the driver and firmware
+interface versions, then returns success without requiring equality. Thus a
+working Linux driver with newer firmware is evidence of intended compatibility,
+but the version comparison alone is not a field-layout guarantee. No reviewed
+primary schema or explicit compatibility statement establishes that interface
+0x33 exports this exact 412-byte table with unchanged offsets and units.
+
+The implementation therefore keeps 0x33 unsupported. Decoder and collection
+tests explicitly reject it, verify zero mailbox requests/VRAM reads, and retain
+the actual interface in the cached snapshot. Compatibility rejection does not
+set the firmware-transaction fault flag in subsequent builds. The monitor
+reports `unsupported_firmware_interface`, the firmware's actual version and the
+verified version instead of labeling this rejection as a crashed GPU. A future
+change requires a verified schema/compatibility reference and corresponding
+layout tests; changing the accepted version number alone is insufficient.
 
 The decoder reads little-endian bytes without unaligned casts. It uses Linux's
 5% busy threshold to select pre/post-deep-sleep averages. It converts whole-watt

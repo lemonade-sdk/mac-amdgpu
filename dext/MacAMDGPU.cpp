@@ -41,6 +41,8 @@
 #include "amdgpu/amdgpu_ucode_extract.h"
 #include "amdgpu/amdgpu_pci_rebar.h"
 #include "amdgpu/amdgpu_client_lifecycle.h"
+#include "amdgpu/amdgpu_buffer_io.h"
+#include "amdgpu/amdgpu_vram_io.h"
 
 #define MACAMDGPU_LOG(fmt, ...) \
     os_log(OS_LOG_DEFAULT, "mac.amdgpu: " fmt, ##__VA_ARGS__)
@@ -107,6 +109,9 @@ enum {
     kMacAMDGPUMethodComputeTest        = 45, // fixed wave32 shader with full readback
     kMacAMDGPUMethodCollectMetrics     = 46, // owner-only one-shot SMU telemetry
     kMacAMDGPUMethodMetricsSnapshot    = 47, // cached CPU snapshot, observer only
+    kMacAMDGPUMethodBOCopy             = 48, // bounded synchronous SDMA, owned BOs
+    kMacAMDGPUMethodBOWrite            = 49, // verified BAR0 staging upload
+    kMacAMDGPUMethodBORead             = 50, // BAR0 staging readback
 };
 
 // v0.1.28 — IP types accepted by CSCreate. Match the upstream
@@ -239,6 +244,7 @@ enum {
     kBODomainGTTLegacy = 0,   // pre-v0.1.27: subrange of client DMA buffer
     kBODomainVRAM      = 1,   // VRAM-resident, BAR0-LOW mapped
     kBODomainGTT       = 2,   // sysmem, DART-pinned, GART-bound
+    kBODomainDeviceVRAM = 3,  // GPU-only VRAM above the CPU-visible BAR0 window
 };
 
 struct BOEntry {
@@ -1303,14 +1309,16 @@ mac_amdgpu_bo_release_all(MacAMDGPUUserClient_IVars *ivars,
     for (uint32_t i = 0; i < MACAMDGPU_MAX_BO; i++) {
         BOEntry &e = ivars->bos[i];
         if (!e.in_use) continue;
-        if (e.domain == kBODomainVRAM && driver != nullptr &&
+        if (amdgpu::buffer_vram_domain(e.domain) && driver != nullptr &&
             driver->ivars != nullptr) {
             amdgpu::VRAMAllocation va = {};
             va.gpu_va    = e.gpu_va;
             va.size      = e.size;
             va.alignment = e.alignment;
             va.cpu_ptr   = nullptr;
-            driver->ivars->bringup.gmc.vram_alloc.free(va);
+            auto &gmc = driver->ivars->bringup.gmc;
+            auto &allocator = e.domain == kBODomainVRAM ? gmc.vram_alloc : gmc.device_vram_alloc;
+            allocator.free(va);
         }
         else if (e.domain == kBODomainGTT) {
             // This bulk path runs only after reset/PCI isolation.
@@ -3192,6 +3200,77 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         return r;
     }
 
+    case kMacAMDGPUMethodBOCopy: {
+        // [src handle, src offset, dst handle, dst offset, bytes]. The owning
+        // connection and shared submission gate serialize copies with frees.
+        if (!arguments->scalarInput || arguments->scalarInputCount != 5 ||
+            !arguments->scalarOutput || arguments->scalarOutputCount < 1 ||
+            arguments->structureInput || arguments->structureInputDescriptor ||
+            arguments->structureOutputDescriptor || arguments->structureOutputMaximumSize)
+            return kIOReturnBadArgument;
+        auto *source = mac_amdgpu_bo_lookup(ivars, arguments->scalarInput[0]);
+        auto *destination = mac_amdgpu_bo_lookup(ivars, arguments->scalarInput[2]);
+        if (!source || !destination || !amdgpu::buffer_vram_domain(source->domain) ||
+            !amdgpu::buffer_vram_domain(destination->domain)) return kIOReturnBadArgument;
+        uint64_t src = 0, dst = 0;
+        const auto bytes = arguments->scalarInput[4];
+        if (!amdgpu::buffer_copy_ranges(source->gpu_va, source->size, arguments->scalarInput[1],
+            destination->gpu_va, destination->size, arguments->scalarInput[3], bytes, src, dst))
+            return kIOReturnBadArgument;
+        auto &b = driver->ivars->bringup;
+        if (b.reached != amdgpu::BringupStage::SDMAInit) return kIOReturnNotReady;
+        auto &sdma = b.sdma.instance[0];
+        const auto previousWptr = sdma.wptr;
+        amdgpu::amdgpu_hdp_flush(b.device);
+        const auto status = amdgpu::sdma_copy_linear_test(b.device, sdma, src, dst,
+                                                        static_cast<uint32_t>(bytes), 100000);
+        // An unsuccessful published copy may still access either allocation.
+        // Retain all owner storage and permit only recovery/status operations.
+        if (status != kIOReturnSuccess && sdma.wptr != previousWptr)
+            driver->ivars->shutdownBlocked = true;
+        arguments->scalarOutput[0] = static_cast<uint32_t>(status);
+        arguments->scalarOutputCount = 1;
+        return kIOReturnSuccess;
+    }
+
+    case kMacAMDGPUMethodBOWrite:
+    case kMacAMDGPUMethodBORead: {
+        // Bounded, dword-aligned access to an owned CPU-visible staging BO.
+        // High VRAM is never passed to a BAR accessor.
+        const bool write = selector == kMacAMDGPUMethodBOWrite;
+        if (!arguments->scalarInput || arguments->scalarInputCount != 3 ||
+            arguments->scalarOutputCount || arguments->structureInputDescriptor ||
+            arguments->structureOutputDescriptor) return kIOReturnBadArgument;
+        const auto offset = arguments->scalarInput[1], bytes = arguments->scalarInput[2];
+        if (!bytes || bytes > amdgpu::kBufferIOChunkBytes || ((offset | bytes) & 3))
+            return kIOReturnBadArgument;
+        if (write ? (!arguments->structureInput ||
+                     arguments->structureInput->getLength() != bytes || arguments->structureOutputMaximumSize)
+                  : (arguments->structureInput || arguments->structureOutputMaximumSize < bytes))
+            return kIOReturnBadArgument;
+        auto *entry = mac_amdgpu_bo_lookup(ivars, arguments->scalarInput[0]);
+        if (!entry || entry->domain != kBODomainVRAM ||
+            !amdgpu::client_subrange(offset, bytes, entry->size)) return kIOReturnBadArgument;
+        auto &b = driver->ivars->bringup;
+        uint64_t gpu = 0;
+        if (!amdgpu::buffer_gpu_range(entry->gpu_va, entry->size, offset, bytes, gpu) ||
+            gpu < b.gmc.vram_start ||
+            !amdgpu::vram_io_range(b.device, gpu - b.gmc.vram_start, bytes))
+            return kIOReturnBadArgument;
+        const auto barOffset = gpu - b.gmc.vram_start;
+        if (write) {
+            const auto status = amdgpu::vram_write_verified(b.device, barOffset,
+                arguments->structureInput->getBytesNoCopy(), bytes);
+            if (status == kIOReturnSuccess) amdgpu::amdgpu_hdp_flush(b.device);
+            return status;
+        }
+        uint32_t data[amdgpu::kBufferIOChunkBytes / 4]{};
+        for (uint64_t i = 0; i < bytes / 4; ++i)
+            pci->MemoryRead32(b.device.bar0MemIndex, barOffset + i * 4, data + i);
+        arguments->structureOutput = OSData::withBytes(data, bytes);
+        return arguments->structureOutput ? kIOReturnSuccess : kIOReturnNoMemory;
+    }
+
     case kMacAMDGPUMethodBOAlloc: {
         // Dual ABI for back-compat with the pre-v0.1.27 single-input
         // callers (scripts/macamdgpu_ping.swift):
@@ -3223,6 +3302,8 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         uint64_t alignment = legacy ? (uint64_t)MACAMDGPU_BO_ALIGN
                                     : arguments->scalarInput[2];
         uint64_t flags     = legacy ? 0ULL : arguments->scalarInput[3];
+        if (!legacy && arguments->scalarInput[1] > kBODomainDeviceVRAM)
+            return kIOReturnBadArgument;
         if (size == 0) return kIOReturnBadArgument;
         if (flags != 0) return kIOReturnUnsupported;
         uint64_t rounded_size = 0;
@@ -3275,14 +3356,15 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             e.byte_offset = alignedOffset;
             ivars->boBumpOffset = alignedOffset + rounded_size;
         }
-        else if (domain == kBODomainVRAM) {
+        else if (amdgpu::buffer_vram_domain(domain)) {
             auto &gmc = driver->ivars->bringup.gmc;
-            if (!gmc.vram_alloc.is_inited()) {
+            auto &allocator = domain == kBODomainVRAM ? gmc.vram_alloc : gmc.device_vram_alloc;
+            if (!allocator.is_inited()) {
                 allocRet = kIOReturnNotReady;
                 goto bo_alloc_fail;
             }
             amdgpu::VRAMAllocation va = {};
-            if (!gmc.vram_alloc.alloc(rounded_size, alignment, &va)) {
+            if (!allocator.alloc(rounded_size, alignment, &va)) {
                 allocRet = kIOReturnNoSpace;
                 goto bo_alloc_fail;
             }
@@ -3290,7 +3372,8 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             e.vram_offset = va.gpu_va - gmc.vram_start;
             e.size        = va.size;
             e.alignment   = va.alignment;
-            // CPU pointer left null; userspace maps via BAR0 + BOMap.
+            // CPU pointer remains null. Visible buffers use BOWrite/BORead;
+            // device-only buffers are transferred through BOCopy.
         }
         else if (domain == kBODomainGTT) {
             // Allocate per-BO sysmem + DART-pin + bind into GART. Mirrors
@@ -3377,14 +3460,15 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         if (e == nullptr) return kIOReturnBadArgument;
 
         // Release domain-specific storage.
-        if (e->domain == kBODomainVRAM) {
+        if (amdgpu::buffer_vram_domain(e->domain)) {
             auto &gmc = driver->ivars->bringup.gmc;
             amdgpu::VRAMAllocation va = {};
             va.gpu_va    = e->gpu_va;
             va.size      = e->size;
             va.alignment = e->alignment;
             va.cpu_ptr   = nullptr;
-            gmc.vram_alloc.free(va);
+            auto &allocator = e->domain == kBODomainVRAM ? gmc.vram_alloc : gmc.device_vram_alloc;
+            allocator.free(va);
         }
         else if (e->domain == kBODomainGTT) {
             const auto r = amdgpu::gart_unbind(driver->ivars->bringup.device,

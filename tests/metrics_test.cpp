@@ -82,6 +82,7 @@ int main() {
         assert(!decode(&wire, n, 14, 0, 3, 0x2e, s) && s.valid == 0);
     assert(!decode(&wire, sizeof(wire), 14, 0, 2, 0x2e, s));
     assert(!decode(&wire, sizeof(wire), 14, 0, 3, 0x2f, s));
+    assert(!decode(&wire, sizeof(wire), 14, 0, 3, 0x33, s) && !s.valid);
     assert(!decode(nullptr, sizeof(wire), 14, 0, 3, 0x2e, s));
     std::memset(&wire, 0, sizeof(wire));
     assert(!read() && !s.valid);

@@ -12,6 +12,12 @@ firmware validation is still pending. Automatic collection is not enabled. Older
 failed requests and stale samples are explicitly **unavailable**; it does not
 show fabricated zero load, temperature, power or memory use.
 
+The tested R9700 currently reports SMU interface **0x33**; the independently
+verified decoder targets **0x2e**. Its statistics remain unavailable pending
+layout verification. The monitor names this compatibility mismatch explicitly
+and includes both interface versions in JSON; it does not treat it as proof of
+a firmware crash.
+
 ```sh
 cmake -S amdgpu_mtop -B build/amdgpu_mtop -DCMAKE_BUILD_TYPE=Release
 cmake --build build/amdgpu_mtop --parallel 4

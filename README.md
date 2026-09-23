@@ -1,13 +1,20 @@
 # Status
 
-**v0.1.76 — explicit compute VMID and firmware telemetry.**
-Compute checkpoints now enter through Linux's GFX indirect-buffer submission,
-selecting VMID 0 explicitly. Build 175 reached the shader but faulted fetching
-its code under VMID 3; this change addresses that context selection and still
-requires hardware validation. Sample Metrics requests one bounded SMU snapshot;
-`amdgpu_mtop` reads the cached, versioned response without hardware ownership.
-Periodic collection is not enabled, and stale samples are marked unavailable.
-All 24 regression suites, the Debug build and strict signature checks pass.
+**v0.1.77 — GPU-only buffers and bounded transfers.**
+A separate allocator covers usable VRAM above BAR0, keeping firmware and visible
+staging storage separate. Owner-only buffer upload/readback and SDMA copy APIs
+validate handles, ranges and transfer limits. Large VRAM Test reserves 22 GiB
+and checks 4 KiB transfers at three offsets, including its end; it does not
+validate every byte. All 25 regression suites and the Debug build pass.
+Hardware acceptance of these new APIs is pending.
+
+**v0.1.76 — compute shader execution verified.**
+Two consecutive runs passed all 32 shader results, input words and guards,
+with changing seeds, fences 3 and 6, and successful allocation reuse. Explicit
+VMID 0 in Linux-style GFX indirect-buffer submission fixed the observed shader
+instruction-fetch fault. Firmware telemetry is unavailable: the board reports
+interface 0x33, while the verified decoder covers 0x2e. No telemetry transfer
+is issued for an unverified interface.
 
 **v0.1.75 — compute fault isolated to shader instruction fetch.**
 Cache preparation and register-programming fences passed. Shader completion
@@ -15,23 +22,13 @@ timed out with a GFXHUB VMID-3 fault at the shader code address, while the queue
 itself used VMID 0. Output was not checked. Stop GPU recovered through function
 reset and session release without an enclosure power cycle.
 
-**v0.1.74 — bounded compute shader diagnostic (dispatch timed out).**
-The new Compute Smoke test dispatches one 32-thread gfx1201 workgroup through
-the existing GFX queue. It reads input values, adds a changing seed and writes
-32 results. Readback checks every result, the unchanged inputs and surrounding
-guard words after compute completion and cache flush. Failures retain storage
-and require Stop GPU before retry. All 21 regression suites, the Debug build
-and strict signature verification pass. The first hardware dispatch timed out before its fence; output was not checked.
-Stop GPU recovered without a power cycle, and reinitialization plus GFX CS
-passed. HSA dispatch and HRX/LSE inference remain unavailable.
-
 The native [amdgpu_mtop monitor](amdgpu_mtop/README.md) enumerates attached
 MacAMDGPU devices with GPU switching and JSON output. Live discovery and VRAM
-capacity queries work; dynamic firmware metrics await hardware validation.
+capacity queries work; dynamic firmware metrics require a verified interface-0x33 layout.
 
 The current target is AI compute and model inference. The initial [HSA runtime](hsa/README.md)
-discovers the live GPU through IOKit and passes lifecycle tests. HRX integration,
-shader dispatch and a working inference runtime remain required.
+discovers the live GPU through IOKit and passes lifecycle tests. General dispatch, queues, signals, executable loading and HRX/LSE inference
+remain required; the fixed diagnostic is not an HSA dispatch interface.
 
 Older release history and detailed hardware results are in [PROGRESS.md](PROGRESS.md).
 
@@ -49,7 +46,7 @@ but no public PCI resource-resizing operation was found in its headers. A
 ReBAR capability ID alone cannot allocate larger Thunderbolt bridge windows.
 The driver does not write ReBAR size controls.
 
-The next milestones are compute dispatch, HSA runtime integration for HRX,
+The next milestones are general compute dispatch, the HSA interface for HRX,
 and data-verified inference workloads. Mesa winsys integration remains unimplemented.
 
 Software checks and the non-submitting status probe:

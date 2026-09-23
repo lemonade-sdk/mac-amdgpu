@@ -29,8 +29,15 @@ inline bool validSnapshot(const amdgpu::SMUMetricsSnapshot &s) {
 
 inline bool fresh(const Device &d, uint64_t now) {
     return d.telemetrySupported && d.telemetryError.empty() && validSnapshot(d.metrics) &&
+        amdgpu::metrics::verified_interface(d.metrics.driverInterface) &&
         (d.metrics.flags & amdgpu::kSMUMetricsValid) && now >= d.metrics.collectedAtNs &&
         now - d.metrics.collectedAtNs <= amdgpu::kSMUMetricsStaleAfterNs;
+}
+
+inline bool interfaceMismatch(const Device &d) {
+    return d.telemetrySupported && validSnapshot(d.metrics) &&
+        d.metrics.driverInterface != 0 &&
+        !amdgpu::metrics::verified_interface(d.metrics.driverInterface);
 }
 
 // Selection survives enumeration reordering and removal. Never silently

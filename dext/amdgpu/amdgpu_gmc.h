@@ -133,6 +133,7 @@ struct GMCContext {
 
     // Bump allocator over the visible VRAM aperture (top-down).
     VRAMBumpAllocator vram_alloc;
+    VRAMBumpAllocator device_vram_alloc; // GPU-only range above BAR0; never CPU mapped.
 
     // The dummy page is DART-mapped sysmem; PT and scratch live in VRAM.
 #ifdef __APPLE__

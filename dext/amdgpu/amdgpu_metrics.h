@@ -12,6 +12,7 @@ namespace metrics {
 constexpr uint32_t kDriverInterface = 0x2e;
 constexpr uint32_t kFirmwareTable = 5;
 constexpr size_t kTableBytes = 412;
+constexpr bool verified_interface(uint32_t version) { return version == kDriverInterface; }
 
 enum Field : uint32_t {
     GfxActivityPercent, UmcActivityPercent, MediaActivityPercent,
@@ -34,7 +35,7 @@ inline bool decode(const void *bytes, size_t length, uint32_t smuMajor,
                    uint32_t driverInterface, Sample &sample) {
     sample = {};
     if (!bytes || length != kTableBytes || smuMajor != 14 || smuMinor != 0 ||
-        smuRevision != 3 || driverInterface != kDriverInterface) return false;
+        smuRevision != 3 || !verified_interface(driverInterface)) return false;
     const auto *p = static_cast<const uint8_t *>(bytes);
     auto u16 = [p](size_t i) -> uint32_t { return p[i] | (uint32_t(p[i + 1]) << 8); };
     auto u32 = [p](size_t i) -> uint32_t {

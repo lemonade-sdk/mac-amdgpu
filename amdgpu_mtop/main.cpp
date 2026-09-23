@@ -63,10 +63,19 @@ std::string metric(const mtop::Device &d, amdgpu::metrics::Field field,
 }
 std::string telemetryStatus(const mtop::Device &d) {
     if (!d.telemetrySupported) return d.telemetryError.empty() ? "not_implemented" : "unavailable";
+    if (mtop::interfaceMismatch(d)) return "unsupported_firmware_interface";
     if (d.metrics.flags & amdgpu::kSMUMetricsFaulted) return "faulted";
     if (mtop::fresh(d, clock_gettime_nsec_np(CLOCK_UPTIME_RAW))) return "fresh";
     if ((d.metrics.flags & amdgpu::kSMUMetricsStale) || d.metrics.validFields) return "stale";
     return "unavailable";
+}
+std::string telemetryReason(const mtop::Device &d) {
+    if (!d.telemetryError.empty()) return d.telemetryError;
+    if (mtop::interfaceMismatch(d))
+        return "SMU firmware interface " + id(d.metrics.driverInterface) +
+            "; verified metrics layout is " + id(amdgpu::metrics::kDriverInterface) +
+            ". Collection disabled before requesting firmware data.";
+    return {};
 }
 void json(const std::vector<mtop::Device> &devices, const mtop::Selection &selection,
           const std::string &error) {
@@ -87,10 +96,13 @@ void json(const std::vector<mtop::Device> &devices, const mtop::Selection &selec
                       << ",\"vram_cpu_visible_bytes\":" << (d.visible ? std::to_string(d.visible) : "null");
         }
         using namespace amdgpu::metrics;
+        const auto reason = telemetryReason(d);
         std::cout << ",\"telemetry_status\":" << quote(telemetryStatus(d))
-                  << ",\"telemetry_error\":" << (d.telemetryError.empty() ? "null" : quote(d.telemetryError));
+                  << ",\"telemetry_error\":" << (reason.empty() ? "null" : quote(reason));
         if (d.telemetrySupported)
             std::cout << ",\"telemetry_driver_status\":" << d.metrics.status
+                      << ",\"firmware_interface\":" << d.metrics.driverInterface
+                      << ",\"verified_firmware_interfaces\":[" << amdgpu::metrics::kDriverInterface << ']'
                       << ",\"sample_generation\":" << d.metrics.generation
                       << ",\"sample_sequence\":" << d.metrics.sequence
                       << ",\"sample_uptime_ns\":" << d.metrics.collectedAtNs
@@ -155,7 +167,8 @@ void dashboard(const std::vector<mtop::Device> &devices, const mtop::Selection &
         std::cout << "\n Telemetry: " << telemetryStatus(*d);
         if (d->telemetrySupported) std::cout << "  sample " << d->metrics.sequence
                                            << "  driver status " << id(d->metrics.status);
-        if (!d->telemetryError.empty()) std::cout << "  " << d->telemetryError;
+        const auto reason = telemetryReason(*d);
+        if (!reason.empty()) std::cout << "\n " << reason;
         std::cout << "\n UMC activity measures memory-controller work; VRAM used measures allocations.\n";
     }
     if (interactive) std::cout << "\n [n] next GPU  [p] previous GPU  [q] quit  | refresh 1 s\n";
