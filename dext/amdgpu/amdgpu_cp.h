@@ -1,28 +1,6 @@
-//
-//  amdgpu_cp.h — Command Processor / KIQ ring infrastructure for GFX12.
-//
-//  This first chunk gets the storage (ring buffer + MQD + write-back
-//  page) and the abstraction for staging PM4 commands into a ring
-//  in place. Actual MMIO programming of the HQD registers, doorbell
-//  setup, and CP enable lands in the next chunk.
-//
-//  See docs/port_plans/HELLO_PM4.md for the full critical path.
-//
-//  Memory layout:
-//      KIQ ring buffer  — 16 KB, **DART-mapped sysmem** (via GART
-//                         once GMC is up). The CP fetches PM4 from
-//                         here through GART translation. Sysmem
-//                         (not VRAM) so we can write PM4 directly
-//                         from the dext without needing an in-dext
-//                         BAR2 mapping.
-//      KIQ MQD          — 4 KB, **DART-mapped sysmem**. Memory
-//                         Queue Descriptor; the CP reads it once at
-//                         queue-create time to learn what's in the
-//                         ring.
-//      Write-back page  — 16 KB, **DART-mapped sysmem**. The CP
-//                         writes back rptr/wptr and fence values
-//                         here; the host reads from the same backing.
-//
+// GFX12 kernel graphics queue and PM4 submission.
+// MES KIQ maps the queue from a VRAM-backed graphics MQD.
+// Ring and write-back storage use GPU-addressable visible VRAM.
 
 #pragma once
 
@@ -30,55 +8,19 @@
 
 #ifdef __APPLE__
 #include <DriverKit/IOBufferMemoryDescriptor.h>
-#include <DriverKit/IODMACommand.h>
 #endif
 
 #include "amdgpu_ip.h"
 #include "amdgpu_regs.h"
 #include "amdgpu_vram.h"
 #include "amdgpu_pm4.h"
+#include "amdgpu_cp_registers.h"
+#include "amdgpu_cp_firmware.h"
 
 namespace amdgpu {
+struct MESContext;
 
 struct GMCContext;   // forward — we ask its VRAM allocator for storage
-
-// GC register offsets for the CP HQD registers we touch.
-// Sourced from gc_12_0_0_offset.h. Used by cp_hqd_program / cp_enable.
-namespace CPRegs {
-    // gc_12_0_0_offset.h: regCP_RB_WPTR_DELAY  = 0x0f61
-    constexpr uint32_t CP_RB_WPTR_DELAY           = 0x0F61;
-    // gc_12_0_0_offset.h: regCP_RB0_BASE = 0x1DE0
-    constexpr uint32_t CP_RB0_BASE                = 0x1DE0;
-    constexpr uint32_t CP_RB0_CNTL                = 0x1DE1;
-    constexpr uint32_t CP_RB0_RPTR_ADDR           = 0x1DE3;
-    constexpr uint32_t CP_RB0_RPTR_ADDR_HI        = 0x1DE4;
-    // gc_12_0_0_offset.h: regCP_DEVICE_ID = 0x1deb
-    constexpr uint32_t CP_DEVICE_ID               = 0x1DEB;
-    constexpr uint32_t CP_RB_VMID                 = 0x1DF1;
-    constexpr uint32_t CP_RB0_WPTR                = 0x1DF4;
-    // gc_12_0_0_offset.h: regCP_RB0_WPTR_HI = 0x1df5
-    constexpr uint32_t CP_RB0_WPTR_HI             = 0x1DF5;
-    constexpr uint32_t CP_RB_DOORBELL_RANGE_LOWER = 0x1DFA;
-    constexpr uint32_t CP_RB_DOORBELL_RANGE_UPPER = 0x1DFB;
-    // gc_12_0_0_offset.h: regCP_MEC_DOORBELL_RANGE_{LOWER,UPPER} = 0x1dfc/0x1dfd
-    constexpr uint32_t CP_MEC_DOORBELL_RANGE_LOWER = 0x1DFC;
-    constexpr uint32_t CP_MEC_DOORBELL_RANGE_UPPER = 0x1DFD;
-    // gc_12_0_0_offset.h: regCP_MAX_CONTEXT = 0x1e4e
-    constexpr uint32_t CP_MAX_CONTEXT             = 0x1E4E;
-    constexpr uint32_t CP_RB0_BASE_HI             = 0x1E51;
-    // gc_12_0_0_offset.h: regCP_RB_WPTR_POLL_ADDR_LO/_HI = 0x1e8b/0x1e8c
-    constexpr uint32_t CP_RB_WPTR_POLL_ADDR_LO    = 0x1E8B;
-    constexpr uint32_t CP_RB_WPTR_POLL_ADDR_HI    = 0x1E8C;
-    constexpr uint32_t CP_RB_DOORBELL_CONTROL     = 0x1E8D;
-    // gc_12_0_0_offset.h: regCP_RB_ACTIVE = 0x1f40
-    constexpr uint32_t CP_RB_ACTIVE               = 0x1F40;
-    constexpr uint32_t CP_ME_CNTL                 = 0x0803;
-    // gc_12_0_0_offset.h: regCP_MEC_RS64_CNTL = 0x2904 (BASE_IDX=1, we still
-    // use single-base-table; offset is the same since IPBaseTable.get(GC) is
-    // the BASE_IDX=0 entry's value — BASE_IDX semantics covered by
-    // amdgpu_regs.h's note).
-    constexpr uint32_t CP_MEC_RS64_CNTL           = 0x2904;
-}
 
 // CP_ME_CNTL bit positions per gc_12_0_0_sh_mask.h:13868-13889.
 //   PFP_HALT__SHIFT = 0x1a (26) → MASK 0x04000000
@@ -134,11 +76,8 @@ namespace CPRegs {
 // `RB_RPTR_ADDR_HI` field mask to keep only the low 16 bits).
 #define CP_RB_RPTR_ADDR_HI__RB_RPTR_ADDR_HI_MASK 0x0000FFFF
 
-// Default ring size — 4 KB matches Linux's KIQ ring default for
-// GFX12 (one page; smaller than the upstream 16 KB only because the
-// GPU's CP can address any power-of-two ≥ 4 KB).
+// 16 KiB ring, matching the GFX12 fetch alignment requirements.
 constexpr uint32_t kCPRingDefaultBytes = 16 * 1024;
-constexpr uint32_t kCPMQDBytes         = 4 * 1024;
 constexpr uint32_t kCPWBPageBytes      = 16 * 1024;   // AS page-aligned
 
 // Write-back layout (host + GPU agree on these offsets within
@@ -149,37 +88,28 @@ constexpr uint32_t kCPWBOffsetFence = 0x080;   // 8 B, qword-aligned
 
 struct CPContext {
     bool             inited;
+    CPFirmwareStart  firmware[3]; // PFP, ME, MEC (in Linux order)
+    bool             firmwarePrepared; // PCs/reset/doorbell range ready; engines halted.
+    bool             enginesStarted; // Async GFX/MEC enabled before KIQ bootstrap.
+    uint64_t         mqd_bus; // Firmware-owned VRAM descriptor, retained until reset.
+    bool             ringReady; // Hardware programmed and CP enable acknowledged.
 
-    // KIQ ring (sysmem, GART-mapped)
+    // CPU staging is never exposed as a GPU address. GMC owns the VRAM
+    // allocations until successful reset/PCI close resets the session arena.
 #ifdef __APPLE__
     IOBufferMemoryDescriptor *ring_buf;
-    IODMACommand             *ring_dma;
 #endif
-    uint64_t          ring_bus;        // GPU-side bus address (== GART iova)
-    void             *ring_cpu;        // CPU-side write target
+    uint64_t          ring_bus;        // GPU VRAM address
+    uint64_t          ring_vram_off;   // BAR0 byte offset
+    void             *ring_cpu;        // CPU-only packet staging
     uint32_t          ring_size_dwords;
-    uint32_t          ring_ptr_mask;   // ring_size_dwords - 1
-
-    // KIQ MQD (sysmem)
-#ifdef __APPLE__
-    IOBufferMemoryDescriptor *mqd_buf;
-    IODMACommand             *mqd_dma;
-#endif
-    uint64_t          mqd_bus;
-    void             *mqd_cpu;
-
-    // Write-back page (sysmem)
-#ifdef __APPLE__
-    IOBufferMemoryDescriptor *wb_buf;
-    IODMACommand             *wb_dma;
-#endif
-    uint64_t          wb_bus;
-    void             *wb_cpu;
-
-    // Convenience pointers into the WB page (CPU-side):
-    volatile uint32_t *rptr_cpu;
-    volatile uint32_t *wptr_cpu;
-    volatile uint64_t *fence_cpu;
+    uint32_t          ring_ptr_mask;
+    uint64_t          published_wptr;
+    uint64_t          wb_bus;          // GPU VRAM address
+    uint64_t          wb_vram_off;
+    const DeviceContext *wb_device;
+    uint64_t          fence_shadow;    // cache of the last successful BAR read
+    volatile uint64_t *fence_cpu;      // points to fence_shadow, never GPU backing
 
     // GPU-side addresses derived from wb_bus
     uint64_t  rptr_gpu_addr;
@@ -187,45 +117,44 @@ struct CPContext {
     uint64_t  fence_gpu_addr;
 
     // Software wptr — what the host has committed but not yet kicked.
-    uint32_t  wptr;
+    uint64_t  wptr;
     uint32_t  fence_counter;
 
-    // Doorbell index (allocated separately in the next chunk).
+    // Doorbell index in DWORDs, as in Linux ring->doorbell_index.
     uint32_t  doorbell_index;
 };
 
-// Allocate KIQ ring + MQD + write-back page. Idempotent.
-// Requires GMCContext.vram_alloc to be ready and the IOPCIDevice
-// to be available via DeviceContext for the WB-page DMA mapping.
+// Allocate visible VRAM ring/write-back and CPU-only staging. Idempotent.
 kern_return_t cp_alloc_storage(DeviceContext &dev,
                                GMCContext &gmc, CPContext &cp);
 
-// Free everything cp_alloc_storage allocated. VRAMBumpAllocator
-// doesn't currently support free (bump-only), so the VRAM regions
-// stay reserved; only the sysmem WB page is torn down.
+// Release CPU staging only after GPU access has been stopped.
+// VRAM backing is retained until the GMC arena is reset.
 void cp_release_storage(CPContext &cp);
 
+// Read GPU completion through BAR0; the callback feeds ClientSubmission.
+kern_return_t cp_read_fence(const CPContext &cp, uint64_t *value);
+bool cp_read_cs_fence(void *context, uint64_t *value);
+
 // Append PM4 dwords to the ring at the current software wptr.
-// Wraps modulo the ring size. Returns the number of dwords written
-// (or 0 if `dwords` would overflow the ring). Does NOT kick the
+// Masks buffer indices, retaining a monotonic 64-bit write pointer.
+// Returns 0 if there is insufficient space including commit padding.
+// Does NOT kick the
 // doorbell — caller does that after all packets are staged.
 uint32_t cp_ring_write(CPContext &cp, const uint32_t *src,
                        uint32_t dwords);
 
 // Build a NOP+RELEASE_MEM packet pair into the ring. Returns the
 // fence value the EOP write will deposit at fence_gpu_addr; caller
-// should kick the doorbell then poll *fence_cpu for that value.
+// should kick the doorbell then read the VRAM fence for that value.
 uint32_t cp_emit_eop_fence(CPContext &cp);
 
-// Program the GFX ring's HQD registers (CP_RB0_BASE/BASE_HI/CNTL,
-// RPTR_ADDR/HI, WPTR, VMID, doorbell range). Mirrors
-// gfx_v12_0_cp_gfx_resume's register sequence — minus the per-pipe
-// GRBM_GFX_INDEX selection since we're targeting RB0 on the default
-// pipe. Caller must have populated CPContext via cp_alloc_storage.
-//
-// Picks doorbell index from cp.doorbell_index (caller sets — for
-// first PM4 we hardcode 0 inside cp_init_full).
-kern_return_t cp_hqd_program(const DeviceContext &dev, CPContext &cp);
+// Build a Linux kernel GFX MQD in VRAM and map it through MES KIQ.
+kern_return_t cp_map_gfx_queue(DeviceContext &dev, GMCContext &gmc,
+                              CPContext &cp, MESContext &mes);
+
+// Configure PSP-loaded RS64 entry PCs and reset pipes after RLC autoload.
+kern_return_t cp_configure_rs64(const DeviceContext &dev, const CPContext &cp);
 
 // Toggle CP_ME_CNTL.{ME_HALT,PFP_HALT}. After cp_enable(true) the
 // CP can fetch + execute from the GFX ring; before, the ring is
@@ -246,15 +175,14 @@ kern_return_t cp_set_doorbell_range(const DeviceContext &dev,
                                     uint32_t mec_first_doorbell,
                                     uint32_t mec_last_doorbell);
 
-// Write the GFX ring's doorbell (BAR5 + doorbell_index<<3) with the
-// current software wptr. The actual register-level write goes through
-// IOPCIDevice::MemoryWrite32 on dev.bar5MemIndex.
+// Pad to the GFX fetch boundary, publish the 64-bit write pointer,
+// then notify BAR2 using the queue's DWORD doorbell index.
 kern_return_t cp_kick_doorbell(const DeviceContext &dev,
-                               const CPContext &cp);
+                               CPContext &cp);
 
 // End-to-end test: emit NOP+RELEASE_MEM, kick doorbell, poll fence.
 // Returns kIOReturnSuccess if the fence value materialised at
-// *fence_cpu within timeout_us microseconds. Designed for the
+// the VRAM completion slot within timeout_us microseconds. Designed for the
 // SubmitTestPM4 selector — sanity-checks the entire submit path
 // once HQD + CP enable have run.
 kern_return_t cp_submit_eop_test(const DeviceContext &dev,
@@ -265,18 +193,11 @@ kern_return_t cp_submit_eop_test(const DeviceContext &dev,
 // Forward decls — defined in amdgpu_gmc.h / amdgpu_mes.h respectively.
 struct MESContext;
 
-// v0.1.26 — KIQ PM4 NOP + RELEASE_MEM smoke test.
-//
-// Builds a tiny PM4 packet sequence (PACKET3_NOP + PACKET3_RELEASE_MEM)
-// targeting a VRAM-resident 64-byte fence slot. CP MEC firmware should
-// process both and write `expected_fence_value` into the fence slot.
-//
-// Pre-fills the fence slot with 0xCAFEBABE so a "no write" outcome is
-// distinguishable from a transient zero.
-//
-// Returns kIOReturnSuccess if the fence write was observed within
-// `timeout_us`, kIOReturnTimeout otherwise. `kIOReturnNotReady` if
-// the CP / MES KIQ state isn't initialized.
+// Kernel GFX queue NOP + RELEASE_MEM test; name retained for ABI compatibility.
+// A Linux scratch-register test must pass first, then a poisoned VRAM fence
+// must become expected_fence_value before its deadline. A zero output GPU
+// address means the fence target was not allocated (scratch/preflight failure).
+// Requires the kernel queue to have been mapped through MES KIQ.
 //
 // Out scalars:
 //   *out_elapsed_us     — wall-clock from kick to observed fence
@@ -292,9 +213,13 @@ kern_return_t cp_kiq_smoke_test(DeviceContext &dev,
                                 uint64_t *out_fence_gpu_va,
                                 uint32_t *out_observed_fence);
 
-// Top-level CPInit stage entry — alloc storage + (if IP base is
-// resolved) program HQD + enable CP. Idempotent.
+// Stage 12 prepares firmware without starting the queue.
+kern_return_t cp_prepare_firmware(DeviceContext &dev, GMCContext &gmc, CPContext &cp);
+kern_return_t cp_start_engines(const DeviceContext &dev, CPContext &cp);
+void cp_log_control(const DeviceContext &dev, const char *phase);
+
+// Stage 14 resumes the queue after GFXHUB/constants and MES preparation.
 kern_return_t cp_init_full(DeviceContext &dev,
-                           GMCContext &gmc, CPContext &cp);
+                           GMCContext &gmc, CPContext &cp, MESContext &mes);
 
 } // namespace amdgpu

@@ -8,7 +8,7 @@
 //  top of VRAM, and on RDNA3+ also accessible via DRIVER_SCRATCH_0/1/2
 //  registers. It's a packed structure with:
 //
-//      binary_header (16 bytes + 6 × 8 bytes of table_info entries)
+//      binary_header (12 bytes + 6 × 8 bytes of table_info entries)
 //        - signature 0x28211407, version_major/minor, checksum, size
 //        - 6 table_info[] entries pointing to:
 //            [0] IP Discovery (signature "IPDS")
@@ -82,8 +82,8 @@ struct DiscoveryIPDSHeader {
     uint32_t id;
     uint16_t num_dies;
     DiscoveryDieInfo die_info[16];
-    // For version == 4 there's an extra base_addr_64_bit flag byte;
-    // we handle that in the parser.
+    uint8_t flags;     // v4 bit 0: 64-bit base addresses; padding in v1-v3
+    uint8_t reserved;
 };
 
 struct DiscoveryDieHeader {
@@ -131,7 +131,7 @@ struct DiscoveryParseResult {
     uint16_t num_dies;
     uint32_t num_ips_total;
     // The actual IPBaseTable lives in DeviceContext; the parser
-    // writes into it directly.
+    // publishes it only after the complete parse succeeds.
 };
 
 //
@@ -159,7 +159,7 @@ kern_return_t discovery_parse(const uint8_t *binary, uint64_t binarySize,
 //      PCIDriverKit doesn't expose; we error out and ask the
 //      caller to use LoadDiscoveryBin as the escape hatch.
 //   3. Else compute (vram_size_mb << 20) - kDiscoveryTMROffset and
-//      read the binary from BAR2 at that VRAM offset.
+//      read the binary via the VRAM indirect aperture at that offset.
 //   4. discovery_parse() the binary, populating dev.ip.
 //
 // Returns kIOReturnSuccess on success. On the "TMR in sysmem"

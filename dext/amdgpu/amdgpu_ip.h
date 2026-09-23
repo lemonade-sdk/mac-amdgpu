@@ -368,7 +368,7 @@ namespace PPSMC {
     constexpr uint32_t SetSoftMinByFreq           = 0x19;
     constexpr uint32_t SetSoftMaxByFreq           = 0x1A;
     // v0.1.29 — AC/DC source notify. Upstream smu_smc_hw_setup sends
-    // this after RunDcBtc. Param: 0=DC, 1=AC. Opcode per upstream
+    // this after RunDcBtc. Param: 0=AC, 1=DC. Opcode per upstream
     // smu_v14_0_2_ppsmc.h (#define PPSMC_MSG_NotifyPowerSource 0x35).
     constexpr uint32_t NotifyPowerSource          = 0x35;
     constexpr uint32_t RunDcBtc                   = 0x36;
@@ -434,7 +434,7 @@ constexpr uint32_t kPSPFwPriBufSize       = 1024u * 1024u;  // PSP_1_MEG
 //       size   = DISCOVERY_TMR_SIZE
 // ============================================================
 namespace BootstrapRegs {
-    // BAR0-absolute dword offsets — these are the upstream "legacy
+    // BAR5-absolute dword offsets — these are the upstream "legacy
     // aliases" that work pre-IP-discovery. Same offset across NBIO
     // 6_1 / 7_0 / 7_4 / 7_11. They become valid only AFTER IFWI
     // init completes (poll MP0_C2PMSG_33 bit 31).
@@ -443,20 +443,10 @@ namespace BootstrapRegs {
     constexpr uint32_t DRIVER_SCRATCH_1   = 0x0095;
     constexpr uint32_t DRIVER_SCRATCH_2   = 0x0096;
 
-    // MP0 PSP bootloader-ready handshake register. Upstream amdgpu uses
-    // mmMP0_SMN_C2PMSG_35 bit 31 as the authoritative "PSP bootloader
-    // is alive" signal; psp_v14_0_wait_for_bootloader / psp_v*_wait_for_*
-    // all poll C2PMSG_35 specifically. C2PMSG_33 is not used by upstream
-    // as a ready gate on RDNA4 (mp_14_0 has dropped its use).
-    //
-    // Both are pre-IP-base "legacy alias" dword offsets and read identically
-    // regardless of IP base resolution. We use C2PMSG_35 here so the
-    // IFWI poll matches the gate PSP itself drives.
-    // Offset matches mp_11_5_0 / mp_13_0_* / mp_14_0_* ASIC headers
-    // (regMPASP_SMN_C2PMSG_35 = 0x0063).
-    //
-    // Audit #9 #2: was previously C2PMSG_33 (0x0061) — wrong register.
-    constexpr uint32_t MP0_C2PMSG_35      = 0x0063;
+    // Absolute BAR5 dword address used before IP discovery, matching
+    // amdgpu_discovery.c. C2PMSG_33 reports IFWI boot completion;
+    // C2PMSG_35 is the separate bootloader command handshake.
+    constexpr uint32_t MP0_C2PMSG_33      = 0x16061;
     constexpr uint32_t kIFWIReadyMask     = 0x80000000u;
     constexpr uint32_t kIFWIReadyValue    = 0x80000000u;
     constexpr uint64_t kIFWITimeoutMs     = 2000;

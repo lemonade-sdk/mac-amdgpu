@@ -18,6 +18,7 @@
 class MacAMDGPU: public IOService
 {
 public:
+    virtual void free() override;
     virtual kern_return_t Start(IOService *provider) override;
     virtual kern_return_t Stop(IOService *provider) override;
     virtual kern_return_t NewUserClient(uint32_t type,

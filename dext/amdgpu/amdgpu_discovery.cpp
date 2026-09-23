@@ -100,88 +100,83 @@ discovery_parse(const uint8_t *binary, uint64_t binarySize,
         fail(outResult, msg);
         return kIOReturnInvalid;
     }
-    if (hdr->binary_size > binarySize) {
-        char msg[128];
-        snprintf(msg, sizeof(msg),
-                 "header says binary_size=%u but only %llu bytes available",
-                 hdr->binary_size, binarySize);
-        fail(outResult, msg);
+    // This port consumes the v1 fixed six-table directory. v2 moves it.
+    if (hdr->version_major != 1 || hdr->binary_size < sizeof(*hdr) ||
+        hdr->binary_size > binarySize) {
+        fail(outResult, "unsupported binary header or invalid declared size");
+        return kIOReturnInvalid;
+    }
+    const uint32_t declaredSize = hdr->binary_size;
+    constexpr uint32_t checksumStart =
+        offsetof(DiscoveryBinaryHeader, binary_checksum) + sizeof(hdr->binary_checksum);
+    if (compute_checksum(binary + checksumStart, declaredSize - checksumStart) !=
+        hdr->binary_checksum) {
+        fail(outResult, "binary checksum mismatch");
         return kIOReturnInvalid;
     }
 
-    // Validate top-level checksum (sum of bytes after the checksum field).
-    // checksum lives at offset 0x08 and covers bytes [0x0C..binary_size).
-    const uint32_t kHeaderChecksumStart = 12;
-    if (hdr->binary_size > kHeaderChecksumStart) {
-        uint16_t sum = compute_checksum(binary + kHeaderChecksumStart,
-                                        hdr->binary_size - kHeaderChecksumStart);
-        if (sum != hdr->binary_checksum) {
-            DISC_LOG("warning: binary checksum mismatch (computed %#06x, "
-                     "header says %#06x) — continuing anyway",
-                     sum, hdr->binary_checksum);
-            // Linux also warns but doesn't bail.
-        }
-    }
-
-    // Table[0] is the IP discovery section.
     const DiscoveryTableInfo &ipds_info = hdr->table_list[0];
-    if (ipds_info.offset == 0 || ipds_info.offset + sizeof(DiscoveryIPDSHeader) > binarySize) {
+    if (ipds_info.offset < sizeof(*hdr) ||
+        uint32_t(ipds_info.offset) + sizeof(DiscoveryIPDSHeader) > declaredSize) {
         fail(outResult, "IPDS table offset out of range");
         return kIOReturnInvalid;
     }
-    auto *ipds = reinterpret_cast<const DiscoveryIPDSHeader *>(
-        binary + ipds_info.offset);
-    if (ipds->signature != kDiscoveryIPDSSignature) {
-        char msg[128];
-        snprintf(msg, sizeof(msg), "bad IPDS signature %#010x", ipds->signature);
-        fail(outResult, msg);
+    auto *ipds = reinterpret_cast<const DiscoveryIPDSHeader *>(binary + ipds_info.offset);
+    const uint32_t tableEnd = uint32_t(ipds_info.offset) + ipds->size;
+    if (ipds->signature != kDiscoveryIPDSSignature ||
+        ipds->version < 1 || ipds->version > 4 ||
+        ipds->size < sizeof(*ipds) || tableEnd > declaredSize ||
+        ipds->num_dies == 0 || ipds->num_dies > 16) {
+        fail(outResult, "invalid IPDS header, version or table bounds");
         return kIOReturnInvalid;
     }
-
-    // v4 binaries include an extra byte indicating 64-bit base addresses.
-    bool base_addr_64 = false;
-    if (ipds->version >= 4) {
-        // After die_info[16], v4 has a packed { uint8 base_addr_64_bit:1 } byte.
-        const uint8_t *flag = reinterpret_cast<const uint8_t *>(ipds)
-            + offsetof(DiscoveryIPDSHeader, die_info)
-            + sizeof(DiscoveryDieInfo) * 16;
-        if (flag >= binary && flag < binary + binarySize) {
-            base_addr_64 = (*flag & 0x01) != 0;
-        }
+    // Linux uses the size inside IPDS, rather than table_info.size.
+    if (compute_checksum(binary + ipds_info.offset, ipds->size) != ipds_info.checksum) {
+        fail(outResult, "IPDS checksum mismatch");
+        return kIOReturnInvalid;
     }
-
+    const bool base_addr_64 = ipds->version == 4 && (ipds->flags & 1);
+    IPBaseTable parsed;
     DISC_LOG("IPDS v%u, num_dies=%u, base_addr_64=%d",
              ipds->version, ipds->num_dies, base_addr_64 ? 1 : 0);
 
     uint32_t ips_recognised = 0;
     uint32_t ips_total = 0;
 
-    for (uint16_t d = 0; d < ipds->num_dies && d < 16; d++) {
+    for (uint16_t d = 0; d < ipds->num_dies; d++) {
         uint32_t die_off = ipds->die_info[d].die_offset;
-        if (die_off == 0 || die_off + sizeof(DiscoveryDieHeader) > binarySize) {
-            DISC_LOG("die[%u]: die_offset %u out of range — skipping",
-                     d, die_off);
-            continue;
+        if (die_off < ipds_info.offset + sizeof(*ipds) ||
+            die_off + sizeof(DiscoveryDieHeader) > tableEnd) {
+            fail(outResult, "die offset outside IPDS table");
+            return kIOReturnInvalid;
         }
         auto *die = reinterpret_cast<const DiscoveryDieHeader *>(binary + die_off);
+        if (die->die_id != ipds->die_info[d].die_id) {
+            fail(outResult, "die identifier mismatch");
+            return kIOReturnInvalid;
+        }
         uint32_t pos = die_off + sizeof(DiscoveryDieHeader);
 
         DISC_LOG("die[%u] id=%u, num_ips=%u, ips start at %#x",
                  d, die->die_id, die->num_ips, pos);
 
         for (uint16_t i = 0; i < die->num_ips; i++) {
-            if (pos + sizeof(DiscoveryIPv4) > binarySize) {
-                DISC_LOG("die[%u] ip[%u]: walked off the end at %#x",
-                         d, i, pos);
-                break;
+            if (pos + sizeof(DiscoveryIPv4) > tableEnd) {
+                fail(outResult, "truncated IP record");
+                return kIOReturnInvalid;
             }
             auto *ip = reinterpret_cast<const DiscoveryIPv4 *>(binary + pos);
             const uint32_t base_size = base_addr_64 ? 8 : 4;
             const uint32_t this_ip_size =
                 sizeof(DiscoveryIPv4) + ip->num_base_address * base_size;
-            if (pos + this_ip_size > binarySize) {
-                DISC_LOG("die[%u] ip[%u]: spans past binary", d, i);
-                break;
+            // Linux struct_size(ip, base_address, num_base_address) permits
+            // zero bases: the record still carries an IP version. GC-housed
+            // engines may have no independent register segment here.
+            if (pos + this_ip_size > tableEnd) {
+                DISC_LOG("die[%u] ip[%u] hw_id=%u bases=%u: record [%#x..%#x) exceeds table end %#x",
+                         d, i, ip->hw_id, ip->num_base_address, pos, pos + this_ip_size, tableEnd);
+                fail(outResult, "IP base-address array exceeds table bounds");
+                return kIOReturnInvalid;
             }
 
             // Read ALL base addresses (up to kMaxBaseSegments). Upstream
@@ -193,16 +188,15 @@ discovery_parse(const uint8_t *binary, uint64_t binarySize,
                 numBases = IPBaseTable::kMaxBaseSegments;
             }
             for (uint8_t b = 0; b < numBases; b++) {
+                const uint8_t *p = binary + pos + sizeof(DiscoveryIPv4) + b * base_size;
+                // Packed records need not align uint64_t on ARM64. Linux also
+                // discards ASIC-specific high bits from 64-bit base addresses.
                 if (base_addr_64) {
-                    auto *p = reinterpret_cast<const uint64_t *>(
-                        reinterpret_cast<const uint8_t *>(ip) +
-                        sizeof(DiscoveryIPv4));
-                    bases[b] = static_cast<uint32_t>(p[b]);
+                    uint64_t value;
+                    memcpy(&value, p, sizeof(value));
+                    bases[b] = uint32_t(value) & 0x3FFFFFFFu;
                 } else {
-                    auto *p = reinterpret_cast<const uint32_t *>(
-                        reinterpret_cast<const uint8_t *>(ip) +
-                        sizeof(DiscoveryIPv4));
-                    bases[b] = p[b];
+                    memcpy(&bases[b], p, sizeof(bases[b]));
                 }
             }
 
@@ -211,13 +205,13 @@ discovery_parse(const uint8_t *binary, uint64_t binarySize,
                 // Only first instance — multi-instance for things like SDMA
                 // already has its own HWID per instance (SDMA0 vs SDMA1).
                 for (uint8_t b = 0; b < numBases; b++) {
-                    dev.ip.setBase(blk, b, bases[b]);
+                    parsed.setBase(blk, b, bases[b]);
                 }
                 // Capture the discovered IP version per block so runtime
                 // code can switch register-offset tables / function
                 // pointers based on the actual chip.
                 // [[feedback_mac_amdgpu_per_ip_version_offsets]]
-                dev.ip.setVersion(blk, IPVersion{
+                parsed.setVersion(blk, IPVersion{
                     ip->major, ip->minor, ip->revision});
                 ips_recognised++;
                 DISC_LOG("  ip[%u] hw_id=%u %{public}s v%u.%u.%u "
@@ -242,6 +236,7 @@ discovery_parse(const uint8_t *binary, uint64_t binarySize,
         }
     }
 
+    dev.ip = parsed;
     if (outResult) {
         outResult->ok            = true;
         outResult->num_dies      = ipds->num_dies;
@@ -271,38 +266,35 @@ discover_ips_on_die(DeviceContext &dev, DiscoveryParseResult *outResult)
 {
     if (outResult) memset(outResult, 0, sizeof(*outResult));
 
-    // Step 0: wait for the PSP bootloader to come up. The authoritative
-    // gate in upstream amdgpu is MP0_SMN_C2PMSG_35 bit 31 — that's the
-    // bit psp_v*_wait_for_bootloader (and the discovery path) polls.
-    // Until the bootloader has signalled, BAR5 register aliases like
-    // mmRCC_CONFIG_MEMSIZE read back as 0/garbage.
-    //
-    // Audit #9 #2: previously polled C2PMSG_33 which is *not* the PSP
-    // readiness gate upstream uses. C2PMSG_35 matches both the discovery
-    // path and the psp_load_sos wait_for_bootloader handshake — so by
-    // the time we leave this loop we have the same "PSP alive" signal
-    // PSP itself drives.
+    // Step 0: match amdgpu_discovery_read_binary_from_mem: wait for
+    // IFWI via the absolute C2PMSG_33 alias before reading MEMSIZE.
+    // C2PMSG_35 is only the later PSP bootloader command-ready gate.
     {
+        const uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         uint64_t waited_ms = 0;
         uint32_t msg = 0;
         bool psp_ready = false;
         while (waited_ms < BootstrapRegs::kIFWITimeoutMs) {
-            msg = RREG32_abs(dev, BootstrapRegs::MP0_C2PMSG_35);
+            msg = RREG32_abs(dev, BootstrapRegs::MP0_C2PMSG_33);
+            if (msg == UINT32_MAX) {
+                fail(outResult, "IFWI register unavailable; GPU detached");
+                return kIOReturnNotAttached;
+            }
             if ((msg & BootstrapRegs::kIFWIReadyMask) ==
                 BootstrapRegs::kIFWIReadyValue) {
                 psp_ready = true;
                 break;
             }
             IOSleep(1);
-            waited_ms += 1;
+            waited_ms = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start) / 1000000;
         }
         if (!psp_ready) {
-            DISC_LOG("on-die: PSP bootloader poll inconclusive after %llu ms "
-                     "(MP0_C2PMSG_35=%#x); proceeding — MEMSIZE will be the "
+            DISC_LOG("on-die: IFWI poll inconclusive after %llu ms "
+                     "(MP0_C2PMSG_33=%#x); proceeding — MEMSIZE will be the "
                      "authoritative ready check", waited_ms, msg);
         } else {
-            DISC_LOG("on-die: PSP bootloader ready after %llu ms "
-                     "(MP0_C2PMSG_35=%#x)", waited_ms, msg);
+            DISC_LOG("on-die: IFWI ready after %llu ms "
+                     "(MP0_C2PMSG_33=%#x)", waited_ms, msg);
         }
     }
 
@@ -369,11 +361,11 @@ discover_ips_on_die(DeviceContext &dev, DiscoveryParseResult *outResult)
     // inside the visible aperture, use BAR0 memcpy_fromio; otherwise
     // use the mmMM_INDEX/DATA register pair to walk VRAM dword-by-dword.
     uint64_t tmr_offset = vram_bytes - kDiscoveryTMROffset;
-    bool use_aperture = (tmr_offset + kDiscoveryTMRSize) <= dev.bar2VisibleVRAMSize;
+    bool use_aperture = (tmr_offset + kDiscoveryTMRSize) <= dev.bar0Size;
     DISC_LOG("on-die: TMR at VRAM offset %#llx (size %u); "
              "visible aperture %llu MB → using %{public}s path",
              tmr_offset, kDiscoveryTMRSize,
-             dev.bar2VisibleVRAMSize >> 20,
+             dev.bar0Size >> 20,
              use_aperture ? "BAR0-aperture" : "MM_INDEX/DATA");
 
     // Step 4: read the binary into a local buffer.
@@ -397,7 +389,7 @@ discover_ips_on_die(DeviceContext &dev, DiscoveryParseResult *outResult)
                  "(visible-VRAM %llu MB)",
                  hdr->signature, tmr_offset,
                  use_aperture ? "BAR0-aperture" : "MM_INDEX/DATA",
-                 dev.bar2VisibleVRAMSize >> 20);
+                 dev.bar0Size >> 20);
         DISC_LOG("on-die: first 8 dwords: "
                  "%#010x %#010x %#010x %#010x %#010x %#010x %#010x %#010x",
                  out_dw[0], out_dw[1], out_dw[2], out_dw[3],

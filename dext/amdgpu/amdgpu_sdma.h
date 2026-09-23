@@ -26,13 +26,14 @@
 //        uses GC base[1] with SDMA1_HYP_DEC_REG_OFFSET=0x30 per
 //        instance (sdma_v7_1.c:49-51).
 //
-//  On Apple Silicon the SDMA ring buffers live in DART-mapped sysmem
-//  (16 KB-aligned), addressed by GPU through GART once GMC is up.
+//  Rings and write-back pages use 16 KB-aligned visible VRAM allocations.
+//  CPU access uses BAR0; GPU registers and packets receive VRAM MC addresses.
 //
 
 #pragma once
 
 #include <stdint.h>
+#include "amdgpu_sdma_packets.h"
 
 #ifdef __APPLE__
 #include <DriverKit/IOBufferMemoryDescriptor.h>
@@ -227,22 +228,6 @@ inline const SDMARegOffsets &sdma_regs(const DeviceContext &dev) {
 // SDMA opcode + helpers — sdma_pkt_open.h subset for NOP / FENCE /
 // TRAP. Enough to emit a ring test that the host can wait on.
 //------------------------------------------------------------------
-constexpr uint32_t SDMA_OP_NOP    = 0;
-constexpr uint32_t SDMA_OP_COPY   = 1;
-constexpr uint32_t SDMA_OP_FENCE  = 5;
-constexpr uint32_t SDMA_OP_TRAP   = 6;
-constexpr uint32_t SDMA_OP_TIMESTAMP = 13;
-
-constexpr uint32_t SDMA_SUBOP_COPY_LINEAR = 0;
-
-static inline uint32_t SDMA_PKT_HEADER_OP(uint32_t op)         { return (op & 0xff); }
-static inline uint32_t SDMA_PKT_HEADER_SUB_OP(uint32_t sub_op) { return ((sub_op & 0xff) << 8); }
-static inline uint32_t SDMA_PKT_HEADER_CPV(uint32_t v)         { return ((v & 0x1) << 28); }
-
-// COPY_LINEAR max byte count is 0x400000 - 1 on RDNA4
-// (HW counter is a 22-bit field, byte_count - 1).
-constexpr uint32_t kSDMACopyLinearMaxBytes = 0x00400000u;
-
 //------------------------------------------------------------------
 // Per-instance ring state. Two instances live side by side; we
 // drive both with the same layout.
@@ -252,26 +237,19 @@ struct SDMAInstance {
     bool      inited;
     bool      enabled;
 
-#ifdef __APPLE__
-    // WB page only — stays in sysmem because GPU WRITES through DART
-    // work (only reads are broken on AS+TB5). Ring is now VRAM.
-    IOBufferMemoryDescriptor *wb_buf;
-    IODMACommand             *wb_dma;
-#endif
-    // Ring buffer — VRAM-resident on AS+TB5 (sysmem reads return zero
-    // for GPU-initiated fetches; see feedback_mac_amdgpu_dart_tb5_
-    // pcie_reads). Engine reads packets through the FB aperture using
-    // ring_gpu_va; CPU writes go through BAR0 at ring_vram_off.
+    // Ring and write-back live in the visible VRAM arena, retained until
+    // reset/PCI close. CPU access goes through BAR0, not a host DMA mapping.
     uint64_t  ring_gpu_va;       // MC address (= ring_bus equivalent)
     uint64_t  ring_vram_off;     // BAR0-relative byte offset for CPU writes
     uint32_t  ring_size_dwords;
     uint32_t  ring_ptr_mask;
 
     uint64_t  wb_bus;
-    void     *wb_cpu;
+    uint64_t  wb_vram_off;
+    const DeviceContext *wb_device;
+    uint32_t  cs_fence_shadow; // CPU cache populated only by a valid BAR read
     uint64_t  rptr_gpu_addr;    // wb_bus + 0
     uint64_t  wptr_poll_gpu_addr; // wb_bus + 0x40
-    volatile uint32_t *rptr_cpu;
 
     uint32_t  wptr;             // software wptr (dword index)
     // DWORD offset into the doorbell BAR (BAR2). Programmed into
@@ -353,14 +331,19 @@ uint32_t sdma_ring_write(const DeviceContext &dev, SDMAInstance &inst,
                          const uint32_t *src, uint32_t dwords);
 
 // Submit an SDMA COPY_LINEAR + FENCE pair, kick doorbell, poll fence.
-// Used by item 195: GART sanity test. src/dst are GPU-visible bus
-// addresses (either DART iovas for sysmem or GART iovas for mapped
-// sysmem-as-VRAM aliases). byte_count must be ≤ kSDMACopyLinearMaxBytes.
+// src/dst must be GPU addresses: VRAM or explicitly GART-mapped system memory.
+// byte_count must be ≤ kSDMACopyLinearMaxBytes. Completion alone does not prove
+// data integrity; the caller must verify the destination contents.
 kern_return_t sdma_copy_linear_test(const DeviceContext &dev,
                                     SDMAInstance &inst,
                                     uint64_t src_bus, uint64_t dst_bus,
                                     uint32_t byte_count,
                                     uint64_t timeout_us);
+
+// Internal completion slots: diagnostics at 0x80, CS ABI at 0xC0.
+kern_return_t sdma_clear_fence(const DeviceContext &, const SDMAInstance &, uint32_t offset);
+kern_return_t sdma_read_fence(const DeviceContext &, const SDMAInstance &, uint32_t offset, uint32_t *value);
+bool sdma_read_cs_fence(void *context, uint32_t *value);
 
 // End-to-end ring test: emit FENCE + TRAP, poll the fence word.
 // Returns kIOReturnSuccess if fence materialised, else the

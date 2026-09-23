@@ -24,6 +24,7 @@
 #include "amdgpu_ip.h"
 #include "amdgpu_regs.h"
 #include "amdgpu_vram.h"
+#include "amdgpu_gart_allocator.h"
 
 namespace amdgpu {
 
@@ -70,6 +71,7 @@ struct HubContext {
     uint32_t  vm_invalidate_eng0_req;
     uint32_t  vm_invalidate_eng0_ack;
     uint32_t  vm_invalidate_eng0_sem;
+    uint32_t  vm_l2_bank_select_reserved_cid2; // MMHUB private invalidation
     uint32_t  vm_invalidate_eng0_addr_range_lo32;
     uint32_t  vm_invalidate_eng0_addr_range_hi32;
     uint32_t  vm_system_aperture_low_addr;
@@ -105,9 +107,7 @@ struct HubContext {
 struct GMCContext {
     bool      inited;
 
-    // Memory geometry. We hardcode R9700 32 GB total VRAM for now
-    // (confirmed via devcoredump real_vram_size=34208743424). The
-    // visible window comes from dev.bar2VisibleVRAMSize at runtime.
+    // Geometry comes from RCC_CONFIG_MEMSIZE and the OS-assigned BAR0.
     uint64_t  real_vram_size;       // 32 GB on R9700
     uint64_t  visible_vram_size;    // ~256 MB / 1 GB depending on ReBAR
     uint64_t  vram_start;           // GPU-VA base of VRAM
@@ -134,7 +134,7 @@ struct GMCContext {
     // Bump allocator over the visible VRAM aperture (top-down).
     VRAMBumpAllocator vram_alloc;
 
-    // Resources allocated at gart_init time. All DART-mapped sysmem.
+    // The dummy page is DART-mapped sysmem; PT and scratch live in VRAM.
 #ifdef __APPLE__
     IOBufferMemoryDescriptor *gart_pt_buf;
     IODMACommand             *gart_pt_dma;
@@ -147,23 +147,17 @@ struct GMCContext {
     void     *gart_pt_cpu;
     uint64_t  gart_pt_size;         // page table size in bytes
     uint64_t  dummy_page_bus;       // for protection-fault redirect
-    uint64_t  mem_scratch_bus;      // default aperture address
+    uint64_t  mem_scratch_bus;      // VRAM MC address of system-aperture scratch
 
-    // Bump allocator for sysmem buffers bound into GART (e.g. firmware
-    // staging from the host DMA buffer). Offsets are within
-    // [gart_start, gart_end). Reset to 0 at gmc_init time.
-    uint64_t  gart_bump_offset;
+    // Shared by firmware and GTT bindings; reset only with the full session.
+    GARTApertureAllocator gart_allocator;
 
     // Hub register offset tables.
     HubContext mmhub;     // MMHUB v4_1_0
     HubContext gfxhub;    // GFXHUB v12_0
 };
 
-// mc_init — port of gmc_v12_0_mc_init (gmc_v12_0.c:727). Fills in
-// real_vram_size / visible_vram_size / vram_start / vram_end. For
-// the first cut we trust dev.bar2VisibleVRAMSize and hardcode the
-// total to 32 GB (R9700). A future revision will read VRAM size
-// from the discovery binary or mmRCC_CONFIG_MEMSIZE.
+// Read VRAM geometry and place the fixed-size GART outside the framebuffer.
 kern_return_t gmc_mc_init(DeviceContext &dev, GMCContext &gmc);
 
 // vram_alloc_init — initialize the bump allocator over the visible
@@ -178,10 +172,7 @@ kern_return_t gmc_mmhub_offsets_init(GMCContext &gmc);
 // Source: gfxhub_v12_0_init (drivers/gpu/drm/amd/amdgpu/gfxhub_v12_0.c)
 kern_return_t gmc_gfxhub_offsets_init(GMCContext &gmc);
 
-// Allocate GART page table + dummy_page + mem_scratch in DART-mapped
-// system memory. ~128 KB + 16 KB + 16 KB total — well under DART
-// ceiling. Mirrors amdgpu_gart_table_ram_alloc + the dummy_page +
-// mem_scratch allocations Linux does in gmc_v12_0_sw_init.
+// Allocate the VRAM page table + scratch and the DART-mapped fault dummy page.
 kern_return_t gmc_alloc_resources(DeviceContext &dev, GMCContext &gmc);
 
 // Free everything alloc_resources allocated.

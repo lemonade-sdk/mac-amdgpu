@@ -12,6 +12,7 @@
 //
 
 #pragma once
+#include "amdgpu_gfx_registers.h"
 
 #include <stdint.h>
 #include "amdgpu_ip.h"
@@ -22,33 +23,7 @@ namespace amdgpu {
 // GC register offsets that belong to top-level GFX init (as opposed
 // to the CP HQD registers in amdgpu_cp.h). All offsets sourced from
 // drivers/gpu/drm/amd/include/asic_reg/gc/gc_12_0_0_offset.h.
-namespace GFXRegs {
-    constexpr uint32_t GRBM_CNTL        = 0x0DA0;
-    constexpr uint32_t GRBM_GFX_CNTL    = 0x0900;
-    // gc_12_0_0_offset.h: regGRBM_GFX_INDEX = 0x2200.
-    constexpr uint32_t GRBM_GFX_INDEX   = 0x2200;
-    constexpr uint32_t SH_MEM_BASES     = 0x09E3;
-    constexpr uint32_t SH_MEM_CONFIG    = 0x09E4;
-    // gc_12_0_0_offset.h: regSPI_GDBG_PER_VMID_CNTL = 0x1f72.
-    constexpr uint32_t SPI_GDBG_PER_VMID_CNTL = 0x1F72;
-    // RB / SA harvest map registers. gfx_v12_0_get_rb_active_bitmap
-    // and gfx_v12_0_get_sa_active_bitmap read these via SE-broadcast
-    // GRBM_GFX_INDEX writes.
-    //   regCC_RB_BACKEND_DISABLE / regCC_GC_SHADER_ARRAY_CONFIG and
-    //   regGRBM_CC_GC_SA_UNIT_DISABLE — used by setup_rb.
-    constexpr uint32_t CC_RB_BACKEND_DISABLE       = 0x13DD; // gc_12_0_0_offset.h
-    constexpr uint32_t CC_GC_SHADER_ARRAY_CONFIG   = 0x100F;
-    constexpr uint32_t GRBM_CC_GC_SA_UNIT_DISABLE  = 0x0CFD;
-    // RDNA4 CU-harvest registers used by get_cu_info.
-    //   regGC_USER_SHADER_ARRAY_CONFIG = 0x5b90
-    //   regGRBM_GC_USER_SA_UNIT_DISABLE = 0x5b92
-    //   regGC_USER_RB_BACKEND_DISABLE = 0x5b94
-    constexpr uint32_t GC_USER_SHADER_ARRAY_CONFIG = 0x5B90;
-    constexpr uint32_t GRBM_GC_USER_SA_UNIT_DISABLE = 0x5B92;
-    constexpr uint32_t GC_USER_RB_BACKEND_DISABLE  = 0x5B94;
-    // regGB_ADDR_CONFIG = 0x13de — used by get_gb_addr_config.
-    constexpr uint32_t GB_ADDR_CONFIG              = 0x13DE;
-}
+
 
 // GRBM_GFX_CNTL field shift/mask defs. Sourced from
 // gc_12_0_0_sh_mask.h. (Mirrored in amdgpu_mes.h for code paths

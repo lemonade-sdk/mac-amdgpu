@@ -8,8 +8,8 @@
 //      from there, exit. (macOS won't stage a DriverKit extension
 //      unless its parent app lives in /Applications.)
 //
-//   2. Once running from /Applications: auto-submit an
-//      OSSystemExtensionRequest.activationRequest. macOS may prompt
+//   2. Once running from /Applications: check the installed build,
+//      then activate only if it is not already enabled. macOS may prompt
 //      the user to approve in System Settings → Privacy & Security;
 //      we surface that requirement live in the window.
 //
@@ -22,11 +22,38 @@ import SystemExtensions
 import AppKit
 import IOKit
 
+// The identity is produced by the responding binary, independent of sysextd's
+// installed-version metadata. An old or unknown ABI cannot authorize GPU work.
+private struct DriverRuntimeIdentity: Sendable {
+    let build: UInt64?
+    init(transport: Int32, output: [UInt64], count: UInt32) {
+        build = transport == 0 && count == 3 && output.count == 3 &&
+            output[0] == 0x414D444750554142 && output[1] == 1 && output[2] > 0
+                ? output[2] : nil
+    }
+    func permitsHardware(expectedBuild: UInt64?) -> Bool {
+        guard let build, let expectedBuild else { return false }
+        return build == expectedBuild
+    }
+    func permitsConnection(expectedBuild: UInt64?, allowUnverified: Bool) -> Bool {
+        allowUnverified || permitsHardware(expectedBuild: expectedBuild)
+    }
+}
+
+private struct DriverRuntimeProbe: Sendable {
+    let connectionError: Int32
+    let identity: DriverRuntimeIdentity
+}
+
 // MARK: - User-client selectors (must match dext/MacAMDGPU.cpp)
 
 private let kSelPing:            UInt32 = 0
 private let kSelGetIdentity:     UInt32 = 1
 private let kSelGetBARInfo:      UInt32 = 2
+private let kSelRuntimeBuild:    UInt32 = 43
+private let kSelHostMemoryTest:  UInt32 = 44
+private let kSelShutdownGPU:     UInt32 = 42
+private let kSelGetReBARInfo:    UInt32 = 41
 private let kSelAllocateDMA:     UInt32 = 6
 private let kSelResetDevice:     UInt32 = 8
 private let kSelInitDevice:      UInt32 = 9
@@ -220,10 +247,23 @@ struct ContentView: View {
                     Text("Installed").font(.caption2).foregroundStyle(.secondary)
                     Text(controller.installedVersion)
                         .font(.system(.callout, design: .monospaced))
-                        .foregroundStyle(controller.versionMatch ? Color.green : Color.orange)
+                        .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("Refresh") { controller.refreshVersions() }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Running").font(.caption2).foregroundStyle(.secondary)
+                    Text(controller.runningVersion)
+                        .font(.system(.callout, design: .monospaced))
+                        .foregroundStyle(controller.runningVersionMatch ? Color.green : Color.orange)
+                }
+                Button("Verify Running") { controller.verifyRunningDriver() }
+                    .disabled(controller.isWorking)
+                    .controlSize(.small)
+                Button("Refresh") {
+                    controller.refreshVersions()
+                    controller.verifyRunningDriver()
+                }
+                    .disabled(controller.isWorking)
                     .controlSize(.small)
             }
             .padding(.vertical, 4)
@@ -266,6 +306,14 @@ struct ContentView: View {
                 HStack {
                     Button("Initialize GPU") { controller.initializeGPU() }
                         .help("Run every bringup stage in order, printing each as it completes.")
+                    Button("Load Firmware Only") {
+                        controller.initializeGPU(stopAfterFirmware: true)
+                    }
+                    .help("Stop after PSP firmware loading, before SMU/CP/MES setup. Initialize GPU can continue from this checkpoint.")
+                    Button("Stop GPU") { controller.shutdownGPU() }
+                        .help("Reset the GPU with DMA disabled, close PCI, and release the session. Does not power off the enclosure.")
+                    Button("Restart GPU") { controller.shutdownGPU(reinitialize: true) }
+                        .help("Stop the GPU safely, then load firmware and initialize a fresh session without unplugging it.")
                     Spacer()
                 }
 
@@ -302,10 +350,19 @@ struct ContentView: View {
                         .help("v0.1.27 BO ABI smoke test: alloc VRAM + GTT BOs, round-trip GetInfo, map GTT BO, write pattern, free.")
                     Button("SDMA Copy") { controller.testSDMACopyVRAM() }
                         .help("VRAM→VRAM 4 KB SDMA COPY_LINEAR smoke test. Proves the SDMA engine processes a packet end-to-end + writes its fence.")
-                    Button("CP NOP") { controller.testCPKIQSmoke() }
-                        .help("v0.1.26 — first PM4 packet on KIQ: NOP + RELEASE_MEM(0xDEADBEEF). Verifies CP MEC firmware processes PM4.")
-                    Button("CS Smoke") { controller.testCSSmokeSDMA() }
+                    Button("CP GFX Fence") { controller.testCPKIQSmoke() }
+                        .help("Verify a CP register-write packet first, then submit and verify a GFX memory fence.")
+                    Button("CS Smoke") { controller.testCSSmoke() }
                         .help("v0.1.28 — Drive the new CS submission ABI: CSCreate(SDMA) → CSWriteDwords(4×NOP) → SubmitIB → WaitFence(1s) → CSDestroy.")
+                    Button("GFX CS Smoke") { controller.testCSSmoke(gfx: true) }
+                        .help("Submit PM4 NOP packets through a GFX command-stream handle and verify its memory fence.")
+                    Spacer()
+                }
+
+                HStack(spacing: 6) {
+                    GroupLabel("Memory")
+                    Button("Host Memory Copy") { controller.testHostMemoryTransfer() }
+                        .help("Verify 16 KB in each direction between host memory and VRAM through GART, then unbind the DMA mapping.")
                     Spacer()
                 }
 
@@ -329,6 +386,7 @@ struct ContentView: View {
                 }
             }
             .font(.caption)
+            .disabled(controller.isWorking)
             .padding(.vertical, 4)
 
             ScrollView {
@@ -364,6 +422,10 @@ final class DriverController: NSObject, ObservableObject,
     @Published var bundledVersion: String = "—"
     @Published var installedVersion: String = "—"
     @Published var versionMatch: Bool = false
+    @Published var runningVersion: String = "not verified"
+    @Published var runningVersionMatch: Bool = false
+    private var lastConnectionError: Int32 = kIOReturnNotFound
+    private var runtimeVerificationInProgress = false
 
     // Cached PCI identity, populated by the first testGetIdentity().
     // Used to pick the kicker firmware variant where required (R9700
@@ -372,15 +434,19 @@ final class DriverController: NSObject, ObservableObject,
     var pciRevision: UInt8 = 0
 
     private var didAutoActivate = false
+    private var activationCheck: OSSystemExtensionRequest?
+    private var lifecycleRequest: OSSystemExtensionRequest?
+    private var lifecycleIsDeactivation = false
+    private var cancelledIdenticalReplacement = false
 
     // MARK: Startup flow
 
     func runStartupFlow() async {
         let bundlePath = Bundle.main.bundlePath
         append("launched from \(bundlePath)")
-        refreshVersions()
 
         if !bundlePath.hasPrefix("/Applications/") {
+            refreshVersions()
             // Step 1: not in /Applications. Need user to opt in.
             needsMoveToApplications = true
             status = "needs install"
@@ -393,7 +459,7 @@ final class DriverController: NSObject, ObservableObject,
         // Step 2: in /Applications. Auto-activate the dext.
         if !didAutoActivate {
             didAutoActivate = true
-            append("running from /Applications — submitting activation request")
+            append("running from /Applications — checking whether activation is needed")
             requestActivate()
         }
     }
@@ -401,6 +467,10 @@ final class DriverController: NSObject, ObservableObject,
     // MARK: Step 1 — install to /Applications
 
     func installToApplications() {
+        guard !isWorking else {
+            append("install deferred: another operation is running")
+            return
+        }
         isWorking = true
         status = "installing…"
         statusColor = .orange
@@ -445,21 +515,32 @@ final class DriverController: NSObject, ObservableObject,
         // child of this process.
         let config = NSWorkspace.OpenConfiguration()
         config.activates = true
+        config.createsNewApplicationInstance = true
         NSWorkspace.shared.openApplication(at: appURL,
-                                            configuration: config) { _, error in
-            if let error {
-                Task { @MainActor in
+                                            configuration: config) { app, error in
+            Task { @MainActor in
+                if let error {
                     self.append("relaunch failed: \(error.localizedDescription)")
                     self.status = "relaunch failed"
                     self.statusColor = .red
                     self.isWorking = false
+                    return
                 }
-                return
-            }
-            // Give the new instance a beat to claim the foreground
-            // before this one exits.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                NSApp.terminate(nil)
+                guard let app, !app.isTerminated,
+                      app.processIdentifier != ProcessInfo.processInfo.processIdentifier,
+                      app.bundleURL?.standardizedFileURL == appURL.standardizedFileURL
+                else {
+                    self.append("relaunch did not confirm a separate /Applications instance; keeping this window open")
+                    self.status = "relaunch failed"
+                    self.statusColor = .red
+                    self.isWorking = false
+                    return
+                }
+                self.append("relaunch confirmed: PID \(app.processIdentifier)")
+                // Give the confirmed new instance a beat to claim the foreground.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    NSApp.terminate(nil)
+                }
             }
         }
     }
@@ -467,28 +548,83 @@ final class DriverController: NSObject, ObservableObject,
     // MARK: Step 2 — activate / deactivate the dext
 
     func requestActivate() {
+        guard !isWorking, activationCheck == nil, lifecycleRequest == nil else {
+            append("activation deferred: another operation or approval is pending")
+            return
+        }
         isWorking = true
-        status = "activating…"
+        bundledVersion = readBundledVersion()
+        status = "checking installed driver…"
         statusColor = .orange
-        append("OSSystemExtensionRequest.activationRequest("
-               + "\(dextBundleIdentifier))")
-        let req = OSSystemExtensionRequest.activationRequest(
-            forExtensionWithIdentifier: dextBundleIdentifier,
-            queue: .main)
+        let req = OSSystemExtensionRequest.propertiesRequest(
+            forExtensionWithIdentifier: dextBundleIdentifier, queue: .main)
+        activationCheck = req
         req.delegate = self
         OSSystemExtensionManager.shared.submitRequest(req)
     }
 
-    func requestDeactivate() {
-        isWorking = true
-        status = "deactivating…"
+    private func submitActivation() {
+        status = "preparing driver upgrade…"
         statusColor = .orange
-        append("OSSystemExtensionRequest.deactivationRequest")
-        let req = OSSystemExtensionRequest.deactivationRequest(
-            forExtensionWithIdentifier: dextBundleIdentifier,
-            queue: .main)
-        req.delegate = self
-        OSSystemExtensionManager.shared.submitRequest(req)
+        Task { [weak self] in
+            guard let self else { return }
+            // Compatible legacy drivers may be stopped even though they cannot
+            // answer the new runtime identity query. Never initialize them.
+            if self.openUserClient(allowUnverified: true) {
+                guard await self.stopGPUConnection(), self.closeUserClientForLifecycle() else {
+                    self.append("activation cancelled: the old GPU session could not be stopped safely")
+                    self.isWorking = false
+                    return
+                }
+            } else if self.lastConnectionError != kIOReturnNotFound {
+                self.append("activation cancelled: the existing driver could not be contacted for safe shutdown")
+                self.isWorking = false
+                return
+            }
+            self.status = "activating…"
+            self.statusColor = .orange
+            self.append("OSSystemExtensionRequest.activationRequest(\(self.dextBundleIdentifier))")
+            let req = OSSystemExtensionRequest.activationRequest(
+                forExtensionWithIdentifier: self.dextBundleIdentifier, queue: .main)
+            self.lifecycleRequest = req
+            self.lifecycleIsDeactivation = false
+            self.cancelledIdenticalReplacement = false
+            req.delegate = self
+            OSSystemExtensionManager.shared.submitRequest(req)
+        }
+    }
+
+    func requestDeactivate() {
+        guard !isWorking, activationCheck == nil, lifecycleRequest == nil else {
+            append("deactivation deferred: another operation or approval is pending")
+            return
+        }
+        isWorking = true
+        status = "preparing driver deactivation…"
+        statusColor = .orange
+        Task { [weak self] in
+            guard let self else { return }
+            if self.openUserClient(allowUnverified: true) {
+                guard await self.stopGPUConnection(), self.closeUserClientForLifecycle() else {
+                    self.append("deactivation cancelled: the GPU session could not be stopped safely")
+                    self.isWorking = false
+                    return
+                }
+            } else if self.lastConnectionError != kIOReturnNotFound {
+                self.append("deactivation cancelled: the driver could not be contacted for safe shutdown")
+                self.isWorking = false
+                return
+            }
+            self.status = "deactivating…"
+            self.append("OSSystemExtensionRequest.deactivationRequest")
+            let req = OSSystemExtensionRequest.deactivationRequest(
+                forExtensionWithIdentifier: self.dextBundleIdentifier, queue: .main)
+            self.lifecycleRequest = req
+            self.lifecycleIsDeactivation = true
+            self.cancelledIdenticalReplacement = false
+            req.delegate = self
+            OSSystemExtensionManager.shared.submitRequest(req)
+        }
     }
 
     // MARK: OSSystemExtensionRequestDelegate
@@ -498,21 +634,27 @@ final class DriverController: NSObject, ObservableObject,
                  withExtension ext: OSSystemExtensionProperties)
         -> OSSystemExtensionRequest.ReplacementAction
     {
-        append("replacing existing \(existing.bundleShortVersion) → "
-               + "\(ext.bundleShortVersion)")
+        guard request === lifecycleRequest else { return .cancel }
+        if existing.bundleShortVersion == ext.bundleShortVersion &&
+           existing.bundleVersion == ext.bundleVersion {
+            cancelledIdenticalReplacement = true
+            append("identical driver build \(ext.bundleShortVersion) (\(ext.bundleVersion)); replacement cancelled — increment the build number for changed drivers")
+            return .cancel
+        }
+        append("replacing existing \(existing.bundleShortVersion) (\(existing.bundleVersion)) → "
+               + "\(ext.bundleShortVersion) (\(ext.bundleVersion))")
         return .replace
     }
 
     func requestNeedsUserApproval(_ request: OSSystemExtensionRequest) {
+        guard request === lifecycleRequest else { return }
         append("user approval required — open System Settings → General "
                + "→ Login Items & Extensions → Driver Extensions, toggle "
                + "MacAMDGPU on")
         status = "approval required"
         statusColor = .yellow
-        // Don't keep the buttons greyed out — the OS hands the
-        // approval flow to System Settings; the user may take a while
-        // and we want to let them retry / deactivate manually.
-        isWorking = false
+        // The activation remains pending while System Settings handles approval.
+        // Keep lifecycle operations and hardware tests blocked until its callback.
         // Pop System Settings to the right pane (Tahoe path).
         if let url = URL(string:
             "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {
@@ -523,12 +665,20 @@ final class DriverController: NSObject, ObservableObject,
     func request(_ request: OSSystemExtensionRequest,
                  didFinishWithResult result: OSSystemExtensionRequest.Result)
     {
+        guard request === lifecycleRequest else { return }
+        lifecycleRequest = nil
         isWorking = false
         switch result {
         case .completed:
             append("request completed")
-            status = "installed"
-            statusColor = .green
+            status = lifecycleIsDeactivation ? "removed" : "registered — verifying attachment"
+            statusColor = lifecycleIsDeactivation ? .green : .orange
+            if lifecycleIsDeactivation {
+                runningVersion = "not connected"
+                runningVersionMatch = false
+            } else {
+                startRuntimeVerification()
+            }
         case .willCompleteAfterReboot:
             append("request will complete after reboot")
             status = "reboot required"
@@ -538,11 +688,29 @@ final class DriverController: NSObject, ObservableObject,
             status = "unknown"
             statusColor = .secondary
         }
+        refreshVersions()
     }
 
     func request(_ request: OSSystemExtensionRequest,
                  foundProperties properties: [OSSystemExtensionProperties])
     {
+        defer {
+            if request === activationCheck {
+                activationCheck = nil
+                let exactEnabled = properties.contains {
+                    $0.isEnabled && !$0.isUninstalling &&
+                    "\($0.bundleShortVersion) (\($0.bundleVersion))" == bundledVersion
+                }
+                if exactEnabled {
+                    append("driver \(bundledVersion) is already enabled; activation skipped")
+                    status = "registered — verifying attachment"
+                    statusColor = .orange
+                    startRuntimeVerification()
+                } else {
+                    submitActivation()
+                }
+            }
+        }
         if properties.isEmpty {
             installedVersion = "not installed"
             versionMatch = false
@@ -550,7 +718,7 @@ final class DriverController: NSObject, ObservableObject,
         }
         // macOS keeps zombie 'waiting to uninstall on reboot' entries
         // alongside the live one across version bumps. Prefer the
-        // genuinely-running one (isEnabled && !isUninstalling), else
+        // currently enabled registration (not proof of a running process), else
         // fall back to the highest version we have on disk.
         let active = properties.first {
                         $0.isEnabled && !$0.isUninstalling
@@ -564,9 +732,7 @@ final class DriverController: NSObject, ObservableObject,
         let build = active.bundleVersion
         installedVersion = "\(short) (\(build))"
         // Compare against the bundled one we already computed.
-        let bundledShort = (bundledVersion as NSString)
-            .components(separatedBy: " ").first ?? ""
-        versionMatch = bundledShort == short
+        versionMatch = bundledVersion == "\(short) (\(build))"
         let stateBits: [String] = [
             active.isEnabled ? "enabled" : "",
             active.isAwaitingUserApproval ? "awaiting-approval" : "",
@@ -579,7 +745,29 @@ final class DriverController: NSObject, ObservableObject,
     func request(_ request: OSSystemExtensionRequest,
                  didFailWithError error: any Error)
     {
-        isWorking = false
+        if request === activationCheck {
+            activationCheck = nil
+            isWorking = false
+            append("installed-driver check failed; activation was not submitted")
+        } else if request === lifecycleRequest {
+            lifecycleRequest = nil
+            isWorking = false
+            let nsError = error as NSError
+            if cancelledIdenticalReplacement &&
+               nsError.domain == OSSystemExtensionErrorDomain &&
+               nsError.code == OSSystemExtensionError.Code.requestCanceled.rawValue {
+                cancelledIdenticalReplacement = false
+                append("identical-build replacement cancelled; existing driver was left unchanged")
+                status = "replacement skipped"
+                statusColor = .secondary
+                refreshVersions()
+                return
+            }
+        } else {
+            // A Refresh failure must not unlock a concurrent activation or bringup.
+            append("version refresh failed: \(error.localizedDescription)")
+            return
+        }
         append("request failed: \(error.localizedDescription)")
         if let osErr = error as? OSSystemExtensionError {
             append("  OSSystemExtensionError code=\(osErr.errorCode)")
@@ -591,6 +779,74 @@ final class DriverController: NSObject, ObservableObject,
     // MARK: User-client connection (talks to the dext directly)
 
     private var ucConn: io_connect_t = 0
+
+    private func closeUserClientForLifecycle() -> Bool {
+        guard ucConn != 0 else { return true }
+        let kr = IOServiceClose(ucConn)
+        guard kr == KERN_SUCCESS else {
+            append(String(format: "user-client close failed: %#x; lifecycle request not submitted", kr))
+            status = "user-client close failed"
+            statusColor = .red
+            return false
+        }
+        ucConn = 0
+        append("user client closed before driver lifecycle request")
+        return true
+    }
+
+    /// Reset-based teardown is separate from extension activation. A successful
+    /// stop gives Initialize a fresh context without asking macOS to unload the
+    /// driver binary; binary replacement still uses Install Driver.
+    func shutdownGPU(reinitialize: Bool = false) {
+        guard !isWorking, activationCheck == nil, lifecycleRequest == nil else {
+            append("GPU stop deferred: another operation or approval is pending")
+            return
+        }
+        guard openUserClient(allowUnverified: true) else { return }
+        isWorking = true
+        Task { [weak self] in
+            guard let self else { return }
+            guard await self.stopGPUConnection(), self.closeUserClientForLifecycle() else {
+                self.isWorking = false
+                return
+            }
+            self.pciDeviceId = 0
+            self.pciRevision = 0
+            self.status = "GPU stopped — ready to initialize"
+            self.statusColor = .green
+            self.isWorking = false
+            if reinitialize { self.initializeGPU() }
+        }
+    }
+
+    // Shared by explicit Stop/Restart and activation preparation. FLR is a
+    // blocking RPC, so it runs away from the UI actor with controls disabled.
+    private func stopGPUConnection() async -> Bool {
+        guard ucConn != 0 else { return false }
+        let connection = ucConn
+        status = "stopping GPU…"
+        statusColor = .orange
+        append("Stop GPU: block submissions → disable DMA → drain PCIe → function reset → release session")
+        let result = await Task.detached(priority: .userInitiated) {
+            var output = [UInt64](repeating: 0, count: 2)
+            var count: UInt32 = 2
+            let kr = IOConnectCallScalarMethod(connection, kSelShutdownGPU,
+                                               nil, 0, &output, &count)
+            return (kr, output, count)
+        }.value
+        let (kr, output, count) = result
+        let operation = kr == KERN_SUCCESS && count == 2
+            ? UInt32(truncatingIfNeeded: output[0]) : UInt32(bitPattern: kr)
+        guard kr == KERN_SUCCESS, count == 2, operation == 0, output[1] == 6 else {
+            append(String(format: "Stop GPU failed: transport=%#x operation=%#x phase=%llu", kr, operation, output[1]))
+            append("Session backing was not released by Stop GPU. Close other clients or mapped/interrupt sessions before retrying; an unavailable reset may still require a hardware power cycle.")
+            status = "GPU stop failed — see log"
+            statusColor = .red
+            return false
+        }
+        append("Stop GPU complete: function reset succeeded, PCI closed, session resources released. The enclosure remains powered.")
+        return true
+    }
 
     /// Open the dext's IOUserUserClient. Idempotent.
     ///
@@ -605,60 +861,139 @@ final class DriverController: NSObject, ObservableObject,
     /// `DK: <SomeAppleDext>:UC failed userclient-access check, needed
     /// bundle ID com.apple.DriverKit-...` is the giveaway.
     @discardableResult
-    func openUserClient() -> Bool {
-        if ucConn != 0 { return true }
-        guard let raw = IOServiceMatching("IOUserService") else {
-            append("openUserClient: IOServiceMatching nil")
+    func openUserClient(allowUnverified: Bool = false) -> Bool {
+        guard activationCheck == nil, lifecycleRequest == nil, !runtimeVerificationInProgress else {
+            append("hardware operation deferred: driver lifecycle request or approval is pending")
             return false
         }
-        var iter: io_iterator_t = 0
-        guard IOServiceGetMatchingServices(kIOMainPortDefault,
-                                           raw as CFDictionary,
-                                           &iter) == KERN_SUCCESS else {
-            append("openUserClient: IOServiceGetMatchingServices failed")
+        if ucConn == 0 {
+            let opened = Self.openDriverConnection(bundleID: dextBundleIdentifier)
+            lastConnectionError = opened.0
+            guard opened.0 == KERN_SUCCESS else {
+                append(String(format: "openUserClient: no usable driver connection (kr=%#x)", opened.0))
+                return false
+            }
+            ucConn = opened.1
+        }
+        let identity = Self.queryRuntime(connection: ucConn)
+        updateRuntimeDisplay(identity)
+        guard identity.permitsConnection(expectedBuild: expectedDriverBuild,
+                                          allowUnverified: allowUnverified) else {
+            append("GPU operation blocked: responding driver build does not match the bundled build; installed metadata does not prove attachment")
+            _ = closeUserClientForLifecycle()
             return false
         }
-        defer { IOObjectRelease(iter) }
+        lastConnectionError = KERN_SUCCESS
+        return true
+    }
 
-        var svc: io_service_t = IOIteratorNext(iter)
-        var candidates = 0
+    nonisolated private static func openDriverConnection(bundleID: String) -> (Int32, io_connect_t) {
+        guard let raw = IOServiceMatching("IOUserService") else { return (kIOReturnNotFound, 0) }
+        var iter: io_iterator_t = 0
+        let matched = IOServiceGetMatchingServices(kIOMainPortDefault, raw as CFDictionary, &iter)
+        guard matched == KERN_SUCCESS else { return (matched, 0) }
+        defer { IOObjectRelease(iter) }
+        var svc = IOIteratorNext(iter)
         while svc != 0 {
-            candidates += 1
-            // Pull CFBundleIdentifier from the matched personality and
-            // compare to our dext bundle ID.
             var props: Unmanaged<CFMutableDictionary>?
-            let kr = IORegistryEntryCreateCFProperties(
-                svc, &props, kCFAllocatorDefault, 0)
-            if kr == KERN_SUCCESS, let dict = props?.takeRetainedValue()
-                as? [String: Any]
-            {
-                let bid = dict["CFBundleIdentifier"] as? String
-                let userClass = dict["IOUserClass"] as? String
-                if bid == dextBundleIdentifier ||
-                   userClass == "MacAMDGPU"
-                {
-                    var conn: io_connect_t = 0
-                    let ok = IOServiceOpen(svc, mach_task_self_, 0, &conn)
-                    IOObjectRelease(svc)
-                    guard ok == KERN_SUCCESS else {
-                        append(String(format:
-                            "openUserClient: matched bid=%@ but "
-                          + "IOServiceOpen kr=%#x",
-                            bid ?? "?", ok))
-                        return false
-                    }
-                    ucConn = conn
-                    append("openUserClient: connected to "
-                           + "\(bid ?? "?") (handle=\(conn))")
-                    return true
-                }
+            let kr = IORegistryEntryCreateCFProperties(svc, &props, kCFAllocatorDefault, 0)
+            let dict = props?.takeRetainedValue() as? [String: Any]
+            if kr == KERN_SUCCESS,
+               dict?["CFBundleIdentifier"] as? String == bundleID || dict?["IOUserClass"] as? String == "MacAMDGPU" {
+                var conn: io_connect_t = 0
+                let opened = IOServiceOpen(svc, mach_task_self_, 0, &conn)
+                IOObjectRelease(svc)
+                if opened != KERN_SUCCESS, conn != 0 { IOServiceClose(conn) }
+                return (opened, opened == KERN_SUCCESS ? conn : 0)
             }
             IOObjectRelease(svc)
             svc = IOIteratorNext(iter)
         }
-        append("openUserClient: scanned \(candidates) IOUserService "
-               + "candidates, none matched bundle id \(dextBundleIdentifier)")
-        return false
+        return (kIOReturnNotFound, 0)
+    }
+
+    nonisolated private static func queryRuntime(connection: io_connect_t) -> DriverRuntimeIdentity {
+        var output = [UInt64](repeating: 0, count: 3)
+        var count: UInt32 = 3
+        let kr = IOConnectCallScalarMethod(connection, kSelRuntimeBuild, nil, 0, &output, &count)
+        return DriverRuntimeIdentity(transport: kr, output: output, count: count)
+    }
+
+    private func updateRuntimeDisplay(_ identity: DriverRuntimeIdentity) {
+        runningVersionMatch = identity.permitsHardware(expectedBuild: expectedDriverBuild)
+        if let build = identity.build {
+            runningVersion = runningVersionMatch ? "build \(build) verified" : "build \(build) — differs"
+        } else {
+            runningVersion = "unverified / older driver"
+        }
+    }
+
+    func verifyRunningDriver() {
+        guard !isWorking, activationCheck == nil, lifecycleRequest == nil else { return }
+        startRuntimeVerification()
+    }
+
+    nonisolated private static func probeRuntime(bundleID: String,
+                                                   existingConnection: io_connect_t) -> DriverRuntimeProbe {
+        if existingConnection != 0 {
+            // Verification of an active session must not close its PCI owner.
+            return DriverRuntimeProbe(connectionError: KERN_SUCCESS,
+                                      identity: queryRuntime(connection: existingConnection))
+        }
+        let opened = openDriverConnection(bundleID: bundleID)
+        guard opened.0 == KERN_SUCCESS else {
+            return DriverRuntimeProbe(connectionError: opened.0,
+                identity: DriverRuntimeIdentity(transport: opened.0, output: [], count: 0))
+        }
+        defer { IOServiceClose(opened.1) }
+        return DriverRuntimeProbe(connectionError: KERN_SUCCESS,
+                                  identity: queryRuntime(connection: opened.1))
+    }
+
+    private func startRuntimeVerification() {
+        guard !runtimeVerificationInProgress, activationCheck == nil, lifecycleRequest == nil else { return }
+        runtimeVerificationInProgress = true
+        isWorking = true
+        runningVersionMatch = false
+        runningVersion = "checking…"
+        status = "verifying running driver…"
+        statusColor = .orange
+        let bundleID = dextBundleIdentifier
+        let existingConnection = ucConn
+        Task { [weak self] in
+            guard let self else { return }
+            defer {
+                self.runtimeVerificationInProgress = false
+                self.isWorking = false
+            }
+            var lastConnectionError: Int32 = kIOReturnNotFound
+            // A finite retry window accommodates kernel rematching. Temporary
+            // probes always close; an existing initialized session stays open.
+            // These calls never open PCI, submit commands or reset hardware.
+            for attempt in 0..<12 {
+                let probe = await Task.detached(priority: .utility) {
+                    Self.probeRuntime(bundleID: bundleID, existingConnection: existingConnection)
+                }.value
+                lastConnectionError = probe.connectionError
+                self.updateRuntimeDisplay(probe.identity)
+                if self.runningVersionMatch {
+                    self.append("running driver verified directly: \(self.runningVersion)")
+                    self.status = "driver ready — runtime verified"
+                    self.statusColor = .green
+                    return
+                }
+                if attempt < 11 { try? await Task.sleep(nanoseconds: 500_000_000) }
+            }
+            if lastConnectionError == kIOReturnNotFound {
+                self.runningVersion = "no attached driver"
+                self.status = "GPU unavailable — no driver service"
+                self.append("No MacAMDGPU service is attached. Check that the GPU is connected; registration alone does not mean a driver has matched it.")
+            } else {
+                self.status = "driver handoff pending — see log"
+                self.append("Responding driver is unverified or has a different build. macOS may still be retiring the old process; this app does not force-terminate it. GPU tests remain blocked.")
+            }
+            self.statusColor = .orange
+        }
     }
 
     private func callScalar(_ selector: UInt32,
@@ -733,19 +1068,24 @@ final class DriverController: NSObject, ObservableObject,
         guard openUserClient() else { return }
         for i in 0..<6 {
             let (kr, out) = callScalar(kSelGetBARInfo,
-                                       input: [UInt64(i)],
-                                       outCount: 3)
-            if kr == KERN_SUCCESS && out.count >= 3 {
-                let type = out[0]
-                let size = out[1]
-                let pref = out[2]
-                if size != 0 {
-                    append(String(format:
-                        "bar[%d]: type=%d size=%#llx pref=%d",
-                        i, Int(type), size, Int(pref)))
+                                       input: [UInt64(i)], outCount: 3)
+            guard kr == KERN_SUCCESS, out.count >= 3, out[1] != 0 else { continue }
+            append(String(format: "BAR%d: memoryIndex=%llu size=%llu KiB type=%#llx",
+                          i, out[0], out[1] >> 10, out[2]))
+            let (rebarKr, r) = callScalar(kSelGetReBARInfo,
+                                          input: [UInt64(i)], outCount: 6)
+            if rebarKr == KERN_SUCCESS && r.count == 6 {
+                let supported = (0..<28).filter { r[3] & (UInt64(1) << $0) != 0 }
+                    .map { "\(UInt64(1) << $0) MiB" }.joined(separator: ", ")
+                append("  ReBAR: supported [\(supported)], selected \(r[4] >> 20) MiB, macOS assigned \(r[5] >> 20) MiB")
+                if r[4] != r[5] {
+                    append("  ReBAR size differs from the macOS mapping; only the assigned mapping is usable.")
                 }
+            } else {
+                append(String(format: "  ReBAR query unavailable: kr=%#x (absent capability, access error, or older driver)", rebarKr))
             }
         }
+        append("ReBAR is queried only. This driver has no public PCIDriverKit API to request larger PCI bridge windows.")
     }
 
     func testQueryInfo() {
@@ -845,8 +1185,8 @@ final class DriverController: NSObject, ObservableObject,
         1: "IPDiscovery", 2: "IHInit", 3: "GMCInit",
         4: "PSPInit", 5: "PSPLoadSOS", 6: "PSPRingCreate",
         7: "TMRSetup", 8: "PSPFwLoad", 9: "SMUInit", 10: "IMUInit",
-        11: "RLCInit", 12: "CPInit", 13: "MESInit",
-        14: "GFXInit", 15: "SDMAInit"
+        11: "RLCInit", 12: "CPInit (prepare)", 13: "MESInit",
+        14: "GFXInit (queue resume)", 15: "SDMAInit"
     ]
     // Stage progression for initializeGPU(). LoadFirmware(SMU/IMU/RLC/CP/MES/SDMA)
     // is interleaved between TMRSetup and PSPFwLoad — see
@@ -927,8 +1267,8 @@ final class DriverController: NSObject, ObservableObject,
             "psp/C2PMSG_64 (ring base low):       %#010x",
             c64))
         append(String(format:
-            "psp/C2PMSG_81 (sOS sign-of-life, bit 31): %#010x %@",
-            c81, (c81 & 0x80000000) != 0 ? "✓ ALIVE" : "✗ NOT ALIVE"))
+            "psp/C2PMSG_81 (sOS sign-of-life, nonzero): %#010x %@",
+            c81, c81 != 0 ? "✓ ALIVE" : "✗ NOT ALIVE"))
         append("psp/ring created: \(ringCreated)")
         let wptr = UInt32(out[11] & 0xFFFFFFFF)
         append(String(format: "psp/C2PMSG_67 (ring wptr, dwords): %#010x", wptr))
@@ -1239,7 +1579,7 @@ final class DriverController: NSObject, ObservableObject,
         // bytes=4096, instance=0 (defaults)
         let (kr, out) = callScalar(kSelSDMACopyVRAM,
                                    input: [4096, 0],
-                                   outCount: 7)
+                                   outCount: 12)
         if kr != KERN_SUCCESS {
             append(String(format:
                 "SDMA Copy: kr=%#x (dext rejected the call)", kr))
@@ -1254,8 +1594,9 @@ final class DriverController: NSObject, ObservableObject,
         let mismatched = UInt32(out[2] & 0xFFFFFFFF)
         let firstBad   = UInt32(out[3] & 0xFFFFFFFF)
         let bytes      = out[4]
-        let srcVA      = UInt32(out[5] & 0xFFFFFFFF)
-        let dstVA      = UInt32(out[6] & 0xFFFFFFFF)
+        let extended = out.count >= 12 && out[9] == 0x53444d41
+        let srcVA = extended ? out[10] : out[5]
+        let dstVA = extended ? out[11] : out[6]
 
         // Decode the SDMA status. kIOReturnSuccess == 0; the canonical
         // mac error codes (kIOReturnTimeout etc.) are full mach codes,
@@ -1282,7 +1623,14 @@ final class DriverController: NSObject, ObservableObject,
             "SDMA Copy: %llu B status=%d (%@) mismatched=%u elapsed=%llu µs",
             bytes, status, statusLabel, mismatched, elapsedUs))
         append(String(format:
-            "  src=0x%08x dst=0x%08x", srcVA, dstVA))
+            "  src=%#llx dst=%#llx%@", srcVA, dstVA,
+            extended ? "" : " (low 32 bits; older driver)"))
+        if extended {
+            append("  source upload: \(out[7]) mismatches before SDMA submit")
+            if out[7] != 0 {
+                append(String(format: "  source upload failed at byte %#llx; SDMA copy was not submitted", out[8]))
+            }
+        }
         if mismatched > 0 {
             append(String(format:
                 "  first mismatched dword @ byte_offset=0x%x (%u/%llu mismatches)",
@@ -1307,9 +1655,9 @@ final class DriverController: NSObject, ObservableObject,
     func testCPKIQSmoke() {
         guard openUserClient() else { return }
         let (kr, out) = callScalar(kSelCPKIQSmoke, outCount: 6)
-        if out.count < 6 {
+        if kr != KERN_SUCCESS || out.count < 6 {
             append(String(format:
-                "CP KIQ Smoke: kr=%#x (no scalars returned)", kr))
+                "CP GFX Fence: FAIL kr=%#x (no valid diagnostic reply)", kr))
             return
         }
         let status   = UInt32(out[0] & 0xFFFFFFFF)
@@ -1319,10 +1667,16 @@ final class DriverController: NSObject, ObservableObject,
         let lo       = out[4] & 0xFFFFFFFF
         let hi       = out[5] & 0xFFFFFFFF
         let gpuVa    = (hi << 32) | lo
-        let okLabel  = (status == 0) ? "OK" : "FAIL"
+        let okLabel = (status == 0 && expected == 0xDEADBEEF && observed == expected)
+            ? "OK" : "FAIL"
         append(String(format:
-            "CP KIQ Smoke: status=%#x (%@) elapsed=%llu us",
+            "CP GFX Fence: status=%#x (%@) elapsed=%llu us",
             status, okLabel, elapsed))
+        if gpuVa == 0 && status != 0 {
+            append(String(format: "  CP register-test/preflight failed (observed=%#x); memory fence was not submitted", observed))
+            return
+        }
+        append("  CP register-write test passed")
         append(String(format:
             "  fence expected=%#x observed=%#x @ gpu_va=%#llx",
             expected, observed, gpuVa))
@@ -1331,52 +1685,71 @@ final class DriverController: NSObject, ObservableObject,
         }
     }
 
-    // v0.1.28 — exercise the command-stream submission ABI end-to-end:
-    //   CSCreate(SDMA) → CSWriteDwords(NOP*4) → SubmitIB → WaitFence(1s) → CSDestroy.
-    //
-    // SDMA OP_NOP is `0` (the whole header dword) which the engine
-    // happily consumes; we emit four to prove that bulk-append works
-    // and that the trailing FENCE packet the dext appends signals
-    // correctly. This is the SDMA-only first pass — GFX/Compute path
-    // returns kIOReturnUnsupported until v0.1.29 lands MES user-queues.
-    func testCSSmokeSDMA() {
+    func testHostMemoryTransfer() {
         guard openUserClient() else { return }
-
-        // Step 1: create CS on SDMA engine 0.
-        let (krC, outC) = callScalar(kSelCSCreate,
-                                     input: [kCSIPTypeSDMA, 0],
-                                     outCount: 1)
-        guard krC == KERN_SUCCESS, let handle = outC.first, handle != 0 else {
-            append(String(format: "CS smoke: CSCreate failed kr=%#x", krC))
+        let seed = UInt32(truncatingIfNeeded: DispatchTime.now().uptimeNanoseconds)
+        append("Host Memory Copy: starting 16 KB host → VRAM → host verification")
+        let (kr, out) = callScalar(kSelHostMemoryTest, input: [UInt64(seed)], outCount: 6)
+        guard kr == KERN_SUCCESS, out.count == 6 else {
+            append(String(format: "Host Memory Copy: RPC failed kr=%#x", kr))
             return
         }
-        append(String(format: "CS smoke: created handle=%#llx (SDMA0)", handle))
+        let stages = ["preflight", "allocate/map", "upload", "GPU read",
+                      "verify VRAM", "GPU write", "verify host", "unbind", "complete"]
+        let stage = out[1] < UInt64(stages.count) ? stages[Int(out[1])] : "unknown"
+        append(String(format: "Host Memory Copy: status=%#llx stage=%@ mismatches=%llu",
+                      out[0], stage, out[2]))
+        append(String(format: "  host GPU VA=%#llx VRAM GPU VA=%#llx seed=%#x", out[4], out[5], seed))
+        if out[2] != 0 {
+            append(String(format: "  first mismatch at byte offset=%#llx", out[3]))
+        }
+        if out[0] == 0 && out[1] == 8 {
+            append("Host Memory Copy: GPU read and write verified; mappings released")
+        } else if out[1] != 0 {
+            append("Host Memory Copy: session retained for recovery — Stop GPU before retry")
+        }
+    }
 
-        // Step 2: append 4 dwords (SDMA NOPs).
-        // CSWriteDwords expects 10 scalars: [handle, dw0..dw7, count].
-        let writeIn: [UInt64] = [handle,
-                                 0, 0, 0, 0, 0, 0, 0, 0,  // 8 NOP dwords
-                                 4]                        // count=4
+    // Exercise the command-stream handle API on SDMA0 or the kernel GFX queue.
+    // GFX NOP uses a PACKET3 header plus one payload dword; SDMA NOP is zero.
+    func testCSSmoke(gfx: Bool = false) {
+        guard openUserClient() else { return }
+
+        let engine = gfx ? "GFX0" : "SDMA0"
+        let ipType = gfx ? kCSIPTypeGFX : kCSIPTypeSDMA
+        // Step 1: create CS on the selected engine.
+        let (krC, outC) = callScalar(kSelCSCreate,
+                                     input: [ipType, 0],
+                                     outCount: 1)
+        guard krC == KERN_SUCCESS, let handle = outC.first, handle != 0 else {
+            append(String(format: "\(engine) CS smoke: CSCreate failed kr=%#x", krC))
+            return
+        }
+        append(String(format: "\(engine) CS smoke: created handle=%#llx", handle))
+
+        // CSWriteDwords expects [handle, dw0..dw7, count].
+        let nop: UInt64 = gfx ? 0xc0001000 : 0
+        let writeIn: [UInt64] = [handle, nop, 0, nop, 0, 0, 0, 0, 0, 4]
         let (krW, _) = callScalar(kSelCSWriteDwords,
                                   input: writeIn,
                                   outCount: 1)
         if krW != KERN_SUCCESS {
-            append(String(format: "CS smoke: CSWriteDwords failed kr=%#x", krW))
+            append(String(format: "\(engine) CS smoke: CSWriteDwords failed kr=%#x", krW))
             _ = callScalar(kSelCSDestroy, input: [handle], outCount: 1)
             return
         }
-        append("CS smoke: appended 4 NOP dwords")
+        append("\(engine) CS smoke: appended 4 NOP dwords")
 
         // Step 3: submit.
         let (krS, outS) = callScalar(kSelSubmitIB,
                                      input: [handle],
                                      outCount: 1)
         guard krS == KERN_SUCCESS, let fence = outS.first else {
-            append(String(format: "CS smoke: SubmitIB failed kr=%#x", krS))
+            append(String(format: "\(engine) CS smoke: SubmitIB failed kr=%#x", krS))
             _ = callScalar(kSelCSDestroy, input: [handle], outCount: 1)
             return
         }
-        append(String(format: "CS smoke: submitted, fence_handle=%#llx", fence))
+        append(String(format: "\(engine) CS smoke: submitted, fence_handle=%#llx", fence))
 
         // Step 4: wait 1 s (timeout in ns).
         let (krWf, outWf) = callScalar(kSelWaitFence,
@@ -1385,12 +1758,12 @@ final class DriverController: NSObject, ObservableObject,
         let status = outWf.first ?? 0xFF
         switch krWf {
         case KERN_SUCCESS where status == 0:
-            append("CS smoke: WaitFence ok — fence signaled")
+            append("\(engine) CS smoke: WaitFence ok — fence signaled")
         case KERN_SUCCESS:
-            append(String(format: "CS smoke: WaitFence ok but status=%llu", status))
+            append(String(format: "\(engine) CS smoke: WaitFence ok but status=%llu", status))
         default:
             append(String(format:
-                "CS smoke: WaitFence kr=%#x status=%llu", krWf, status))
+                "\(engine) CS smoke: WaitFence kr=%#x status=%llu", krWf, status))
         }
 
         // Step 5: destroy.
@@ -1398,9 +1771,9 @@ final class DriverController: NSObject, ObservableObject,
                                   input: [handle],
                                   outCount: 1)
         if krD != KERN_SUCCESS {
-            append(String(format: "CS smoke: CSDestroy kr=%#x", krD))
+            append(String(format: "\(engine) CS smoke: CSDestroy kr=%#x", krD))
         } else {
-            append("CS smoke: destroyed handle")
+            append("\(engine) CS smoke: destroyed handle")
         }
     }
 
@@ -1593,9 +1966,9 @@ final class DriverController: NSObject, ObservableObject,
     }
 
     // initializeGPU: one-button bring-up that logs EVERY step it
-    // attempts with a "→ start" line and a result line, and continues
-    // past failures so the user sees the full ladder.
-    func initializeGPU() {
+    // attempts with a "→ start" line and a result line, stopping at
+    // the first failure so later stages cannot hide an incomplete setup.
+    func initializeGPU(stopAfterFirmware: Bool = false) {
         guard !isWorking else {
             append("initializeGPU: already running")
             return
@@ -1604,16 +1977,16 @@ final class DriverController: NSObject, ObservableObject,
         status = "initializing GPU…"
         statusColor = .orange
         Task.detached(priority: .userInitiated) { [weak self] in
-            await self?.initializeGPUBlocking()
+            let succeeded = await self?.initializeGPUBlocking(stopAfterFirmware: stopAfterFirmware) ?? false
             await MainActor.run {
                 self?.isWorking = false
-                self?.status = "initializeGPU finished"
-                self?.statusColor = .green
+                self?.status = succeeded ? (stopAfterFirmware ? "firmware checkpoint complete" : "initialization stages complete") : "initialization failed — see log"
+                self?.statusColor = succeeded ? .green : .red
             }
         }
     }
 
-    private func initializeGPUBlocking() async {
+    private func initializeGPUBlocking(stopAfterFirmware: Bool) async -> Bool {
         append("──── initializeGPU starting ────")
 
         // Helper to log "step → start" then "step → result".
@@ -1628,7 +2001,41 @@ final class DriverController: NSObject, ObservableObject,
         let uc = step("open user client") { self.openUserClient() }
         if !uc {
             append("initializeGPU: aborted — no user client; stop here")
-            return
+            return false
+        }
+        let (stageKr, stageOut) = callScalar(kSelQueryInfo,
+                                             input: [kInfoBringupReached],
+                                             outCount: 1)
+        guard stageKr == KERN_SUCCESS, let stage = stageOut.first else {
+            append(String(format: "initializeGPU: cannot verify current stage (kr=%#x); reset was not attempted", stageKr))
+            return false
+        }
+        if stage == 15 {
+            let (identityKr, _) = callScalar(kSelGetIdentity, outCount: 7)
+            guard identityKr == KERN_SUCCESS else {
+                append("initializeGPU: previous stages completed, but PCI access is no longer active; reconnect the GPU for a fresh session")
+                return false
+            }
+            append("initializeGPU: all bringup stages are already complete; keeping the current GPU session")
+            return true
+        }
+        if stage == 8 {
+            let (identityKr, _) = callScalar(kSelGetIdentity, outCount: 7)
+            guard identityKr == KERN_SUCCESS else {
+                append("initializeGPU: firmware checkpoint lost PCI access; reconnect for a fresh session")
+                return false
+            }
+            if stopAfterFirmware {
+                append("firmware checkpoint already complete; no reset or upload performed")
+                return true
+            }
+            append("continuing from verified firmware checkpoint without resetting the GPU")
+            return initializeRemainingIPs()
+        }
+        if stage != 0 {
+            append("initializeGPU: stopped at stage \(stage); use Restart GPU to reset and rebuild this session")
+            append("Restart GPU requires a supported function reset and no other connected clients or mapped/interrupt sessions")
+            return false
         }
         // 1b. Read identity (PCI device id + revision) so we can pick
         // the kicker firmware variant where applicable.
@@ -1637,14 +2044,18 @@ final class DriverController: NSObject, ObservableObject,
         let dma = step("alloc DMA buffer") { self.ensureDMABuffer() }
         if !dma {
             append("initializeGPU: aborted — no DMA buffer; stop here")
-            return
+            return false
         }
         // 3. Function-Level Reset — kicks off IFWI on cold-hotplugged
         // cards. qemu-vfio-apple does this before MMIO; we were
         // skipping it which is why C2PMSG_33 stays 0.
-        _ = step("PCIe Function-Level Reset (kicks IFWI)") {
+        let reset = step("PCIe Function-Level Reset (kicks IFWI)") {
             let (kr, _) = self.callScalar(kSelResetDevice, outCount: 0)
             return kr == KERN_SUCCESS
+        }
+        guard reset else {
+            append("initializeGPU: reset failed; firmware loading was not started")
+            return false
         }
         // Give IFWI ~150 ms to start the watchdog after reset before
         // we begin polling its status. Linux waits the same way.
@@ -1658,7 +2069,7 @@ final class DriverController: NSObject, ObservableObject,
             append("initializeGPU: discovery failed — without IP versions we")
             append("  can't construct firmware filenames. Click Diagnostics")
             append("  to inspect IFWI / BAR state.")
-            return
+            return false
         }
 
         guard let psp  = self.ipPSP?.path,
@@ -1667,7 +2078,7 @@ final class DriverController: NSObject, ObservableObject,
               let gfx  = self.ipGFX?.path
         else {
             append("initializeGPU: discovery didn't fill IP versions")
-            return
+            return false
         }
 
         // Stages 1–3: IPDiscovery → IHInit → GMCInit (no firmware needed).
@@ -1676,14 +2087,14 @@ final class DriverController: NSObject, ObservableObject,
         for s: UInt64 in [1, 2, 3] {
             if !testInitDeviceUpTo(s) {
                 append("initializeGPU: stopping early — stage \(s) failed; downstream stages depend on it")
-                return
+                return false
             }
         }
 
         // Stage 4: PSPInit (allocates fw_pri).
         if !testInitDeviceUpTo(4) {
             append("initializeGPU: stopping early — PSPInit failed")
-            return
+            return false
         }
 
         // PSP SOS firmware load. Mirror upstream amdgpu_psp.c
@@ -1701,6 +2112,7 @@ final class DriverController: NSObject, ObservableObject,
             append("\(sosName) → loaded")
         } else {
             append("\(sosName) → FAILED to load")
+            return false
         }
 
         // Stages 5–7: PSPLoadSOS → PSPRingCreate → TMRSetup. These don't
@@ -1708,7 +2120,7 @@ final class DriverController: NSObject, ObservableObject,
         for s: UInt64 in [5, 6, 7] {
             if !testInitDeviceUpTo(s) {
                 append("initializeGPU: stopping early — stage \(s) failed; downstream stages depend on it")
-                return
+                return false
             }
         }
 
@@ -1724,6 +2136,7 @@ final class DriverController: NSObject, ObservableObject,
             append("\(taName) → loaded")
         } else {
             append("\(taName) → FAILED to load (PSP autoload may stall)")
+            return false
         }
 
         // (No TOC load on psp_v14_0_3 — upstream's psp_v14_0_init_microcode
@@ -1758,33 +2171,46 @@ final class DriverController: NSObject, ObservableObject,
             append("\(smuName) → loaded")
         } else {
             append("initializeGPU: SMU PMFW load failed")
+            return false
         }
-        _ = loadFirmware(kFwFile_SDMA,    "sdma_\(sdma).bin")
-        _ = loadFirmware(kFwFile_CP_PFP,  "gc_\(gfx)_pfp.bin")
-        _ = loadFirmware(kFwFile_CP_ME,   "gc_\(gfx)_me.bin")
-        _ = loadFirmware(kFwFile_CP_MEC,  "gc_\(gfx)_mec.bin")
-        _ = loadFirmware(kFwFile_MES_UNI, "gc_\(gfx)_uni_mes.bin")
-        _ = loadFirmware(kFwFile_IMU,     imuName)
-        _ = loadFirmware(kFwFile_RLC,     rlcName)
+        guard loadFirmware(kFwFile_SDMA,    "sdma_\(sdma).bin"),
+              loadFirmware(kFwFile_CP_PFP,  "gc_\(gfx)_pfp.bin"),
+              loadFirmware(kFwFile_CP_ME,   "gc_\(gfx)_me.bin"),
+              loadFirmware(kFwFile_CP_MEC,  "gc_\(gfx)_mec.bin"),
+              loadFirmware(kFwFile_MES_UNI, "gc_\(gfx)_uni_mes.bin"),
+              loadFirmware(kFwFile_IMU,     imuName),
+              loadFirmware(kFwFile_RLC,     rlcName) else {
+            append("initializeGPU: firmware load failed; later loads and stages were not attempted")
+            return false
+        }
 
         // Stage 8: PSPFwLoad — synchronization point. Validates that
         // all firmware was loaded by the LoadFirmware calls above.
         if !testInitDeviceUpTo(8) {
             append("initializeGPU: stopping early — PSPFwLoad validation failed")
-            return
+            return false
         }
 
+        if stopAfterFirmware {
+            append("──── firmware checkpoint complete; SMU/CP/MES setup not started ────")
+            return true
+        }
+        return initializeRemainingIPs()
+    }
+
+    private func initializeRemainingIPs() -> Bool {
         // Stages 9–15: SMUInit → IMUInit → RLCInit → CPInit → MESInit →
         // GFXInit → SDMAInit. Each gates on its firmware being loaded
         // above (the microcode_loaded flags are set by LoadFirmware).
         for s: UInt64 in [9, 10, 11, 12, 13, 14, 15] {
             if !testInitDeviceUpTo(s) {
                 append("initializeGPU: stopping early — stage \(s) failed; downstream stages depend on it")
-                break
+                return false
             }
         }
 
         append("──── initializeGPU done ────")
+        return true
     }
 
     private func runFullBringupBlocking() async {
@@ -1861,6 +2287,16 @@ final class DriverController: NSObject, ObservableObject,
     }
 
     // MARK: Version reporting
+
+    private var expectedDriverBuild: UInt64? {
+        let plistURL = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/Library/SystemExtensions")
+            .appendingPathComponent(dextBundleIdentifier + ".dext/Info.plist")
+        guard let data = try? Data(contentsOf: plistURL),
+              let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any],
+              let text = plist["CFBundleVersion"] as? String else { return nil }
+        return UInt64(text)
+    }
 
     /// Read the version from the dext embedded inside this app bundle.
     private func readBundledVersion() -> String {

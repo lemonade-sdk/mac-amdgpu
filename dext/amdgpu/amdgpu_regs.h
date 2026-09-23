@@ -24,6 +24,7 @@
 #ifdef __APPLE__
 #include <PCIDriverKit/IOPCIDevice.h>
 #include <DriverKit/IOLib.h>
+#include <time.h>
 #endif
 
 //============================================================
@@ -57,11 +58,12 @@ struct DeviceContext {
     uint8_t      bar2MemIndex;
     uint8_t      bar5MemIndex;
     uint64_t     bar0Size;
-    uint64_t     bar2VisibleVRAMSize;  // small-BAR on AS
+    uint64_t     bar2Size;            // doorbell aperture, not VRAM
 #endif
     IPBaseTable  ip;
     bool         psoCAlive;
     bool         smuOnline;
+    mutable bool smuMessagePending; // serialized mailbox; retain after timeout
     bool         gmcReady;
     // Doorbell state — populated by doorbell_init().
     // On Apple Silicon BAR2 is accessed via MemoryRead/Write, not
@@ -69,20 +71,9 @@ struct DeviceContext {
     // provides ASIC-specific doorbell offsets for each ring.
     struct DoorbellState doorbell;
 
-    // **Platform health gate** — does the BAR2 doorbell aperture actually
-    // deliver writes to the chip on this platform? Defaults FALSE.
-    // On Apple Silicon + Thunderbolt 5 the answer is no:
-    // PCIDriverKit's MemoryWrite64 to the doorbell BAR2 does not
-    // reach the engine's MCU, verified v0.1.30-v0.1.46 with every
-    // routing/SELFRING/WC-flush combination. Engine ring kicks
-    // (SDMA, CP, MES) must fall back to MMIO RB_WPTR writes
-    // (upstream's use_doorbell=false branch) when this is false.
-    //
-    // Mirrored from gart.reads_supported in gart_init — same root
-    // cause (GPU-initiated PCIe path partially broken on this
-    // platform). When Apple exposes a working primitive, both flags
-    // flip together and the engine kicks use BAR2 doorbell as the
-    // sole path. [[feedback_mac_amdgpu_doorbell_mmio_mode_as_tb5]]
+    // Controls the existing CP/SDMA MMIO write-pointer fallback. MES uses
+    // BAR2-only submissions, as required by its Linux implementation. Validate
+    // each engine's routing independently; this flag is not proof of failure.
     bool         doorbell_works;
 };
 
@@ -449,28 +440,19 @@ poll_psp_response(const DeviceContext &ctx, uint32_t reg,
                   uint64_t timeout_us, uint32_t *outValue)
 {
     constexpr uint32_t kPSPStatusMask = 0x0000FFFFu;
-    const uint64_t kStepMs = 1;
-    uint64_t elapsed_us = 0;
-    uint32_t v = 0;
+    const uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     while (true) {
-        v = RREG32(ctx, reg);
-        if ((v & mask) == expected) {
-            if (outValue) *outValue = v;
-            return kIOReturnSuccess;
-        }
-        // PSP responded with non-zero status — surface the error
-        // immediately instead of timing out.
-        if ((v & 0x80000000u) && (v & kPSPStatusMask) != 0) {
-            if (outValue) *outValue = v;
-            return kIOReturnIOError;
-        }
-        if (elapsed_us >= timeout_us) {
-            if (outValue) *outValue = v;
+        const uint32_t v = RREG32(ctx, reg);
+        if (outValue) *outValue = v;
+        // Removed/unreachable PCI functions commonly read back all ones.
+        if (v == UINT32_MAX) return kIOReturnNotAttached;
+        if ((v & 0x80000000u) && (v & kPSPStatusMask)) return kIOReturnIOError;
+        if ((v & mask) == expected) return kIOReturnSuccess;
+        if ((clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start) / 1000 >= timeout_us)
             return kIOReturnTimeout;
-        }
-        IOSleep(kStepMs);
-        elapsed_us += kStepMs * 1000;
+        IOSleep(1);
     }
+
 }
 #endif
 
@@ -487,29 +469,19 @@ poll_reg(const DeviceContext &ctx, uint32_t reg,
          uint32_t mask, uint32_t expected,
          uint64_t timeout_us, uint32_t *outValue = nullptr)
 {
-    // 1 ms IOSleep between probes. On Apple Silicon each MMIO read
-    // over the DART path is ~10× the latency of a native PCI read,
-    // so the previous "busy spin 1000 RREG32 = 50 µs" approximation
-    // actually burned tens of ms per iteration and stretched a
-    // nominal 5 s timeout into minutes while pegging a CPU. IOSleep
-    // yields the dispatcher and gives a deterministic wall-clock
-    // timeout.
-    const uint64_t kStepMs = 1;
-    uint64_t elapsed_us = 0;
-    uint32_t v = 0;
+    // Sleep yields the CPU, not this serial dispatch queue. Count MMIO and
+    // scheduler delay against a monotonic deadline as well as sleep time.
+    const uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     while (true) {
-        v = RREG32(ctx, reg);
-        if ((v & mask) == expected) {
-            if (outValue) *outValue = v;
-            return true;
-        }
-        if (elapsed_us >= timeout_us) {
-            if (outValue) *outValue = v;
+        const uint32_t v = RREG32(ctx, reg);
+        if (outValue) *outValue = v;
+        if (v == UINT32_MAX) return false;
+        if ((v & mask) == expected) return true;
+        if ((clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start) / 1000 >= timeout_us)
             return false;
-        }
-        IOSleep(kStepMs);
-        elapsed_us += kStepMs * 1000;
+        IOSleep(1);
     }
+
 }
 #endif
 

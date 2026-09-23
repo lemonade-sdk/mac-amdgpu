@@ -26,6 +26,12 @@
 
 namespace amdgpu {
 
+static uint32_t gfx_reg(const DeviceContext &dev, GFXRegs::Register r)
+{
+    return SOC15_REG_OFFSET_BIDX(dev, IPBlock::GC, r.baseIndex, r.offset);
+}
+
+
 //------------------------------------------------------------------
 // Helpers — bit math.
 //------------------------------------------------------------------
@@ -76,7 +82,7 @@ gfx_select_se_sh(const DeviceContext &dev, uint32_t se_num,
     }
 
     WREG32(dev,
-           SOC15_REG_OFFSET(dev, IPBlock::GC, GFXRegs::GRBM_GFX_INDEX),
+           gfx_reg(dev, GFXRegs::GRBM_GFX_INDEX),
            data);
 }
 
@@ -89,15 +95,13 @@ gfx_get_sa_active_bitmap(const DeviceContext &dev, const GFXConfig &cfg)
 {
     const uint32_t cc_dis =
         (RREG32(dev,
-            SOC15_REG_OFFSET(dev, IPBlock::GC,
-                             GFXRegs::GRBM_CC_GC_SA_UNIT_DISABLE))
+            gfx_reg(dev, GFXRegs::GRBM_CC_GC_SA_UNIT_DISABLE))
          & GRBM_CC_GC_SA_UNIT_DISABLE__SA_DISABLE_MASK)
         >> GRBM_CC_GC_SA_UNIT_DISABLE__SA_DISABLE__SHIFT;
 
     const uint32_t user_dis =
         (RREG32(dev,
-            SOC15_REG_OFFSET(dev, IPBlock::GC,
-                             GFXRegs::GRBM_GC_USER_SA_UNIT_DISABLE))
+            gfx_reg(dev, GFXRegs::GRBM_GC_USER_SA_UNIT_DISABLE))
          & GRBM_GC_USER_SA_UNIT_DISABLE__SA_DISABLE_MASK)
         >> GRBM_GC_USER_SA_UNIT_DISABLE__SA_DISABLE__SHIFT;
 
@@ -115,15 +119,13 @@ gfx_get_rb_active_bitmap(const DeviceContext &dev, const GFXConfig &cfg)
 {
     const uint32_t cc_dis =
         (RREG32(dev,
-            SOC15_REG_OFFSET(dev, IPBlock::GC,
-                             GFXRegs::CC_RB_BACKEND_DISABLE))
+            gfx_reg(dev, GFXRegs::CC_RB_BACKEND_DISABLE))
          & CC_RB_BACKEND_DISABLE__BACKEND_DISABLE_MASK)
         >> CC_RB_BACKEND_DISABLE__BACKEND_DISABLE__SHIFT;
 
     const uint32_t user_dis =
         (RREG32(dev,
-            SOC15_REG_OFFSET(dev, IPBlock::GC,
-                             GFXRegs::GC_USER_RB_BACKEND_DISABLE))
+            gfx_reg(dev, GFXRegs::GC_USER_RB_BACKEND_DISABLE))
          & GC_USER_RB_BACKEND_DISABLE__BACKEND_DISABLE_MASK)
         >> GC_USER_RB_BACKEND_DISABLE__BACKEND_DISABLE__SHIFT;
 
@@ -145,12 +147,10 @@ gfx_get_wgp_active_bitmap_per_sh(const DeviceContext &dev,
 {
     uint32_t data =
         RREG32(dev,
-            SOC15_REG_OFFSET(dev, IPBlock::GC,
-                             GFXRegs::CC_GC_SHADER_ARRAY_CONFIG));
+            gfx_reg(dev, GFXRegs::CC_GC_SHADER_ARRAY_CONFIG));
     data |=
         RREG32(dev,
-            SOC15_REG_OFFSET(dev, IPBlock::GC,
-                             GFXRegs::GC_USER_SHADER_ARRAY_CONFIG));
+            gfx_reg(dev, GFXRegs::GC_USER_SHADER_ARRAY_CONFIG));
 
     data &= CC_GC_SHADER_ARRAY_CONFIG__INACTIVE_WGPS_MASK;
     data >>= CC_GC_SHADER_ARRAY_CONFIG__INACTIVE_WGPS__SHIFT;
@@ -191,7 +191,7 @@ gfx_get_gb_addr_config(const DeviceContext &dev, GFXConfig &cfg)
 
     // gfx_v12_0.c:3579 — read regGB_ADDR_CONFIG.
     const uint32_t gb = RREG32(dev,
-        SOC15_REG_OFFSET(dev, IPBlock::GC, GFXRegs::GB_ADDR_CONFIG));
+        gfx_reg(dev, GFXRegs::GB_ADDR_CONFIG));
     if (gb == 0 || gb == 0xFFFFFFFFu) {
         GFX_LOG("get_gb_addr_config: GB_ADDR_CONFIG=%#x (driver may be "
                 "racing with PSP/RLC autoload)", gb);
@@ -341,13 +341,13 @@ gfx_init_compute_vmid(const DeviceContext &dev)
     constexpr uint32_t kNumVmid      = 16;
 
     const uint32_t reg_mem_config =
-        SOC15_REG_OFFSET(dev, IPBlock::GC, GFXRegs::SH_MEM_CONFIG);
+        gfx_reg(dev, GFXRegs::SH_MEM_CONFIG);
     const uint32_t reg_mem_bases  =
-        SOC15_REG_OFFSET(dev, IPBlock::GC, GFXRegs::SH_MEM_BASES);
+        gfx_reg(dev, GFXRegs::SH_MEM_BASES);
     const uint32_t reg_gdbg       =
-        SOC15_REG_OFFSET(dev, IPBlock::GC, GFXRegs::SPI_GDBG_PER_VMID_CNTL);
+        gfx_reg(dev, GFXRegs::SPI_GDBG_PER_VMID_CNTL);
     const uint32_t reg_grbm_cntl  =
-        SOC15_REG_OFFSET(dev, IPBlock::GC, GFXRegs::GRBM_GFX_CNTL);
+        gfx_reg(dev, GFXRegs::GRBM_GFX_CNTL);
 
     for (uint32_t i = kFirstKFDVmid; i < kNumVmid; i++) {
         // Equivalent of soc24_grbm_select(adev, me=0, pipe=0, queue=0, vmid=i).
@@ -396,8 +396,8 @@ gfx_constants_init(const DeviceContext &dev, GFXConfig &cfg)
     cfg.max_cu_per_sh       = 8;
     cfg.max_hw_contexts     = 8;
 
-    auto reg = [&](uint32_t off) {
-        return SOC15_REG_OFFSET(dev, IPBlock::GC, off);
+    auto reg = [&](GFXRegs::Register r) {
+        return SOC15_REG_OFFSET_BIDX(dev, IPBlock::GC, r.baseIndex, r.offset);
     };
 
     // gfx_v12_0.c:1812 — GRBM_CNTL.READ_TIMEOUT = 0xFF.

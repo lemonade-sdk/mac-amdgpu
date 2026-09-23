@@ -38,26 +38,16 @@ smu_wait_for_response(const DeviceContext &dev, uint32_t *outResp)
                                                MP1Regs::C2PMSG_90);
     // Upstream uses `adev->usec_timeout * 20 = 100 ms * 20 = 2 s` here.
     const uint64_t kBudgetUs = 2 * 1000000;
-    uint32_t v = 0;
-    bool ok = poll_reg(dev, reg, 0xFFFFFFFFu, 0u, /*invert below*/
-                       0, &v);
-    (void)ok;
-    // poll_reg's mask/expected semantics don't fit "wait for non-zero"
-    // — do it explicitly instead.
-    uint32_t cur = 0;
-    uint64_t elapsed = 0;
-    const uint64_t kStep = 1000;  // 1 ms
-    while (elapsed < kBudgetUs) {
-        cur = RREG32(dev, reg);
-        if (cur != 0) {
-            if (outResp) *outResp = cur;
-            return true;
-        }
+    const uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    while (true) {
+        const uint32_t cur = RREG32(dev, reg);
+        if (outResp) *outResp = cur;
+        if (cur == UINT32_MAX) return false;
+        if (cur != 0) return true;
+        if ((clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start) / 1000 >= kBudgetUs)
+            return false;
         IOSleep(1);
-        elapsed += kStep;
     }
-    if (outResp) *outResp = 0;
-    return false;
 }
 
 kern_return_t
@@ -82,6 +72,14 @@ smu_send_msg_with_param(const DeviceContext &dev,
     const uint32_t regResp  = SOC15_REG_OFFSET_BIDX(dev, IPBlock::MP1, 1,
                                                     MP1Regs::C2PMSG_90);
 
+    // An earlier timed-out command still owns the mailbox. Do not replace
+    // its parameter/message until firmware acknowledges it (Linux pre-poll).
+    // The initial message skips this check, like SMU_FW_INIT in Linux.
+    uint32_t previous = 0;
+    if (dev.smuMessagePending && !smu_wait_for_response(dev, &previous))
+        return previous == UINT32_MAX ? kIOReturnNotAttached : kIOReturnTimeout;
+    dev.smuMessagePending = true;
+
     // 1. Clear any stale response.
     WREG32(dev, regResp, 0);
     // 2. Stage the parameter.
@@ -93,13 +91,9 @@ smu_send_msg_with_param(const DeviceContext &dev,
     uint32_t resp = 0;
     if (!smu_wait_for_response(dev, &resp)) {
         SMU_LOG("msg=%#x param=%#x timeout (no response)", msgId, param);
-        return kIOReturnTimeout;
+        return resp == UINT32_MAX ? kIOReturnNotAttached : kIOReturnTimeout;
     }
-
-    // 5. Read return value if caller asked.
-    if (outReturn != nullptr) {
-        *outReturn = RREG32(dev, regParam);
-    }
+    dev.smuMessagePending = false;
 
     if (resp != SMUResp::OK) {
         SMU_LOG("msg=%#x param=%#x resp=%#x (not OK)", msgId, param, resp);
@@ -112,6 +106,7 @@ smu_send_msg_with_param(const DeviceContext &dev,
         default:                        return kIOReturnInternalError;
         }
     }
+    if (outReturn) *outReturn = RREG32(dev, regParam);
     return kIOReturnSuccess;
 }
 
@@ -306,7 +301,7 @@ smu_smc_hw_setup(DeviceContext &dev, PSPContext &psp)
     }
 
     // 4. RunDcBtc — boot-time calibration. Upstream: smu_v14_0.c:1558.
-    //    No parameter, no return value parsing (resp=0 == success).
+    //    No parameter; SMUResp::OK (1) acknowledges success.
     {
         kern_return_t r = smu_send_msg(dev, PPSMC::RunDcBtc);
         if (r != kIOReturnSuccess) {
@@ -319,12 +314,12 @@ smu_smc_hw_setup(DeviceContext &dev, PSPContext &psp)
     // 4.5 v0.1.29 — NotifyPowerSource(AC). Upstream amdgpu_smu.c:1662
     //     smu_smc_hw_setup calls smu_notify_display_change /
     //     smu_set_power_source after RunDcBtc with the current power
-    //     source. We're an external GPU so assume AC (param=1). Some
+    //     source. POWER_SOURCE_AC is 0 in smu14_driver_if_v14_0.h. Some
     //     PMFW builds don't expose this message — same non-fatal pattern
     //     as SetAllowedFeaturesMask{Low,High} above.
     {
         kern_return_t r = smu_send_msg_with_param(
-            dev, PPSMC::NotifyPowerSource, /*AC*/ 1, nullptr);
+            dev, PPSMC::NotifyPowerSource, /*POWER_SOURCE_AC*/ 0, nullptr);
         if (r != kIOReturnSuccess) {
             SMU_LOG("smc_hw_setup: NotifyPowerSource(AC) non-fatal kr=%#x", r);
         } else {
@@ -377,8 +372,7 @@ smu_smc_hw_setup(DeviceContext &dev, PSPContext &psp)
             SMU_LOG("smc_hw_setup: EnableAllSmuFeatures FAILED kr=%#x — "
                     "if UnknownCmd, PMFW feature control is autoload-"
                     "internal on this chip", r);
-            // Continue to the diagnostic readback — log what features
-            // ARE running even though we couldn't toggle them.
+            return r;
         } else {
             SMU_LOG("smc_hw_setup: EnableAllSmuFeatures ok");
         }

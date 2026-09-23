@@ -6,12 +6,9 @@
 //  In Linux it's split between amdgpu_rlc.c (CSB allocation) and
 //  gfx_v12_0.c (RLC start/wait/microcode load).
 //
-//  For "Hello PM4" the minimum we need:
-//      1. Allocate the clear-state buffer (CSB) in VRAM.
-//      2. Trigger hardware autoload via CG/Pg enable + SRM setup.
-//      3. Wait for RLC microcode autoload chain to complete
-//         (the PSP loads RLC sub-bins into TEE memory; CG/Pg trigger
-//          the hardware pull, we poll regRLC_RLCS_BOOTLOAD_STATUS bit31).
+//  PSP starts the firmware autoload chain. First wait for CP_STAT==0
+//  and RLC BOOTLOAD_COMPLETE; after RS64, GFXHUB and constants setup,
+//  install the VRAM clear-state buffer and enable SRM (Linux PSP path).
 //
 //  Sources:
 //      drivers/gpu/drm/amd/amdgpu/amdgpu_rlc.c

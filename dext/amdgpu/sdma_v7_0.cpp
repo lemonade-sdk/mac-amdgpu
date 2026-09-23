@@ -14,6 +14,7 @@
 
 #include <os/log.h>
 #include <string.h>
+#include <time.h>
 #include <DriverKit/IOLib.h>
 #include <DriverKit/IOBufferMemoryDescriptor.h>
 #include <DriverKit/IODMACommand.h>
@@ -21,55 +22,12 @@
 #include "amdgpu_sdma.h"
 #include "amdgpu_psp.h"
 #include "amdgpu_gmc.h"
+#include "amdgpu_vram_io.h"
 
 #define SDMA_LOG(fmt, ...) \
     os_log(OS_LOG_DEFAULT, "mac.amdgpu.sdma: " fmt, ##__VA_ARGS__)
 
 namespace amdgpu {
-
-// Local DMA helper — same pattern as cp_alloc_dma_block. Promote
-// once a fourth consumer shows up.
-static kern_return_t
-sdma_alloc_dma_block(DeviceContext &dev, uint64_t size,
-                     IOBufferMemoryDescriptor **outBuf,
-                     IODMACommand             **outDma,
-                     uint64_t *outBus, void **outCpu)
-{
-    *outBuf = nullptr; *outDma = nullptr; *outBus = 0; *outCpu = nullptr;
-    IOBufferMemoryDescriptor *buf = nullptr;
-    kern_return_t r = IOBufferMemoryDescriptor::Create(
-        kIOMemoryDirectionOutIn, size, kASPageSize, &buf);
-    if (r != kIOReturnSuccess || buf == nullptr) {
-        return r != kIOReturnSuccess ? r : kIOReturnNoMemory;
-    }
-    buf->SetLength(size);
-    IODMACommandSpecification spec = {};
-    spec.options = kIODMACommandSpecificationNoOptions;
-    spec.maxAddressBits = 64;
-    IODMACommand *dma = nullptr;
-    r = IODMACommand::Create(dev.pci, kIODMACommandCreateNoOptions,
-                             &spec, &dma);
-    if (r != kIOReturnSuccess || dma == nullptr) {
-        buf->release();
-        return r != kIOReturnSuccess ? r : kIOReturnNoMemory;
-    }
-    uint64_t flags = 0;
-    uint32_t segCount = 1;
-    IOAddressSegment seg = {};
-    r = dma->PrepareForDMA(kIODMACommandPrepareForDMANoOptions, buf, 0,
-                           size, &flags, &segCount, &seg);
-    if (r != kIOReturnSuccess || segCount != 1) {
-        dma->release(); buf->release();
-        return r != kIOReturnSuccess ? r : kIOReturnNotAligned;
-    }
-    IOAddressSegment cpu = {};
-    buf->GetAddressRange(&cpu);
-    *outBuf = buf;
-    *outDma = dma;
-    *outBus = seg.address;
-    *outCpu = reinterpret_cast<void *>(cpu.address);
-    return kIOReturnSuccess;
-}
 
 //------------------------------------------------------------------
 // sdma_alloc_storage — ring + WB page for one instance.
@@ -82,13 +40,8 @@ sdma_alloc_storage(DeviceContext &dev, SDMAInstance &inst, GMCContext &gmc)
         SDMA_LOG("instance %u: vram_alloc not ready", inst.instance);
         return kIOReturnNotReady;
     }
-    void *cpu = nullptr;
-
-    // Ring goes in VRAM. On AS+TB5, GPU-initiated reads of DART-mapped
-    // sysmem return zeros, so a sysmem ring (DART-pinned) would be
-    // fetched as all-zero NOPs and never reach the FENCE packet. The
-    // FB aperture (BAR0) is GMC-routable and the engine can fetch from
-    // it directly. See feedback_mac_amdgpu_dart_tb5_pcie_reads.
+    // Keep command fetch and write-back in GPU-addressable VRAM. PCI DMA
+    // addresses require a separate GART mapping before GPU VM use.
     VRAMAllocation ring_alloc{};
     if (!gmc.vram_alloc.alloc(kSDMARingDefaultBytes, kASPageSize, &ring_alloc)) {
         SDMA_LOG("instance %u: ring VRAM alloc failed (need %u, free=%llu)",
@@ -100,21 +53,24 @@ sdma_alloc_storage(DeviceContext &dev, SDMAInstance &inst, GMCContext &gmc)
     inst.ring_vram_off   = ring_alloc.gpu_va - gmc.vram_start;  // BAR0 offset
     inst.ring_size_dwords = kSDMARingDefaultBytes / 4;
     inst.ring_ptr_mask   = inst.ring_size_dwords - 1;
-    // Zero the ring in VRAM via BAR0.
-    bar0_memset_vram(dev, inst.ring_vram_off, 0, kSDMARingDefaultBytes);
-
-    kern_return_t r = sdma_alloc_dma_block(dev, kSDMAWBPageBytes,
-                             &inst.wb_buf, &inst.wb_dma,
-                             &inst.wb_bus, &cpu);
+    VRAMAllocation wb_alloc{};
+    if (!gmc.vram_alloc.alloc(kSDMAWBPageBytes, kASPageSize, &wb_alloc)) {
+        gmc.vram_alloc.free(ring_alloc);
+        return kIOReturnNoMemory;
+    }
+    inst.wb_bus = wb_alloc.gpu_va;
+    inst.wb_vram_off = wb_alloc.gpu_va - gmc.vram_start;
+    auto r = vram_clear_verified(dev, inst.ring_vram_off, ring_alloc.size);
+    if (r == kIOReturnSuccess)
+        r = vram_clear_verified(dev, inst.wb_vram_off, wb_alloc.size);
     if (r != kIOReturnSuccess) {
-        SDMA_LOG("instance %u: WB page alloc failed: %#x",
-                 inst.instance, r);
+        gmc.vram_alloc.free(wb_alloc);
+        gmc.vram_alloc.free(ring_alloc);
         return r;
     }
-    memset(cpu, 0, kSDMAWBPageBytes);
-    inst.wb_cpu             = cpu;
-    inst.rptr_cpu           = reinterpret_cast<volatile uint32_t *>(cpu);
-    inst.rptr_gpu_addr      = inst.wb_bus + 0;
+    inst.wb_device = &dev;
+    inst.cs_fence_shadow = 0;
+    inst.rptr_gpu_addr = inst.wb_bus;
     inst.wptr_poll_gpu_addr = inst.wb_bus + 0x40;
 
     inst.wptr           = 0;
@@ -254,9 +210,8 @@ sdma_gfx_resume_instance(const DeviceContext &dev, SDMAInstance &inst)
     // 5) Enable RPTR writeback + MCU_WPTR_POLL.
     //
     // WPTR_POLL_ENABLE — only enabled on SR-IOV (upstream line 526).
-    // It makes the engine poll sysmem at wptr_poll_gpu_addr; on AS+TB5
-    // GPU-initiated reads of DART-mapped sysmem return zeros, so we
-    // can't use this path anyway. Bare-metal sets it to 0 (matches us).
+    // Bare-metal sets it to 0 (matches us); changing write-back placement
+    // does not require enabling the SR-IOV polling mode.
     //
     // MCU_WPTR_POLL_ENABLE — the SDMA microcontroller (MCU) uses this
     // to watch for WPTR updates. Upstream sets this to 1 UNCONDITIONALLY
@@ -373,23 +328,38 @@ sdma_ring_write(const DeviceContext &dev, SDMAInstance &inst,
     return dwords;
 }
 
+kern_return_t
+sdma_clear_fence(const DeviceContext &dev, const SDMAInstance &inst, uint32_t offset)
+{
+    if (!inst.inited) return kIOReturnNotReady;
+    if (offset != 0x80 && offset != 0xC0) return kIOReturnBadArgument;
+    const uint32_t zero = 0;
+    return vram_write_verified(dev, inst.wb_vram_off + offset, &zero, 4);
+}
+
+kern_return_t
+sdma_read_fence(const DeviceContext &dev, const SDMAInstance &inst,
+                 uint32_t offset, uint32_t *value)
+{
+    if (!inst.inited) return kIOReturnNotReady;
+    if (offset != 0x80 && offset != 0xC0) return kIOReturnBadArgument;
+    return vram_read_fence32(dev, inst.wb_vram_off + offset, value);
+}
+
+bool
+sdma_read_cs_fence(void *context, uint32_t *value)
+{
+    const auto *inst = static_cast<const SDMAInstance *>(context);
+    return inst && inst->wb_device &&
+        sdma_read_fence(*inst->wb_device, *inst, 0xC0, value) == kIOReturnSuccess;
+}
+
 //------------------------------------------------------------------
 // sdma_kick_doorbell — write the new wptr into the BAR2 doorbell
 // aperture.
 //
-// Upstream (sdma_v7_0_ring_set_wptr → WDOORBELL64) does a 64-bit
-// write to the doorbell at:
-//     BAR2 + ring->doorbell_index * 8
-//
-// where `ring->doorbell_index = sdma_engine[i] << 1` (already in
-// qword-index units, e.g. 0x200 for SDMA0). The PCIe write must be
-// 64-bit (WDOORBELL64, not WDOORBELL32) — the doorbell controller
-// distinguishes; a 32-bit write may be silently dropped on RDNA4.
-//
-// Linux uses BAR2 via pci_resource_start(pdev, 2) in
-// amdgpu_doorbell_mgr.c. BAR5 holds MMIO registers, NOT doorbells.
-//
-// Value: `wptr << 2` (byte_wptr); high 32 bits zero.
+// WDOORBELL64 takes a dword index, so the BAR2 byte offset is index * 4.
+// SDMA's WPTR value is a byte count (unlike MES's dword count).
 //------------------------------------------------------------------
 kern_return_t
 sdma_kick_doorbell(const DeviceContext &dev, const SDMAInstance &inst)
@@ -398,45 +368,20 @@ sdma_kick_doorbell(const DeviceContext &dev, const SDMAInstance &inst)
     if (!dev.ip.isResolved(IPBlock::GC)) return kIOReturnNotReady;
     const uint64_t v = static_cast<uint64_t>(inst.wptr) << 2;
 
-    // 1) sysmem WPTR shadow — upstream sdma_v7_0_ring_set_wptr line 220
-    //    writes (ring->wptr << 2) to ring->wptr_cpu_addr. With MCU_WPTR
-    //    _POLL_ENABLE=1 the SDMA MCU polls this sysmem slot. Even on
-    //    AS+TB5 (where GPU-initiated DART sysmem reads return zero)
-    //    we still write this — upstream's contract is the contract.
-    if (inst.wb_cpu) {
-        volatile uint64_t *wptr_shadow =
-            reinterpret_cast<volatile uint64_t *>(
-                static_cast<uint8_t *>(inst.wb_cpu) + 0x40);
-        *wptr_shadow = v;
-    }
+    if (!dev.pci) return kIOReturnNotAttached;
+    const uint64_t offs = sdma_doorbell_byte_offset(inst.doorbell_index);
+    if (offs > dev.bar2Size || 8 > dev.bar2Size - offs) return kIOReturnBadArgument;
+    const auto upload = vram_write_verified(dev, inst.wb_vram_off + 0x40, &v, 8);
+    if (upload != kIOReturnSuccess) return upload;
 
-    // 2) HDP flush so the engine's PCIe read of wptr_poll_addr drains
-    //    past our CPU write.
     amdgpu_hdp_flush(dev);
 
-    // 3) BAR2 doorbell aperture write — port of upstream WDOORBELL64.
-    //    On AS+TB5 the BAR2 write does NOT cause the SDMA MCU to update
-    //    its internal RB_WPTR (see step 4). We keep the upstream-shape
-    //    write for portability — on a platform where doorbell delivery
-    //    works it's sufficient by itself and step 4 below is skipped.
-    const uint64_t offs =
-        static_cast<uint64_t>(inst.doorbell_index) * 8ull;
+    // Publish WPTR before ringing the same dword index programmed in the queue.
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     dev.pci->MemoryWrite64(dev.bar2MemIndex, offs, v);
 
-    // 4) MMIO RB_WPTR fallback — gated on the platform health flag.
-    //    [[feedback_mac_amdgpu_doorbell_mmio_mode_as_tb5]]
-    //
-    //    When dev.doorbell_works == false (current AS+TB5 default per
-    //    gart_init): BAR2 doorbell delivery is silently broken, so we
-    //    write the engine's RB_WPTR registers directly. Direct port of
-    //    upstream's sdma_v7_0_ring_set_wptr use_doorbell=false branch
-    //    (sdma_v7_0.c:233-241).
-    //
-    //    When dev.doorbell_works == true (future Apple fix flips the
-    //    flag in gart_init): skip the MMIO write — the BAR2 doorbell
-    //    above is enough, matching upstream's use_doorbell=true branch
-    //    exactly. No double-write race because the MCU's WPTR snoop is
-    //    the same source-of-truth regardless of which path delivers.
+    // Retain the existing MMIO fallback until SDMA doorbell-only delivery
+    // is validated. MES's successful BAR2 submissions do not validate SDMA routing.
     if (!dev.doorbell_works) {
         const uint32_t wptr_reg = sdma_reg_offset(
             dev, inst.instance, sdma_regs(dev).QUEUE0_RB_WPTR);
@@ -467,15 +412,14 @@ sdma_ring_test(const DeviceContext &dev, SDMAInstance &inst,
 
     // Use an unused part of the WB page (offset 0x80) as the fence
     // landing slot. Pre-clear it.
-    auto *wb_bytes = static_cast<volatile uint8_t *>(inst.wb_cpu);
-    volatile uint32_t *fence_cpu =
-        reinterpret_cast<volatile uint32_t *>(wb_bytes + 0x80);
-    *fence_cpu = 0;
+    auto r = sdma_clear_fence(dev, inst, 0x80);
+    if (r != kIOReturnSuccess) return r;
+    uint32_t observed = 0;
     const uint64_t fence_gpu = inst.wb_bus + 0x80;
     const uint32_t fence_value = 0xCAFEC0DEu;
 
     uint32_t pkt[4];
-    pkt[0] = SDMA_PKT_HEADER_OP(SDMA_OP_FENCE);
+    pkt[0] = sdma_fence_header();
     pkt[1] = static_cast<uint32_t>(fence_gpu);
     pkt[2] = static_cast<uint32_t>(fence_gpu >> 32);
     pkt[3] = fence_value;
@@ -485,26 +429,22 @@ sdma_ring_test(const DeviceContext &dev, SDMAInstance &inst,
                  inst.instance);
         return kIOReturnNoSpace;
     }
-    kern_return_t r = sdma_kick_doorbell(dev, inst);
+    r = sdma_kick_doorbell(dev, inst);
     if (r != kIOReturnSuccess) return r;
 
-    // Poll the WB landing slot.
-    const uint64_t step_us = 50;
-    uint64_t elapsed = 0;
-    while (elapsed < timeout_us) {
-        if (*fence_cpu == fence_value) {
-            SDMA_LOG("instance %u: ring_test ok in ~%llu us",
-                     inst.instance, (unsigned long long)elapsed);
+    const uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    while (true) {
+        r = sdma_read_fence(dev, inst, 0x80, &observed);
+        if (r != kIOReturnSuccess) return r;
+        if (observed == fence_value) {
+            SDMA_LOG("instance %u: ring_test completed", inst.instance);
             return kIOReturnSuccess;
         }
-        // crude busy-wait — refine when we have a real ns delay
-        uint32_t scratch = 0;
-        for (int i = 0; i < 1000; i++) { scratch ^= *fence_cpu; }
-        (void)scratch;
-        elapsed += step_us;
+        if ((clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start) / 1000 >= timeout_us) break;
+        IOSleep(1);
     }
     SDMA_LOG("instance %u: ring_test timeout (last=%#x)",
-             inst.instance, *fence_cpu);
+             inst.instance, observed);
     return kIOReturnTimeout;
 }
 
@@ -534,10 +474,9 @@ sdma_copy_linear_test(const DeviceContext &dev, SDMAInstance &inst,
         return kIOReturnBadArgument;
     }
 
-    auto *wb_bytes = static_cast<volatile uint8_t *>(inst.wb_cpu);
-    volatile uint32_t *fence_cpu =
-        reinterpret_cast<volatile uint32_t *>(wb_bytes + 0x80);
-    *fence_cpu = 0;
+    auto r = sdma_clear_fence(dev, inst, 0x80);
+    if (r != kIOReturnSuccess) return r;
+    uint32_t observed = 0;
     const uint64_t fence_gpu   = inst.wb_bus + 0x80;
     const uint32_t fence_value = 0xDEC0FFEEu;
 
@@ -555,7 +494,7 @@ sdma_copy_linear_test(const DeviceContext &dev, SDMAInstance &inst,
     pkt[n++] = static_cast<uint32_t>(dst_bus >> 32);
     pkt[n++] = 0;                          // CPV byte
     // FENCE — engine writes fence_value to fence_gpu after the copy.
-    pkt[n++] = SDMA_PKT_HEADER_OP(SDMA_OP_FENCE);
+    pkt[n++] = sdma_fence_header();
     pkt[n++] = static_cast<uint32_t>(fence_gpu);
     pkt[n++] = static_cast<uint32_t>(fence_gpu >> 32);
     pkt[n++] = fence_value;
@@ -564,26 +503,26 @@ sdma_copy_linear_test(const DeviceContext &dev, SDMAInstance &inst,
         SDMA_LOG("copy_linear_test: ring_write failed");
         return kIOReturnNoSpace;
     }
-    kern_return_t r = sdma_kick_doorbell(dev, inst);
+    r = sdma_kick_doorbell(dev, inst);
     if (r != kIOReturnSuccess) return r;
 
-    const uint64_t step_us = 50;
-    uint64_t elapsed = 0;
-    while (elapsed < timeout_us) {
-        if (*fence_cpu == fence_value) {
-            SDMA_LOG("copy_linear_test ok: %u bytes %#llx -> %#llx in ~%llu us",
-                     byte_count,
-                     (unsigned long long)src_bus,
-                     (unsigned long long)dst_bus,
-                     (unsigned long long)elapsed);
+    const uint64_t start_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    uint64_t elapsed_us = 0;
+    do {
+        elapsed_us = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start_ns) / 1000;
+        r = sdma_read_fence(dev, inst, 0x80, &observed);
+        if (r != kIOReturnSuccess) return r;
+        if (observed == fence_value) {
+            SDMA_LOG("copy_linear_test fence complete: %u bytes %#llx -> %#llx after %llu us",
+                     byte_count, (unsigned long long)src_bus,
+                     (unsigned long long)dst_bus, (unsigned long long)elapsed_us);
             return kIOReturnSuccess;
         }
-        uint32_t scratch = 0;
-        for (int i = 0; i < 1000; i++) { scratch ^= *fence_cpu; }
-        (void)scratch;
-        elapsed += step_us;
-    }
-    SDMA_LOG("copy_linear_test: timeout (last fence=%#x)", *fence_cpu);
+        if (elapsed_us >= timeout_us) break;
+        IOSleep(1);
+    } while (true);
+    SDMA_LOG("copy_linear_test: timeout after %llu us (last fence=%#x)",
+             (unsigned long long)elapsed_us, observed);
     return kIOReturnTimeout;
 }
 
@@ -706,7 +645,7 @@ sdma_init_full(DeviceContext &dev,
         SDMA_LOG("init_full: microcode_loaded=false — storage allocated, "
                  "deferring gfx_resume + ring_test until "
                  "LoadFirmware(SDMA0/SDMA1) completes");
-        return kIOReturnSuccess;
+        return kIOReturnNotReady;
     }
 
     // 3) gfx_resume each. Mirrors upstream sdma_v7_0_gfx_resume.
@@ -726,13 +665,16 @@ sdma_init_full(DeviceContext &dev,
         sdma_log_status(dev, i);
     }
 
-    // 4) Ring test on each. Failure is logged but doesn't kill the
-    //    init — userspace can re-run via a selector. Mirrors upstream
-    //    sdma_v7_0_ring_test_ring (sdma_v7_0.c:934).
+    // 4) Match Linux amdgpu_ring_test_helper: a failed ring must not
+    //    publish a completed SDMA stage. Reset before retrying failed work.
     SDMA_LOG("init_full: step 4/4 — sdma_ring_test on each instance "
              "(submit FENCE pkt, watch WB write)");
     for (uint32_t i = 0; i < kSDMAInstanceCount; i++) {
-        sdma_ring_test(dev, sdma.instance[i], /*timeout_us=*/100000);
+        kern_return_t r = sdma_ring_test(dev, sdma.instance[i], /*timeout_us=*/100000);
+        if (r != kIOReturnSuccess) {
+            sdma_log_status(dev, i);
+            return r;
+        }
     }
 
     SDMA_LOG("init_full: done — final per-instance status:");

@@ -172,7 +172,7 @@ rlc_alloc_csb(GMCContext &gmc, RLCContext &rlc)
 kern_return_t
 rlc_wait_for_autoload_complete(const DeviceContext &dev, RLCContext &rlc)
 {
-    if (!dev.ip.isResolved(IPBlock::GC)) {
+    if (!dev.ip.isResolved(IPBlock::GC, 0) || !dev.ip.isResolved(IPBlock::GC, 1)) {
         RLC_LOG("GC IP base not resolved");
         return kIOReturnNotReady;
     }
@@ -217,11 +217,14 @@ rlc_wait_for_autoload_complete(const DeviceContext &dev, RLCContext &rlc)
 
     // 10-second budget — Apple Silicon cold-boot autoload can be slow.
     const uint64_t kBudgetUs = 10 * 1000000;
+    const uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     uint64_t elapsed = 0;
     uint32_t cp_stat = 0xFFFFFFFFu, bs = 0;
     while (elapsed < kBudgetUs) {
         cp_stat = RREG32(dev, cp_stat_reg);
         bs      = RREG32(dev, bootload_reg);
+        if (cp_stat == UINT32_MAX || bs == UINT32_MAX) return kIOReturnNotAttached;
+        elapsed = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start) / 1000;
         if (cp_stat == 0 &&
             (bs & kRLC_RLCS_BOOTLOAD_STATUS__BOOTLOAD_COMPLETE_MASK)) {
             rlc.bootload_complete = true;
@@ -230,7 +233,7 @@ rlc_wait_for_autoload_complete(const DeviceContext &dev, RLCContext &rlc)
             return kIOReturnSuccess;
         }
         IOSleep(1);
-        elapsed += 1000;
+        elapsed = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start) / 1000;
     }
     RLC_LOG("RLC autoload timeout (cp_stat=%#010x bootload=%#010x "
             "after %llu ms) — SRM enabled=%u",
@@ -361,8 +364,8 @@ rlc_init_full(const DeviceContext &dev, GMCContext &gmc, RLCContext &rlc)
     // after psp_rlc_autoload_start (GFX_CMD_ID_AUTOLOAD_RLC); the
     // driver's job is just to wait for completion, then set up CSB+SRM.
 
-    // 1. Wait for PSP+IMU-driven autoload to finish bringing RLC up.
-    r = rlc_wait_for_autoload_complete(dev, rlc);
+    // Autoload was checked before RS64/GFXHUB preparation.
+    r = rlc.bootload_complete ? kIOReturnSuccess : rlc_wait_for_autoload_complete(dev, rlc);
     if (r != kIOReturnSuccess) {
         RLC_LOG("autoload wait failed: %#x", r);
         return r;

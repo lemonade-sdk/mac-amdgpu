@@ -34,6 +34,9 @@ public:
     virtual kern_return_t Start(IOService *provider) override;
     virtual kern_return_t Stop(IOService *provider) override;
 
+    // Local completion after all interrupt callbacks have drained.
+    void FinishStop(IOService *provider) LOCALONLY;
+
     virtual kern_return_t
     ExternalMethod(uint64_t selector,
                    IOUserClientMethodArguments *arguments,

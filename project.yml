@@ -31,6 +31,8 @@ options:
 
 settings:
   base:
+    CURRENT_PROJECT_VERSION: 173
+    MARKETING_VERSION: "0.1.73"
     SWIFT_VERSION: "5.10"
     CLANG_CXX_LANGUAGE_STANDARD: "gnu++20"
     CLANG_CXX_LIBRARY: "libc++"
@@ -97,6 +99,9 @@ targets:
         ONLY_ACTIVE_ARCH: "NO"
         SUPPORTED_PLATFORMS: driverkit
         INFOPLIST_FILE: dext/Info.plist
+        GCC_PREPROCESSOR_DEFINITIONS:
+          - $(inherited)
+          - MACAMDGPU_BUILD_VERSION=$(CURRENT_PROJECT_VERSION)
         CODE_SIGN_ENTITLEMENTS: dext/MacAMDGPU.entitlements
         # `-o library,runtime` (= flags=0x12000) is required for AMFI
         # to honor restricted DriverKit entitlements like

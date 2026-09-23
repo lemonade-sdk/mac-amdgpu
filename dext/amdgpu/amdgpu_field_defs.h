@@ -75,7 +75,7 @@
 
 // MMVM_L2_CNTL5
 #define MMVM_L2_CNTL5__L2_CACHE_SMALLK_FRAGMENT_SIZE__SHIFT                     0x0
-#define MMVM_L2_CNTL5__L2_CACHE_SMALLK_FRAGMENT_SIZE_MASK                       0x0000003F
+#define MMVM_L2_CNTL5__L2_CACHE_SMALLK_FRAGMENT_SIZE_MASK                       0x0000001F
 
 // MMVM_CONTEXT0_CNTL (and CONTEXT1 has identical layout)
 #define MMVM_CONTEXT0_CNTL__ENABLE_CONTEXT__SHIFT                               0x0

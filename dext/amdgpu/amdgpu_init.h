@@ -28,9 +28,9 @@
 //      9 SMUInit       — after PSP has LoadFirmware(SMU); mailbox handshake
 //     10 IMUInit       — after PSP has LoadFirmware(IMU_I/D)
 //     11 RLCInit       — after PSP has loaded the RLC sub-bins
-//     12 CPInit        — after RS64 firmwares loaded
+//     12 CPInit        — RS64 setup, GFXHUB and constants; queue halted
 //     13 MESInit       — after CP_MES + CP_MES_DATA loaded
-//     14 GFXInit       — first PM4 submit
+//     14 GFXInit       — resume legacy GFX queue after MES
 //     15 SDMAInit      — after SDMA TH0
 //
 //  Each stage either runs to completion or returns an error. The
@@ -49,6 +49,7 @@
 #include "amdgpu_sdma.h"
 #include "amdgpu_mes.h"
 #include "amdgpu_gart.h"
+#include "amdgpu_memory_test.h"
 #include "amdgpu_discovery.h"
 #include "amdgpu_imu.h"
 #include "amdgpu_gfx.h"
@@ -94,6 +95,7 @@ struct BringupContext {
     SDMAContext   sdma;
     MESContext    mes;
     GARTContext   gart;        // GART page-table state + bindings (DMA fix)
+    MemoryTransferTest memoryTest;
     IMUContext    imu;         // IMU microcode-loaded gate
     GFXConfig     gfx;         // gfx_constants_init harvest + caps
     DoorbellState doorbell;    // BAR2 doorbell index map + state
@@ -107,6 +109,11 @@ struct BringupContext {
 // Subsequent calls with a higher target pick up where we left off.
 //
 kern_return_t bringup_to(BringupContext &ctx, BringupStage target);
+
+// Final CPU-side teardown only: PCI must already be closed and every
+// user-client/interrupt callback drained. Never accesses GPU registers.
+// Safe after partial initialization and safe to call more than once.
+void bringup_release_resources(BringupContext &ctx);
 
 //
 // IP discovery — hardcoded R9700 values; sets the IP base table.

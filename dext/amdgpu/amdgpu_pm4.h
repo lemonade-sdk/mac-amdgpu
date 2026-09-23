@@ -8,12 +8,12 @@
 //
 //  Header layout (DWORD 0):
 //      bits [31:30] = packet type (3 = PACKET3)
-//      bits [29:16] = opcode      (NOP=0, WRITE_DATA=0x37, RELEASE_MEM=0x49)
-//      bits [15:0]  = count of dwords AFTER the header (= total - 1)
+//      bits [29:16] = payload dword count minus one (= total - 2)
+//      bits [15:8]  = opcode (NOP=0x10, WRITE_DATA=0x37, RELEASE_MEM=0x49)
 //
 //  Sources: PM4 packet definitions live in upstream
-//      drivers/gpu/drm/amd/include/v12_structs.h
-//      drivers/gpu/drm/amd/amdgpu/{gfx,sdma}_v*_pkt.h
+//      drivers/gpu/drm/amd/amdgpu/nvd.h
+//      drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c: gfx_v12_0_ring_emit_fence
 //
 //  We hand-roll the headers here rather than vendor those headers
 //  (each is hundreds of fields); the subset we need is tiny.
@@ -27,22 +27,25 @@ namespace amdgpu {
 
 constexpr uint32_t kPM4Type3 = 3u;   // PACKET3
 
-constexpr uint32_t kPM4OpNop        = 0x00;
+constexpr uint32_t kPM4OpNop        = 0x10;
 constexpr uint32_t kPM4OpWriteData  = 0x37;
 constexpr uint32_t kPM4OpReleaseMem = 0x49;
+constexpr uint32_t kPM4OpSetUconfigReg = 0x79;
+constexpr uint32_t kPM4UconfigStart = 0xc000;
+constexpr uint32_t kPM4UconfigEnd = 0xc400;
 
 // Build a PACKET3 header DWORD. `count` is the number of DWORDs
 // that follow the header (NOT including the header itself), minus 1.
-// e.g. RELEASE_MEM is 6 dwords of payload after the header → count=6.
+// e.g. RELEASE_MEM has 7 payload dwords → count_minus_1=6.
 static inline uint32_t
 pm4_header(uint32_t op, uint32_t count_minus_1)
 {
     return (kPM4Type3 << 30)
-         | ((op & 0x3FFF) << 16)
-         | (count_minus_1 & 0xFFFF);
+         | ((op & 0xFF) << 8)
+         | ((count_minus_1 & 0x3FFF) << 16);
 }
 
-// ---- NOP: payload-less header (count=0). 1 DWORD total. ----
+// ---- NOP header (count=0). Must be followed by one payload DWORD. ----
 static inline uint32_t pm4_nop(void) { return pm4_header(kPM4OpNop, 0); }
 
 // ---- WRITE_DATA: write N DWORDs to memory. Minimum form (1 DW data):
@@ -72,7 +75,7 @@ pm4_write_data_control(uint32_t engine_sel, uint32_t dst_sel,
 
 // ---- RELEASE_MEM (EOP fence). 8 DWORDs total (header + 7 payload).
 //
-//   DW0: header (count=6, since count is total-1 = 7-1 = 6)
+//   DW0: header (count=6, since count is payload-1 = 7-1 = 6)
 //   DW1: event_type + event_index + cache flush + GCR flags
 //   DW2: data_sel + int_sel
 //   DW3: dst addr lo (must be qword-aligned)
@@ -90,8 +93,8 @@ constexpr uint32_t kPM4RMEventIndexFence         = 0x05;   // event_index
 constexpr uint32_t kPM4RMCachePolicyBypass = 0x3;
 
 // GCR (Global Cache Refresh) bits — minimal: GL2_WB + SEQ
-constexpr uint32_t kPM4RMGCRGL2WB  = (1u << 16);
-constexpr uint32_t kPM4RMGCRSeq    = (1u << 20);
+constexpr uint32_t kPM4RMGCRGL2WB  = (1u << 21);
+constexpr uint32_t kPM4RMGCRSeq    = (1u << 22);
 
 constexpr uint32_t kPM4RMDataSel32       = 1;
 constexpr uint32_t kPM4RMDataSel64       = 2;
@@ -117,6 +120,27 @@ pm4_release_mem_dw2(uint32_t data_sel, uint32_t int_sel)
     v |= ((data_sel & 0x7) << 29);
     v |= ((int_sel  & 0x3) << 24);
     return v;
+}
+
+// Two-dword NOP followed by the eight-dword GFX12 RELEASE_MEM packet.
+// Callers provide a dword-aligned address (qword-aligned for 64-bit writes).
+static inline uint32_t
+pm4_build_fence(uint32_t (&packet)[10], uint64_t address, uint64_t value,
+                bool write64, bool interrupt)
+{
+    packet[0] = pm4_nop();
+    packet[1] = 0;
+    packet[2] = pm4_header(kPM4OpReleaseMem, 6);
+    packet[3] = pm4_release_mem_dw1();
+    packet[4] = pm4_release_mem_dw2(
+        write64 ? kPM4RMDataSel64 : kPM4RMDataSel32,
+        interrupt ? kPM4RMIntSelSendInt : kPM4RMIntSelNone);
+    packet[5] = static_cast<uint32_t>(address);
+    packet[6] = static_cast<uint32_t>(address >> 32);
+    packet[7] = static_cast<uint32_t>(value);
+    packet[8] = static_cast<uint32_t>(value >> 32);
+    packet[9] = 0;
+    return 10;
 }
 
 } // namespace amdgpu

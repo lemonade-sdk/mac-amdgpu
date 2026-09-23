@@ -320,7 +320,11 @@ uint32_t
 ih_drain(const DeviceContext &dev, IHContext &ih,
          IHDispatchFn dispatch, void *user)
 {
-    if (!ih.inited || !ih.enabled) return 0;
+    if (!ih.inited || !ih.enabled || !ih.ring_cpu ||
+        ih.ring_size_bytes < kIHEntryBytes ||
+        (ih.ring_size_bytes & (ih.ring_size_bytes - 1)) ||
+        ih.ptr_mask != ih.ring_size_bytes - 1 ||
+        ih.rptr > ih.ptr_mask || (ih.rptr & (kIHEntryBytes - 1))) return 0;
     if (!dev.ip.isResolved(IPBlock::OSSSYS)) return 0;
 
     // Prefer shadow (avoids a slow BAR read each interrupt).
@@ -329,6 +333,9 @@ ih_drain(const DeviceContext &dev, IHContext &ih,
         : RREG32(dev,
                  SOC15_REG_OFFSET(dev, IPBlock::OSSSYS,
                                   IHRegs::IH_RB_WPTR));
+    // A non-entry-aligned WPTR can never be reached by advancing RPTR by
+    // 32, trapping the serial lifecycle queue in an endless ring walk.
+    if (wptr == UINT32_MAX || (wptr & (kIHEntryBytes - 2))) return 0;
     // Overflow flag lives in IH_RB_WPTR.RB_OVERFLOW (bit 0) per
     // osssys_7_0_0_sh_mask.h:206 and ih_v7_0_get_wptr (ih_v7_0.c:462).
     // The earlier "bit 31" check was bogus.
@@ -340,6 +347,7 @@ ih_drain(const DeviceContext &dev, IHContext &ih,
         wptr = RREG32(dev,
                       SOC15_REG_OFFSET(dev, IPBlock::OSSSYS,
                                        IHRegs::IH_RB_WPTR));
+        if (wptr == UINT32_MAX || (wptr & (kIHEntryBytes - 2))) return 0;
         // Recovery per upstream: skip ahead to wptr+32 (drop oldest)
         // and assert + de-assert IH_RB_CNTL.WPTR_OVERFLOW_CLEAR so a
         // new overflow can be latched.

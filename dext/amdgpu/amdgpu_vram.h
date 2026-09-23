@@ -46,7 +46,7 @@ namespace amdgpu {
 
 struct VRAMAllocation {
     uint64_t gpu_va;     // GPU-side bus address
-    void    *cpu_ptr;    // CPU-side pointer (nullptr if BAR2 not mapped in-dext)
+    void    *cpu_ptr;    // CPU-side pointer (nullptr if BAR0 not mapped in-dext)
     uint64_t size;
     uint64_t alignment;
 };
@@ -83,7 +83,7 @@ public:
         m_pool[root].length = size;
         m_pool[root].next   = kInvalid;
         m_head = root;
-        m_inited = true;
+        m_inited = size != 0 && base <= UINT64_MAX - size;
     }
 
     bool is_inited() const { return m_inited; }
@@ -98,7 +98,9 @@ public:
     // re-export of these allocations).
     bool alloc(uint64_t bytes, uint64_t alignment, VRAMAllocation *out) {
         if (!m_inited || bytes == 0 || out == nullptr) return false;
+        if (alignment && (alignment & (alignment - 1))) return false;
         if (alignment < 16384) alignment = 16384;
+        if (bytes > UINT64_MAX - (alignment - 1)) return false;
         // Round size up to alignment to keep neighbouring allocs aligned
         // too. Free coalesce will eat the slop on release.
         uint64_t rounded = (bytes + alignment - 1) & ~(alignment - 1);
@@ -110,10 +112,11 @@ public:
             FreeNode &n = m_pool[cur];
             // Compute aligned start within this node.
             uint64_t start_abs = m_base + n.offset;
+            if (start_abs > UINT64_MAX - (alignment - 1)) return false;
             uint64_t aligned_abs = (start_abs + alignment - 1) &
                                   ~(alignment - 1);
             uint64_t pad = aligned_abs - start_abs;
-            if (n.length >= pad + rounded) {
+            if (pad <= n.length && rounded <= n.length - pad) {
                 // Carve.
                 uint64_t alloc_offset = n.offset + pad;
                 // 3 cases: exact, head-trim, tail-trim, middle-split.
@@ -157,11 +160,12 @@ public:
         return false;  // OOM
     }
 
-    // Free. Returns the bytes released to the pool, or 0 if the
-    // allocation didn't match this allocator's range.
+    // Free a trusted allocation returned by alloc. Reject out-of-range and
+    // overlapping free ranges; callers still own allocation identity checks.
     void free(const VRAMAllocation &a) {
         if (!m_inited || a.size == 0) return;
-        if (a.gpu_va < m_base || a.gpu_va + a.size > m_base + m_size) {
+        if (a.gpu_va < m_base || a.gpu_va - m_base > m_size ||
+            a.size > m_size - (a.gpu_va - m_base) || a.size > m_bytes_used) {
             return;  // not ours
         }
         uint64_t offset = a.gpu_va - m_base;
@@ -173,6 +177,9 @@ public:
             prev = cur;
             cur  = m_pool[cur].next;
         }
+        // A duplicate or overlapping free must not corrupt accounting/list.
+        if ((prev != kInvalid && m_pool[prev].offset + m_pool[prev].length > offset) ||
+            (cur != kInvalid && offset + length > m_pool[cur].offset)) return;
         // Try merge with prev.
         bool merged_prev = false;
         if (prev != kInvalid &&

@@ -28,8 +28,12 @@
 
 #include "amdgpu_regs.h"
 #include "amdgpu_ip.h"
+#include "amdgpu_gart_allocator.h"
 
 namespace amdgpu {
+
+struct GARTContext;
+struct GMCContext;
 
 // One BO bound into GART. Tracks the sysmem buffer + the GART MC address
 // PSP (or any other GPU IP) should use to reach it.
@@ -41,9 +45,13 @@ struct GARTBinding {
     uint64_t  busAddr;       // DART-mapped bus address (1 segment for now)
     void     *cpuAddr;       // CPU pointer for writes/reads
     uint64_t  sizeBytes;
-    uint64_t  gartOffset;    // dword offset into the GART aperture
+    uint64_t  reservationID; // rejects stale/copy unbind after range reuse
+    uint64_t  gartOffset;    // byte offset into the GART aperture
     uint64_t  gartMCAddr;    // gart_start + gartOffset — what PSP uses
     uint32_t  numGPUPages;   // number of 4 KB PTEs used
+    GARTContext *owner;
+    bool ready;             // PTE readback and both hub invalidations succeeded
+    bool dmaPrepared;
 };
 
 struct GARTContext {
@@ -61,29 +69,12 @@ struct GARTContext {
     uint64_t    gartEnd;         // gartStart + (numPTEs * GPU_PAGE_SIZE) - 1
     uint64_t    gartSize;        // numPTEs * GPU_PAGE_SIZE
 
-    // Bump-allocator state — next free GART offset (in bytes).
-    uint64_t    nextFreeOffset;
+    // GMC owns the shared range allocator, including firmware reservations.
+    GARTApertureAllocator *allocator;
+    GMCContext *gmc;
 
-    // Platform gate: are GPU-initiated reads through GART → DART → sysmem
-    // actually returning real bytes? On Apple Silicon + TB5 the answer is
-    // currently NO — see [[feedback_mac_amdgpu_dart_tb5_pcie_reads]].
-    // GART itself is fully programmed (PTEs get written correctly, MC
-    // resolution works), but DART silently zeros every GPU-initiated read
-    // of mapped sysmem. The PTE points at the right host RAM, the engine
-    // just never receives the actual data.
-    //
-    // We keep this defaulting to FALSE on the dext's current platforms.
-    // Higher layers gate GTT BO allocations on this flag and return
-    // kIOReturnUnsupported when it's false, so clients fail fast instead
-    // of silently allocating a BO that returns zeros on every read.
-    //
-    // When Apple exposes a sysmem mapping primitive whose GPU-initiated
-    // reads return real data (a new IODMACommand option, an entitlement,
-    // a non-DART path — whatever it ends up being), the platform-detect
-    // code in gart_init / gart_post_enable can flip this to true and the
-    // GTT path automatically becomes a first-class allocation domain.
-    // No other driver changes needed; the rest of the GART stack is
-    // already operational.
+    // GTT allocations stay gated until a data-verified GPU host-memory
+    // read passes. This is independent of BAR2 doorbell delivery.
     bool        reads_supported;
 };
 
@@ -92,18 +83,23 @@ struct GARTContext {
 // GART, return the GART MC address to pass to PSP. The IODMACommand is
 // stashed in the GARTBinding so we can release it later.
 //
-// alignment must be a multiple of kASPageSize (16 KB) for DART to accept
-// the mapping.
+// alignment must be a power of two; allocations round to at least 16 KiB.
+// On a mapping/cleanup failure, outBinding can retain resources. The caller
+// must keep it alive until gart_unbind succeeds or verified session reset.
 //
 kern_return_t gart_bind_sysmem(DeviceContext &dev, GARTContext &gart,
                                uint64_t sizeBytes, uint64_t alignment,
                                GARTBinding *outBinding);
 
 //
-// gart_unbind — release a binding (CompleteDMA, release buffer, mark
-// PTEs invalid).
+// Caller must first retire every GPU job referencing this binding. Invalidates
+// PTEs and both hub TLBs before completing DMA and releasing owned storage.
+// Failure retains storage/reservation for retry or verified reset. Successful
+// teardown reclaims the range regardless of allocation order.
 //
-void gart_unbind(GARTContext &gart, GARTBinding *binding);
+kern_return_t gart_unbind(DeviceContext &dev, GARTContext &gart, GARTBinding *binding);
+// Only after verified GPU reset/PCI isolation; performs no GPU register access.
+void gart_release_after_reset(GARTBinding &binding);
 
 //
 // gart_bind_existing — bind an EXISTING bus address range into GART.
@@ -111,16 +107,13 @@ void gart_unbind(GARTContext &gart, GARTBinding *binding);
 // shared firmware-staging buffer the user client owns) and we just
 // need PSP to be able to read it via a GMC MC address.
 //
-// Writes PTEs at the next free GART slot. The caller retains ownership
-// of the underlying IOBufferMemoryDescriptor / IODMACommand — this
-// function doesn't take a reference. PTEs stay live until the GART is
-// reset (GMC re-zero's the page table) or the binding is
-// overwritten by another bind at the same offset.
+// Writes PTEs at the next free GART slot. The caller retains ownership of the
+// DMA mapping, including on failure if binding.numGPUPages is nonzero. Retain
+// that mapping until unbind or verified reset. Ranges must cover whole 4 KiB
+// pages. Zero is a valid GART MC address.
 //
-// Idempotent across re-binds of the same buffer: if the same busAddr/
-// size is re-bound, you can pass the previous binding back in to reuse
-// its `gartOffset` (avoids bumping the allocator); pass a zero-init
-// binding to allocate a fresh slot.
+// An acknowledged identical binding is idempotent. Replacing a live or failed
+// binding requires unbind first; pass a zero-init binding to allocate fresh.
 //
 kern_return_t gart_bind_existing(DeviceContext &dev, GARTContext &gart,
                                  uint64_t busAddr, uint64_t sizeBytes,
@@ -133,17 +126,14 @@ kern_return_t gart_bind_existing(DeviceContext &dev, GARTContext &gart,
 // this returns, gart_bind_sysmem / gart_bind_existing / gart_unbind
 // are operational.
 //
-// Also sets `gart.reads_supported` based on platform detection. On
-// AS+TB5 today this stays false — DART zeros every GPU-initiated
-// sysmem read (see [[feedback_mac_amdgpu_dart_tb5_pcie_reads]]). Higher
-// layers gate GTT BO allocations on this flag and fail fast.
+// GTT BO allocations remain gated by reads_supported until data-verified
+// GPU host-memory transfers pass. Prior failures do not distinguish DART
+// behavior from incomplete GPU page-table programming or engine addressing.
+// This facade shares GMC's range allocator; reinitializing it does not
+// clear the page table or reclaim bindings. Teardown/invalidation must be
+// completed before general GTT allocation can be enabled.
 //
-// Future: when Apple exposes a working sysmem-mapping primitive,
-// extend the platform-detect block here to set reads_supported=true
-// under that condition. No other GART code needs to change.
-//
-struct GMCContext;
-kern_return_t gart_init(DeviceContext &dev, const GMCContext &gmc,
+kern_return_t gart_init(DeviceContext &dev, GMCContext &gmc,
                         GARTContext &gart);
 
 } // namespace amdgpu

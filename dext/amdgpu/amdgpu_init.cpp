@@ -15,6 +15,49 @@
 
 namespace amdgpu {
 
+void bringup_release_resources(BringupContext &ctx)
+{
+    // PCI Close disables bus mastering before any DMA mapping is released.
+    // Do not try to halt engines here: the device may already be unplugged.
+    auto release_dma = [](IOBufferMemoryDescriptor *&buffer,
+                          IODMACommand *&dma) {
+        if (dma) {
+            dma->CompleteDMA(kIODMACommandCompleteDMANoOptions);
+            dma->release();
+            dma = nullptr;
+        }
+        if (buffer) {
+            buffer->release();
+            buffer = nullptr;
+        }
+    };
+    for (auto &pipe : ctx.mes.pipe) {
+        release_dma(pipe.eop_buf, pipe.eop_dma);
+        release_dma(pipe.mqd_buf, pipe.mqd_dma);
+        release_dma(pipe.ring_buf, pipe.ring_dma);
+        release_dma(pipe.cmd_buf, pipe.cmd_dma);
+        release_dma(pipe.wb_buf, pipe.wb_dma);
+        release_dma(pipe.resource_1_buf, pipe.resource_1_dma);
+        release_dma(pipe.sch_ctx_buf, pipe.sch_ctx_dma);
+        release_dma(pipe.status_fence_buf, pipe.status_fence_dma);
+    }
+    // SDMA ring/write-back storage belongs to the GMC VRAM arena.
+    cp_release_storage(ctx.cp);
+    memory_transfer_release_after_reset(ctx.memoryTest);
+    ih_release(ctx.ih);
+    psp_release(ctx.psp);
+    release_dma(ctx.psp.ringBuffer, ctx.psp.ringDMACommand);
+    release_dma(ctx.psp.ringBinding.sysmemBuffer, ctx.psp.ringBinding.dmaCommand);
+    release_dma(ctx.psp.cmdBinding.sysmemBuffer, ctx.psp.cmdBinding.dmaCommand);
+    release_dma(ctx.psp.fenceBinding.sysmemBuffer, ctx.psp.fenceBinding.dmaCommand);
+    gmc_release_resources(ctx.gmc);
+
+    // Firmware views and VRAM allocations are borrowed pointers/offsets;
+    // clearing them also removes stale stage and initialized flags.
+    ctx = {};
+    INIT_LOG("released shared bringup resources after PCI/client teardown");
+}
+
 //============================================================
 // NBIF v6.3.1 port — drivers/gpu/drm/amd/amdgpu/nbif_v6_3_1.c.
 //
@@ -779,6 +822,11 @@ run_stage(BringupContext &ctx, BringupStage s)
             INIT_LOG("PSPFwLoad: SOS not alive");
             return kIOReturnNotReady;
         }
+        if (!br.psp.firmwareLoadComplete || !br.rlc.microcode_loaded ||
+            !br.imu.microcode_loaded || !br.sdma.microcode_loaded) {
+            INIT_LOG("PSPFwLoad: firmware chain incomplete (including AUTOLOAD_RLC/ASD/REG_LIST)");
+            return kIOReturnNotReady;
+        }
         INIT_LOG("PSPFwLoad: all firmware loaded (host-side LoadFirmware)");
         return kIOReturnSuccess;
     }
@@ -792,56 +840,46 @@ run_stage(BringupContext &ctx, BringupStage s)
         (void)smu_get_version(ctx.device, &ver);
         ctx.device.smuOnline = true;
 
-        // 2. v0.1.20: SMU PMFW handshake (smu_smc_hw_setup). Mirrors
-        //    upstream amdgpu_smu.c:1662. Hypothesis is that PMFW must
-        //    enable DPM features for the IMU autoload state machine to
-        //    fire — without this, BOOTLOAD_STATUS stays at 0 even though
-        //    PSP returns resp=0 for every command (v0.1.18-0.1.19
-        //    symptom). Failures here are NON-FATAL for the SMUInit
-        //    stage itself (SMU is still "alive" per TestMessage); we
-        //    log and continue so RLCInit's BOOTLOAD_STATUS poll surfaces
-        //    the real diagnostic signal.
+        // A successful ping proves communication, not completed setup.
+        // Required SMU setup failures must stop initialization here.
         kern_return_t hwr = smu_smc_hw_setup(ctx.device, ctx.psp);
-        if (hwr != kIOReturnSuccess) {
-            INIT_LOG("SMUInit: smc_hw_setup non-fatal failure: %#x — "
-                     "proceeding to RLCInit anyway", hwr);
-        }
-        return kIOReturnSuccess;
+        if (hwr != kIOReturnSuccess)
+            INIT_LOG("SMUInit: required hardware setup failed: %#x", hwr);
+        return hwr;
     }
     case BringupStage::GMCInit:
         return gmc_init(ctx.device, ctx.gmc);
     case BringupStage::IHInit:
         return ih_init_full(ctx.device, ctx.ih);
     case BringupStage::RLCInit:
-        return rlc_init_full(ctx.device, ctx.gmc, ctx.rlc);
-    case BringupStage::CPInit:
-        return cp_init_full(ctx.device, ctx.gmc, ctx.cp);
+        if (!ctx.rlc.microcode_loaded) return kIOReturnNotReady;
+        return rlc_wait_for_autoload_complete(ctx.device, ctx.rlc);
     case BringupStage::SDMAInit:
         return sdma_init_full(ctx.device, ctx.psp, ctx.gmc, ctx.sdma);
-    case BringupStage::MESInit:
-        return mes_init_full(ctx.device, ctx.psp, ctx.gmc, ctx.mes);
+    case BringupStage::MESInit: {
+        const auto started = cp_start_engines(ctx.device, ctx.cp);
+        if (started != kIOReturnSuccess) return started;
+        cp_log_control(ctx.device, "before MES initialization");
+        const auto r = mes_init_full(ctx.device, ctx.psp, ctx.gmc, ctx.mes);
+        cp_log_control(ctx.device, "after MES initialization");
+        return r;
+    }
+    case BringupStage::GFXInit:
+        return cp_init_full(ctx.device, ctx.gmc, ctx.cp, ctx.mes);
     case BringupStage::IMUInit:
         // Audit-7 #11. PSP-load path: imu microcode comes via PSP
         // LOAD_IP_FW(IMU_I) + LOAD_IP_FW(IMU_D); the firmware
         // extractor (separate agent) sets imu.microcode_loaded.
         // This handler only validates that gate, no MMIO.
         return imu_init_full(ctx.device, ctx.imu);
-    case BringupStage::GFXInit: {
-        // Audit-7 #8 + #10. Run gfx_constants_init (still nominally
-        // a CPInit prerequisite — but here we re-arm GFXHUB so it
-        // survives RLC autoload's register reset).
-        //
-        // Upstream sequence (gfx_v12_0_hw_init:3697):
-        //     gfx_v12_0_gfxhub_enable(adev);     // gart_enable + hdp_flush + tlb_flush
-        //     gfx_v12_0_constants_init(adev);
-        //     gfx_v12_0_rlc_resume(adev);        // not driver-side on PSP path
-        //     gfx_v12_0_cp_resume(adev);         // already done in CPInit
-        //
-        // We delegate the gart_enable re-run to gmc_gfxhub_gart_enable
-        // (which has the full upstream port), then HDP flush, then
-        // gfx_constants_init.
+    case BringupStage::CPInit: {
+        // Linux gfx_v12_0_hw_init orders RS64 setup -> GFXHUB -> constants
+        // before cp_resume. Async resume enables engines, bootstraps MES KIQ,
+        // then maps the GFX queue. Preserve the public stage numbers.
+        kern_return_t prepared = cp_prepare_firmware(ctx.device, ctx.gmc, ctx.cp);
+        if (prepared != kIOReturnSuccess) return prepared;
         if (!ctx.device.ip.isResolved(IPBlock::GC)) {
-            INIT_LOG("stage GFXInit: GC IP base not resolved");
+            INIT_LOG("CP preparation: GC IP base not resolved");
             return kIOReturnNotReady;
         }
         // First (and only) GFXHUB program — upstream defers this to
@@ -849,35 +887,39 @@ run_stage(BringupContext &ctx, BringupStage s)
         // Programming GFXHUB before PSP staged GFX-block firmware
         // makes PSP reject SDMA/CP/MES/RLC with TEE_BAD_PARAMETERS
         // while still accepting SMU/IMU. gmc_init now only programs
-        // MMHUB; GFXHUB lands here.
-        if (ctx.device.ip.isResolved(IPBlock::GMC)) {
+        // MMHUB; GFXHUB lands here, after RLC and before MES/CP queue resume.
+        if (ctx.device.ip.isResolved(ctx.gmc.gfxhub.ip)) {
             kern_return_t r = gmc_gfxhub_gart_enable(ctx.device, ctx.gmc);
             if (r != kIOReturnSuccess) {
-                INIT_LOG("GFXInit: gfxhub_gart_enable failed: %#x", r);
+                INIT_LOG("CP preparation: gfxhub_gart_enable failed: %#x", r);
                 return r;
             }
             // HDP flush + GFXHUB-side TLB flush — moved here from
             // gmc_init since GFXHUB only just got programmed.
-            gmc_hdp_flush(ctx.device);
-            gmc_flush_gpu_tlb(ctx.device, ctx.gmc, ctx.gmc.gfxhub,
-                              /*vmid*/ 0, /*type*/ 0);
+            r = gmc_hdp_flush(ctx.device);
+            if (r != kIOReturnSuccess) return r;
+            r = gmc_flush_gpu_tlb(ctx.device, ctx.gmc, ctx.gmc.gfxhub,
+                                  /*vmid*/ 0, /*type*/ 0);
+            if (r != kIOReturnSuccess) return r;
 
             // GART page table / aperture are programmed — now populate
             // the GARTContext so the BO allocator can hand out GTT BOs
-            // (gated on gart.reads_supported, which is FALSE on AS+TB5
-            // until the platform fixes GPU-initiated DART sysmem reads).
+            // (gated until host-memory transfers and general binding
+            // lifetime/reclamation are validated).
             kern_return_t gr = gart_init(ctx.device, ctx.gmc, ctx.gart);
             if (gr != kIOReturnSuccess) {
-                INIT_LOG("GFXInit: gart_init failed: %#x — GTT BOs "
+                INIT_LOG("CP preparation: gart_init failed: %#x — GTT BOs "
                          "will return kIOReturnNotReady", gr);
                 // Non-fatal: VRAM BOs still work, only GTT path lost.
             }
         } else {
-            INIT_LOG("GFXInit: skipping gfxhub (GMC IP base unresolved)");
+            INIT_LOG("CP preparation: GFXHUB register block unresolved");
+            return kIOReturnNotReady;
         }
-        // Run gfx_v12_0_constants_init now (idempotent — CPInit's
-        // cp_init_full also calls the legacy convenience overload).
-        return gfx_constants_init(ctx.device, ctx.gfx);
+        // Linux enables RLC CSB/SRM only after GFXHUB and constants.
+        kern_return_t constants = gfx_constants_init(ctx.device, ctx.gfx);
+        if (constants != kIOReturnSuccess) return constants;
+        return rlc_init_full(ctx.device, ctx.gmc, ctx.rlc);
     }
     }
     return kIOReturnUnsupported;

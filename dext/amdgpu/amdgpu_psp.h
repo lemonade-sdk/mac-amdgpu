@@ -102,12 +102,14 @@ struct PSPContext {
     };
     ASDContext asd;
 
-    // Owning pointer to the whole `_sos.bin` file when LoadFirmware
-    // hands us the blob — kept alive while sub-bin descriptors point
-    // into it. Currently the dext doesn't own this (host's DMA buffer
-    // is the backing store), but reserved here for the future.
+    // Private snapshot of `_sos.bin`. In particular RL is consumed only
+    // after subsequent uploads have overwritten the host staging buffer.
+#ifdef __APPLE__
+    IOBufferMemoryDescriptor *sosPackageBuffer;
+#endif
     const uint8_t *sos_fw_blob;
     uint64_t       sos_fw_blob_size;
+    bool           firmwareLoadComplete; // AUTOLOAD_RLC, ASD and RL acknowledged
 
     // Legacy fields used by code that hasn't been refactored to use
     // .sos.start_addr yet — kept until psp_load_sos is updated.
@@ -252,8 +254,8 @@ kern_return_t psp_setup_fw_buf_sysmem(DeviceContext &dev, PSPContext &psp,
 // and populates psp.sos / psp.kdb / psp.sys / etc. with pointers into
 // fw_data plus per-sub-binary sizes.
 //
-// The caller retains ownership of fw_data; the sub-bin pointers in
-// PSPContext stay valid only as long as fw_data is alive. Returns
+// Copies fw_data into driver-owned storage retained through psp_release;
+// later host uploads cannot invalidate the sub-bin pointers. Returns
 // kIOReturnSuccess on a recognised header, kIOReturnUnsupported on
 // an unknown header_version_major, kIOReturnBadArgument on bad input.
 //

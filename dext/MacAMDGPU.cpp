@@ -14,6 +14,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include <DriverKit/OSMetaClass.h>
 #include <DriverKit/IOLib.h>
@@ -37,6 +38,8 @@
 #include "amdgpu/amdgpu_sdma.h"
 #include "amdgpu/amdgpu_mes.h"
 #include "amdgpu/amdgpu_ucode_extract.h"
+#include "amdgpu/amdgpu_pci_rebar.h"
+#include "amdgpu/amdgpu_client_lifecycle.h"
 
 #define MACAMDGPU_LOG(fmt, ...) \
     os_log(OS_LOG_DEFAULT, "mac.amdgpu: " fmt, ##__VA_ARGS__)
@@ -96,6 +99,10 @@ enum {
     // v0.1.29 — per-state GFXCLK soft-clamp. scalarInput[0] selects
     // a power state (0=auto, 1=low, 2=nominal, 3=high, 4=peak).
     kMacAMDGPUMethodSetPowerState      = 40,
+    kMacAMDGPUMethodGetReBARInfo       = 41, // read-only PCIe capability query
+    kMacAMDGPUMethodShutdownGPU        = 42, // reset, close PCI, discard session
+    kMacAMDGPUMethodRuntimeBuild       = 43, // actual responding binary, no hardware access
+    kMacAMDGPUMethodHostMemoryTest     = 44, // data-verified SDMA transfers through GART
 };
 
 // v0.1.28 — IP types accepted by CSCreate. Match the upstream
@@ -249,6 +256,7 @@ struct BOEntry {
     IOBufferMemoryDescriptor *gtt_buf;
     IODMACommand             *gtt_dma;
     uint64_t  gtt_bus_addr;
+    amdgpu::GARTBinding gttBinding; // authoritative mapping/storage ownership
 
     // Cached cpu pointer for in-dext access (e.g. CP_DMA / IB staging).
     // Userspace gets its own mapping via IOConnectMapMemory64 against
@@ -297,14 +305,28 @@ enum {
 //============================================================
 // Driver instance state.
 //============================================================
+struct MacAMDGPUUserClient_IVars;
 struct MacAMDGPU_IVars {
+    bool stopping;              // atomic: read by client/IRQ dispatch queues
     bool       pciOpen;
+    bool       shutdownBlocked;  // failed shutdown: only status/retry allowed
+    bool       shutdownInProgress; // atomic admission barrier for new clients
+    uint32_t   connectedClients; // atomic, decremented only after Stop drains
     IOService *openerUserClient;  // tracked so Open/Close entities match
+    IOPCIDevice *retainedPCI;     // outlives superclass Stop until final free
+    MacAMDGPUUserClient_IVars *quarantinedClient; // backing retained after failed reset
+    amdgpu::ClientSubmission submission;
 
     // Phase 1B: per-device bringup state shared across user clients.
     // Populated lazily when PCI is opened. Stages run on demand via
     // InitDevice selector.
     amdgpu::BringupContext bringup;
+
+    // Serial queue protecting all mutations of shared per-device state
+    // (bringup stages, bump allocators, ring wptrs, opener tracking).
+    // Required for safe multi-UserClient / multi-session operation on the
+    // same card (see approved multi-GPU + multi-session plan).
+    IODispatchQueue *bringupQueue;   // created in Start, never null after success
 };
 
 //
@@ -313,6 +335,12 @@ struct MacAMDGPU_IVars {
 //
 struct MacAMDGPUUserClient_IVars {
     bool claimed;
+    bool mappedBAR; // direct MMIO mappings cannot be revoked by this selector
+    bool stopping;                 // atomic: also read by the IRQ queue
+    uint32_t stopPendingSources;   // atomic cancellation countdown + submission sentinel
+    IODispatchQueue *stopQueue;    // retained default queue for final cleanup
+    IOService *stopProvider;       // retained until superclass Stop finishes
+    MacAMDGPU *ownerDriver;        // keeps shared bringup state alive through teardown
 
     // DMA — single contiguous buffer per client (Path A from apple-vfio).
     IOBufferMemoryDescriptor *dmaBuffer;
@@ -468,15 +496,16 @@ mac_amdgpu_bo_cpu_addr(MacAMDGPUUserClient_IVars *ivars, BOEntry *e)
 //
 // Release the storage owned by a single BO entry, then mark it free.
 // VRAM BOs return their range to gmc.vram_alloc; GTT BOs release the
-// per-BO IOBuffer + IODMACommand (and leak the GART PTE slot — bump
-// allocator inside gart.cpp doesn't reclaim, which is fine for Phase
-// 1B's BO churn pattern: gart_init re-zeros the table on reset).
+// per-BO binding after verified reset/PCI isolation. Live BOFree instead
+// invalidates its PTEs and both hub TLBs before completing DMA. Non-trailing
+// aperture holes remain reserved until the session is reset.
 //
 // Forward decl only — implementation lives below the driver class
 // definitions where bringup context fields are visible.
 static void
 mac_amdgpu_bo_release_all(MacAMDGPUUserClient_IVars *ivars,
                           IOService *driverService);
+static void mac_amdgpu_release_quarantine(MacAMDGPU *driver);
 
 //============================================================
 // Helpers.
@@ -486,6 +515,11 @@ mac_amdgpu_pci(IOService *service)
 {
     if (service == nullptr) {
         return nullptr;
+    }
+    auto *driver = OSDynamicCast(MacAMDGPU, service);
+    if (driver != nullptr && driver->ivars != nullptr &&
+        driver->ivars->retainedPCI != nullptr) {
+        return driver->ivars->retainedPCI;
     }
     return OSDynamicCast(IOPCIDevice, service->GetProvider());
 }
@@ -509,6 +543,28 @@ mac_amdgpu_bar_type_string(uint8_t barType)
 // All static so they don't pollute the IIG-generated dispatch.
 //============================================================
 
+// Standard capabilities occupy at most 48 aligned slots in config space.
+// Reject malformed/cyclic chains rather than blocking the lifecycle queue.
+static uint8_t
+mac_amdgpu_find_pm_capability(IOPCIDevice *pci)
+{
+    uint8_t pointer = 0;
+    pci->ConfigurationRead8(0x34, &pointer);
+    uint64_t visited = 0;
+    for (unsigned steps = 0; pointer != 0 && steps < 48; ++steps) {
+        if (pointer < 0x40 || pointer > 0xFC || (pointer & 3)) return 0;
+        const uint64_t bit = uint64_t(1) << ((pointer - 0x40) / 4);
+        if (visited & bit) return 0;
+        visited |= bit;
+        uint16_t header = 0xFFFF;
+        pci->ConfigurationRead16(pointer, &header);
+        if (header == 0xFFFF) return 0;
+        if ((header & 0xFF) == 1) return pointer <= 0xF8 ? pointer : 0;
+        pointer = uint8_t(header >> 8);
+    }
+    return 0;
+}
+
 // Open the PCI device (idempotent) and populate the bringup
 // DeviceContext from BAR info + enable Memory Space + Bus Master.
 // Called from every selector that touches MMIO/config so the order
@@ -520,7 +576,14 @@ mac_amdgpu_ensure_open(IOService *opener, MacAMDGPU *driver,
     if (driver == nullptr || driver->ivars == nullptr || pci == nullptr) {
         return kIOReturnNotReady;
     }
-    if (driver->ivars->pciOpen) return kIOReturnSuccess;
+    if (driver->ivars->shutdownBlocked) return kIOReturnNotReady;
+    if (driver->ivars->pciOpen)
+        return driver->ivars->openerUserClient == opener ? kIOReturnSuccess : kIOReturnBusy;
+
+    // Closing the opener releases client DMA mappings. Re-enabling bus
+    // mastering on retained rings could expose those stale addresses.
+    if (driver->ivars->bringup.reached != amdgpu::BringupStage::None)
+        return kIOReturnNotReady;
 
     kern_return_t ret = pci->Open(opener, 0);
     if (ret != kIOReturnSuccess) {
@@ -528,7 +591,7 @@ mac_amdgpu_ensure_open(IOService *opener, MacAMDGPU *driver,
         return ret;
     }
     driver->ivars->pciOpen = true;
-    driver->ivars->openerUserClient = opener;
+    __atomic_store_n(&driver->ivars->openerUserClient, opener, __ATOMIC_RELEASE);
 
     uint16_t cmd = 0;
     pci->ConfigurationRead16(0x04, &cmd);
@@ -556,17 +619,16 @@ mac_amdgpu_ensure_open(IOService *opener, MacAMDGPU *driver,
             // BAR0 is the visible-VRAM/framebuffer aperture on Bonaire+.
             bdev.bar0MemIndex         = mi;
             bdev.bar0Size             = sz;
-            bdev.bar2VisibleVRAMSize  = sz;  // visible VRAM window size
             break;
-        case 2: bdev.bar2MemIndex = mi; break;       // doorbell BAR
+        case 2: bdev.bar2MemIndex = mi; bdev.bar2Size = sz; break; // doorbells
         case 5: bdev.bar5MemIndex = mi; break;       // MMIO register window
         default: break;
         }
     }
     MACAMDGPU_LOG("ensure_open: PCI opened, cmd=%#x, "
-                  "BAR0(visible VRAM)=%llu B, BAR2(doorbell)=2MB, "
+                  "BAR0(visible VRAM)=%llu B, BAR2(doorbell)=%llu B, "
                   "BAR5(registers)=512KB",
-                  (unsigned)cmd, bdev.bar0Size);
+                  (unsigned)cmd, bdev.bar0Size, bdev.bar2Size);
 
     // Read PCI config space + try to wake device to D0.
     uint32_t bar0_cfg = 0, bar2_cfg = 0, bar2_cfg_hi = 0, bar5_cfg = 0;
@@ -599,30 +661,22 @@ mac_amdgpu_ensure_open(IOService *opener, MacAMDGPU *driver,
 
     // Look for the PM capability and force D0. The capability list
     // pointer is at config offset 0x34.
-    uint8_t cap_ptr = 0;
-    pci->ConfigurationRead8(0x34, &cap_ptr);
-    while (cap_ptr != 0 && cap_ptr != 0xFF) {
-        uint16_t cap_hdr = 0;
-        pci->ConfigurationRead16(cap_ptr, &cap_hdr);
-        uint8_t cap_id = cap_hdr & 0xFF;
-        if (cap_id == 0x01) {  // PCI Power Management Capability
-            uint16_t pmcsr = 0;
+    const uint8_t cap_ptr = mac_amdgpu_find_pm_capability(pci);
+    if (cap_ptr != 0) {
+        uint16_t pmcsr = 0;
+        pci->ConfigurationRead16(cap_ptr + 4, &pmcsr);
+        uint8_t state = pmcsr & 0x3;
+        MACAMDGPU_LOG("ensure_open: PM cap at %#x, PMCSR=%#x "
+                      "(power state D%u)", cap_ptr, (unsigned)pmcsr,
+                      (unsigned)state);
+        if (state != 0) {
+            pmcsr = (pmcsr & ~0x3u);  // state bits → 0 (D0)
+            pci->ConfigurationWrite16(cap_ptr + 4, pmcsr);
+            IOSleep(10);
             pci->ConfigurationRead16(cap_ptr + 4, &pmcsr);
-            uint8_t state = pmcsr & 0x3;
-            MACAMDGPU_LOG("ensure_open: PM cap at %#x, PMCSR=%#x "
-                          "(power state D%u)", cap_ptr, (unsigned)pmcsr,
-                          (unsigned)state);
-            if (state != 0) {
-                pmcsr = (pmcsr & ~0x3u);  // state bits → 0 (D0)
-                pci->ConfigurationWrite16(cap_ptr + 4, pmcsr);
-                IOSleep(10);
-                pci->ConfigurationRead16(cap_ptr + 4, &pmcsr);
-                MACAMDGPU_LOG("ensure_open: forced D0, PMCSR now %#x",
-                              (unsigned)pmcsr);
-            }
-            break;
+            MACAMDGPU_LOG("ensure_open: forced D0, PMCSR now %#x",
+                          (unsigned)pmcsr);
         }
-        cap_ptr = (cap_hdr >> 8) & 0xFF;
     }
 
     // MMIO sanity probe — read several BAR0 dwords. On a healthy
@@ -643,28 +697,55 @@ mac_amdgpu_ensure_open(IOService *opener, MacAMDGPU *driver,
     return kIOReturnSuccess;
 }
 
-static void
-mac_amdgpu_release_dma_buffer(MacAMDGPUUserClient *client)
+static kern_return_t
+mac_amdgpu_admit_external(IOService *client, MacAMDGPU *driver,
+                          IOPCIDevice *pci, uint64_t selector)
 {
-    if (client == nullptr || client->ivars == nullptr) {
+    if (selector == kMacAMDGPUMethodMESAddQueue) return kIOReturnUnsupported;
+    const bool observer = selector == kMacAMDGPUMethodRuntimeBuild ||
+                          selector == kMacAMDGPUMethodPing ||
+                          selector == kMacAMDGPUMethodQueryInfo;
+    if (!observer && selector != kMacAMDGPUMethodShutdownGPU) {
+        kern_return_t ownerRet = mac_amdgpu_ensure_open(client, driver, pci);
+        if (ownerRet != kIOReturnSuccess) return ownerRet;
+        // Raw packets have no BO list. Until a scheduler owns their references,
+        // all other mutation/resource recycling waits for the one live fence.
+        if (!driver->ivars->submission.poll() &&
+            selector != kMacAMDGPUMethodWaitFence &&
+            selector != kMacAMDGPUMethodBOGetInfo)
+            return kIOReturnBusy;
+    }
+    return kIOReturnSuccess;
+}
+
+static void
+mac_amdgpu_release_dma_state(MacAMDGPUUserClient_IVars *state)
+{
+    if (state == nullptr) {
         return;
     }
-    if (client->ivars->dmaCommand != nullptr) {
-        client->ivars->dmaCommand->CompleteDMA(kIODMACommandCompleteDMANoOptions);
+    if (state->dmaCommand != nullptr) {
+        state->dmaCommand->CompleteDMA(kIODMACommandCompleteDMANoOptions);
     }
-    OSSafeReleaseNULL(client->ivars->dmaCommand);
-    OSSafeReleaseNULL(client->ivars->dmaBuffer);
-    client->ivars->dmaBufferSize    = 0;
-    client->ivars->dmaFlags         = 0;
-    client->ivars->dmaSegmentsCount = 0;
-    memset(client->ivars->dmaSegments, 0,
-           sizeof(client->ivars->dmaSegments));
+    OSSafeReleaseNULL(state->dmaCommand);
+    OSSafeReleaseNULL(state->dmaBuffer);
+    state->dmaBufferSize    = 0;
+    state->dmaFlags         = 0;
+    state->dmaSegmentsCount = 0;
+    memset(state->dmaSegments, 0,
+           sizeof(state->dmaSegments));
     // The bus address goes away with the buffer; the GART slot stays
     // mapped to a stale address until something rewrites it. Clear the
     // binding's MC addr so the next LOAD_IP_FW path rebinds afresh.
-    memset(&client->ivars->dmaGartBinding, 0,
-           sizeof(client->ivars->dmaGartBinding));
-    client->ivars->dmaGartMcAddr = 0;
+    memset(&state->dmaGartBinding, 0,
+           sizeof(state->dmaGartBinding));
+    state->dmaGartMcAddr = 0;
+}
+
+static void
+mac_amdgpu_release_dma_buffer(MacAMDGPUUserClient *client)
+{
+    if (client) mac_amdgpu_release_dma_state(client->ivars);
 }
 
 static kern_return_t
@@ -688,12 +769,21 @@ mac_amdgpu_allocate_dma_buffer(MacAMDGPUUserClient *client,
         return kIOReturnUnsupported;
     }
 
+    // Firmware/rings may still reference the existing DMA address. Repeated
+    // same-size requests are idempotent; replacement requires Shutdown GPU.
+    if (driver->ivars->bringup.reached != amdgpu::BringupStage::None) {
+        return client->ivars->dmaBuffer != nullptr &&
+               client->ivars->dmaBufferSize == requestedSize
+                   ? kIOReturnSuccess : kIOReturnBusy;
+    }
+    uint64_t alignment = 0, rounded = 0;
+    if (!amdgpu::client_allocation_shape(requestedSize, requestedAlignment,
+                                         amdgpu::kASPageSize, alignment, rounded))
+        return kIOReturnBadArgument;
     mac_amdgpu_release_dma_buffer(client);
 
     // Apple Silicon page size is 16 KB. DART rejects mappings that
     // aren't page-aligned; coerce upward if the caller asked for less.
-    uint64_t alignment = requestedAlignment < amdgpu::kASPageSize
-                           ? amdgpu::kASPageSize : requestedAlignment;
 
     IOBufferMemoryDescriptor *buf = nullptr;
     kern_return_t ret = IOBufferMemoryDescriptor::Create(
@@ -748,17 +838,8 @@ static void
 mac_amdgpu_release_all_interrupts(MacAMDGPUUserClient *client)
 {
     if (client == nullptr || client->ivars == nullptr) return;
-    if (!client->ivars->interruptsSetUp) return;
-
-    for (uint32_t i = 0; i < client->ivars->numInterrupts; i++) {
-        IOInterruptDispatchSource *src = client->ivars->interruptSources[i];
-        if (src != nullptr) {
-            // Cancel is async — release inside the completion block so the
-            // source outlives any in-flight handler.
-            src->Cancel(^{ src->release(); });
-            client->ivars->interruptSources[i] = nullptr;
-        }
-    }
+    // Called only after the Stop cancellation barrier. Partial setup owns
+    // a queue/shared page too, even if interruptsSetUp was never published.
     if (client->ivars->irqQueue != nullptr) {
         client->ivars->irqQueue->release();
         client->ivars->irqQueue = nullptr;
@@ -775,11 +856,25 @@ mac_amdgpu_release_all_interrupts(MacAMDGPUUserClient *client)
 
     OSAction *pending = __atomic_exchange_n(
         &client->ivars->pendingInterruptNotify, nullptr, __ATOMIC_ACQ_REL);
-    if (pending != nullptr) pending->release();
+    if (pending != nullptr) {
+        client->AsyncCompletion(pending, kIOReturnAborted, nullptr, 0);
+        pending->release();
+    }
 
     client->ivars->irqPending = nullptr;
     client->ivars->irqEnabled = nullptr;
     OSSafeReleaseNULL(client->ivars->irqSharedBuffer);
+}
+
+static void
+mac_amdgpu_stop_source_drained(MacAMDGPUUserClient *client)
+{
+    if (__atomic_sub_fetch(&client->ivars->stopPendingSources, 1,
+                           __ATOMIC_ACQ_REL) != 0) return;
+    // Cleanup must share the default queue with ExternalMethod and Stop.
+    // Running it on an IRQ callback queue would race newly rejected RPCs.
+    IOService *provider = client->ivars->stopProvider;
+    client->ivars->stopQueue->DispatchAsync(^{ client->FinishStop(provider); });
 }
 
 static uint32_t
@@ -813,7 +908,7 @@ mac_amdgpu_setup_interrupts(MacAMDGPUUserClient *client)
     if (client == nullptr || client->ivars == nullptr) {
         return kIOReturnBadArgument;
     }
-    if (client->ivars->interruptsSetUp) {
+    if (client->ivars->irqQueue != nullptr) {
         return kIOReturnStillOpen;
     }
 
@@ -823,11 +918,16 @@ mac_amdgpu_setup_interrupts(MacAMDGPUUserClient *client)
     if (pci == nullptr) return kIOReturnUnsupported;
 
     IODispatchQueue *queue = nullptr;
-    kern_return_t ret = IODispatchQueue::Create("MacAMDGPUIRQ", 0, 0, &queue);
+    // Use the owning driver's serial queue for IRQ delivery too. A handler
+    // cannot remain in MMIO/IH work while root Stop closes PCI or an RPC
+    // mutates the same ring state. Cancellation itself remains asynchronous.
+    kern_return_t ret = client->CopyDispatchQueue(kIOServiceDefaultQueueName,
+                                                  &queue);
     if (ret != kIOReturnSuccess || queue == nullptr) {
-        MACAMDGPU_LOG("IODispatchQueue::Create failed: %#x", ret);
+        MACAMDGPU_LOG("IRQ CopyDispatchQueue failed: %#x", ret);
         return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
     }
+
     client->ivars->irqQueue = queue;
 
     // 16 KB shared page (only first 64 B used; round to 16 K for alignment).
@@ -896,11 +996,13 @@ mac_amdgpu_setup_interrupts(MacAMDGPUUserClient *client)
                           (unsigned)i, (unsigned)requested, ret);
             break;
         }
+        // Own even a partially configured source until the Stop barrier.
+        client->ivars->interruptSources[i] = src;
         OSAction *action = nullptr;
         ret = client->CreateActionInterruptOccurred(sizeof(uint32_t),
                                                     &action);
         if (ret != kIOReturnSuccess || action == nullptr) {
-            src->release();
+            OSSafeReleaseNULL(action);
             MACAMDGPU_LOG("CreateAction v=%u: %#x", (unsigned)i, ret);
             break;
         }
@@ -910,23 +1012,22 @@ mac_amdgpu_setup_interrupts(MacAMDGPUUserClient *client)
         ret = src->SetHandler(action);
         if (ret != kIOReturnSuccess) {
             action->release();
-            src->release();
             MACAMDGPU_LOG("SetHandler v=%u: %#x", (unsigned)i, ret);
             break;
         }
+        // SetHandler retains the action; balance our CreateAction reference.
+        action->release();
         ret = src->SetEnable(true);
         if (ret != kIOReturnSuccess) {
-            action->release();
-            src->release();
             MACAMDGPU_LOG("SetEnable v=%u: %#x", (unsigned)i, ret);
             break;
         }
-        client->ivars->interruptSources[i] = src;
         registered++;
     }
 
     client->ivars->numInterrupts   = registered;
-    client->ivars->interruptsSetUp = (registered > 0);
+    __atomic_store_n(&client->ivars->interruptsSetUp, registered > 0,
+                     __ATOMIC_RELEASE);
     MACAMDGPU_LOG("registered %u/%u %s vectors",
                   (unsigned)registered, (unsigned)requested,
                   usingMSIX ? "MSI-X" : "MSI");
@@ -938,21 +1039,30 @@ mac_amdgpu_reset_device(MacAMDGPUUserClient *client)
 {
     if (client == nullptr) return kIOReturnBadArgument;
     MacAMDGPU *driver = OSDynamicCast(MacAMDGPU, client->GetProvider());
-    if (driver == nullptr) return kIOReturnNotAttached;
+    if (driver == nullptr || driver->ivars == nullptr) return kIOReturnNotAttached;
+    if (driver->ivars->bringup.reached != amdgpu::BringupStage::None) {
+        // A live reset needs engine quiescence, BO preservation, and a full
+        // firmware/ring rebuild. FLR alone leaves initialized software state
+        // pointing at hardware that has lost that state.
+        MACAMDGPU_LOG("reset rejected after stage %u: reconnect for a fresh driver session",
+                      (unsigned)driver->ivars->bringup.reached);
+        return kIOReturnBusy;
+    }
     IOPCIDevice *pci = mac_amdgpu_pci(driver);
     if (pci == nullptr) return kIOReturnUnsupported;
 
-    // FLR first; fall back to upstream-port hot reset.
+    if (driver->ivars->openerUserClient != client ||
+        client->ivars->mappedBAR || client->ivars->irqQueue != nullptr)
+        return kIOReturnBusy;
+
+    // A failed function reset must not disturb other devices on the bridge.
     kern_return_t ret = pci->Reset(kIOPCIDeviceResetTypeFunctionReset,
                                    kIOPCIDeviceResetOptionNone);
     if (ret == kIOReturnSuccess) {
         MACAMDGPU_LOG("FLR ok");
         return ret;
     }
-    MACAMDGPU_LOG("FLR failed: %#x — trying hot reset", ret);
-    ret = pci->Reset(kIOPCIDeviceResetTypeHotReset,
-                     kIOPCIDeviceResetOptionNone);
-    MACAMDGPU_LOG("hot reset: %#x", ret);
+    MACAMDGPU_LOG("FLR failed: %#x; bridge reset is not permitted", ret);
     return ret;
 }
 
@@ -973,12 +1083,35 @@ IMPL(MacAMDGPU, Start)
         return kIOReturnNoMemory;
     }
 
+    // Create the serial bringup protection queue early (before any
+    // bringup or allocator work). This is the foundation for safe
+    // multi-UserClient operation on the same card (per the approved plan).
+    IODispatchQueue *bqueue = nullptr;
+    kern_return_t qret = IODispatchQueue::Create("MacAMDGPUBringup", 0, 0, &bqueue);
+    if (qret != kIOReturnSuccess || bqueue == nullptr) {
+        IOSafeDeleteNULL(ivars, MacAMDGPU_IVars, 1);
+        MACAMDGPU_LOG("IODispatchQueue::Create (MacAMDGPUBringup) failed: %#x", qret);
+        return qret != kIOReturnSuccess ? qret : kIOReturnNoMemory;
+    }
+    ivars->bringupQueue = bqueue;
+    qret = SetDispatchQueue(kIOServiceDefaultQueueName, bqueue);
+    if (qret != kIOReturnSuccess) {
+        bqueue->release();
+        IOSafeDeleteNULL(ivars, MacAMDGPU_IVars, 1);
+        MACAMDGPU_LOG("SetDispatchQueue (MacAMDGPUBringup) failed: %#x", qret);
+        return qret;
+    }
+
     IOPCIDevice *pci = mac_amdgpu_pci(this);
     if (pci == nullptr) {
         MACAMDGPU_LOG("provider is not an IOPCIDevice");
+        ivars->bringupQueue->release();
         IOSafeDeleteNULL(ivars, MacAMDGPU_IVars, 1);
         return kIOReturnUnsupported;
     }
+
+    pci->retain();
+    ivars->retainedPCI = pci;
 
     uint8_t bus = 0, device = 0, function = 0;
     uint16_t vendorID = 0xFFFF, deviceID = 0xFFFF;
@@ -1021,21 +1154,41 @@ IMPL(MacAMDGPU, Start)
 }
 
 //============================================================
-// MacAMDGPU::Stop — release ivars (PCI Open/Close lives on
-// UserClient lifetime, see below).
+// MacAMDGPU::Stop — gate new work and stop bus mastering. Shared
+// storage remains alive until retained user clients have drained.
 //============================================================
 kern_return_t
 IMPL(MacAMDGPU, Stop)
 {
-    if (ivars != nullptr && ivars->pciOpen) {
-        MACAMDGPU_LOG("WARNING: PCI still open in driver Stop "
-                      "(opener=%p) — should have been closed by UserClient",
-                      (void *)ivars->openerUserClient);
-        ivars->pciOpen = false;
-        ivars->openerUserClient = nullptr;
+    if (ivars != nullptr) {
+        __atomic_store_n(&ivars->stopping, true, __ATOMIC_RELEASE);
+        if (ivars->pciOpen && ivars->openerUserClient != nullptr) {
+            // PCIDriverKit Close disables Bus Lead Enable and Memory Space
+            // Enable. Do this before any DMA descriptors can be completed.
+            ivars->retainedPCI->Close(ivars->openerUserClient, 0);
+            ivars->pciOpen = false;
+            __atomic_store_n(&ivars->openerUserClient, (IOService *)nullptr,
+                             __ATOMIC_RELEASE);
+            MACAMDGPU_LOG("driver Stop: PCI closed; shared storage retained until clients drain");
+        }
     }
-    IOSafeDeleteNULL(ivars, MacAMDGPU_IVars, 1);
     return Stop(provider, SUPERDISPATCH);
+}
+
+void
+MacAMDGPU::free()
+{
+    if (ivars != nullptr) {
+        // Every successful UserClient Start retains this service until its
+        // callbacks and cleanup finish. No live client can observe this free.
+        mac_amdgpu_release_quarantine(this);
+        amdgpu::bringup_release_resources(ivars->bringup);
+        OSSafeReleaseNULL(ivars->bringupQueue);
+        OSSafeReleaseNULL(ivars->retainedPCI);
+        IOSafeDeleteNULL(ivars, MacAMDGPU_IVars, 1);
+        MACAMDGPU_LOG("driver free: shared bringup storage released");
+    }
+    IOService::free();
 }
 
 //============================================================
@@ -1044,6 +1197,11 @@ IMPL(MacAMDGPU, Stop)
 kern_return_t
 IMPL(MacAMDGPU, NewUserClient)
 {
+    if (ivars == nullptr || __atomic_load_n(&ivars->stopping, __ATOMIC_ACQUIRE)) {
+        return kIOReturnNotAttached;
+    }
+    if (__atomic_load_n(&ivars->shutdownInProgress, __ATOMIC_ACQUIRE))
+        return kIOReturnBusy;
     if (type != 0) {
         MACAMDGPU_LOG("unsupported user-client type %u", (unsigned)type);
         return kIOReturnUnsupported;
@@ -1080,15 +1238,40 @@ IMPL(MacAMDGPUUserClient, Start)
         return ret;
     }
 
-    if (OSDynamicCast(MacAMDGPU, provider) == nullptr) {
+    auto *driver = OSDynamicCast(MacAMDGPU, provider);
+    if (driver == nullptr) {
         MACAMDGPU_LOG("user client provider is not MacAMDGPU");
         return kIOReturnUnsupported;
     }
+
+    if (driver->ivars == nullptr ||
+        __atomic_load_n(&driver->ivars->stopping, __ATOMIC_ACQUIRE)) {
+        return kIOReturnNotAttached;
+    }
+
+    // Serialize subsequent RPCs, IRQs and Stop with the owning driver's
+    // lifecycle. IRQ cancellation still needs its asynchronous completion barrier.
+    IODispatchQueue *ownerQueue = nullptr;
+    ret = driver->CopyDispatchQueue(kIOServiceDefaultQueueName, &ownerQueue);
+    if (ret != kIOReturnSuccess || ownerQueue == nullptr) {
+        return ret != kIOReturnSuccess ? ret : kIOReturnNoResources;
+    }
+    ret = SetDispatchQueue(kIOServiceDefaultQueueName, ownerQueue);
+    ownerQueue->release();
+    if (ret != kIOReturnSuccess) return ret;
 
     ivars = IONewZero(MacAMDGPUUserClient_IVars, 1);
     if (ivars == nullptr) {
         return kIOReturnNoMemory;
     }
+    __atomic_add_fetch(&driver->ivars->connectedClients, 1, __ATOMIC_ACQ_REL);
+    if (__atomic_load_n(&driver->ivars->shutdownInProgress, __ATOMIC_ACQUIRE)) {
+        __atomic_sub_fetch(&driver->ivars->connectedClients, 1, __ATOMIC_ACQ_REL);
+        IOSafeDeleteNULL(ivars, MacAMDGPUUserClient_IVars, 1);
+        return kIOReturnBusy;
+    }
+    driver->retain();
+    ivars->ownerDriver = driver;
     return kIOReturnSuccess;
 }
 
@@ -1117,13 +1300,8 @@ mac_amdgpu_bo_release_all(MacAMDGPUUserClient_IVars *ivars,
             driver->ivars->bringup.gmc.vram_alloc.free(va);
         }
         else if (e.domain == kBODomainGTT) {
-            if (e.gtt_dma != nullptr) {
-                e.gtt_dma->CompleteDMA(kIODMACommandCompleteDMANoOptions);
-                e.gtt_dma->release();
-            }
-            if (e.gtt_buf != nullptr) {
-                e.gtt_buf->release();
-            }
+            // This bulk path runs only after reset/PCI isolation.
+            amdgpu::gart_release_after_reset(e.gttBinding);
         }
         e.in_use   = false;
         e.gtt_buf  = nullptr;
@@ -1133,49 +1311,244 @@ mac_amdgpu_bo_release_all(MacAMDGPUUserClient_IVars *ivars,
     ivars->boBumpOffset = 0;
 }
 
+static void
+mac_amdgpu_release_client_storage(MacAMDGPUUserClient_IVars *state, MacAMDGPU *driver)
+{
+    mac_amdgpu_bo_release_all(state, driver);
+    mac_amdgpu_release_dma_state(state);
+    for (auto &cs : state->cs)
+        if (cs.in_use) mac_amdgpu_cs_free_slot(&cs);
+}
+
+static void
+mac_amdgpu_release_quarantine(MacAMDGPU *driver)
+{
+    auto *state = driver->ivars->quarantinedClient;
+    if (!state) return;
+    mac_amdgpu_release_client_storage(state, driver);
+    IOSafeDeleteNULL(driver->ivars->quarantinedClient, MacAMDGPUUserClient_IVars, 1);
+}
+
+// Keep all DMA backing pinned until FLR has completed and bus mastering is
+// verified off. Unlike the cold-start helper, this must never fall back to a
+// bridge hot reset, which could disrupt other functions/devices on that link.
+static kern_return_t
+mac_amdgpu_quiesce_for_shutdown(IOPCIDevice *pci, uint64_t &phase)
+{
+    phase = 1; // validate a live endpoint and FLR support before changing it
+    uint16_t vendor = 0xFFFF;
+    pci->ConfigurationRead16(0, &vendor);
+    if (vendor != 0x1002) return kIOReturnNotAttached;
+    uint64_t cap = 0;
+    kern_return_t ret = pci->FindPCICapability(kIOPCICapabilityIDPCIExpress, 0, &cap);
+    if (ret != kIOReturnSuccess || cap < 0x40 || cap > 0xF4 || (cap & 3))
+        return kIOReturnUnsupported;
+    uint32_t deviceCaps = 0xFFFFFFFF;
+    pci->ConfigurationRead32((uint32_t)cap + 4, &deviceCaps);
+    if (deviceCaps == 0xFFFFFFFF) return kIOReturnNotAttached;
+    if (!(deviceCaps & (1u << 28))) return kIOReturnUnsupported;
+
+    phase = 2; // stop new PCI transactions, retaining every buffer
+    uint16_t command = 0xFFFF;
+    pci->ConfigurationRead16(4, &command);
+    if (command == 0xFFFF) return kIOReturnNotAttached;
+    pci->ConfigurationWrite16(4, command & ~uint16_t(4));
+    command = 0xFFFF;
+    pci->ConfigurationRead16(4, &command);
+    if (command == 0xFFFF || (command & 4)) return kIOReturnNotReady;
+
+    phase = 3; // drain in-flight PCIe transactions before issuing FLR
+    const uint64_t startNS = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    for (;;) {
+        uint16_t status = 0xFFFF;
+        pci->ConfigurationRead16((uint32_t)cap + 0x0A, &status);
+        if (status == 0xFFFF) return kIOReturnNotAttached;
+        if (!(status & (1u << 5))) break; // PCI_EXP_DEVSTA_TRPND
+        const uint64_t nowNS = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (nowNS - startNS >= 1000000000ull) return kIOReturnTimeout;
+        IOSleep(1);
+    }
+
+    phase = 4; // reset purges engine queues before their storage is unpinned
+    ret = pci->Reset(kIOPCIDeviceResetTypeFunctionReset, kIOPCIDeviceResetOptionNone);
+    if (ret != kIOReturnSuccess) return ret;
+
+    // Reset restores configuration state. Verify the saved BM-off state was
+    // restored, and that the endpoint is still present, before releasing DMA.
+    phase = 5;
+    vendor = 0xFFFF;
+    pci->ConfigurationRead16(0, &vendor);
+    command = 0xFFFF;
+    pci->ConfigurationRead16(4, &command);
+    if (vendor != 0x1002 || command == 0xFFFF || (command & 4))
+        return kIOReturnNotReady;
+    return kIOReturnSuccess;
+}
+
+static kern_return_t
+mac_amdgpu_shutdown_gpu(MacAMDGPUUserClient *client, uint64_t &phase)
+{
+    auto *driver = client->ivars->ownerDriver;
+    auto *state = driver->ivars;
+    auto *pci = state->retainedPCI;
+    phase = 0;
+    __atomic_store_n(&state->shutdownInProgress, true, __ATOMIC_RELEASE);
+    struct AdmissionGuard {
+        bool *flag;
+        ~AdmissionGuard() { __atomic_store_n(flag, false, __ATOMIC_RELEASE); }
+    } admission { &state->shutdownInProgress };
+
+    // Other clients may own DMA or access BAR mappings outside our RPC queue.
+    // IRQ owners must close and let the existing cancellation barrier drain.
+    if (__atomic_load_n(&state->connectedClients, __ATOMIC_ACQUIRE) != 1 ||
+        (state->pciOpen && state->openerUserClient != client) ||
+        client->ivars->mappedBAR || client->ivars->pendingInterruptNotify != nullptr)
+        return kIOReturnBusy;
+    for (auto *source : client->ivars->interruptSources)
+        if (source != nullptr) return kIOReturnBusy;
+
+    // A previous owner may have closed with shared rings retained. Reopen
+    // exclusively for reset, without ensure_open (which enables bus mastering).
+    state->shutdownBlocked = true;
+    if (!state->pciOpen) {
+        kern_return_t ret = pci->Open(client, 0);
+        if (ret != kIOReturnSuccess) return ret;
+        state->pciOpen = true;
+        __atomic_store_n(&state->openerUserClient, (IOService *)client, __ATOMIC_RELEASE);
+    }
+    kern_return_t ret = mac_amdgpu_quiesce_for_shutdown(pci, phase);
+    if (ret != kIOReturnSuccess) {
+        MACAMDGPU_LOG("Shutdown GPU failed at phase %llu: %#x; backing retained, retry permitted",
+                      phase, ret);
+        return ret;
+    }
+    // SDK Close is void; its documented contract disables BM and MEM. BM was
+    // also explicitly verified off above while configuration access was open.
+    pci->Close(client, 0);
+    state->pciOpen = false;
+    __atomic_store_n(&state->openerUserClient, (IOService *)nullptr, __ATOMIC_RELEASE);
+    state->submission = {};
+    mac_amdgpu_release_quarantine(driver);
+    mac_amdgpu_bo_release_all(client->ivars, driver);
+    for (auto &cs : client->ivars->cs)
+        if (cs.in_use) mac_amdgpu_cs_free_slot(&cs);
+    mac_amdgpu_release_dma_buffer(client);
+    amdgpu::bringup_release_resources(state->bringup);
+    state->shutdownBlocked = false;
+    phase = 6;
+    MACAMDGPU_LOG("Shutdown GPU complete: FLR, PCI closed, all session storage released; ready to reinitialize");
+    return kIOReturnSuccess;
+}
+
 //============================================================
 // MacAMDGPUUserClient::Stop
 //============================================================
 kern_return_t
 IMPL(MacAMDGPUUserClient, Stop)
 {
-    // Order matters: release interrupts and DMA before closing PCI so
-    // any outstanding kernel state has somewhere to drain to. BO
-    // release happens BEFORE DMA-buffer release because GTT-legacy BOs
-    // point into the DMA buffer; while VRAM/GTT BOs are independent,
-    // staying consistent on order keeps any future per-BO sysmem fixup
-    // simple.
-    mac_amdgpu_bo_release_all(ivars, GetProvider());
-    mac_amdgpu_release_all_interrupts(this);
-    mac_amdgpu_release_dma_buffer(this);
-
-    // Release PCI Open if this client opened it. The Open/Close entities
-    // must match per IOPCIFamily.
-    MacAMDGPU *driver = OSDynamicCast(MacAMDGPU, GetProvider());
-    if (driver != nullptr && driver->ivars != nullptr &&
-        driver->ivars->pciOpen &&
-        driver->ivars->openerUserClient == (IOService *)this) {
-        IOPCIDevice *pci = mac_amdgpu_pci(driver);
-        if (pci != nullptr) {
-            pci->Close(this, 0);
-        }
-        driver->ivars->pciOpen = false;
-        driver->ivars->openerUserClient = nullptr;
-        MACAMDGPU_LOG("PCI closed on UserClient Stop");
+    if (ivars == nullptr) return Stop(provider, SUPERDISPATCH);
+    if (__atomic_load_n(&ivars->stopping, __ATOMIC_ACQUIRE)) {
+        return kIOReturnSuccess;
     }
-
-    // v0.1.28 — release any CS scratch buffers the client forgot to
-    // destroy. Each CSCreate allocates an IONewZero(uint32_t, cap) block.
-    if (ivars != nullptr) {
-        for (uint32_t i = 0; i < MACAMDGPU_MAX_CS; i++) {
-            if (ivars->cs[i].in_use) {
-                mac_amdgpu_cs_free_slot(&ivars->cs[i]);
+    kern_return_t ret = CopyDispatchQueue(kIOServiceDefaultQueueName,
+                                          &ivars->stopQueue);
+    if (ret != kIOReturnSuccess || ivars->stopQueue == nullptr) {
+        MACAMDGPU_LOG("Stop cannot obtain completion queue: %#x", ret);
+        return ret != kIOReturnSuccess ? ret : kIOReturnNoResources;
+    }
+    __atomic_store_n(&ivars->stopping, true, __ATOMIC_RELEASE);
+    retain();
+    provider->retain();
+    ivars->stopProvider = provider;
+    // Count every source before issuing any cancellation, including setup
+    // failures. The sentinel prevents synchronous callbacks completing Stop
+    // while the submission loop still accesses ivars.
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < MACAMDGPU_MAX_IRQ_VECTORS; ++i) {
+        if (ivars->interruptSources[i] != nullptr) ++count;
+    }
+    __atomic_store_n(&ivars->stopPendingSources, count + 1, __ATOMIC_RELEASE);
+    MACAMDGPU_LOG("UserClient Stop: draining %u interrupt sources", count);
+    auto *client = this;
+    for (uint32_t i = 0; i < MACAMDGPU_MAX_IRQ_VECTORS; ++i) {
+        IOInterruptDispatchSource *src = ivars->interruptSources[i];
+        if (src == nullptr) continue;
+        auto drained = ^{
+            client->ivars->interruptSources[i] = nullptr;
+            src->release();
+            mac_amdgpu_stop_source_drained(client);
+        };
+        ret = src->Cancel(drained);
+        if (ret != kIOReturnSuccess) {
+            MACAMDGPU_LOG("Stop Cancel vector %u failed %#x; trying disable/drain", i, ret);
+            ret = src->SetEnableWithCompletion(false, drained);
+            if (ret != kIOReturnSuccess) {
+                // Neither API promised quiescence. Keep the source and its
+                // client/provider/backing alive rather than cause a use-after-free.
+                MACAMDGPU_LOG("Stop blocked: vector %u cannot drain (%#x); backing retained", i, ret);
             }
         }
     }
+    mac_amdgpu_stop_source_drained(this); // drop submission sentinel
+    return kIOReturnSuccess;
+}
 
-    IOSafeDeleteNULL(ivars, MacAMDGPUUserClient_IVars, 1);
-    return Stop(provider, SUPERDISPATCH);
+void
+MacAMDGPUUserClient::FinishStop(IOService *provider)
+{
+    // All source callbacks have finished. No new RPC may access resources
+    // after stopping was published, and this runs on their default queue.
+    mac_amdgpu_release_all_interrupts(this);
+
+    MacAMDGPU *driver = OSDynamicCast(MacAMDGPU, provider);
+    bool quarantine = false;
+    bool resetComplete = false;
+    if (driver != nullptr && driver->ivars != nullptr &&
+        driver->ivars->pciOpen && driver->ivars->openerUserClient == this) {
+        auto *state = driver->ivars;
+        uint64_t phase = 0;
+        // Root Stop already isolates an unplugged/terminated provider. For a
+        // live client close, flush engine work before recycling VRAM or DMA.
+        kern_return_t stopped = mac_amdgpu_quiesce_for_shutdown(state->retainedPCI, phase);
+        resetComplete = stopped == kIOReturnSuccess;
+        state->retainedPCI->Close(this, 0);
+        state->pciOpen = false;
+        __atomic_store_n(&state->openerUserClient, (IOService *)nullptr, __ATOMIC_RELEASE);
+        if (!resetComplete) {
+            state->shutdownBlocked = true;
+            // A retry client cannot own new storage while shutdownBlocked.
+            quarantine = state->quarantinedClient == nullptr;
+            MACAMDGPU_LOG("client close: reset failed at phase %llu (%#x); PCI closed, backing quarantined", phase, stopped);
+        } else {
+            state->submission = {};
+            mac_amdgpu_release_quarantine(driver);
+        }
+    }
+
+    if (!quarantine) mac_amdgpu_release_client_storage(ivars, driver);
+    if (resetComplete) {
+        amdgpu::bringup_release_resources(driver->ivars->bringup);
+        driver->ivars->shutdownBlocked = false;
+    }
+
+    IODispatchQueue *completionQueue = ivars->stopQueue;
+    MacAMDGPU *ownerDriver = ivars->ownerDriver;
+    __atomic_sub_fetch(&ownerDriver->ivars->connectedClients, 1, __ATOMIC_ACQ_REL);
+    if (quarantine) {
+        ownerDriver->ivars->quarantinedClient = ivars;
+        ivars->ownerDriver = nullptr;
+        ivars->stopQueue = nullptr;
+        ivars->stopProvider = nullptr;
+        ivars = nullptr;
+    } else {
+        IOSafeDeleteNULL(ivars, MacAMDGPUUserClient_IVars, 1);
+    }
+    MACAMDGPU_LOG("UserClient Stop: callbacks drained; completing superclass Stop");
+    Stop(provider, SUPERDISPATCH);
+    provider->release();
+    ownerDriver->release();
+    completionQueue->release();
+    release();
 }
 
 //============================================================
@@ -1192,6 +1565,10 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
     (void)target;
     (void)reference;
 
+    if (ivars == nullptr || __atomic_load_n(&ivars->stopping, __ATOMIC_ACQUIRE)) {
+        return kIOReturnNotAttached;
+    }
+
     MACAMDGPU_LOG("ExternalMethod entry: sel=%llu args=%p", selector, arguments);
     if (arguments == nullptr) {
         MACAMDGPU_LOG("ExternalMethod: arguments==nullptr → BadArgument");
@@ -1200,11 +1577,44 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
 
     MacAMDGPU  *driver = OSDynamicCast(MacAMDGPU, GetProvider());
     IOPCIDevice *pci    = mac_amdgpu_pci(driver);
-    if (driver == nullptr || pci == nullptr) {
+    if (driver == nullptr || driver->ivars == nullptr || pci == nullptr ||
+        __atomic_load_n(&driver->ivars->stopping, __ATOMIC_ACQUIRE)) {
         return kIOReturnNotAttached;
     }
 
+    if (driver->ivars->shutdownBlocked &&
+        selector != kMacAMDGPUMethodRuntimeBuild &&
+        selector != kMacAMDGPUMethodShutdownGPU &&
+        selector != kMacAMDGPUMethodPing && selector != kMacAMDGPUMethodQueryInfo)
+        return kIOReturnNotReady;
+
+    // A completed stage is historical after the PCI owner has closed.
+    // Keep cached status readable, but require a fresh attachment before
+    // any operation can reuse rings or DMA addresses from that session.
+    if (!driver->ivars->pciOpen &&
+        driver->ivars->bringup.reached != amdgpu::BringupStage::None &&
+        selector != kMacAMDGPUMethodRuntimeBuild &&
+        selector != kMacAMDGPUMethodShutdownGPU &&
+        selector != kMacAMDGPUMethodPing &&
+        selector != kMacAMDGPUMethodQueryInfo &&
+        selector != kMacAMDGPUMethodGetBARInfo) {
+        return kIOReturnNotReady;
+    }
+
+    kern_return_t admission = mac_amdgpu_admit_external(this, driver, pci, selector);
+    if (admission != kIOReturnSuccess) return admission;
+
     switch (selector) {
+
+    case kMacAMDGPUMethodRuntimeBuild: {
+        if (arguments->scalarInputCount != 0 || arguments->scalarOutput == nullptr ||
+            arguments->scalarOutputCount < 3) return kIOReturnBadArgument;
+        arguments->scalarOutput[0] = 0x414D444750554142ull; // AMDGPUAB
+        arguments->scalarOutput[1] = 1; // runtime identity ABI
+        arguments->scalarOutput[2] = MACAMDGPU_BUILD_VERSION;
+        arguments->scalarOutputCount = 3;
+        return kIOReturnSuccess;
+    }
 
     case kMacAMDGPUMethodPing: {
         if (arguments->scalarOutput == nullptr ||
@@ -1264,6 +1674,53 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         arguments->scalarOutput[0] = memoryIndex;
         arguments->scalarOutput[1] = barSize;
         arguments->scalarOutput[2] = barType;
+        return kIOReturnSuccess;
+    }
+
+    case kMacAMDGPUMethodGetReBARInfo: {
+        // in[0] = BAR index; out = capability offset, raw capability,
+        // raw control, supported-size mask, selected bytes, OS-assigned bytes.
+        // Do not write BAR/ReBAR registers: resizing also needs the host
+        // PCI allocator to update bridge windows and memory descriptors.
+        if (!arguments->scalarInput || arguments->scalarInputCount != 1 ||
+            arguments->scalarInput[0] >= 6 || !arguments->scalarOutput ||
+            arguments->scalarOutputCount < 6)
+            return kIOReturnBadArgument;
+        kern_return_t ret = mac_amdgpu_ensure_open(this, driver, pci);
+        if (ret != kIOReturnSuccess) return ret;
+        uint64_t offset = 0;
+        // Apple's extended-capability constant already contains -0x15.
+        ret = pci->FindPCICapability(
+            uint32_t(kIOPCIExpressCapabilityIDResizableBAR), 0, &offset);
+        if (ret != kIOReturnSuccess) return ret;
+        if (offset == 0) return kIOReturnNotFound;
+        amdgpu::ReBARInfo info{};
+        auto read = [&](uint64_t address, uint32_t &value) {
+            value = 0xffffffff;
+            pci->ConfigurationRead32(address, &value);
+            return value != 0xffffffff; // SDK reports failed reads as all ones
+        };
+        auto result = amdgpu::read_rebar(offset,
+            uint32_t(arguments->scalarInput[0]), read, info);
+        switch (result) {
+        case amdgpu::ReBARResult::ReadError: return kIOReturnIOError;
+        case amdgpu::ReBARResult::Malformed: return kIOReturnBadMedia;
+        case amdgpu::ReBARResult::NotFound: return kIOReturnNotFound;
+        case amdgpu::ReBARResult::UnsupportedVersion: return kIOReturnUnsupported;
+        case amdgpu::ReBARResult::Found: break;
+        }
+        uint8_t memoryIndex = 0, barType = 0;
+        uint64_t assignedBytes = 0;
+        ret = pci->GetBARInfo(uint8_t(arguments->scalarInput[0]),
+                             &memoryIndex, &assignedBytes, &barType);
+        if (ret != kIOReturnSuccess) return ret;
+        arguments->scalarOutput[0] = offset;
+        arguments->scalarOutput[1] = info.capability;
+        arguments->scalarOutput[2] = info.control;
+        arguments->scalarOutput[3] = info.supportedSizes;
+        arguments->scalarOutput[4] = info.selectedBytes;
+        arguments->scalarOutput[5] = assignedBytes;
+        arguments->scalarOutputCount = 6;
         return kIOReturnSuccess;
     }
 
@@ -1329,7 +1786,7 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         arguments->scalarOutput[5]  = bar5_cfg;
         arguments->scalarOutput[6]  = ((uint64_t)pm_cap_ptr << 16) | pmcsr;
         arguments->scalarOutput[7]  = bdev.bar0Size;
-        arguments->scalarOutput[8]  = bdev.bar2VisibleVRAMSize;
+        arguments->scalarOutput[8]  = bdev.bar2Size;
         // BAR5 is the MMIO register window on Bonaire+ AMDGPUs.
         // BAR0 is the framebuffer aperture (returns 0 pre-VRAM-setup).
         arguments->scalarOutput[9]  = rdBar(bdev.bar5MemIndex, 0x0000);
@@ -1338,9 +1795,10 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         arguments->scalarOutput[12] = rdBar(bdev.bar0MemIndex, 0x0000);
         arguments->scalarOutput[13] = rdBar(bdev.bar0MemIndex, 0x0004);
         // MP0_C2PMSG_33 (IFWI status) — read from BAR5 (the register
-        // window), dword 0x0061 = byte 0x184. Bit 31 set = IFWI complete.
+        // window), using the same absolute alias as discovery.
         arguments->scalarOutput[14] =
-            rdBar(bdev.bar5MemIndex, (uint64_t)0x0061 * 4ULL);
+            rdBar(bdev.bar5MemIndex,
+                  (uint64_t)amdgpu::BootstrapRegs::MP0_C2PMSG_33 * 4ULL);
         // memIdx values packed in case PCIDriverKit numbered them
         // differently from the BAR numbers (compacted indices).
         arguments->scalarOutput[15] =
@@ -1402,7 +1860,7 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         //   [2] C2PMSG_35 (bootloader ready, bit 31 = 1 when ready)
         //   [3] C2PMSG_36 (firmware buffer address — host-written)
         //   [4] C2PMSG_64 (PSP ring base low — host-written)
-        //   [5] C2PMSG_81 (sOS sign-of-life, bit 31 set when alive)
+        //   [5] C2PMSG_81 (sOS sign-of-life, nonzero when alive)
         //   [6] PSP ring create state (0=not created, 1=created)
         //   [7] MMHUB IP base (or 0xFFFFFFFF if unresolved)
         //   [8] regMMMC_VM_FB_LOCATION_BASE raw value
@@ -1715,6 +2173,8 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             return kIOReturnNotReady;
         }
 
+        if (ivars->pendingInterruptNotify != nullptr) return kIOReturnBusy;
+
         // Fast path: if any enabled+pending bit is already set, complete now.
         for (int i = 0; i < MACAMDGPU_IRQ_PENDING_WORDS; i++) {
             uint64_t en = __atomic_load_n(&ivars->irqEnabled[i],
@@ -1774,11 +2234,25 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
     }
 
     case kMacAMDGPUMethodFreeDMABuffer:
+        if (driver->ivars->bringup.reached != amdgpu::BringupStage::None)
+            return kIOReturnBusy;
         mac_amdgpu_release_dma_buffer(this);
         return kIOReturnSuccess;
 
     case kMacAMDGPUMethodResetDevice:
         return mac_amdgpu_reset_device(this);
+
+    case kMacAMDGPUMethodShutdownGPU: {
+        if (arguments->scalarInputCount != 0 || arguments->scalarOutput == nullptr ||
+            arguments->scalarOutputCount < 2) return kIOReturnBadArgument;
+        uint64_t phase = 0;
+        const kern_return_t ret = mac_amdgpu_shutdown_gpu(this, phase);
+        // Transport succeeds so the failure phase reaches the host even when
+        // the operation itself failed. [status, phase], phase 6 means complete.
+        arguments->scalarOutput[0] = (uint32_t)ret;
+        arguments->scalarOutput[1] = phase;
+        return kIOReturnSuccess;
+    }
 
     case kMacAMDGPUMethodInitDevice: {
         // scalarInput[0] = target BringupStage; scalarOutput[0] = reached.
@@ -1793,14 +2267,30 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         kern_return_t openRet = mac_amdgpu_ensure_open(this, driver, pci);
         if (openRet != kIOReturnSuccess) return openRet;
         auto stage = (amdgpu::BringupStage)arguments->scalarInput[0];
-        kern_return_t ret = amdgpu::bringup_to(driver->ivars->bringup,
-                                                  stage);
+        auto &bringup = driver->ivars->bringup;
+        const auto previousPSPFence = bringup.psp.fenceCounter;
+        const auto previousCPWptr = bringup.cp.wptr;
+        uint32_t previousSDMAWptr[amdgpu::kSDMAInstanceCount] = {};
+        for (uint32_t i = 0; i < amdgpu::kSDMAInstanceCount; ++i)
+            previousSDMAWptr[i] = bringup.sdma.instance[i].wptr;
+        kern_return_t ret = amdgpu::bringup_to(bringup, stage);
+        bool submitted = bringup.psp.fenceCounter != previousPSPFence ||
+                         bringup.cp.wptr != previousCPWptr;
+        for (uint32_t i = 0; i < amdgpu::kSDMAInstanceCount; ++i)
+            submitted |= bringup.sdma.instance[i].wptr != previousSDMAWptr[i];
+        if (ret != kIOReturnSuccess && (ret == kIOReturnTimeout || submitted)) {
+            driver->ivars->shutdownBlocked = true;
+            MACAMDGPU_LOG("initialization failed after possible submission; Stop GPU required before retry");
+        }
         arguments->scalarOutput[0] =
             (uint64_t)driver->ivars->bringup.reached;
         return ret;
     }
 
     case kMacAMDGPUMethodLoadFirmware: {
+        const uint32_t previousFence = driver->ivars->bringup.psp.fenceCounter;
+        const kern_return_t firmwareResult = [&]() -> kern_return_t {
+
         // scalarInput[0] = fw type; [1] = size in bytes; the firmware
         // bytes are sourced from this client's DMABuffer (must be
         // allocated and contain the payload before this call).
@@ -1826,6 +2316,7 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         auto &dev = driver->ivars->bringup.device;
         auto &psp = driver->ivars->bringup.psp;
         const uint8_t *bin = reinterpret_cast<const uint8_t *>(seg.address);
+        psp.firmwareLoadComplete = false;
 
         switch (fwType) {
         case kMacAMDGPUFwTypeSOS: {
@@ -1981,6 +2472,24 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                 // SMU/IMU; SDMA/CP/MES/RLC stay failing pending a
                 // different attack.
 
+                // PSP transfers RS64 microcode but Linux's later hw_init must
+                // still configure its entry PCs and release the pipe resets.
+                int cpFirmwareIndex = -1;
+                switch (fwType) {
+                case kMacAMDGPUFwTypeFile_CP_PFP: cpFirmwareIndex = 0; break;
+                case kMacAMDGPUFwTypeFile_CP_ME:  cpFirmwareIndex = 1; break;
+                case kMacAMDGPUFwTypeFile_CP_MEC: cpFirmwareIndex = 2; break;
+                default: break;
+                }
+                uint64_t cpEntryAddress = 0;
+                if (cpFirmwareIndex >= 0) {
+                    auto &cp = driver->ivars->bringup.cp;
+                    if (cp.firmwarePrepared || cp.ringReady) return kIOReturnBusy;
+                    cp.firmware[cpFirmwareIndex] = {};
+                    if (!amdgpu::cp_parse_firmware_start(bin, fwSize, cpEntryAddress))
+                        return kIOReturnBadArgument;
+                }
+
                 // Decode the .bin into one-or-more LOAD_IP_FW payloads.
                 amdgpu::UcodePayload payloads[amdgpu::kMaxUcodePayloadsPerFile];
                 uint32_t count = amdgpu::amdgpu_ucode_extract(
@@ -1999,29 +2508,19 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                 // when the SDMA payload submits successfully.
                 bool sdma_loaded_this_call = false;
 
-                // MES start address extraction — pre-loop because it's
-                // a property of the .bin file, not a per-payload value.
-                // Upstream: amdgpu_mes.c:708-713 stashes
-                // adev->mes.uc_start_addr[pipe] from the header before
-                // PSP load. The KIQ pipe is not exposed on R9700 yet —
-                // mes_v12_0 uses one file per pipe so we only see the
-                // SCHED pipe via uni_mes/mes.bin.
-                //
-                // We trigger on the FILE-typed path (0x200+3 = MES_UNI)
-                // and on the legacy CP_MES (0x100+33) single-payload
-                // path that also loads a uni_mes-format file.
-                if (fwType == kMacAMDGPUFwTypeFile_MES_UNI ||
-                    fwType == 0x100ULL + amdgpu::PSPGfxFwType::CP_MES) {
-                    if (fwSize >= sizeof(amdgpu::mes_firmware_header_v1_0)) {
-                        auto *mhdr = reinterpret_cast<
-                            const amdgpu::mes_firmware_header_v1_0 *>(bin);
-                        uint64_t uc_addr =
-                            static_cast<uint64_t>(mhdr->mes_uc_start_addr_lo) |
-                            (static_cast<uint64_t>(mhdr->mes_uc_start_addr_hi) << 32);
-                        amdgpu::mes_set_uc_start_addr(
-                            driver->ivars->bringup.mes,
-                            amdgpu::MESPipe::Sched, uc_addr);
-                    }
+                uint64_t mesEntryAddress = 0;
+                uint32_t mesPayloadMask = 0;
+                const bool isMESPackage = fwType == kMacAMDGPUFwTypeFile_MES_UNI ||
+                    fwType == 0x100ULL + amdgpu::PSPGfxFwType::CP_MES;
+                if (isMESPackage) {
+                    auto &mes = driver->ivars->bringup.mes;
+                    mes.sched_ucode_loaded = mes.kiq_ucode_loaded = false;
+                    if (fwSize < sizeof(amdgpu::mes_firmware_header_v1_0))
+                        return kIOReturnBadArgument;
+                    const auto *hdr = reinterpret_cast<const amdgpu::mes_firmware_header_v1_0 *>(bin);
+                    mesEntryAddress = uint64_t(hdr->mes_uc_start_addr_lo) |
+                        (uint64_t(hdr->mes_uc_start_addr_hi) << 32);
+                    if (!mesEntryAddress || (mesEntryAddress & 3)) return kIOReturnBadArgument;
                 }
 
                 // Submit each payload as its own LOAD_IP_FW frame. Stage
@@ -2112,6 +2611,14 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                                       fwType, i, payloads[i].fw_type, r);
                         return r;
                     }
+                    if (isMESPackage) {
+                        switch (payloads[i].fw_type) {
+                        case amdgpu::PSPGfxFwType::CP_MES: mesPayloadMask |= 1; break;
+                        case amdgpu::PSPGfxFwType::CP_MES_DATA: mesPayloadMask |= 2; break;
+                        case amdgpu::PSPGfxFwType::CP_MES_KIQ: mesPayloadMask |= 4; break;
+                        case amdgpu::PSPGfxFwType::MES_KIQ_STACK: mesPayloadMask |= 8; break;
+                        }
+                    }
                     if (payloads[i].fw_type == amdgpu::PSPGfxFwType::SDMA0 ||
                         payloads[i].fw_type == amdgpu::PSPGfxFwType::SDMA1 ||
                         payloads[i].fw_type == amdgpu::PSPGfxFwType::SDMA_UCODE_TH0) {
@@ -2133,7 +2640,7 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                             MACAMDGPU_LOG("rlc_autoload_start FAILED kr=%#x", a);
                             return a;
                         }
-                        driver->ivars->bringup.rlc.microcode_loaded = true;
+                        driver->ivars->bringup.rlc.microcode_loaded = false;
 
                         // Upstream amdgpu_psp.c:3153 — psp_asd_initialize
                         // runs BETWEEN psp_load_non_psp_fw (which ends
@@ -2154,12 +2661,7 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                                           "(resp=%#x) — autoload may stay "
                                           "stuck",
                                           asd, psp.asd.resp_status);
-                            // Continue rather than abort: if ASD is
-                            // truly required, BOOTLOAD_STATUS poll
-                            // (RLCInit) will time out and surface the
-                            // real symptom — but we want to see
-                            // psp_rl_load's resp too as diagnostic
-                            // signal, so we don't return here.
+                            return asd;
                         }
 
                         // Upstream amdgpu_psp.c:3159 follows
@@ -2168,18 +2670,29 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                         // REG_LIST (fw_type=67). psp.rl is populated
                         // from the v2 SOS package by
                         // psp_parse_sos_microcode. psp_rl_load is
-                        // best-effort on Apple Silicon: v0.1.15/0.1.16
-                        // both saw PSP return resp=0x11 on REG_LIST.
-                        // The same RL bytes from psp_14_0_3_sos.bin
-                        // work on Linux. Warn and continue.
+                        // required when present. Keep its SOS package
+                        // alive through all intervening firmware uploads.
                         kern_return_t rl =
                             amdgpu::psp_rl_load(dev, psp);
                         if (rl != kIOReturnSuccess) {
-                            MACAMDGPU_LOG("psp_rl_load returned kr=%#x — "
-                                          "continuing (PSP-side quirk on AS, "
-                                          "not autoload-gating)", rl);
+                            MACAMDGPU_LOG("psp_rl_load FAILED kr=%#x — firmware initialization stopped", rl);
+                            return rl;
                         }
+                        driver->ivars->bringup.rlc.microcode_loaded = true;
+                        psp.firmwareLoadComplete = true;
                     }
+                }
+                if (isMESPackage) {
+                    if (mesPayloadMask != 0xf) return kIOReturnNotReady;
+                    auto &mes = driver->ivars->bringup.mes;
+                    amdgpu::mes_set_uc_start_addr(mes, amdgpu::MESPipe::Sched, mesEntryAddress);
+                    amdgpu::mes_set_uc_start_addr(mes, amdgpu::MESPipe::KIQ, mesEntryAddress);
+                }
+                if (cpFirmwareIndex >= 0) {
+                    driver->ivars->bringup.cp.firmware[cpFirmwareIndex] =
+                        {cpEntryAddress, true};
+                    MACAMDGPU_LOG("CP RS64 firmware %d acknowledged; entry=%#llx",
+                                  cpFirmwareIndex, cpEntryAddress);
                 }
                 if (sdma_loaded_this_call) {
                     driver->ivars->bringup.sdma.microcode_loaded = true;
@@ -2190,6 +2703,15 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                           fwType);
             return kIOReturnUnsupported;
         }
+
+        }();
+        if (firmwareResult != kIOReturnSuccess &&
+            (firmwareResult == kIOReturnTimeout ||
+             driver->ivars->bringup.psp.fenceCounter != previousFence)) {
+            driver->ivars->shutdownBlocked = true;
+            MACAMDGPU_LOG("firmware command failed after possible submission; Stop GPU required before retry");
+        }
+        return firmwareResult;
     }
 
     case kMacAMDGPUMethodSetIPBase: {
@@ -2239,12 +2761,15 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         }
         if (!driver->ivars->pciOpen) return kIOReturnNotOpen;
         uint64_t timeout_us = arguments->scalarInput[0];
-        if (timeout_us == 0) timeout_us = 1000000;  // 1 s default
+        timeout_us = amdgpu::client_wait_ns(timeout_us, true) / 1000;
+        const auto previousWptr = driver->ivars->bringup.cp.wptr;
         uint32_t fence = 0;
         kern_return_t r = amdgpu::cp_submit_eop_test(
             driver->ivars->bringup.device,
             driver->ivars->bringup.cp,
             timeout_us, &fence);
+        if (r != kIOReturnSuccess && driver->ivars->bringup.cp.wptr != previousWptr)
+            driver->ivars->shutdownBlocked = true;
         arguments->scalarOutput[0] = fence;
         return r;
     }
@@ -2273,6 +2798,7 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         uint64_t fence_gpu_va     = 0;
         uint32_t observed         = 0;
 
+        const auto previousWptr = driver->ivars->bringup.cp.wptr;
         kern_return_t r = amdgpu::cp_kiq_smoke_test(
             driver->ivars->bringup.device,
             driver->ivars->bringup.cp,
@@ -2280,6 +2806,8 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             driver->ivars->bringup.gmc,
             expected, timeout_us,
             &elapsed_us, &fence_gpu_va, &observed);
+        if (r != kIOReturnSuccess && driver->ivars->bringup.cp.wptr != previousWptr)
+            driver->ivars->shutdownBlocked = true;
 
         arguments->scalarOutput[0] = static_cast<uint64_t>(r);
         arguments->scalarOutput[1] = elapsed_us;
@@ -2287,7 +2815,33 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         arguments->scalarOutput[3] = observed;
         arguments->scalarOutput[4] = fence_gpu_va & 0xFFFFFFFFull;
         arguments->scalarOutput[5] = (fence_gpu_va >> 32) & 0xFFFFFFFFull;
-        return r;
+        // Preserve diagnostics on timeout: failed RPCs may discard scalars.
+        // The operation status is carried in output[0], as for SDMACopyVRAM.
+        return kIOReturnSuccess;
+    }
+
+    case kMacAMDGPUMethodHostMemoryTest: {
+        if (!arguments->scalarInput || arguments->scalarInputCount < 1 ||
+            !arguments->scalarOutput || arguments->scalarOutputCount < 6)
+            return kIOReturnBadArgument;
+        if (!driver->ivars->pciOpen) return kIOReturnNotOpen;
+        auto &b = driver->ivars->bringup;
+        amdgpu::MemoryTransferResult result{};
+        const auto r = amdgpu::memory_transfer_test(b.device, b.gmc, b.gart,
+            b.sdma.instance[0], b.memoryTest,
+            static_cast<uint32_t>(arguments->scalarInput[0]), result);
+        if (r != kIOReturnSuccess && b.memoryTest.active)
+            driver->ivars->shutdownBlocked = true;
+        arguments->scalarOutput[0] = static_cast<uint32_t>(r);
+        arguments->scalarOutput[1] = result.stage;
+        arguments->scalarOutput[2] = result.mismatches;
+        arguments->scalarOutput[3] = result.firstMismatch;
+        arguments->scalarOutput[4] = result.hostGPUAddress;
+        arguments->scalarOutput[5] = result.vramGPUAddress;
+        MACAMDGPU_LOG("host-memory test: status=%#x stage=%u mismatches=%u first=%#x host_gpu=%#llx vram_gpu=%#llx",
+            r, result.stage, result.mismatches, result.firstMismatch,
+            result.hostGPUAddress, result.vramGPUAddress);
+        return kIOReturnSuccess; // preserve diagnostics even when operation failed
     }
 
     case kMacAMDGPUMethodSDMACopyTest: {
@@ -2313,19 +2867,23 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         uint64_t count   = arguments->scalarInput[3];
         uint64_t to_us   = arguments->scalarInput[4];
         if (inst >= amdgpu::kSDMAInstanceCount || count == 0 ||
-            src_off + count > ivars->dmaBufferSize ||
-            dst_off + count > ivars->dmaBufferSize) {
+            count > UINT32_MAX ||
+            !amdgpu::client_subrange(src_off, count, ivars->dmaBufferSize) ||
+            !amdgpu::client_subrange(dst_off, count, ivars->dmaBufferSize)) {
             return kIOReturnBadArgument;
         }
         // First segment bus base — we already enforce single-segment
         // mappings, so contiguous offsets are valid bus addresses.
         const uint64_t bus_base = ivars->dmaSegments[0].address;
+        const auto previousWptr = driver->ivars->bringup.sdma.instance[inst].wptr;
         kern_return_t r = amdgpu::sdma_copy_linear_test(
             driver->ivars->bringup.device,
             driver->ivars->bringup.sdma.instance[inst],
             bus_base + src_off, bus_base + dst_off,
             static_cast<uint32_t>(count),
-            to_us ? to_us : 1000000ull);
+            amdgpu::client_wait_ns(to_us, true) / 1000);
+        if (r != kIOReturnSuccess && driver->ivars->bringup.sdma.instance[inst].wptr != previousWptr)
+            driver->ivars->shutdownBlocked = true;
         arguments->scalarOutput[0] = static_cast<uint64_t>(r);
         return r;
     }
@@ -2351,6 +2909,9 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         //   [4] bytes copied
         //   [5] src.gpu_va & 0xFFFFFFFF
         //   [6] dst.gpu_va & 0xFFFFFFFF
+        // Extended reply (when caller offers 12 words):
+        //   [7] source readback mismatches before submit, [8] first bad offset
+        //   [9] format marker 0x53444d41, [10..11] full source/dest MC addresses
         if (arguments->scalarOutput == nullptr ||
             arguments->scalarOutputCount < 7) {
             return kIOReturnBadArgument;
@@ -2442,11 +3003,33 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                       (unsigned long long)dst.gpu_va,
                       (unsigned long long)dst_vram_off);
 
-        kern_return_t r = amdgpu::sdma_copy_linear_test(
-            dev, sdma_inst,
-            src.gpu_va, dst.gpu_va,
-            static_cast<uint32_t>(bytes_in),
-            /*timeout_us=*/100000ull);
+        // Verify the upload through an independent read path before
+        // blaming SDMA for a mismatch. Do not submit corrupt source data.
+        uint32_t source_mismatched = 0, source_first_bad = 0;
+        for (uint32_t i = 0; i < n_dwords; ++i) {
+            const uint32_t observed = amdgpu::RVRAM32_via_mm(
+                dev, src_vram_off + uint64_t(i) * 4);
+            if (observed != pattern_buf[i]) {
+                if (source_mismatched == 0) {
+                    source_first_bad = i * 4;
+                    MACAMDGPU_LOG("SDMACopyVRAM: source upload mismatch at %#x "
+                                  "expected=%#x observed=%#x",
+                                  source_first_bad, pattern_buf[i], observed);
+                }
+                ++source_mismatched;
+            }
+        }
+        const uint64_t copy_start_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        const auto previousWptr = sdma_inst.wptr;
+        kern_return_t r = source_mismatched ? kIOReturnIOError :
+            amdgpu::sdma_copy_linear_test(dev, sdma_inst,
+                src.gpu_va, dst.gpu_va, static_cast<uint32_t>(bytes_in),
+                /*timeout_us=*/100000ull);
+        if (r != kIOReturnSuccess && sdma_inst.wptr != previousWptr)
+            driver->ivars->shutdownBlocked = true;
+
+        const uint64_t copy_elapsed_us =
+            (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - copy_start_ns) / 1000;
 
         // Readback regardless of fence status — even a partial copy
         // tells us whether the engine touched dst at all.
@@ -2469,12 +3052,22 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                       r, mismatched, n_dwords, first_bad_off);
 
         arguments->scalarOutput[0] = static_cast<uint64_t>(r);
-        arguments->scalarOutput[1] = 0;  // elapsed_us — no mach time yet
+        arguments->scalarOutput[1] = copy_elapsed_us;
         arguments->scalarOutput[2] = static_cast<uint64_t>(mismatched);
         arguments->scalarOutput[3] = static_cast<uint64_t>(first_bad_off);
         arguments->scalarOutput[4] = bytes_in;
         arguments->scalarOutput[5] = src.gpu_va & 0xFFFFFFFFull;
         arguments->scalarOutput[6] = dst.gpu_va & 0xFFFFFFFFull;
+        if (arguments->scalarOutputCount >= 12) {
+            arguments->scalarOutput[7] = source_mismatched;
+            arguments->scalarOutput[8] = source_first_bad;
+            arguments->scalarOutput[9] = 0x53444d41;
+            arguments->scalarOutput[10] = src.gpu_va;
+            arguments->scalarOutput[11] = dst.gpu_va;
+            arguments->scalarOutputCount = 12;
+        } else {
+            arguments->scalarOutputCount = 7;
+        }
         // Always return success at the IOConnect layer; the actual
         // SDMA kr lives in scalarOutput[0] so the host can decode it.
         return kIOReturnSuccess;
@@ -2551,18 +3144,10 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         uint64_t flags     = legacy ? 0ULL : arguments->scalarInput[3];
         if (size == 0) return kIOReturnBadArgument;
         if (flags != 0) return kIOReturnUnsupported;
-        if (alignment < MACAMDGPU_BO_ALIGN) alignment = MACAMDGPU_BO_ALIGN;
-        // Coerce alignment up to next power of two if user passed a
-        // non-pow2 value.
-        if ((alignment & (alignment - 1)) != 0) {
-            uint64_t pow2 = MACAMDGPU_BO_ALIGN;
-            while (pow2 < alignment) pow2 <<= 1;
-            alignment = pow2;
-        }
-        // Round size up to alignment so successive allocations stay
-        // aligned in the underlying allocator.
-        const uint64_t rounded_size = (size + alignment - 1) &
-                                      ~(alignment - 1);
+        uint64_t rounded_size = 0;
+        if (!amdgpu::client_allocation_shape(size, alignment, MACAMDGPU_BO_ALIGN,
+                                             alignment, rounded_size))
+            return kIOReturnBadArgument;
 
         // Find a free slot in the table.
         uint32_t idx = MACAMDGPU_MAX_BO;
@@ -2583,6 +3168,7 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         e.gpu_va       = 0;
         e.gtt_buf      = nullptr;
         e.gtt_dma      = nullptr;
+        e.gttBinding   = {};
         e.gtt_bus_addr = 0;
         e.cpu_addr     = nullptr;
         e.generation   = ++ivars->boGenCounter;
@@ -2595,14 +3181,18 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                 goto bo_alloc_fail;
             }
             // Bump-align the legacy cursor.
-            ivars->boBumpOffset = (ivars->boBumpOffset + alignment - 1)
-                                & ~(alignment - 1);
-            if (ivars->boBumpOffset + rounded_size > ivars->dmaBufferSize) {
+            if (ivars->boBumpOffset > UINT64_MAX - (alignment - 1)) {
                 allocRet = kIOReturnNoSpace;
                 goto bo_alloc_fail;
             }
-            e.byte_offset = ivars->boBumpOffset;
-            ivars->boBumpOffset += rounded_size;
+            const uint64_t alignedOffset = (ivars->boBumpOffset + alignment - 1)
+                                           & ~(alignment - 1);
+            if (!amdgpu::client_subrange(alignedOffset, rounded_size, ivars->dmaBufferSize)) {
+                allocRet = kIOReturnNoSpace;
+                goto bo_alloc_fail;
+            }
+            e.byte_offset = alignedOffset;
+            ivars->boBumpOffset = alignedOffset + rounded_size;
         }
         else if (domain == kBODomainVRAM) {
             auto &gmc = driver->ivars->bringup.gmc;
@@ -2633,28 +3223,29 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                 allocRet = kIOReturnNotReady;
                 goto bo_alloc_fail;
             }
-            // **Platform gate** — GPU-initiated DART sysmem reads return
-            // zero on AS+TB5 (see [[feedback_mac_amdgpu_dart_tb5_pcie_reads]]).
-            // GART itself is fully programmed, but engines reading through
-            // GART → DART → sysmem get all zeros. Fail loud here instead
-            // of handing out a BO that silently misbehaves on every read.
-            // When Apple exposes a working sysmem-mapping primitive,
-            // gart_init() flips reads_supported=true and this path lights
-            // up automatically. No client API changes.
+            // Require data-verified GPU host-memory transfers and complete
+            // mapping teardown before exposing GTT BOs. Earlier zero readback
+            // does not establish which address-translation layer failed.
             if (!gart.reads_supported) {
                 MACAMDGPU_LOG("BOAlloc(GTT): refused — gart.reads_supported "
-                              "= false on this platform (AS+TB5 DART "
-                              "zeroes GPU-initiated sysmem reads). Use "
+                              "= false; GPU host-memory transfers "
+                              "remain unverified. Use "
                               "kBODomainVRAM instead. Returning "
                               "kIOReturnUnsupported.");
                 allocRet = kIOReturnUnsupported;
                 goto bo_alloc_fail;
             }
-            amdgpu::GARTBinding binding = {};
+            auto &binding = e.gttBinding;
             kern_return_t r = amdgpu::gart_bind_sysmem(
                 driver->ivars->bringup.device, gart,
                 rounded_size, alignment, &binding);
             if (r != kIOReturnSuccess) {
+                if (binding.sysmemBuffer || binding.numGPUPages) {
+                    // A partially published mapping must survive until Stop.
+                    // Keep the slot in use even though no handle is returned.
+                    driver->ivars->shutdownBlocked = true;
+                    return r;
+                }
                 allocRet = r;
                 goto bo_alloc_fail;
             }
@@ -2715,16 +3306,12 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             gmc.vram_alloc.free(va);
         }
         else if (e->domain == kBODomainGTT) {
-            if (e->gtt_dma != nullptr) {
-                e->gtt_dma->CompleteDMA(kIODMACommandCompleteDMANoOptions);
-                e->gtt_dma->release();
+            const auto r = amdgpu::gart_unbind(driver->ivars->bringup.device,
+                driver->ivars->bringup.gart, &e->gttBinding);
+            if (r != kIOReturnSuccess) {
+                driver->ivars->shutdownBlocked = true;
+                return r;
             }
-            if (e->gtt_buf != nullptr) {
-                e->gtt_buf->release();
-            }
-            // GART PTEs leak until GART reset — gart.cpp bump allocator
-            // doesn't reclaim individual slots. Phase 2 task: per-PTE
-            // free-list when we revisit GART scheduling.
         }
         // kBODomainGTTLegacy: bump cursor stays where it is so existing
         // submits in flight don't get clobbered; the table slot is freed.
@@ -2846,11 +3433,9 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             case kMacAMDGPUCSIPTypeSDMA: {
                 // Append the user CS dwords directly into the SDMA
                 // ring as an inline submission, then close with a
-                // FENCE packet so WaitFence can poll a WB slot. This
-                // is the simplest valid SDMA submission shape — no
-                // GART-bound IB needed, which sidesteps the DART/TB5
-                // sysmem-read trap (see feedback_mac_amdgpu_dart_tb5
-                // _pcie_reads memory).
+                // FENCE packet so WaitFence can poll a VRAM WB slot.
+                // Inline VRAM packets avoid depending on the unverified
+                // GART-bound system-memory IB path.
                 auto &b = driver->ivars->bringup;
                 if (cs->ip_instance >= amdgpu::kSDMAInstanceCount) {
                     return kIOReturnBadArgument;
@@ -2861,22 +3446,21 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                 // Pre-clear our fence slot at WB+0xC0 (0x80 belongs to
                 // sdma_ring_test/copy_linear_test) and emit user
                 // dwords + FENCE.
-                auto *wb_bytes = static_cast<volatile uint8_t *>(inst.wb_cpu);
-                volatile uint32_t *fence_cpu =
-                    reinterpret_cast<volatile uint32_t *>(wb_bytes + 0xC0);
-                *fence_cpu = 0;
+                const auto clear = amdgpu::sdma_clear_fence(b.device, inst, 0xC0);
+                if (clear != kIOReturnSuccess) return clear;
+                const uint32_t fence_value = driver->ivars->submission.beginSDMA(
+                    &inst.cs_fence_shadow, amdgpu::sdma_read_cs_fence, &inst);
+                if (!fence_value) return kIOReturnNoResources;
                 const uint64_t fence_gpu   = inst.wb_bus + 0xC0;
-                // Distinctive sentinel; the upper bits encode "CS" so a
-                // WB dump distinguishes user CS submits from the ring
-                // self-test (sdma_ring_test uses 0xCAFEC0DE).
-                const uint32_t fence_value = 0xC50000u | (cs->generation & 0xFFFFu);
+                cs->last_fence = fence_value;
+                // The device sequence is never reused within this session.
 
                 uint32_t wrote = amdgpu::sdma_ring_write(
                     b.device, inst, cs->cpu_buffer, cs->written_dw);
                 if (wrote != cs->written_dw) return kIOReturnNoSpace;
 
                 uint32_t pkt[4];
-                pkt[0] = amdgpu::SDMA_PKT_HEADER_OP(amdgpu::SDMA_OP_FENCE);
+                pkt[0] = amdgpu::sdma_fence_header();
                 pkt[1] = static_cast<uint32_t>(fence_gpu);
                 pkt[2] = static_cast<uint32_t>(fence_gpu >> 32);
                 pkt[3] = fence_value;
@@ -2892,11 +3476,33 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                 arguments->scalarOutput[0] = arguments->scalarInput[0];
                 return kIOReturnSuccess;
             }
-            case kMacAMDGPUCSIPTypeGFX:
+            case kMacAMDGPUCSIPTypeGFX: {
+                if (cs->ip_instance != 0) return kIOReturnBadArgument;
+                auto &b = driver->ivars->bringup;
+                auto &cp = b.cp;
+                if (!cp.ringReady) return kIOReturnNotReady;
+                if (cp.fence_counter == UINT32_MAX) return kIOReturnNoResources;
+                // Use the MES-mapped kernel GFX queue. Raw developer PM4 has
+                // no BO reference list, so admission keeps every allocation
+                // alive and blocks other mutations until this fence completes.
+                if (!driver->ivars->submission.beginCP(
+                        cp.fence_cpu, amdgpu::cp_read_cs_fence, &cp))
+                    return kIOReturnBusy;
+                if (amdgpu::cp_ring_write(cp, cs->cpu_buffer, cs->written_dw)
+                        != cs->written_dw) return kIOReturnNoSpace;
+                const uint32_t fence = amdgpu::cp_emit_eop_fence(cp);
+                if (!fence) return kIOReturnNoSpace;
+                driver->ivars->submission.expected = fence;
+                cs->last_fence = fence;
+                // On upload/kick failure the submission remains pending;
+                // only verified completion or StopGPU can release resources.
+                const auto r = amdgpu::cp_kick_doorbell(b.device, cp);
+                if (r != kIOReturnSuccess) return r;
+                arguments->scalarOutput[0] = arguments->scalarInput[0];
+                return kIOReturnSuccess;
+            }
             case kMacAMDGPUCSIPTypeCompute:
-                // GFX / COMPUTE submission needs MES user-queue MQD
-                // plumbing that's deferred to v0.1.29 — the structural
-                // ABI is what ships in v0.1.28.
+                // Compute needs its own queue and dispatch setup.
                 return kIOReturnUnsupported;
             default:
                 return kIOReturnBadArgument;
@@ -2908,7 +3514,10 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         BOEntry *e = mac_amdgpu_bo_lookup(ivars, arguments->scalarInput[0]);
         if (e == nullptr) return kIOReturnBadArgument;
         uint64_t ib_dw = arguments->scalarInput[1];
-        if (ib_dw == 0 || ib_dw * 4 > e->size) {
+        if (e->domain != kBODomainGTTLegacy || ivars->dmaBuffer == nullptr ||
+            ivars->dmaSegmentsCount == 0 || ib_dw == 0 || ib_dw > UINT32_MAX ||
+            ib_dw > e->size / sizeof(uint32_t) ||
+            !amdgpu::client_subrange(e->byte_offset, e->size, ivars->dmaBufferSize)) {
             return kIOReturnBadArgument;
         }
         if (arguments->scalarInput[2] != 0) return kIOReturnUnsupported;
@@ -2921,11 +3530,18 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             seg.address + e->byte_offset);
 
         auto &cp = driver->ivars->bringup.cp;
+        if (cp.fence_counter == UINT32_MAX) return kIOReturnNoResources;
+        if (!cp.ringReady || !driver->ivars->submission.beginCP(
+                cp.fence_cpu, amdgpu::cp_read_cs_fence, &cp))
+            return kIOReturnNotReady;
         uint32_t wrote = amdgpu::cp_ring_write(cp, ib_words,
                                                static_cast<uint32_t>(ib_dw));
         if (wrote != ib_dw) return kIOReturnNoSpace;
 
         uint32_t fence = amdgpu::cp_emit_eop_fence(cp);
+        if (fence == 0) return kIOReturnNoSpace;
+        driver->ivars->submission.expected = fence;
+        driver->ivars->submission.lastCPFence = fence;
         kern_return_t r = amdgpu::cp_kick_doorbell(
             driver->ivars->bringup.device, cp);
         if (r != kIOReturnSuccess) return r;
@@ -2934,50 +3550,10 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         return kIOReturnSuccess;
     }
 
-    case kMacAMDGPUMethodMESAddQueue: {
-        // scalarInput[0] = queue_type (0=GFX, 1=COMPUTE, 2=SDMA)
-        // scalarInput[1] = doorbell_offset
-        // scalarInput[2] = mqd BO handle (must be allocated by BOAlloc)
-        // scalarInput[3] = wptr BO handle (or 0 for none)
-        // scalarInput[4] = inprocess priority (0..4)
-        // scalarOutput[0] = kIOReturn from mes_add_hw_queue
-        if (arguments->scalarInput == nullptr ||
-            arguments->scalarInputCount < 5 ||
-            arguments->scalarOutput == nullptr ||
-            arguments->scalarOutputCount < 1) {
-            return kIOReturnBadArgument;
-        }
-        BOEntry *mqd_bo  = mac_amdgpu_bo_lookup(ivars, arguments->scalarInput[2]);
-        BOEntry *wptr_bo = arguments->scalarInput[3] == 0
-                          ? nullptr
-                          : mac_amdgpu_bo_lookup(ivars, arguments->scalarInput[3]);
-        if (mqd_bo == nullptr) return kIOReturnBadArgument;
-        const uint64_t bus_base = ivars->dmaSegments[0].address;
-
-        amdgpu::MESAddQueueInput in{};
-        in.process_id    = 1;
-        in.queue_type    = static_cast<uint32_t>(arguments->scalarInput[0]);
-        in.doorbell_offset = static_cast<uint32_t>(arguments->scalarInput[1]);
-        in.mqd_addr      = bus_base + mqd_bo->byte_offset;
-        in.wptr_addr     = wptr_bo ? (bus_base + wptr_bo->byte_offset) : 0;
-        in.inprocess_gang_priority    =
-            static_cast<uint32_t>(arguments->scalarInput[4]);
-        in.gang_global_priority_level =
-            static_cast<uint32_t>(arguments->scalarInput[4]);
-        in.page_table_base_addr = 0;  // VMID 0 GART path
-        in.gang_context_addr    = 0;
-        in.process_context_addr = 0;
-        in.pipe_id  = 0;
-        in.queue_id = 0;
-        in.flags    = 0;
-
-        kern_return_t r = amdgpu::mes_add_hw_queue(
-            driver->ivars->bringup.device,
-            driver->ivars->bringup.mes,
-            in);
-        arguments->scalarOutput[0] = static_cast<uint64_t>(r);
-        return r;
-    }
+    case kMacAMDGPUMethodMESAddQueue:
+        // Persistent user queues require queue removal and retained MQD/wptr
+        // BO references. Raw CS fencing does not establish that lifetime.
+        return kIOReturnUnsupported;
 
     case kMacAMDGPUMethodQueryInfo: {
         // scalarInput[0] = info type tag
@@ -3027,9 +3603,8 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         //   scalarInput[1] = timeout_ns
         //   scalarOutput[0] = status (0=signaled, 1=timeout)
         //
-        // Internally we still drive a us-resolution busy-wait — the
-        // ns precision is exposed for API symmetry with the Vulkan
-        // semaphore wait shape we'll need in v0.2.0.
+        // Monotonic timeout is capped at one second so removal and Stop
+        // cannot be blocked by an arbitrary caller-supplied duration.
         if (arguments->scalarInput == nullptr ||
             arguments->scalarInputCount < 2 ||
             arguments->scalarOutput == nullptr ||
@@ -3057,28 +3632,38 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
                     return kIOReturnBadArgument;
                 }
                 auto &inst = b.sdma.instance[cs->ip_instance];
-                if (inst.wb_cpu == nullptr) return kIOReturnNotReady;
-                auto *wb_bytes = static_cast<volatile uint8_t *>(inst.wb_cpu);
-                volatile uint32_t *fence_cpu =
-                    reinterpret_cast<volatile uint32_t *>(wb_bytes + 0xC0);
-
-                const uint64_t to_us = to_ns / 1000ull + 1;
-                const uint64_t step_us = 50;
-                uint64_t elapsed = 0;
-                while (elapsed < to_us) {
-                    if (*fence_cpu == cs->last_fence) {
-                        arguments->scalarOutput[0] = 0;  // signaled
+                if (!inst.inited) return kIOReturnNotReady;
+                const uint64_t duration = amdgpu::client_wait_ns(to_ns);
+                const uint64_t started = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+                for (;;) {
+                    driver->ivars->submission.poll();
+                    if (cs->last_fence <= driver->ivars->submission.completed) {
+                        arguments->scalarOutput[0] = 0;
                         return kIOReturnSuccess;
                     }
-                    uint32_t scratch = 0;
-                    for (int i = 0; i < 1000; i++) { scratch ^= *fence_cpu; }
-                    (void)scratch;
-                    elapsed += step_us;
+                    if (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - started >= duration) break;
+                    IOSleep(1);
                 }
                 arguments->scalarOutput[0] = 1;  // timeout
                 return kIOReturnTimeout;
             }
-            case kMacAMDGPUCSIPTypeGFX:
+            case kMacAMDGPUCSIPTypeGFX: {
+                if (cs->ip_instance != 0) return kIOReturnBadArgument;
+                if (!driver->ivars->bringup.cp.ringReady) return kIOReturnNotReady;
+                const uint64_t duration = amdgpu::client_wait_ns(to_ns);
+                const uint64_t started = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+                for (;;) {
+                    driver->ivars->submission.poll();
+                    if (cs->last_fence <= driver->ivars->submission.completedCPFence) {
+                        arguments->scalarOutput[0] = 0;
+                        return kIOReturnSuccess;
+                    }
+                    if (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - started >= duration) break;
+                    IOSleep(1);
+                }
+                arguments->scalarOutput[0] = 1;
+                return kIOReturnTimeout;
+            }
             case kMacAMDGPUCSIPTypeCompute:
                 return kIOReturnUnsupported;
             default:
@@ -3091,25 +3676,21 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         // timeout_us (the original shape). Documented as deprecated;
         // remove once macamdgpu_ping is rewired to the CS ABI.
         uint64_t target = fence_handle;
-        uint64_t to_us  = arguments->scalarInput[1];
-        if (to_us == 0) to_us = 1000000ull;
+        if (target == 0 || target != driver->ivars->submission.lastCPFence)
+            return kIOReturnBadArgument;
+        const uint64_t duration = amdgpu::client_wait_ns(arguments->scalarInput[1], true);
         auto &cp = driver->ivars->bringup.cp;
         if (cp.fence_cpu == nullptr) return kIOReturnNotReady;
-
-        const uint64_t step_us = 50;
-        uint64_t elapsed = 0;
-        while (elapsed < to_us) {
-            uint64_t observed = *cp.fence_cpu;
+        const uint64_t started = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        for (;;) {
+            driver->ivars->submission.poll();
+            uint64_t observed = driver->ivars->submission.completedCPFence;
             if (observed >= target) {
                 arguments->scalarOutput[0] = observed;
                 return kIOReturnSuccess;
             }
-            uint32_t scratch = 0;
-            for (int i = 0; i < 1000; i++) {
-                scratch ^= static_cast<uint32_t>(*cp.fence_cpu);
-            }
-            (void)scratch;
-            elapsed += step_us;
+            if (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - started >= duration) break;
+            IOSleep(1);
         }
         arguments->scalarOutput[0] = *cp.fence_cpu;
         return kIOReturnTimeout;
@@ -3222,9 +3803,21 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
 kern_return_t
 IMPL(MacAMDGPUUserClient, CopyClientMemoryForType)
 {
+    if (ivars == nullptr || __atomic_load_n(&ivars->stopping, __ATOMIC_ACQUIRE)) {
+        return kIOReturnNotAttached;
+    }
+    if (ivars->ownerDriver == nullptr || ivars->ownerDriver->ivars == nullptr ||
+        __atomic_load_n(&ivars->ownerDriver->ivars->stopping, __ATOMIC_ACQUIRE)) {
+        return kIOReturnNotAttached;
+    }
+    if (ivars->ownerDriver->ivars->shutdownBlocked) return kIOReturnNotReady;
     if (memory == nullptr || options == nullptr) {
         return kIOReturnBadArgument;
     }
+
+    auto *ownerState = ivars->ownerDriver->ivars;
+    if (ownerState->pciOpen && ownerState->openerUserClient != this) return kIOReturnBusy;
+    if (!ownerState->submission.poll()) return kIOReturnBusy;
 
     // Non-BAR memory types — DMA buffer and IRQ shared page.
     if (type == kMacAMDGPUMemoryTypeDMABuffer) {
@@ -3277,51 +3870,10 @@ IMPL(MacAMDGPUUserClient, CopyClientMemoryForType)
         return kIOReturnUnsupported;
     }
 
-    // Ensure PCI is open (lazy first-touch).
-    if (!driver->ivars->pciOpen) {
-        kern_return_t ret = pci->Open(this, 0);
-        if (ret != kIOReturnSuccess) {
-            MACAMDGPU_LOG("PCI Open failed in CopyClientMemoryForType: %#x",
-                          ret);
-            return ret;
-        }
-        driver->ivars->pciOpen = true;
-        driver->ivars->openerUserClient = (IOService *)this;
-
-        // Enable Memory Space + Bus Master in PCI command register.
-        uint16_t cmd = 0;
-        pci->ConfigurationRead16(0x04, &cmd);
-        uint16_t wanted = cmd | 0x0006;  // bit 1 = MEM, bit 2 = BUSMASTER
-        if (wanted != cmd) {
-            pci->ConfigurationWrite16(0x04, wanted);
-            pci->ConfigurationRead16(0x04, &cmd);
-        }
-        MACAMDGPU_LOG("PCI opened, command=%#x", (unsigned)cmd);
-
-        // Populate per-device bringup context for Phase 1B.
-        auto &bdev = driver->ivars->bringup.device;
-        bdev.pci = pci;
-        bdev.psoCAlive = false;
-        bdev.smuOnline = false;
-        bdev.gmcReady  = false;
-        for (uint8_t bar = 0; bar < 6; bar++) {
-            uint8_t  mi = 0;
-            uint64_t sz = 0;
-            uint8_t  ty = 0;
-            if (pci->GetBARInfo(bar, &mi, &sz, &ty) != kIOReturnSuccess) {
-                continue;
-            }
-            switch (bar) {
-            case 0: bdev.bar0MemIndex = mi; bdev.bar0Size = sz; break;
-            case 2: bdev.bar2MemIndex = mi; bdev.bar2VisibleVRAMSize = sz;
-                    break;
-            case 5: bdev.bar5MemIndex = mi; break;
-            default: break;
-            }
-        }
-        MACAMDGPU_LOG("bringup ctx: BAR0=%llu B BAR2(visible VRAM)=%llu B",
-                      bdev.bar0Size, bdev.bar2VisibleVRAMSize);
-    }
+    // Use the same BAR0 framebuffer / BAR2 doorbell setup regardless of
+    // whether the client maps memory or calls a selector first.
+    kern_return_t openRet = mac_amdgpu_ensure_open(this, driver, pci);
+    if (openRet != kIOReturnSuccess) return openRet;
 
     uint8_t barIndex = (uint8_t)type;
     uint8_t  memoryIndex = 0;
@@ -3348,6 +3900,7 @@ IMPL(MacAMDGPUUserClient, CopyClientMemoryForType)
     MACAMDGPU_LOG("returning BAR%u descriptor size=%llu",
                   (unsigned)barIndex, barSize);
     *options = 0;
+    ivars->mappedBAR = true;
     *memory  = barMem;
     return kIOReturnSuccess;
 }
@@ -3426,7 +3979,8 @@ IMPL(MacAMDGPUUserClient, InterruptOccurred)
 {
     (void)count;
     (void)time;
-    if (ivars == nullptr || !ivars->interruptsSetUp) return;
+    if (ivars == nullptr || __atomic_load_n(&ivars->stopping, __ATOMIC_ACQUIRE) ||
+        !__atomic_load_n(&ivars->interruptsSetUp, __ATOMIC_ACQUIRE)) return;
 
     uint32_t vector = UINT32_MAX;
     uint32_t *vref = (uint32_t *)action->GetReference();
@@ -3447,18 +4001,20 @@ IMPL(MacAMDGPUUserClient, InterruptOccurred)
     // driver) so we route only to the primary opener client.
     MacAMDGPU *driver = OSDynamicCast(MacAMDGPU, GetProvider());
     if (driver != nullptr && driver->ivars != nullptr) {
+        if (__atomic_load_n(&driver->ivars->stopping, __ATOMIC_ACQUIRE)) return;
         auto &bringup = driver->ivars->bringup;
         if (bringup.ih.enabled && bringup.ih.inited) {
             // Only the opener client receives IH events for now.
-            auto *opener = OSDynamicCast(MacAMDGPUUserClient,
-                                         driver->ivars->openerUserClient);
-            if (opener != nullptr && opener->ivars != nullptr) {
-                IHDispatchCtx dctx{ opener->ivars };
+            // Never borrow another client's ivars: its Stop barrier only
+            // drains its own sources, not this client's IRQ queue.
+            if (__atomic_load_n(&driver->ivars->openerUserClient,
+                                __ATOMIC_ACQUIRE) == (IOService *)this) {
+                IHDispatchCtx dctx{ ivars };
                 uint32_t n = amdgpu::ih_drain(bringup.device, bringup.ih,
                                               &mac_amdgpu_ih_dispatch,
                                               &dctx);
                 if (bringup.ih.overflows_seen > 0) {
-                    mac_amdgpu_set_irq_bit(opener->ivars, kIRQBitIHOverflow);
+                    mac_amdgpu_set_irq_bit(ivars, kIRQBitIHOverflow);
                 }
                 (void)n;
             }

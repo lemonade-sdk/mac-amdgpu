@@ -471,6 +471,19 @@ constexpr uint32_t kPSPGfxCmdBufVersion = 1;
 void
 psp_release(PSPContext &psp)
 {
+    if (psp.sosPackageBuffer != nullptr) {
+        psp.sosPackageBuffer->release();
+        psp.sosPackageBuffer = nullptr;
+    }
+    psp.sos_fw_blob = nullptr;
+    psp.sos_fw_blob_size = 0;
+    psp.sos = psp.sys = psp.kdb = psp.toc = psp.spl = psp.rl =
+        psp.soc_drv = psp.intf_drv = psp.dbg_drv = psp.ras_drv =
+        psp.ipkeymgr_drv = psp.spdm_drv = psp.sys_drv_aux =
+        psp.sos_aux = PSPContext::PSPSubBin{};
+    psp.sosFirmware = nullptr;
+    psp.sosFirmwareSize = 0;
+    psp.firmwareLoadComplete = false;
     if (psp.tmrDMACommand != nullptr) {
         psp.tmrDMACommand->CompleteDMA(kIODMACommandCompleteDMANoOptions);
         psp.tmrDMACommand->release();
@@ -565,7 +578,7 @@ psp_is_sos_alive(const DeviceContext &dev)
     // garbage — but on a fresh power-up C2PMSG_81 is reliably zero
     // until SOS sets it, and upstream's broader check is required
     // to accept the real value PSP writes.
-    return sol != 0;
+    return sol != 0 && sol != UINT32_MAX;
 }
 
 bool
@@ -670,10 +683,12 @@ psp_load_sos(DeviceContext &dev, PSPContext &psp)
     // 5-second budget; SOS bringup is normally well under 1 second.
     const uint64_t kBudgetUs = 5 * 1000000;
     uint32_t v = solBefore;
+    const uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     uint64_t elapsed = 0;
-    const uint64_t kStepUs = 1000;
     while (elapsed < kBudgetUs) {
         v = RREG32(dev, regSOL);
+        if (v == UINT32_MAX) return kIOReturnNotAttached;
+        elapsed = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start) / 1000;
         if (v != solBefore && v != 0) {
             psp.sosAlive = true;
             PSP_LOG("SOS alive — C2PMSG_81 %#010x → %#010x after %llu µs",
@@ -681,7 +696,7 @@ psp_load_sos(DeviceContext &dev, PSPContext &psp)
             return kIOReturnSuccess;
         }
         IOSleep(1);
-        elapsed += kStepUs;
+        elapsed = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start) / 1000;
     }
 
     PSP_LOG("SOS load timeout — C2PMSG_81 stayed %#010x", v);
@@ -939,13 +954,15 @@ psp_ring_cmd_submit(DeviceContext &dev, PSPContext &psp,
     //    via the BAR0 aperture — BAR0 reads bypass any CPU cache and go
     //    straight to PCIe / VRAM, so we always see the latest value.
     const uint64_t kBudgetUs = 1 * 1000000;
+    const uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     uint64_t elapsed = 0;
     uint32_t observed = 0;
     while (elapsed < kBudgetUs) {
         observed = RBAR2_32(dev, kFenceVRAMOffset);
+        if (observed == UINT32_MAX) return kIOReturnNotAttached;
         if (observed == fence_index) break;
         IOSleep(1);
-        elapsed += 1000;
+        elapsed = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start) / 1000;
     }
     if (observed != fence_index) {
         PSP_LOG("ring_cmd_submit: fence timeout (expected %u, got %u)",
@@ -1446,6 +1463,19 @@ psp_rl_load(DeviceContext &dev, PSPContext &psp)
                         psp.rl.start_addr, psp.rl.size_bytes);
     amdgpu_hdp_flush(dev);
 
+    // Confirm the bytes PSP will consume match the retained SOS payload.
+    for (uint64_t off = 0; off < psp.rl.size_bytes; off += 4) {
+        uint32_t observed = RVRAM32_via_mm(dev, kFwPriVRAMOffset + off);
+        uint64_t count = psp.rl.size_bytes - off;
+        if (count > 4) count = 4;
+        if (memcmp(&observed, psp.rl.start_addr + off, count) != 0) {
+            PSP_LOG("rl_load: staging readback mismatch at byte %#llx", off);
+            return kIOReturnIOError;
+        }
+    }
+    PSP_LOG("rl_load: verified %llu retained register-list bytes in VRAM",
+            psp.rl.size_bytes);
+
     // Submit LOAD_IP_FW with fw_phy_addr = fwPriBusAddr, fw_type = REG_LIST.
     kern_return_t r = psp_load_ip_fw(dev, psp, psp.fwPriBusAddr,
                                      static_cast<uint32_t>(psp.rl.size_bytes),
@@ -1719,8 +1749,8 @@ set_sub_bin(PSPContext::PSPSubBin &dst,
     dst.fw_version = fw_version;
 }
 
-kern_return_t
-psp_parse_sos_microcode(PSPContext &psp,
+static kern_return_t
+psp_parse_sos_views(PSPContext &psp,
                         const uint8_t *fw_data, uint64_t fw_size)
 {
     // Reset every sub-bin so a re-parse doesn't leave stale pointers.
@@ -1742,6 +1772,9 @@ psp_parse_sos_microcode(PSPContext &psp,
         return kIOReturnBadArgument;
     }
     const uint8_t *ucode_base = fw_data + ucode_off;
+    const uint64_t payload_bytes = fw_size - ucode_off;
+    if (hdr->size_bytes != fw_size || hdr->ucode_size_bytes > payload_bytes)
+        return kIOReturnBadArgument;
 
     PSP_LOG("parse_sos: hdr ver %u.%u, ip %u.%u, ucode_size=%u, "
             "ucode_off=%#x, total=%u",
@@ -1754,6 +1787,25 @@ psp_parse_sos_microcode(PSPContext &psp,
 
     switch (hdr->header_version_major) {
     case 1: {
+        uint64_t header_bytes = 0;
+        switch (hdr->header_version_minor) {
+        case 0: header_bytes = sizeof(psp_firmware_header_v1_0); break;
+        case 1: header_bytes = sizeof(psp_firmware_header_v1_1); break;
+        case 2: header_bytes = sizeof(psp_firmware_header_v1_2); break;
+        case 3: header_bytes = sizeof(psp_firmware_header_v1_3); break;
+        default: return kIOReturnUnsupported;
+        }
+        if (header_bytes > fw_size || header_bytes > ucode_off)
+            return kIOReturnBadArgument;
+        const auto *descs = reinterpret_cast<const psp_fw_legacy_bin_desc *>(
+            fw_data + sizeof(common_firmware_header));
+        const uint64_t desc_count = (header_bytes - sizeof(common_firmware_header)) /
+            sizeof(psp_fw_legacy_bin_desc);
+        for (uint64_t i = 0; i < desc_count; ++i) {
+            if (descs[i].offset_bytes > payload_bytes ||
+                descs[i].size_bytes > payload_bytes - descs[i].offset_bytes)
+                return kIOReturnBadArgument;
+        }
         // v1.0: only sos. v1.1/1.2: + kdb (and maybe toc). v1.3: +spl/rl/aux.
         // Note: v1 layouts pack sub-bins WITHIN the ucode region — the
         // start address is `ucode_base + sub.offset_bytes`. Upstream
@@ -1808,6 +1860,11 @@ psp_parse_sos_microcode(PSPContext &psp,
         return kIOReturnSuccess;
     }
     case 2: {
+        const uint64_t header_bytes = hdr->header_version_minor == 0 ?
+            sizeof(psp_firmware_header_v2_0) : sizeof(psp_firmware_header_v2_1);
+        if (hdr->header_version_minor > 1) return kIOReturnUnsupported;
+        if (header_bytes > fw_size || header_bytes > ucode_off)
+            return kIOReturnBadArgument;
         // v2.0/v2.1: flexible array of psp_fw_bin_desc tagged by fw_type.
         // Iterate and route each desc by fw_type. v2.1 has an extra
         // `psp_aux_fw_bin_index` field we don't currently need (only
@@ -1826,8 +1883,13 @@ psp_parse_sos_microcode(PSPContext &psp,
             PSP_LOG("parse_sos: implausible bin_count=%u", count);
             return kIOReturnBadArgument;
         }
+        if (count > (ucode_off - header_bytes) / sizeof(psp_fw_bin_desc))
+            return kIOReturnBadArgument;
         for (uint32_t i = 0; i < count; i++) {
             const auto &d = bin[i];
+            if (d.offset_bytes > payload_bytes ||
+                d.size_bytes > payload_bytes - d.offset_bytes)
+                return kIOReturnBadArgument;
             switch (d.fw_type) {
             case PSP_FW_TYPE_PSP_SOS:
                 set_sub_bin(psp.sos, ucode_base, d.offset_bytes, d.size_bytes, d.fw_version);
@@ -1879,6 +1941,45 @@ psp_parse_sos_microcode(PSPContext &psp,
                 hdr->header_version_major);
         return kIOReturnUnsupported;
     }
+}
+
+//============================================================
+kern_return_t
+psp_parse_sos_microcode(PSPContext &psp,
+                        const uint8_t *fw_data, uint64_t fw_size)
+{
+    if (fw_data == nullptr || fw_size < sizeof(common_firmware_header) ||
+        fw_size > 16 * 1024 * 1024)
+        return kIOReturnBadArgument;
+
+    IOBufferMemoryDescriptor *snapshot = nullptr;
+    kern_return_t r = IOBufferMemoryDescriptor::Create(
+        kIOMemoryDirectionOutIn, fw_size, kASPageSize, &snapshot);
+    if (r != kIOReturnSuccess || snapshot == nullptr)
+        return r != kIOReturnSuccess ? r : kIOReturnNoMemory;
+    IOAddressSegment storage{};
+    r = snapshot->GetAddressRange(&storage);
+    if (r != kIOReturnSuccess || storage.address == 0 || storage.length < fw_size) {
+        snapshot->release();
+        return r != kIOReturnSuccess ? r : kIOReturnNoMemory;
+    }
+    auto *owned_bytes = reinterpret_cast<uint8_t *>(storage.address);
+    memcpy(owned_bytes, fw_data, fw_size);
+
+    // Validate the new package without invalidating an existing snapshot.
+    PSPContext parsed = psp;
+    r = psp_parse_sos_views(parsed, owned_bytes, fw_size);
+    if (r != kIOReturnSuccess) {
+        snapshot->release();
+        return r;
+    }
+    if (psp.sosPackageBuffer != nullptr) psp.sosPackageBuffer->release();
+    parsed.sosPackageBuffer = snapshot;
+    parsed.firmwareLoadComplete = false;
+    psp = parsed;
+    PSP_LOG("parse_sos: retained private package (%llu bytes); RL=%llu bytes",
+            fw_size, psp.rl.size_bytes);
+    return kIOReturnSuccess;
 }
 
 //============================================================

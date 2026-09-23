@@ -491,7 +491,7 @@ func mesAddQueueTest(_ conn: io_connect_t) {
     } else {
         warn("mes add: kr=\(String(format: "%#x", kr)) "
              + "inner=\(String(format: "%#x", inner)) "
-             + "(needs MES microcode loaded + SET_HW_RESOURCES ok)")
+             + "(selector is disabled until queue teardown and backing ownership are implemented)")
     }
 }
 
