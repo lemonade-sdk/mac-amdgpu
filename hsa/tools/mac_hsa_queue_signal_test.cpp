@@ -45,7 +45,7 @@ int main(int argc,char **argv) {
             return status;
         },&gpu),"agents");require(gpu.handle,"no GPU");
         mac_hsa_device_info_t info{};check(mac_hsa_agent_get_driver_info(gpu,&info,sizeof(info)),"driver");
-        require(info.driver_build>=185,"Install driver 185 first");
+        require(info.driver_build>=187,"Install driver 187 first");
         check(hsa_code_object_reader_create_from_memory(bytes.data(),bytes.size(),&reader),"reader");
         check(hsa_executable_create_alt(HSA_PROFILE_BASE,HSA_DEFAULT_FLOAT_ROUNDING_MODE_DEFAULT,nullptr,&executable),"executable");
         check(hsa_executable_load_agent_code_object(executable,gpu,reader,nullptr,nullptr),"load");

@@ -9,6 +9,8 @@
 
 namespace mac_hsa {
 
+constexpr uint64_t kPersistentQueueDriverBuild=187;
+
 struct DeviceSnapshot {
     uint64_t registryID = 0;
     uint64_t build = 0;
@@ -17,6 +19,11 @@ struct DeviceSnapshot {
     uint64_t totalVRAM = 0;
     uint32_t gfxMajor = 0, gfxMinor = 0, gfxRevision = 0;
 };
+
+inline bool supportsPersistentQueues(const DeviceSnapshot &snapshot) {
+    return snapshot.build >= kPersistentQueueDriverBuild &&
+        snapshot.gfxMajor == 12 && snapshot.gfxMinor == 0 && snapshot.gfxRevision == 1;
+}
 
 struct DeviceBuffer {
     uint64_t handle = 0, address = 0, size = 0;

@@ -89,7 +89,7 @@ hsa_status_t hsa_queue_create(hsa_agent_t agent,uint32_t size,hsa_queue_type32_t
     mac_hsa::DeviceSnapshot info{};
     auto status=connection->read(info);
     if (status!=HSA_STATUS_SUCCESS) return status;
-    if (info.build<185) return HSA_STATUS_ERROR_INVALID_QUEUE_CREATION;
+    if (!mac_hsa::supportsPersistentQueues(info)) return HSA_STATUS_ERROR_INVALID_QUEUE_CREATION;
     try {
         auto queue=std::make_shared<RuntimeQueue>();
         queue->connection=connection;queue->agent=agent;queue->errorCallback=callback;queue->errorData=data;

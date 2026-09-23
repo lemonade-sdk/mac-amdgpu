@@ -1,7 +1,8 @@
 # Persistent HSA queues and shared signals
 
-Driver 185 adds seven persistent legacy compute queues on MEC pipe 0, slots
-1–7. Slot 0 remains reserved for bounded AQL operations, including the runtime's
+Driver 187 supports seven persistent legacy compute queues across two MEC pipes
+with four queues per pipe, matching Linux's gfx1201 topology. Flat slots 1–7 map
+to `(pipe = slot / 4, queue = slot % 4)`. Slot 0 remains reserved for bounded AQL operations, including the runtime's
 GPU atomic signal executor. MES KIQ maps and removes these queues; this is not
 the MES scheduler's GFX queue path. Queue capacity is shared across clients.
 
@@ -41,7 +42,7 @@ Failure of the executor stops all its signal waits without inventing completion.
 
 ## Hardware procedure
 
-Install driver 185 using the host app. Verify the running driver, not only the
+Install driver 187 or newer using the host app. Verify the running driver, not only the
 installed registration. The tools initialize a fresh GPU session or join an
 already initialized session. They refuse to submit persistent work to older
 builds. Run one test at a time, and do not replace the driver during a test.
@@ -55,6 +56,7 @@ build/hsa/mac-hsa-info
 build/hsa/mac-hsa-signal-api-test --run
 build/hsa/mac-hsa-queue-test --run build/tests/hsa-code-object.hsaco
 build/hsa/mac-hsa-queue-signal-test --run build/tests/hsa-signal-object.hsaco
+python3 scripts/test-hsa-multi-process.py
 ```
 
 Required results:
@@ -69,9 +71,22 @@ Required results:
 - Two CP completions and 64 CPU HSA additions to a shared signal produce exactly
   64, without losing either decrement; adjacent signals remain intact.
 - Both queues are successfully removed before any referenced allocation is freed.
+- All seven persistent slots can be created; an eighth fails without poisoning
+  the session. Four CPU producers complete 256 barrier packets through one ring.
+- Two processes each hold two queues. After the first completes and exits, the
+  second executes through its existing queues and tears down successfully.
+
+All these checks passed on installed driver 187. Each process verified 192 shader
+dispatches and all 16 KiB of input/output/guard memory after every dispatch.
+The combined session also crossed the SDMA ring boundary that previously caused
+a timeout. SDMA write pointers now remain monotonic; only ring storage offsets
+wrap. CPU/shader additions produced exactly 131,136 and CPU/CP completion updates
+produced exactly 64. At least one CPU HSA operation was issued while GPU work was
+pending in each concurrency check. Clean final teardown returned the GPU to stage 0.
 
 Completion timeouts are bounded at two seconds. A failed removal retains memory
 for session reset. A passing shader-only test is insufficient to declare CP
-completion atomics or full HRX compatibility working. Agent dispatch capability
-and the HRX requirement audit remain disabled pending these hardware results and
-fine-grained memory integration.
+completion atomics or full HRX compatibility working. Kernel dispatch capability
+is exposed only for gfx1201 with driver 187 or newer: seven device-wide queues,
+64–4096 packets and multi-producer support. The HRX readiness audit still fails
+until fine-grained memory integration and end-to-end inference are verified.

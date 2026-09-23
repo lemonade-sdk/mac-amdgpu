@@ -1,5 +1,6 @@
 #pragma once
 #include "amdgpu_aql_abi.h"
+#include "amdgpu_queue_topology.h"
 #include "../../hsa/third_party/hsa/include/hsa/amd_hsa_signal.h"
 #include <string.h>
 

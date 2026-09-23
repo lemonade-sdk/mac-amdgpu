@@ -7,6 +7,7 @@
 - Loading linked gfx1201 HSA code objects, freezing executables and resolving kernel descriptors.
 - Native synchronous compute: HSA-loaded kernels passed with 128 and 256 results in both VRAM and shared host memory, including every byte of the input/output guards.
 - Bounded hardware AQL dispatch: kernels passed in VRAM and shared host memory, with firmware-acknowledged queue removal and recreation between launches.
+- Persistent HSA compute queues: all seven slots, ring wraparound, four CPU producers, shared completion/barrier signals and two processes sharing the GPU passed hardware tests. One process can exit while the other continues on its existing queues.
 - Coarse shared allocations with identical CPU/GPU addresses. CPU access is allowed between completed GPU operations.
 - GPU-backed HSA signal operations: stores, arithmetic, bitwise operations, exchange, compare-and-swap and waits passed hardware checks. CPU HSA updates execute GPU atomics; direct CPU/GPU atomic RMW interoperability remains unsupported.
 - HSA host services, CPU signals and software queues. All 119 entry points required by LSE’s pinned HRX resolve; the [behavior status](hsa/API_STATUS.md) explains their limits.
@@ -15,7 +16,7 @@
 
 ## Not working yet
 
-- Persistent hardware HSA queues are implemented but await installed-driver hardware validation of ring wraparound and shared completion/dependency signals. General fine-grained shared memory remains unavailable.
+- General fine-grained shared memory and GPU-accessible HSA memory pools.
 - HRX/LSE model inference. No end-to-end AI workload has run.
 - General executable linking, scratch/LDS kernel support and the full HSA feature set. Some platform-specific APIs explicitly return unsupported errors.
 - Live firmware telemetry in amdgpu_mtop: usage, clocks, temperature and power need a verified firmware metrics layout.
@@ -23,8 +24,8 @@
 
 ## Upcoming
 
-- Validate persistent queue lifecycle, barriers and concurrent signal updates with the [queue test procedure](docs/HSA_QUEUE_VALIDATION.md), then integrate shared allocations with HSA pools.
-- Resolve the host/GPU signal requirements for HRX and verify a real inference workload with LSE.
+- Integrate shared allocations with HSA pools, using the verified [queues and shared signals](docs/HSA_QUEUE_VALIDATION.md).
+- Complete HRX memory and kernel-resource integration and verify a real inference workload with LSE.
 - Finish the firmware telemetry path for amdgpu_mtop.
 
 Detailed changes and hardware results are in [PROGRESS.md](PROGRESS.md).

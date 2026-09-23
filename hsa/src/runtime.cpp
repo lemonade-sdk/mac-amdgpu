@@ -197,9 +197,17 @@ hsa_status_t hsa_agent_get_info(hsa_agent_t handle, hsa_agent_info_t attribute, 
     case HSA_AGENT_INFO_DEVICE:
         return writeValue(value, agent->connection ? HSA_DEVICE_TYPE_GPU : HSA_DEVICE_TYPE_CPU);
     case HSA_AGENT_INFO_FEATURE:
-        return writeValue(value, uint32_t(0)); // no kernel/agent dispatch implemented yet
+        return writeValue(value, uint32_t(mac_hsa::supportsPersistentQueues(snapshot) ?
+            HSA_AGENT_FEATURE_KERNEL_DISPATCH : 0));
     case HSA_AGENT_INFO_QUEUES_MAX:
-        return writeValue(value, uint32_t(0));
+        return writeValue(value, uint32_t(mac_hsa::supportsPersistentQueues(snapshot) ? 7 : 0));
+    case HSA_AGENT_INFO_QUEUE_MIN_SIZE:
+        return writeValue(value, uint32_t(mac_hsa::supportsPersistentQueues(snapshot) ? 64 : 0));
+    case HSA_AGENT_INFO_QUEUE_MAX_SIZE:
+        return writeValue(value, uint32_t(mac_hsa::supportsPersistentQueues(snapshot) ? 4096 : 0));
+    case HSA_AGENT_INFO_QUEUE_TYPE:
+        if (!mac_hsa::supportsPersistentQueues(snapshot)) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        return writeValue(value, HSA_QUEUE_TYPE_MULTI);
     case HSA_AGENT_INFO_MACHINE_MODEL:
         return writeValue(value, HSA_MACHINE_MODEL_LARGE);
     case HSA_AGENT_INFO_PROFILE:

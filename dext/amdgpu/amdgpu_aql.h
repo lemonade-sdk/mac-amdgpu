@@ -1,5 +1,6 @@
 #pragma once
 #include "amdgpu_aql_abi.h"
+#include "amdgpu_queue_topology.h"
 #include "amdgpu_vram.h"
 #include "amdgpu_regs.h"
 namespace amdgpu {
@@ -14,7 +15,6 @@ struct AQLLaunchResult {
 kern_return_t aql_launch(DeviceContext &, GMCContext &, MESContext &, const GFXConfig &,
     AQLLaunch &, uint64_t descriptorVA, uint64_t kernargVA,
     const AQLDispatchRequest &, AQLLaunchResult &);
-constexpr unsigned kPersistentAQLQueues=7;
 struct PersistentAQLQueue {
     VRAMAllocation storage;
     void *owner, *metadataCPU;

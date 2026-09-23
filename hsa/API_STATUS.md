@@ -14,7 +14,7 @@ The 29 symbols added with build 181 have these behaviors:
 | Virtual-memory reserve/free, handle create/release, map/unmap/access | 7 | Real host mappings, aligned reservations, physical aliases, access protection, pinned backing when requested and retained lifetimes. GPU VA aliases are unsupported. The system-wide GPU virtual-memory capability remains false. |
 | GPU memory IPC create/attach/detach | 3 | Driver 181 uses a random 128-bit sharing token and per-client BO references. Full allocation, one explicitly selected GPU agent; CPU/peer-GPU mappings are rejected. Repeated imports share a process-local pointer with balanced detach references. Importing over an existing owned MC-address allocation is rejected until distinct process GPU VAs exist. |
 | Signal IPC create/attach | 2 | CPU-only shared atomic signal backing and process-local waits. All core CPU signal operations use the shared value. Cross-process updates, exporter destruction, repeated attachment and abrupt peer death are tested. These signals are not GPU-visible. |
-| Queue profiling/info/CU-mask/priority | 4 | Profiling updates the AMD queue ABI flag. The other three reject software queues, consistent with the local ROCr HostQueue contract; persistent hardware queues now return their owning agent. Physical doorbell IDs, CU affinity and priority changes remain unsupported; persistent dispatch still awaits hardware validation. |
+| Queue profiling/info/CU-mask/priority | 4 | Profiling updates the AMD queue ABI flag. The other three reject software queues, consistent with the local ROCr HostQueue contract; persistent hardware queues now return their owning agent. Physical doorbell IDs, CU affinity and priority changes remain unsupported; persistent dispatch passed on driver 187. |
 | System-event registration | 1 | One handler per runtime session, reset on final shutdown; callback delivery occurs outside the runtime lock and preserves callback status. Delivery is tested with injected events; DriverKit hardware-fault notifications are not connected yet. |
 | Interop map/unmap and portable DMA-BUF export/close | 4 | Unsupported platform paths. No Linux DMA-BUF namespace is available through this transport. Failures preserve export outputs and never close unrelated caller descriptors. |
 | SVM attribute get/set and prefetch | 3 | Unsupported until GPU fault servicing and shared virtual-memory migration exist. Calls fail without changing attributes or falsely decrementing completion signals. SVM capability queries return false. |
@@ -24,17 +24,14 @@ images. AMD loader extension 1.03 now provides all seven table entries:
 address translation, segment/executable/object enumeration, object metadata,
 and embedded-file readers. Original storage and relocated descriptor copies
 remain alive until executable destruction, even after reader destruction.
-General global linking and production hardware queue support remain incomplete. Build 182 passed equal-address CPU/GPU host-buffer transfers, but
-concurrent CPU/GPU atomic updates failed. Build 183 adds explicit coarse shared
-allocations and native synchronous dispatch of frozen HSA-loaded kernels.
-Both VRAM and direct shared-memory shader tests passed on build 183. These are
-separate native APIs, not HSA fine-grained pools, signals or AQL queues.
-Build 184 adds a bounded native AQL dispatch path with MES queue removal;
-both VRAM and shared-memory hardware tests passed with verified queue removal. Public
-HSA queue creation is implemented for driver 185 with seven device-wide slots,
-64–4096 packets per queue, per-client ownership and verified MES removal before
-storage release. Hardware validation of persistent queues is pending installation.
-Agent dispatch capability remains disabled until it passes.
+General global linking and scratch/LDS resource support remain incomplete.
+Native synchronous and bounded AQL dispatch passed in both VRAM and explicit
+shared host memory. Public HSA queues passed on driver 187: seven device-wide
+slots across gfx1201's two four-queue compute pipes, 64–4096 packets per queue,
+per-client ownership and MES removal before storage release. Kernel dispatch
+capability and queue limits are exposed only for gfx1201 on driver 187 or newer.
+The SDMA ring uses monotonic 64-bit write pointers, including across ring wraps.
+These changes do not expose general fine-grained HSA memory pools.
 
 GPU-visible AMD signal storage now uses a shared per-device arena. CPU HSA signal
 updates execute a small system-scope GPU atomic kernel; CPU loads observe that
@@ -44,11 +41,25 @@ RMWs with GPU RMWs, which lost updates on this PCIe path. GPU signal creation is
 limited to one GPU consumer domain and 256 live signals per connection. Signal
 IPC remains CPU-only. Failure of the GPU atomic executor wakes all affected
 waiters and rejects further signals from that executor. Queue-to-queue completion,
-barriers and concurrent shader/CP/CPU-HSA updates are not yet hardware-verified.
+barriers and concurrent shader/CP/CPU-HSA updates passed on driver 187.
 The [hardware procedure](../docs/HSA_QUEUE_VALIDATION.md) tests these separately.
 No HRX/LSE inference has run.
 
 ## Validation
+
+- Driver 187 passed all seven persistent queue slots and rejected an eighth
+  without faulting the session. A 64-packet ring completed 192 shader dispatches,
+  verifying all 16 KiB of input/output/guard memory after each. Four CPU producers
+  completed 256 barrier packets through one queue.
+- Two processes held four queues simultaneously; after one process completed and
+  exited, the survivor dispatched through its existing queues. Both verified all
+  results, dependencies, CPU signal release and independent teardown. The session
+  crossed the SDMA ring boundary that had caused the driver 186 timeout.
+- Two shader queues plus CPU HSA additions produced exactly 131,136 increments.
+  Two CP decrements plus 64 CPU HSA additions produced exactly 64. At least one
+  CPU API call was issued before GPU completion in each case. All GPU-backed
+  signal API operations passed again on driver 187. Final cleanup returned the
+  GPU to stage 0, without a manual power cycle.
 
 - Driver 184 executed two AQL dispatches in each of VRAM and shared host-memory
   modes: 128 and 256 correct results, all 16 KiB verified, GPU completion 1 → 0
@@ -72,7 +83,7 @@ No HRX/LSE inference has run.
   PCIe capabilities lack host AtomicOp completion and Thunderbolt routing.
   No coherent GPU-signal capability was enabled.
 
-- Nine ASan/UBSan runtime suites, including native executable dispatch,
+- Ten ASan/UBSan runtime suites, including native executable dispatch,
   shared allocation lifetime, host virtual memory and
   separate-process IPC signal updates. A SIGKILL test verifies cleanup by a
   surviving attachment.

@@ -251,7 +251,7 @@ struct SDMAInstance {
     uint64_t  rptr_gpu_addr;    // wb_bus + 0
     uint64_t  wptr_poll_gpu_addr; // wb_bus + 0x40
 
-    uint32_t  wptr;             // software wptr (dword index)
+    uint64_t  wptr;             // monotonic dword count; only ring storage wraps
     // DWORD offset into the doorbell BAR (BAR2). Programmed into
     // SDMA_QUEUE0_DOORBELL_OFFSET. SOC21 default: 0x200 for SDMA0,
     // 0x214 for SDMA1 (= sdma_engine[i] << 1).

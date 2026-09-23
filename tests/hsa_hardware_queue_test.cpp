@@ -6,6 +6,8 @@
 
 static unsigned creates,kicks,destroys,atomics,callbacks;
 static bool failKick=false,failAtomic=false;
+static uint64_t driverBuild=187;
+static uint32_t gfxRevision=1;
 namespace mac_hsa {
 struct TestConnection:Connection {
     uint64_t next=0;bool fault=false;
@@ -15,7 +17,7 @@ struct TestConnection:Connection {
     std::set<uint64_t> queues;
     ~TestConnection() override {for (auto &[id,pointer]:shared) { (void)id;std::free(pointer); }}
     bool supportsBuffers() const override {return true;}
-    hsa_status_t read(DeviceSnapshot &s) override {s={1,185,15,256ull<<20,32ull<<30,12,0,1};return HSA_STATUS_SUCCESS;}
+    hsa_status_t read(DeviceSnapshot &s) override {s={1,driverBuild,15,256ull<<20,32ull<<30,12,0,gfxRevision};return HSA_STATUS_SUCCESS;}
     hsa_status_t allocateSharedBuffer(uint64_t bytes,SharedBuffer &out) override {
         bytes=(bytes+16383)&~uint64_t(16383);
         void *p=nullptr;if(posix_memalign(&p,16384,bytes)) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
@@ -87,6 +89,24 @@ int main() {
     assert(hsa_iterate_agents([](hsa_agent_t a,void *p) {hsa_device_type_t type;hsa_agent_get_info(a,HSA_AGENT_INFO_DEVICE,&type);
         if(type==HSA_DEVICE_TYPE_GPU)*static_cast<hsa_agent_t *>(p)=a;return HSA_STATUS_SUCCESS;},&gpu)==0);
     hsa_queue_t *queue=nullptr;
+    driverBuild=186;
+    uint32_t capability=UINT32_MAX;
+    assert(hsa_agent_get_info(gpu,HSA_AGENT_INFO_FEATURE,&capability)==0 && !capability);
+    assert(hsa_agent_get_info(gpu,HSA_AGENT_INFO_QUEUES_MAX,&capability)==0 && !capability);
+    assert(hsa_queue_create(gpu,64,HSA_QUEUE_TYPE_MULTI,nullptr,nullptr,0,0,&queue)==HSA_STATUS_ERROR_INVALID_QUEUE_CREATION);
+    assert(!queue && !creates && mac_hsa::connection->buffers.empty());
+    driverBuild=187;
+    gfxRevision=0;
+    assert(hsa_agent_get_info(gpu,HSA_AGENT_INFO_FEATURE,&capability)==0 && !capability);
+    assert(hsa_queue_create(gpu,64,HSA_QUEUE_TYPE_MULTI,nullptr,nullptr,0,0,&queue)==HSA_STATUS_ERROR_INVALID_QUEUE_CREATION);
+    assert(!queue && !creates && mac_hsa::connection->buffers.empty());
+    gfxRevision=1;
+    assert(hsa_agent_get_info(gpu,HSA_AGENT_INFO_FEATURE,&capability)==0 && capability==HSA_AGENT_FEATURE_KERNEL_DISPATCH);
+    assert(hsa_agent_get_info(gpu,HSA_AGENT_INFO_QUEUES_MAX,&capability)==0 && capability==7);
+    assert(hsa_agent_get_info(gpu,HSA_AGENT_INFO_QUEUE_MIN_SIZE,&capability)==0 && capability==64);
+    assert(hsa_agent_get_info(gpu,HSA_AGENT_INFO_QUEUE_MAX_SIZE,&capability)==0 && capability==4096);
+    hsa_queue_type_t queueType;
+    assert(hsa_agent_get_info(gpu,HSA_AGENT_INFO_QUEUE_TYPE,&queueType)==0 && queueType==HSA_QUEUE_TYPE_MULTI);
     assert(hsa_queue_create(gpu,64,HSA_QUEUE_TYPE_MULTI,[](hsa_status_t status,hsa_queue_t *,void *) {
         assert(status==HSA_STATUS_ERROR);uint64_t now;assert(hsa_system_get_info(HSA_SYSTEM_INFO_TIMESTAMP,&now)==0);++callbacks;
     },nullptr,UINT32_MAX,UINT32_MAX,&queue)==0 && queue);

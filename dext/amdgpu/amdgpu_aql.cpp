@@ -75,7 +75,7 @@ kern_return_t aql_launch(DeviceContext &dev, GMCContext &gmc, MESContext &mes,
 kern_return_t aql_queue_open(DeviceContext &dev,GMCContext &gmc,MESContext &mes,const GFXConfig &gfx,
     PersistentAQLQueue &q,uint64_t ringVA,uint64_t metadataVA,void *metadataCPU,uint32_t packets,uint32_t slot) {
     if (q.mapped || q.retained || q.storage.size) return kIOReturnBusy;
-    if (!metadataCPU || (reinterpret_cast<uintptr_t>(metadataCPU)&63) || slot<1 || slot>7)
+    if (!metadataCPU || (reinterpret_cast<uintptr_t>(metadataCPU)&63) || slot<1 || slot>kPersistentAQLQueues)
         return kIOReturnBadArgument;
     const auto version=dev.ip.version[static_cast<int>(IPBlock::GC)];
     if (version.major!=12 || version.minor!=0 || version.rev!=1) return kIOReturnUnsupported;
@@ -107,7 +107,7 @@ kern_return_t aql_queue_open(DeviceContext &dev,GMCContext &gmc,MESContext &mes,
     q.metadataVA=metadataVA;q.metadataCPU=metadataCPU;q.packets=packets;q.slot=slot;
     q.retained=true;
     __atomic_thread_fence(__ATOMIC_SEQ_CST);amdgpu_hdp_flush(dev);
-    status=mes_map_legacy_queue(dev,mes,1,0,slot,doorbell,base,
+    status=mes_map_legacy_queue(dev,mes,1,gfx1201_compute_pipe(slot),gfx1201_compute_queue(slot),doorbell,base,
         metadataVA+offsetof(amd_queue_t,write_dispatch_id));
     if (status==kIOReturnSuccess) {q.mapped=true;q.retained=false;}
     return status;
@@ -130,7 +130,7 @@ kern_return_t aql_queue_close(DeviceContext &dev,GMCContext &gmc,MESContext &mes
     if (q.retained) return kIOReturnNotReady;
     if (!q.mapped) return kIOReturnBadArgument;
     q.retained=true;
-    const auto status=mes_unmap_legacy_queue(dev,mes,1,0,q.slot,kAQLDoorbell+q.slot*2);
+    const auto status=mes_unmap_legacy_queue(dev,mes,1,gfx1201_compute_pipe(q.slot),gfx1201_compute_queue(q.slot),kAQLDoorbell+q.slot*2);
     if (status!=kIOReturnSuccess) return status;
     gmc.vram_alloc.free(q.storage);q={};
     return kIOReturnSuccess;

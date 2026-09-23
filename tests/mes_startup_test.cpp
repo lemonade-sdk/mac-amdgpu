@@ -160,6 +160,11 @@ int main() {
     assert(!kiq.vmid_mask_gfxhub && !kiq.compute_hqd_mask[0] && !kiq.aggregated_doorbells[0]);
     assert(kiq.g_sch_ctx_gpu_mc_ptr==mes.pipe[1].sch_ctx_bus);
     assert(kiq.query_status_fence_gpu_mc_ptr==mes.pipe[1].status_fence_bus);
+    const auto &scheduler=*reinterpret_cast<const MES_SetHwResources *>(submissions[3].words.data());
+    // Both gfx1201 compute pipes belong to the eight native AQL slots.
+    // No reserved queue or nonexistent compute pipe is offered to MES.
+    for (auto mask:scheduler.compute_hqd_mask) assert(mask==0);
+    assert(scheduler.gfx_hqd_mask[0]==0xfe && scheduler.gfx_hqd_mask[1]==0);
     assert(mes.pipe[0].sch_ctx_bus!=mes.pipe[1].sch_ctx_bus);
     assert(mes.pipe[0].status_fence_bus!=mes.pipe[1].status_fence_bus);
     assert(mes.pipe[0].resource_1_bus!=mes.pipe[1].resource_1_bus);

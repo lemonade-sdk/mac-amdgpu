@@ -2401,7 +2401,7 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         auto &bringup = driver->ivars->bringup;
         const auto previousPSPFence = bringup.psp.fenceCounter;
         const auto previousCPWptr = bringup.cp.wptr;
-        uint32_t previousSDMAWptr[amdgpu::kSDMAInstanceCount] = {};
+        uint64_t previousSDMAWptr[amdgpu::kSDMAInstanceCount] = {};
         for (uint32_t i = 0; i < amdgpu::kSDMAInstanceCount; ++i)
             previousSDMAWptr[i] = bringup.sdma.instance[i].wptr;
         kern_return_t ret = amdgpu::bringup_to(bringup, stage);

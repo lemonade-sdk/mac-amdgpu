@@ -9,6 +9,7 @@
 #include "../upstream/linux/drivers/gpu/drm/amd/include/asic_reg/gc/gc_12_0_0_sh_mask.h"
 using namespace amdgpu;
 #include "aql_mqd_offsets.inc"
+#include "aql_topology.inc"
 static_assert(sizeof(AQLComputeMQD)==sizeof(v12_compute_mqd));
 using kern_return_t=int;
 constexpr int kIOReturnSuccess=0,kIOReturnBusy=1,kIOReturnBadArgument=2,
@@ -54,7 +55,7 @@ struct GFXConfig { unsigned max_shader_engines=4,max_sh_per_se=1,num_active_cus=
 static int mes_map_legacy_queue(DeviceContext &dev,MESContext &,unsigned type,unsigned pipe,unsigned queue,
     unsigned doorbell,uint64_t base,uint64_t wptr) {
     if (persistent) {
-        assert(type==1 && pipe==0 && queue==persistentSlot && doorbell==0x80+persistentSlot*2);
+        assert(type==1 && pipe==persistentSlot/4 && queue==persistentSlot%4 && doorbell==0x80+persistentSlot*2);
         assert(wptr==0x110000000ull+offsetof(amd_queue_t,write_dispatch_id));
         ++maps;return mode==2 ? kIOReturnTimeout : 0;
     }
@@ -65,7 +66,7 @@ static int mes_map_legacy_queue(DeviceContext &dev,MESContext &,unsigned type,un
     ++maps; return mode==2 ? kIOReturnTimeout : 0;
 }
 static int mes_unmap_legacy_queue(DeviceContext &,MESContext &,unsigned type,unsigned pipe,unsigned queue,unsigned doorbell) {
-    assert(type==1 && !pipe && queue==(persistent ? persistentSlot : 0) && doorbell==0x80+queue*2); ++unmaps;
+    assert(type==1 && pipe==(persistent ? persistentSlot/4 : 0) && queue==(persistent ? persistentSlot%4 : 0) && doorbell==0x80+(persistent ? persistentSlot : 0)*2); ++unmaps;
     return mode==6 ? kIOReturnTimeout : 0;
 }
 static void amdgpu_hdp_flush(DeviceContext &) {}

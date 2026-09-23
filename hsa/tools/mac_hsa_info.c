@@ -26,6 +26,14 @@ static hsa_status_t inspect(hsa_agent_t agent, void *unused) {
                info.gfx_major, info.gfx_minor, info.gfx_revision);
         printf("  VRAM visible=%" PRIu64 " total=%" PRIu64 " bytes\n",
                info.visible_vram_bytes, info.total_vram_bytes);
+        uint32_t queues, min_size, max_size;
+        status = hsa_agent_get_info(agent, HSA_AGENT_INFO_QUEUES_MAX, &queues);
+        if (status != HSA_STATUS_SUCCESS) return status;
+        status = hsa_agent_get_info(agent, HSA_AGENT_INFO_QUEUE_MIN_SIZE, &min_size);
+        if (status != HSA_STATUS_SUCCESS) return status;
+        status = hsa_agent_get_info(agent, HSA_AGENT_INFO_QUEUE_MAX_SIZE, &max_size);
+        if (status != HSA_STATUS_SUCCESS) return status;
+        printf("  HSA queues=%u device-wide; ring=%u..%u packets\n", queues, min_size, max_size);
     }
     return HSA_STATUS_SUCCESS;
 }
@@ -42,7 +50,7 @@ int main(void) {
         fprintf(stderr, "HSA discovery failed: 0x%x (shutdown 0x%x)\n", status, shutdown);
         return 1;
     }
-    printf("Discovered %u MacAMDGPU device(s). Discovery only; hardware HSA queue dispatch is unavailable.\n",
+    printf("Discovered %u MacAMDGPU device(s). Discovery only; no GPU work submitted.\n",
            gpu_count);
     return 0;
 }

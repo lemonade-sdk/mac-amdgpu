@@ -1909,3 +1909,38 @@ successfully after cleanup. No hardware AQL queue or HRX inference is claimed.
   seven-slot exhaustion and failed-unmap retention. Xcode build and strict
   code-signature verification passed for host and driver 185. Stop GPU completed
   successfully before the new host app was opened for user installation.
+
+## Builds 186–187 — shared queue topology and SDMA ring wrap
+
+- Driver 185 passed two persistent queues, 192 verified dispatches, barrier
+  dependencies and concurrent shader/CP/CPU-HSA signal updates. A two-process
+  test then exposed the fourth persistent slot targeting a nonexistent HQD.
+  Linux's gfx1201 branch has two compute pipes with four queues each, rather
+  than the larger topology used by other variants. Driver 186 maps flat slots
+  1–7 across those two pipes and reserves both pipes from MES scheduling.
+- With four queues mapped successfully, driver 186 exposed a separate SDMA
+  timeout at the first 4096-DWORD ring wrap. Driver 187 keeps the write pointer
+  as a monotonic 64-bit count and masks only the storage offset. Added regression
+  coverage for repeated wraps, the 32-bit boundary and byte-pointer overflow.
+- Installed driver 187 passed all seven queue slots, graceful eighth-queue
+  exhaustion, 192 dispatches through a 64-packet ring and 256 barrier packets
+  submitted by four CPU producers. Every dispatch verified all 16 KiB of input,
+  output and guard bytes. Queue-to-queue dependencies and CPU HSA signal release
+  passed.
+- Two processes held four queues simultaneously. The first completed and
+  exited; the surviving process continued through its existing queues, including
+  ring wraps and concurrent producers. Both cleaned up successfully. This also
+  crossed the SDMA boundary that had failed on 186.
+- Concurrent shader and CPU HSA additions produced exactly 131,136. Two CP
+  completion decrements plus 64 CPU HSA additions produced exactly 64. At least
+  one CPU API call was issued while GPU work was pending in each concurrency
+  test. The full GPU-backed signal API test passed again.
+- Runtime discovery now reports kernel dispatch, seven device-wide queues,
+  64–4096 packet rings and multi-producer support only for gfx1201 with driver
+  187 or newer. Older builds and other GFX variants remain gated. The read-only
+  observer verified these capabilities and final cleanup at stage 0.
+- Validation: all 30 driver regression scripts and ten HSA ASan/UBSan suites
+  passed. Driver 187 built and passed strict code-signature verification before
+  installation. No manual GPU power cycle was needed during the passing tests.
+  General GPU-accessible HSA host pools, scratch/LDS resources and HRX inference
+  remain incomplete; symbol resolution alone is not runtime readiness.

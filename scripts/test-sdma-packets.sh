@@ -5,7 +5,9 @@ mkdir -p build/tests
 python3 - <<'PY'
 from pathlib import Path
 source = Path('dext/amdgpu/sdma_v7_0.cpp').read_text()
+write_start=source.index('uint32_t\nsdma_ring_write(')
 helper_start = source.index('kern_return_t\nsdma_clear_fence(')
+Path('build/tests/sdma_ring_write_under_test.inc').write_text(source[write_start:helper_start])
 helper_end = source.index('// sdma_ring_test —', helper_start)
 Path('build/tests/sdma_wb_under_test.inc').write_text(source[helper_start:helper_end])
 alloc_start = source.index('kern_return_t\nsdma_alloc_storage(')

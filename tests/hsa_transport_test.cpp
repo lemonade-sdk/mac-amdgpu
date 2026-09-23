@@ -375,11 +375,11 @@ int main() {
     for (queueFault=0;queueFault<=9;++queueFault) {
         mac_hsa::IOKitConnection connection;connection.service=123;connection.registryID=456;
         mac_hsa::SharedBuffer ring,metadata;
-        driverBuild=184;
+        driverBuild=186;
         assert(connection.allocateSharedBuffer(16384,ring)==0 && connection.allocateSharedBuffer(16384,metadata)==0);
         uint64_t handle=123;const auto before=queueCreates;
         assert(connection.createQueue(ring,metadata,64,handle)==HSA_STATUS_ERROR_OUT_OF_RESOURCES && !handle && queueCreates==before);
-        driverBuild=185;
+        driverBuild=187;
         auto wrong=ring;wrong.device.address+=16384;
         assert(connection.createQueue(wrong,metadata,64,handle)==HSA_STATUS_ERROR_INVALID_ALLOCATION && !handle);
         assert(connection.createQueue(ring,ring,64,handle)==HSA_STATUS_ERROR_INVALID_ARGUMENT);

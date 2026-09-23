@@ -26,7 +26,7 @@ struct GPUSignalContext {
         DeviceSnapshot snapshot;
         auto status=connection->read(snapshot);
         if (status!=HSA_STATUS_SUCCESS) return status;
-        if (snapshot.build<184 || snapshot.gfxMajor!=12 || snapshot.gfxMinor!=0 || snapshot.gfxRevision!=1)
+        if (!supportsPersistentQueues(snapshot))
             return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
         if (!parseCodeObject(kSignalOperationsCodeObject,object) || object.kernels.size()!=1)
             return HSA_STATUS_ERROR_INVALID_CODE_OBJECT;

@@ -59,7 +59,8 @@ struct SDMAInstance {
     const DeviceContext *wb_device = nullptr;
     uint32_t cs_fence_shadow = 0;
     uint64_t rptr_gpu_addr = 0, wptr_poll_gpu_addr = 0;
-    unsigned wptr = 0, doorbell_index = 0;
+    uint64_t wptr = 0;
+    unsigned doorbell_index = 0;
 };
 struct GMCContext { VRAMBumpAllocator vram_alloc; uint64_t vram_start = 0x8000000000; };
 static void amdgpu_hdp_flush(const DeviceContext &) {}
@@ -71,6 +72,12 @@ static void WREG32(const DeviceContext &, unsigned, uint32_t) { ++mmioWrites; }
 #define SDMA_LOG(...) do {} while (0)
 #include "sdma_allocation_under_test.inc"
 #include "sdma_wb_under_test.inc"
+static void WBAR0_32(const DeviceContext &dev,uint64_t offset,uint32_t value) {
+    dev.pci->MemoryWrite32(dev.bar0MemIndex,offset,value);
+}
+#define sdma_ring_write production_sdma_ring_write
+#include "sdma_ring_write_under_test.inc"
+#undef sdma_ring_write
 static uint32_t emitted[12];
 static unsigned emitted_count;
 static uint64_t time_ns;
@@ -153,6 +160,29 @@ int main() {
     assert(sdma_ring_test(dev, inst1, 100000) == 0);
     assert(emitted[1] == uint32_t(inst1.wb_bus + 0x80) && emitted[2] == 0x80);
     test_fence = reinterpret_cast<uint32_t *>(pci.vram + inst.wb_vram_off + 0x80);
+    // Reproduce the first 4096-dword wrap and verify that every later
+    // doorbell stays monotonic while the packet storage wraps independently.
+    const uint32_t payload[12]={1,2,3,4,5,6,7,8,9,10,11,12};
+    inst.wptr=inst.ring_size_dwords-4;
+    for (unsigned iteration=0;iteration<700;++iteration) {
+        const auto before=inst.wptr;
+        assert(production_sdma_ring_write(dev,inst,payload,12)==12 && inst.wptr==before+12);
+        for (unsigned i=0;i<12;++i) {
+            uint32_t actual=0;
+            std::memcpy(&actual,pci.vram+inst.ring_vram_off+((before+i)&inst.ring_ptr_mask)*4,4);
+            assert(actual==payload[i]);
+        }
+        assert(sdma_kick_doorbell(dev,inst)==0 && pci.doorbellValue==(before+12)*4);
+    }
+    inst.wptr=(uint64_t(1)<<32)-4;
+    assert(production_sdma_ring_write(dev,inst,payload,12)==12 && inst.wptr==(uint64_t(1)<<32)+8);
+    assert(sdma_kick_doorbell(dev,inst)==0 && pci.doorbellValue==(uint64_t(1)<<34)+32);
+    inst.wptr=(UINT64_MAX>>2)-4;
+    const auto beforeOverflow=inst.wptr;
+    assert(!production_sdma_ring_write(dev,inst,payload,12) && inst.wptr==beforeOverflow);
+    inst.wptr=UINT64_MAX;
+    assert(sdma_kick_doorbell(dev,inst)==kIOReturnBadArgument);
+    assert(!production_sdma_ring_write(dev,inst,nullptr,1));
     // Publish the byte WPTR in GPU memory before ringing the BAR2 doorbell.
     inst.wptr = 37;
     mmioWrites = 0;

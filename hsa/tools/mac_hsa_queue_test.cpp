@@ -48,15 +48,15 @@ void drain(hsa_queue_t *queue) {
 }
 }
 int main(int argc,char **argv) {
-    if (argc!=3 || std::strcmp(argv[1],"--run")) {
-        std::fprintf(stderr,"Usage: %s --run build/tests/hsa-code-object.hsaco\n",argv[0]);return 2;
+    if (argc!=3 || (std::strcmp(argv[1],"--run") && std::strcmp(argv[1],"--shared-session"))) {
+        std::fprintf(stderr,"Usage: %s --run|--shared-session build/tests/hsa-code-object.hsaco\n",argv[0]);return 2;
     }
     std::setvbuf(stdout,nullptr,_IONBF,0);
     std::ifstream file(argv[2],std::ios::binary);std::vector<char> bytes{std::istreambuf_iterator<char>(file),{}};
     if (bytes.empty()) return 1;
     bool initialized=false,passed=false,safe=true;
     hsa_agent_t gpu{};hsa_code_object_reader_t reader{};hsa_executable_t executable{};
-    hsa_queue_t *queues[2]{};hsa_signal_t done{},dependency{};void *data=nullptr,*arguments=nullptr;
+    hsa_queue_t *queues[2]{},*spares[6]{};hsa_signal_t done{},dependency{};void *data=nullptr,*arguments=nullptr;
     try {
         check(hsa_init(),"initialize runtime");initialized=true;
         check(hsa_iterate_agents([](hsa_agent_t a,void *p) {
@@ -65,7 +65,7 @@ int main(int argc,char **argv) {
             return status;
         },&gpu),"enumerate");require(gpu.handle,"no GPU");
         mac_hsa_device_info_t info{};check(mac_hsa_agent_get_driver_info(gpu,&info,sizeof(info)),"driver build");
-        require(info.driver_build>=185,"Install driver 185 before running persistent queues");
+        require(info.driver_build>=187,"Install driver 187 before running persistent queues");
         check(hsa_code_object_reader_create_from_memory(bytes.data(),bytes.size(),&reader),"reader");
         check(hsa_executable_create_alt(HSA_PROFILE_BASE,HSA_DEFAULT_FLOAT_ROUNDING_MODE_DEFAULT,nullptr,&executable),"executable");
         check(hsa_executable_load_agent_code_object(executable,gpu,reader,nullptr,nullptr),"load kernel");
@@ -81,6 +81,18 @@ int main(int argc,char **argv) {
             [](hsa_status_t status,hsa_queue_t *,void *) {++errors;std::fprintf(stderr,"Queue error: %#x\n",status);},
             nullptr,0,0,&queue),"persistent queue");
         std::printf("Two hardware queues created; signal=%#llx data=%p kernargs=%p\n",(unsigned long long)done.handle,data,arguments);
+        if (!std::strcmp(argv[1],"--run")) {
+            for (unsigned i=0;i<5;++i)
+                check(hsa_queue_create(gpu,64,HSA_QUEUE_TYPE_SINGLE,nullptr,nullptr,0,0,&spares[i]),"remaining hardware slot");
+            require(hsa_queue_create(gpu,64,HSA_QUEUE_TYPE_SINGLE,nullptr,nullptr,0,0,&spares[5])==HSA_STATUS_ERROR_OUT_OF_RESOURCES,
+                "eighth persistent queue must report resource exhaustion");
+            for (auto &q:spares) if (q) {check(hsa_queue_destroy(q),"remove spare queue");q=nullptr;}
+            std::puts("PASS: all seven persistent slots; eighth rejected without faulting the session");
+        }
+        if (!std::strcmp(argv[1],"--shared-session")) {
+            std::puts("READY: holding two queues until the other process reaches its checkpoint");
+            require(std::getchar()=='R',"shared-session release missing");
+        }
         hsa_kernel_dispatch_packet_t packet{};
         packet.header=HSA_PACKET_TYPE_KERNEL_DISPATCH|scopes;packet.setup=1<<HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS;
         packet.workgroup_size_x=32;packet.workgroup_size_y=packet.workgroup_size_z=1;
@@ -117,10 +129,24 @@ int main(int argc,char **argv) {
         submit(queues[0],&barrier);
         require(hsa_signal_wait_scacquire(done,HSA_SIGNAL_CONDITION_EQ,0,10000000,HSA_WAIT_STATE_BLOCKED)==1,"CPU dependency not pending");
         hsa_signal_store_screlease(dependency,0);wait(done,"CPU-to-GPU signal timeout");drain(queues[0]);
-        std::puts("PASS: CPU HSA signal store released a waiting hardware queue");passed=true;
+        std::puts("PASS: CPU HSA signal store released a waiting hardware queue");
+        // Concurrent producers reserve distinct slots and can publish/ring in
+        // a different order. Invalid headers must stall fetch until published.
+        hsa_signal_store_screlease(done,256);
+        hsa_barrier_and_packet_t empty{};empty.header=HSA_PACKET_TYPE_BARRIER_AND|scopes;
+        empty.completion_signal=done;
+        std::vector<std::jthread> producers;
+        for (unsigned i=0;i<4;++i) producers.emplace_back([&] {
+            try {for (unsigned n=0;n<64;++n) submit(queues[0],&empty);}
+            catch (const std::exception &e) {++errors;std::fprintf(stderr,"Producer failed: %s\n",e.what());}
+        });
+        producers.clear();
+        wait(done,"multi-producer completion timeout");drain(queues[0]);
+        std::puts("PASS: four CPU producers, 256 barrier completions and ring wraparound");passed=true;
     } catch (const std::exception &e) {std::fprintf(stderr,"FAIL: %s\n",e.what());}
     // Never release payload/code/signal backing while an unmap is unconfirmed.
     for (auto *queue:queues) if (queue && hsa_queue_destroy(queue)) {safe=false;passed=false;}
+    for (auto *queue:spares) if (queue && hsa_queue_destroy(queue)) {safe=false;passed=false;}
     if (safe) {
         if (done.handle && hsa_signal_destroy(done)) passed=false;
         if (dependency.handle && hsa_signal_destroy(dependency)) passed=false;

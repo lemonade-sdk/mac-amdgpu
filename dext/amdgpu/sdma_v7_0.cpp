@@ -315,8 +315,10 @@ uint32_t
 sdma_ring_write(const DeviceContext &dev, SDMAInstance &inst,
                 const uint32_t *src, uint32_t dwords)
 {
-    if (!inst.inited || dwords == 0) return 0;
-    if (dwords > inst.ring_size_dwords) return 0;
+    if (!inst.inited || !src || dwords == 0) return 0;
+    if (!inst.ring_size_dwords || (inst.ring_size_dwords & (inst.ring_size_dwords-1)) ||
+        inst.ring_ptr_mask!=inst.ring_size_dwords-1 || dwords>inst.ring_size_dwords ||
+        inst.wptr>(UINT64_MAX>>2)-dwords) return 0;
     for (uint32_t i = 0; i < dwords; i++) {
         uint32_t slot = (inst.wptr + i) & inst.ring_ptr_mask;
         WBAR0_32(dev, inst.ring_vram_off + slot * 4u, src[i]);
@@ -324,7 +326,9 @@ sdma_ring_write(const DeviceContext &dev, SDMAInstance &inst,
     // Ensure HDP write buffers drain so the engine sees the new
     // packets when it processes the doorbell.
     amdgpu_hdp_flush(dev);
-    inst.wptr = (inst.wptr + dwords) & inst.ring_ptr_mask;
+    // Linux publishes a monotonic 64-bit byte count. Masking this counter
+    // stalls SDMA at the first ring wrap; only the storage index is masked.
+    inst.wptr += dwords;
     return dwords;
 }
 
@@ -366,6 +370,7 @@ sdma_kick_doorbell(const DeviceContext &dev, const SDMAInstance &inst)
 {
     if (!inst.inited) return kIOReturnNotReady;
     if (!dev.ip.isResolved(IPBlock::GC)) return kIOReturnNotReady;
+    if (inst.wptr>(UINT64_MAX>>2)) return kIOReturnBadArgument;
     const uint64_t v = static_cast<uint64_t>(inst.wptr) << 2;
 
     if (!dev.pci) return kIOReturnNotAttached;

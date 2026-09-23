@@ -162,7 +162,7 @@ public:
         std::array<uint64_t,3> build{};
         auto status=scalar(43,{},build);
         if (status!=HSA_STATUS_SUCCESS) return status;
-        if (build[2]<185) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+        if (build[2]<kPersistentQueueDriverBuild) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
         // Reserve bookkeeping before firmware can own the shared buffers.
         auto [record,inserted]=hardwareQueues.emplace(0,std::array<uint64_t,2>{ring.device.handle,metadata.device.handle});
         if (!inserted) return HSA_STATUS_ERROR;
