@@ -7,7 +7,7 @@ PCI access, firmware, DMA mappings and hardware queues.
 
 This is an incomplete runtime, not an HSA-conformant implementation or a
 working HRX backend. The initial implementation provides live discovery and
-runtime lifecycle. It does not execute kernels. ABI version queries describe
+runtime lifecycle and CPU signal operations. It does not execute kernels. ABI version queries describe
 the targeted HSA 1.2 interface, not conformance certification.
 
 ## Build and verify
@@ -47,6 +47,12 @@ after final shutdown rebuilds the device list.
 - hsa_system_get_info for ABI version, monotonic nanosecond timestamp/frequency,
   endianness, machine model and extension mask.
 - hsa_status_string and extension-support queries.
+- Core signal creation/destruction, loads/stores (including silent stores),
+  arithmetic/bitwise atomics, exchange/CAS and condition waits in all required
+  ordering variants. AMD signal creation and wait-any/wait-all are also present.
+  Signals currently support explicit CPU consumers; GPU consumers, IPC signals
+  and unrestricted consumers while a GPU is present return an allocation error
+  until coherent GPU-visible backing is implemented. No GPU completion is faked.
 - mac_hsa_agent_get_driver_info, a separate diagnostic ABI exposing the live
   DriverKit snapshot. Bringup stage is historical and is not a readiness claim.
 
@@ -59,14 +65,16 @@ completion signals or successful no-op dispatches.
 
 LSE commit `b5637a7109d409c21f75586edb75e7631277bce8` pins HRX System to
 `5927b0e0fafdefb5c8b41aa71bca8fd28791ad7c`. This revision requires 119 dynamic
-HSA symbols; the current library supplies 8 of them, leaving 111 missing. It
+HSA symbols; the current library supplies 48 of them, leaving 71 missing. Symbol presence
+is not equivalent to full behavior: queue creation still rejects requests, and
+signals currently require CPU-only consumers. It
 creates hardware queues through `hsa_queue_create`, then casts those queues to
 AMD's queue layout. Signals also have an AMD device-visible layout. The loader
 requires the AMD loader extension, memory pools, signals and code objects.
 The existing driver command/fence tests do not satisfy those contracts.
 
 The separately reviewed HRX main revision
-`437e789eaea207a036c197cf3398a6ca473d6534` requires 121 symbols and uses
+`437e789eaea207a036c197cf3398a6ca473d6534` requires 121 symbols (48 exported, 73 missing) and uses
 `hsa_amd_queue_create`. Keep these baselines distinct; LSE's pinned revision
 and its patches are the initial integration target.
 
@@ -160,5 +168,26 @@ staged/published submission retains the command IB and blocks mutation until
 Stop/reset, including failures that precede the doorbell. Successful calls free
 the IB. The HSA runtime does not yet call this selector or advertise dispatch.
 The host Dispatch Test uploads a separate kernarg-loading shader and checks
-four/eight workgroups, changing arguments and all data/guard words. Hardware
-acceptance of this new path remains pending.
+four/eight workgroups, changing arguments and all data/guard words. Build 178 completed the first
+fence but failed its 128-word output check. Build 179 corrects the test kernel
+to compiler-generated gfx1201 workgroup IDs and dependency instructions;
+hardware retesting remains pending.
+
+## Signal implementation and verification
+
+Signal storage follows the pinned AMD 64-byte layout and alignment, checked
+against upstream declarations. Host atomic operations access the value at byte
+8 using lock-free 64-bit atomics. Waiters retain the object without holding the
+runtime mutex; blocked waits also poll to observe silent/direct atomic stores.
+Final runtime shutdown wakes waiters and releases outstanding signal storage.
+The CPU tests cover every operation variant, wraparound, concurrent increments,
+release/acquire publication of ordinary data, all wait conditions, timeouts,
+consumer validation, AMD attributes, multi-signal waits, and lifetime cleanup.
+The test script checks dynamic exports from the actual dylib, since a function
+compiled into a unit test can still be hidden from HRX's dynamic loader.
+
+The vendored declarations now match LSE's exact pinned header revision
+`cc2b5f429de4d1cb2be96ed10e6f45246e408d0e`. Only ABI headers are copied; the
+runtime implementation remains native. These CPU tests do not establish
+CPU/GPU atomic coherence, device-side signal access, AQL completion semantics
+or an HRX workload. Those remain hardware/integration acceptance requirements.

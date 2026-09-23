@@ -1590,3 +1590,42 @@ Visible usage rose from 491,520 bytes / 24 allocations after initialization to
 524,288 bytes / 26 allocations after the retained test buffers. GPU-only usage
 remained zero. Firmware interface 0x33 remains unsupported by the 0x2e metrics
 decoder; no utilization, frequency, power or fan values are fabricated.
+
+
+## Build 179: compiler-verified gfx1201 test kernel
+
+The native dispatch test kernel now matches LLVM 21.1.8 OpenCL output exactly.
+The regression compiles the source independently, obtains the `vector_add`
+symbol offset/size, and compares that code against both the assembly fixture
+and bytes uploaded by the host. This catches architecture-specific ABI and
+instruction scheduling changes that merely assembling handwritten code cannot.
+The code uses ttmp9 for workgroup X and preserves the compiler's s_delay_alu /
+s_wait_alu instructions. The host reports fence, seed, first bad byte and
+expected/observed/initial words on a mismatch. Selector 51 and the driver-side
+queue/resource protocol are unchanged; retesting on hardware is required.
+
+
+## HSA CPU signal family
+
+Implemented 41 signal entry points together: core create/destroy; all required
+load/store/silent-store, add/subtract/bitwise, exchange/CAS and wait variants;
+AMD create and wait-any/wait-all. Forty are additional symbols in LSE's pinned
+HRX dynamic table, moving the export audit from 8/119 to 48/119 (71 missing).
+This is export coverage, not 48 fully integrated GPU functions. Core queue
+creation still rejects requests; signal creation with GPU consumers or implicit
+all-agent consumers while a GPU exists fails until shared signal mapping is
+implemented. CPU-only consumers are supported with real atomics and waits.
+
+ASan/UBSan tests verify operation results/order variants, signed wraparound,
+40,000 concurrent increments, release/acquire data publication, blocking/active
+waits, silent stores, multi-signal waits and cleanup. Dynamic symbol checks
+verify the actual dylib exports all 41 signal entry points. AMD signal layout
+is checked against the original headers. The vendored headers now match LSE's
+pinned HRX header revision cc2b5f429de4d1cb2be96ed10e6f45246e408d0e rather than
+the separately examined newer HRX main. No ROCr implementation was imported.
+
+Stop GPU completed at 2026-09-23 07:08:02 UTC, releasing build-178 retained
+storage through reset and PCI close. The signed build-179 app is open for the
+next installation. Hardware retesting is deferred while runtime software work
+continues; the completed-fence/bad-data result from 178 is still the latest
+authoritative native-dispatch result.

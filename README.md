@@ -1,5 +1,11 @@
 # Status
 
+**v0.1.79 — compiler-verified dispatch shader (hardware retest pending).**
+The multi-workgroup test now matches LLVM gfx1201 output byte-for-byte,
+including ttmp9 workgroup IDs and instruction dependencies. It reports the
+first mismatched result if validation fails. The native dispatch interface
+and allocation accounting from 178 are unchanged.
+
 **v0.1.78 — native compute dispatch and allocation monitoring (dispatch data fix pending).**
 The owning client can upload kernel code, kernargs and data into BOs, then
 submit variable workgroups with a GPU completion fence. The new Dispatch Test
@@ -8,7 +14,7 @@ hardware launch completed its fence but failed 128 output words; the shader
 used an incorrect gfx1201 workgroup-ID register. Failed queued
 work retains storage until reset. Scratch, wave64, AQL queues and executable
 loading remain unfinished. `amdgpu_mtop` now reports visible and GPU-only
-allocator usage, free space and fragmentation separately from firmware load.
+allocator usage, free space and fragmentation separately from firmware load. Live accounting verified the retained test allocations.
 
 **v0.1.77 — GPU-only buffers and bounded transfers.**
 A separate allocator covers usable VRAM above BAR0, keeping firmware and visible
@@ -19,20 +25,14 @@ validate every byte. All 25 regression suites and the Debug build pass.
 Verified build 177 initialized and passed all three sampled regions in the
 22 GiB allocation, released its buffers, then passed Compute Smoke again.
 
-**v0.1.76 — compute shader execution verified.**
-Two consecutive runs passed all 32 shader results, input words and guards,
-with changing seeds, fences 3 and 6, and successful allocation reuse. Explicit
-VMID 0 in Linux-style GFX indirect-buffer submission fixed the observed shader
-instruction-fetch fault. Firmware telemetry is unavailable: the board reports
-interface 0x33, while the verified decoder covers 0x2e. No telemetry transfer
-is issued for an unverified interface.
-
 The native [amdgpu_mtop monitor](amdgpu_mtop/README.md) enumerates attached
 MacAMDGPU devices with GPU switching and JSON output. Live discovery and VRAM
 capacity queries work; dynamic firmware metrics require a verified interface-0x33 layout.
 
 The current target is AI compute and model inference. The initial [HSA runtime](hsa/README.md)
-discovers the live GPU through IOKit and passes lifecycle tests. General dispatch, queues, signals, executable loading and HRX/LSE inference
+discovers the live GPU through IOKit and implements tested CPU signal operations.
+It exports 48 of the 119 functions resolved by LSE’s pinned HRX; 71 are missing.
+GPU-visible signals, HSA dispatch, queues, executable loading and HRX/LSE inference
 remain required; the fixed diagnostic is not an HSA dispatch interface.
 
 Older release history and detailed hardware results are in [PROGRESS.md](PROGRESS.md).

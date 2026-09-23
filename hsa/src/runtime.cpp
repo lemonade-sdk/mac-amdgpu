@@ -1,5 +1,7 @@
 #include "transport.h"
 #include "mac_hsa.h"
+#include "signal_state.h"
+#include <hsa/hsa_ext_amd.h>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -16,11 +18,61 @@ std::mutex runtimeMutex;
 uint32_t references = 0;
 uint64_t lastHandle = 0;
 std::vector<Agent> agents;
+std::unordered_map<uint64_t, std::shared_ptr<mac_hsa::Signal>> signals;
+std::shared_ptr<mac_hsa::Signal> findSignal(hsa_signal_t handle) {
+    std::lock_guard lock(runtimeMutex);
+    if (!references) return {};
+    const auto entry = signals.find(handle.handle);
+    return entry == signals.end() ? nullptr : entry->second;
+}
+
 
 // Caller holds runtimeMutex. Opaque IDs are never reused across sessions.
 Agent *findAgent(hsa_agent_t handle) {
     for (auto &agent : agents) if (agent.handle.handle == handle.handle) return &agent;
     return nullptr;
+}
+
+uint32_t waitSignals(bool all, uint32_t count, hsa_signal_t *handles,
+    hsa_signal_condition_t *conditions, hsa_signal_value_t *values,
+    uint64_t timeout, hsa_wait_state_t hint, hsa_signal_value_t *observed) {
+    if (count && (!handles || !conditions || !values)) return UINT32_MAX;
+    try {
+        std::vector<std::shared_ptr<mac_hsa::Signal>> waiting;
+        std::vector<bool> satisfied(count, false);
+        waiting.reserve(count);
+        bool valid = false;
+        for (uint32_t i = 0; i < count; ++i) {
+            waiting.push_back(findSignal(handles[i]));
+            valid |= bool(waiting.back());
+            if (all && observed) observed[i] = 0;
+            if (waiting.back() && (conditions[i] < HSA_SIGNAL_CONDITION_EQ ||
+                                  conditions[i] > HSA_SIGNAL_CONDITION_GTE)) return UINT32_MAX;
+        }
+        if (!valid) return all ? 0 : UINT32_MAX;
+        const auto start = std::chrono::steady_clock::now();
+        for (;;) {
+            bool complete = true;
+            for (uint32_t i = 0; i < count; ++i) {
+                const auto &signal = waiting[i];
+                if (!signal || (all && satisfied[i])) continue;
+                if (!signal->alive.load()) return UINT32_MAX;
+                const auto value = signal->value().load(std::memory_order_relaxed);
+                if (mac_hsa::signalCondition(value, conditions[i], values[i])) {
+                    if (observed) observed[all ? i : 0] = value;
+                    if (!all) return i;
+                    satisfied[i] = true;
+                } else complete = false;
+            }
+            if (all && complete) return 0;
+            const auto elapsed = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start).count());
+            if (elapsed >= timeout) return UINT32_MAX;
+            if (hint == HSA_WAIT_STATE_ACTIVE) std::this_thread::yield();
+            else std::this_thread::sleep_for(std::chrono::nanoseconds(std::min<uint64_t>(
+                1000000, timeout - elapsed)));
+        }
+    } catch (const std::bad_alloc &) { return UINT32_MAX; }
 }
 
 template<typename T> hsa_status_t writeValue(void *output, T value) {
@@ -56,7 +108,15 @@ hsa_status_t hsa_init() {
 hsa_status_t hsa_shut_down() {
     std::lock_guard lock(runtimeMutex);
     if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
-    if (!--references) agents.clear();
+    if (!--references) {
+        for (auto &[handle, signal] : signals) {
+            (void)handle;
+            signal->alive.store(false);
+            signal->changed.notify_all();
+        }
+        signals.clear();
+        agents.clear();
+    }
     return HSA_STATUS_SUCCESS;
 }
 
@@ -189,6 +249,149 @@ hsa_status_t hsa_queue_create(hsa_agent_t agent, uint32_t size, hsa_queue_type32
         return HSA_STATUS_ERROR_INVALID_ARGUMENT;
     return HSA_STATUS_ERROR_INVALID_QUEUE_CREATION;
 }
+
+hsa_status_t hsa_signal_create(hsa_signal_value_t initial, uint32_t count,
+                               const hsa_agent_t *consumers, hsa_signal_t *out) {
+    std::lock_guard lock(runtimeMutex);
+    if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+    if (!out || (count && !consumers)) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    *out = {};
+    bool needsGPU = false;
+    if (!count) for (const auto &agent : agents) needsGPU |= bool(agent.connection);
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto *agent = findAgent(consumers[i]);
+        if (!agent) return HSA_STATUS_ERROR_INVALID_AGENT;
+        for (uint32_t j = 0; j < i; ++j)
+            if (consumers[i].handle == consumers[j].handle) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        needsGPU |= bool(agent->connection);
+    }
+    if (needsGPU) return HSA_STATUS_ERROR_OUT_OF_RESOURCES; // shared GPU signal backing pending
+    try {
+        auto signal = std::make_shared<mac_hsa::Signal>();
+        signal->abi.value = initial;
+        const uint64_t handle = reinterpret_cast<uintptr_t>(&signal->abi);
+        signals.emplace(handle, std::move(signal));
+        out->handle = handle;
+        return HSA_STATUS_SUCCESS;
+    } catch (const std::bad_alloc &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
+}
+
+HSA_API_EXPORT hsa_status_t hsa_amd_signal_create(hsa_signal_value_t initial, uint32_t count,
+    const hsa_agent_t *consumers, uint64_t attributes, hsa_signal_t *out) {
+    {
+        std::lock_guard lock(runtimeMutex);
+        if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+        if (!out || (attributes & ~(uint64_t(HSA_AMD_SIGNAL_AMD_GPU_ONLY) | HSA_AMD_SIGNAL_IPC)))
+            return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        *out = {};
+        if ((attributes & HSA_AMD_SIGNAL_IPC) || (!count && (attributes & HSA_AMD_SIGNAL_AMD_GPU_ONLY)))
+            return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+    }
+    // GPU_ONLY is ignored when an explicit consumer list is supplied, as
+    // specified by the AMD ABI. IPC needs separate shared lifetime/backing.
+    return hsa_signal_create(initial, count, consumers, out);
+}
+
+HSA_API_EXPORT uint32_t hsa_amd_signal_wait_all(uint32_t count, hsa_signal_t *handles,
+    hsa_signal_condition_t *conditions, hsa_signal_value_t *values,
+    uint64_t timeout, hsa_wait_state_t hint, hsa_signal_value_t *observed) {
+    return waitSignals(true, count, handles, conditions, values, timeout, hint, observed);
+}
+HSA_API_EXPORT uint32_t hsa_amd_signal_wait_any(uint32_t count, hsa_signal_t *handles,
+    hsa_signal_condition_t *conditions, hsa_signal_value_t *values,
+    uint64_t timeout, hsa_wait_state_t hint, hsa_signal_value_t *observed) {
+    return waitSignals(false, count, handles, conditions, values, timeout, hint, observed);
+}
+
+hsa_status_t hsa_signal_destroy(hsa_signal_t handle) {
+    std::lock_guard lock(runtimeMutex);
+    if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+    if (!handle.handle) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    const auto entry = signals.find(handle.handle);
+    if (entry == signals.end()) return HSA_STATUS_ERROR_INVALID_SIGNAL;
+    entry->second->alive.store(false);
+    entry->second->changed.notify_all();
+    signals.erase(entry);
+    return HSA_STATUS_SUCCESS;
+}
+
+hsa_signal_value_t hsa_signal_load_relaxed(hsa_signal_t handle) {
+    const auto signal = findSignal(handle);
+    return signal ? signal->value().load(std::memory_order_relaxed) : 0;
+}
+hsa_signal_value_t hsa_signal_wait_relaxed(hsa_signal_t handle, hsa_signal_condition_t condition,
+    hsa_signal_value_t compare, uint64_t timeout, hsa_wait_state_t hint) {
+    return mac_hsa::waitSignal(findSignal(handle), condition, compare, timeout, hint,
+                               std::memory_order_relaxed);
+}
+hsa_signal_value_t hsa_signal_load_scacquire(hsa_signal_t handle) {
+    const auto signal = findSignal(handle);
+    return signal ? signal->value().load(std::memory_order_acquire) : 0;
+}
+hsa_signal_value_t hsa_signal_wait_scacquire(hsa_signal_t handle, hsa_signal_condition_t condition,
+    hsa_signal_value_t compare, uint64_t timeout, hsa_wait_state_t hint) {
+    return mac_hsa::waitSignal(findSignal(handle), condition, compare, timeout, hint,
+                               std::memory_order_acquire);
+}
+void hsa_signal_store_relaxed(hsa_signal_t handle, hsa_signal_value_t value) {
+    const auto signal = findSignal(handle);
+    if (!signal) return;
+    signal->value().store(value, std::memory_order_relaxed);
+    signal->changed.notify_all();
+}
+void hsa_signal_silent_store_relaxed(hsa_signal_t handle, hsa_signal_value_t value) {
+    const auto signal = findSignal(handle);
+    if (!signal) return;
+    signal->value().store(value, std::memory_order_relaxed);
+}
+void hsa_signal_store_screlease(hsa_signal_t handle, hsa_signal_value_t value) {
+    const auto signal = findSignal(handle);
+    if (!signal) return;
+    signal->value().store(value, std::memory_order_release);
+    signal->changed.notify_all();
+}
+void hsa_signal_silent_store_screlease(hsa_signal_t handle, hsa_signal_value_t value) {
+    const auto signal = findSignal(handle);
+    if (!signal) return;
+    signal->value().store(value, std::memory_order_release);
+}
+// Keep all atomic variants on the same 64-bit storage, with the ordering
+// specified by each HSA entry point. Fetch arithmetic uses atomic wraparound.
+#define SIGNAL_RMW(name, op, suffix, order) \
+void hsa_signal_##name##_##suffix(hsa_signal_t handle, hsa_signal_value_t value) { \
+    const auto signal = findSignal(handle); \
+    if (!signal) return; \
+    signal->value().op(value, order); \
+    signal->changed.notify_all(); \
+}
+#define SIGNAL_VALUE_RMW(suffix, order, failure) \
+hsa_signal_value_t hsa_signal_exchange_##suffix(hsa_signal_t handle, hsa_signal_value_t value) { \
+    const auto signal = findSignal(handle); \
+    if (!signal) return 0; \
+    const auto old = signal->value().exchange(value, order); \
+    signal->changed.notify_all(); return old; \
+} \
+hsa_signal_value_t hsa_signal_cas_##suffix(hsa_signal_t handle, hsa_signal_value_t expected, \
+                                         hsa_signal_value_t desired) { \
+    const auto signal = findSignal(handle); \
+    if (!signal) return 0; \
+    signal->value().compare_exchange_strong(expected, desired, order, failure); \
+    signal->changed.notify_all(); return expected; \
+}
+#define SIGNAL_ATOMICS(suffix, order, failure) \
+SIGNAL_RMW(add, fetch_add, suffix, order) \
+SIGNAL_RMW(subtract, fetch_sub, suffix, order) \
+SIGNAL_RMW(and, fetch_and, suffix, order) \
+SIGNAL_RMW(or, fetch_or, suffix, order) \
+SIGNAL_RMW(xor, fetch_xor, suffix, order) \
+SIGNAL_VALUE_RMW(suffix, order, failure)
+SIGNAL_ATOMICS(relaxed, std::memory_order_relaxed, std::memory_order_relaxed)
+SIGNAL_ATOMICS(scacquire, std::memory_order_acquire, std::memory_order_acquire)
+SIGNAL_ATOMICS(screlease, std::memory_order_release, std::memory_order_relaxed)
+SIGNAL_ATOMICS(scacq_screl, std::memory_order_acq_rel, std::memory_order_acquire)
+#undef SIGNAL_ATOMICS
+#undef SIGNAL_VALUE_RMW
+#undef SIGNAL_RMW
 
 hsa_status_t hsa_status_string(hsa_status_t status, const char **out) {
     if (!out) return HSA_STATUS_ERROR_INVALID_ARGUMENT;

@@ -336,15 +336,9 @@ typedef enum {
 } hsa_access_permission_t;
 
 /**
- * @brief OS file handle. A POSIX file descriptor on Unix-like systems, a Win32
- * HANDLE (as returned by CreateFile) on Windows. Declared as void* on Windows
- * to avoid pulling windows.h into the public header.
+ * @brief POSIX file descriptor.
  */
-#if defined(_WIN32) || defined(_WIN64)
-typedef void* hsa_file_t;
-#else
 typedef int hsa_file_t;
-#endif
 
 /** @} **/
 
@@ -539,19 +533,6 @@ typedef enum {
    * implementation. The type of this attribute is uint16_t.
    */
   HSA_AMD_SYSTEM_INFO_EXT_VERSION_MINOR = 0x208,
- /**
-   * Returns true if Fabric Handles is supported on this system.
-   * The fabric handle APIs are:
-   * - hsa_amd_vmem_export_fabric_handle
-   * - hsa_amd_vmem_import_fabric_handle
-   * The type of this attribute is bool.
-   */
-  HSA_AMD_SYSTEM_INFO_FABRIC_HANDLES_SUPPORTED = 0x209,
-  /**
-   * Returns true if allocation of dma-buf backed host memory is supported through
-   * virtual memory APIs. The type of this attribute is bool.
-   */
-  HSA_AMD_SYSTEM_INFO_HOST_ALLOC_DMA_BUF_SUPPORTED = 0x20A,
 } hsa_system_info_t;
 
 /**
@@ -2308,12 +2289,12 @@ typedef enum {
   /**
    * Queue supports kernel dispatch packets.
    */
-  HSA_QUEUE_FEATURE_KERNEL_DISPATCH = (1 << 0),
+  HSA_QUEUE_FEATURE_KERNEL_DISPATCH = 1,
 
   /**
    * Queue supports agent dispatch packets.
    */
-  HSA_QUEUE_FEATURE_AGENT_DISPATCH = (1 << 1)
+  HSA_QUEUE_FEATURE_AGENT_DISPATCH = 2
 } hsa_queue_feature_t;
 
 /**
@@ -5700,31 +5681,6 @@ typedef enum {
    */
   HSA_CODE_SYMBOL_INFO_KERNEL_WAVEFRONT_SIZE = 19
 } hsa_code_symbol_info_t;
-
-/**
- * @brief System dependent handle type.
- */
-#if defined(_WIN32)
-typedef void* hsa_handle_t;
-#else
-typedef int hsa_handle_t;
-#endif
-
-/**
- * @brief Interop map flags.
- */
-typedef uint32_t hsa_interop_map_flag_t;
-
-#define HSA_INTEROP_MAP_FLAG_NONE        0u
-#define HSA_INTEROP_MAP_FLAG_KMT_HANDLE  (1u << 0)
-
-/**
- * @brief Platform-independent container for a Windows LUID.
- */
-typedef struct hsa_luid_s {
-  uint32_t low;         //!< Luid low 4 bytes, valid only on Windows
-  uint32_t high;        //!< Luid high 4 bytes, valid only on Windows
-} hsa_luid_t;
 
 /**
  * @deprecated

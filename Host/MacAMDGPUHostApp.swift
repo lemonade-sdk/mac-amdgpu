@@ -371,8 +371,9 @@ struct ContentView: View {
                     Button("Host Memory Copy") { controller.testHostMemoryTransfer() }
                         .help("Verify 16 KB in each direction between host memory and VRAM through GART, then unbind the DMA mapping.")
                     Button("Compute Smoke") { controller.testCompute() }
-                    Button("Dispatch Test") { controller.testNativeDispatch() }
                         .help("Run a 32-thread shader that reads, adds and writes values; verify every result and surrounding guard words.")
+                    Button("Dispatch Test") { controller.testNativeDispatch() }
+                        .help("Upload a kernel and its arguments, then verify 128 and 256 results across multiple workgroups.")
                     Button("Sample Metrics") { controller.sampleMetrics() }
                         .help("Request one firmware telemetry snapshot for amdgpu_mtop. Requires an initialized GPU; stale samples are marked unavailable.")
                     Button("Large VRAM Test") { controller.testLargeVRAM() }
@@ -1830,7 +1831,7 @@ final class DriverController: NSObject, ObservableObject,
     func testNativeDispatch() {
         guard openUserClient() else { return }
         // Assembled from tests/shaders/dispatch_gfx1201.s; verified by the test script.
-        let dispatchCode: [UInt32] = [0xf4004100, 0xf8000000, 0xbfc70000, 0x84038502, 0x4a020003, 0x30020282, 0xee050004, 0x00000002, 0x00000001, 0xbfc00000, 0x4a040406, 0xee068004, 0x01000000, 0x00040001, 0xbfc10000, 0xbfb00000]
+        let dispatchCode: [UInt32] = [0xf400a000, 0xf8000000, 0xd6560000, 0x04010a75, 0x7e020280, 0xbf8700a1, 0x3e040082, 0x4a0000ff, 0x00000100, 0x3e000082, 0xbfc70000, 0xbf870093, 0xd7006a02, 0x00020400, 0xd5207c03, 0x01aa0601, 0xbf870003, 0xd7006a00, 0x00020000, 0xbf88fffd, 0xd5207c01, 0x01aa0201, 0xee05007c, 0x00000002, 0x00000002, 0xbfc00000, 0x4a040402, 0xee06807c, 0x01000000, 0x00000000, 0xbfb00000]
         var handles: [UInt64] = [], addresses: [UInt64] = []
         var canFree = true
         defer {
@@ -1910,7 +1911,12 @@ final class DriverController: NSObject, ObservableObject,
             }
             guard readKR == KERN_SUCCESS, bytesOut == 4096, observed == expected else {
                 let mismatches = zip(observed, expected).filter { $0 != $1 }.count
-                append(String(format: "Dispatch: readback failed kr=%#x mismatches=%llu", readKR, UInt64(mismatches)))
+                append(String(format: "Dispatch: readback failed kr=%#x mismatches=%llu fence=%llu seed=%#x",
+                              readKR, UInt64(mismatches), output[1], seed))
+                if let first = observed.indices.first(where: { observed[$0] != expected[$0] }) {
+                    append(String(format: "  first mismatch byte=%#x expected=%#x observed=%#x initial=%#x",
+                                  first * 4, expected[first], observed[first], initial[first]))
+                }
                 return
             }
             canFree = true
