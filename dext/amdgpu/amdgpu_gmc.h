@@ -192,6 +192,7 @@ void gmc_release_resources(GMCContext &gmc);
 //   program_invalidation      — invalidation engines 0..17
 kern_return_t gmc_mmhub_gart_enable(DeviceContext &dev, GMCContext &gmc);
 kern_return_t gmc_gfxhub_gart_enable(DeviceContext &dev, GMCContext &gmc);
+kern_return_t gmc_program_gart_window(DeviceContext &dev, GMCContext &gmc);
 
 // HDP flush — port of amdgpu_device_flush_hdp. Writes the HDP
 // memory-read-cache invalidate register. Used after writing PTEs

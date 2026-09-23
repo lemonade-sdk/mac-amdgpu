@@ -1,3 +1,4 @@
+#include <hsa/hsa_ven_amd_loader.h>
 #include "transport.h"
 #include "mac_hsa.h"
 #include <atomic>
@@ -95,11 +96,14 @@ int main() {
     assert(hsa_system_get_info(HSA_SYSTEM_INFO_TIMESTAMP, &later) == HSA_STATUS_SUCCESS && later >= timestamp);
     uint8_t extensions[128]; std::memset(extensions, 255, sizeof(extensions));
     assert(hsa_system_get_info(HSA_SYSTEM_INFO_EXTENSIONS, extensions) == HSA_STATUS_SUCCESS);
-    for (auto e : extensions) assert(!e);
+    assert(extensions[HSA_EXTENSION_AMD_LOADER / 8] == (1u << (HSA_EXTENSION_AMD_LOADER % 8)));
     uint16_t minor = 99; bool supported = true;
     assert(hsa_system_major_extension_supported(HSA_EXTENSION_AMD_LOADER, 1, &minor, &supported)
-           == HSA_STATUS_SUCCESS && !minor && !supported);
-    assert(hsa_system_get_major_extension_table(HSA_EXTENSION_AMD_LOADER, 1, 128, extensions)
+           == HSA_STATUS_SUCCESS && minor == 3 && supported);
+    hsa_ven_amd_loader_1_03_pfn_t loader{};
+    assert(hsa_system_get_major_extension_table(HSA_EXTENSION_AMD_LOADER, 1, sizeof(loader), &loader) == 0);
+    assert(loader.hsa_ven_amd_loader_query_host_address && loader.hsa_ven_amd_loader_iterate_executables);
+    assert(hsa_system_get_major_extension_table(HSA_EXTENSION_AMD_LOADER, 2, sizeof(loader), &loader)
            == HSA_STATUS_ERROR_INVALID_ARGUMENT);
     // Parallel reference users cannot prematurely close the observer client.
     std::vector<std::thread> workers;

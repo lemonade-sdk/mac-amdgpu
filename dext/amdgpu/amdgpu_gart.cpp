@@ -20,6 +20,7 @@
 #include "amdgpu_gart.h"
 #include "amdgpu_gmc.h"
 #include "amdgpu_vram_io.h"
+#include "amdgpu_gmc_address.h"
 
 #define GART_LOG(fmt, ...) \
     os_log(OS_LOG_DEFAULT, "mac.amdgpu.gart: " fmt, ##__VA_ARGS__)
@@ -87,9 +88,29 @@ gart_init(DeviceContext &dev, GMCContext &gmc, GARTContext &gart)
     gart.allocator = &gmc.gart_allocator;
     gart.gmc = &gmc;
     gart.reads_supported = false;
+    gart.hostWindowConfigured = false;
     GART_LOG("init: aperture [%#llx..%#llx), %u PTEs; host-memory transfers unverified",
              gart.gartStart, gart.gartEnd + 1, gart.numPTEs);
     return kIOReturnSuccess;
+}
+
+kern_return_t
+gart_configure_host_window(DeviceContext &dev, GARTContext &gart, uint64_t base)
+{
+    if (!gart.enabled || !gart.gmc || !gart.allocator) return kIOReturnNotReady;
+    if (gart.hostWindowConfigured) return kIOReturnSuccess;
+    auto &gmc = *gart.gmc;
+    if (!gfx12_host_window_valid(base, gart.gartSize, gmc.fb_start, gmc.fb_end))
+        return kIOReturnBadArgument;
+    if (gart.allocator->bytes_used()) return kIOReturnBusy;
+    // Mark the mutation before publishing registers. On any failure the caller
+    // must quarantine this session; rolling back cannot prove GPU inactivity.
+    gart.hostWindowConfigured = true;
+    gart.reads_supported = false;
+    gart.gartStart = gmc.gart_start = base;
+    gart.gartEnd = gmc.gart_end = base + gart.gartSize - 1;
+    gart.allocator->base = base; // no reservations exist; preserve generation IDs
+    return gmc_program_gart_window(dev, gmc);
 }
 
 static kern_return_t gart_bind_range(DeviceContext &dev, GARTContext &gart,

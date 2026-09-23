@@ -117,6 +117,7 @@ enum {
     kMacAMDGPUMethodComputeDispatch    = 51, // owned code BO + launch parameters
     kMacAMDGPUMethodBOExport          = 52, // owned device VRAM -> random sharing token
     kMacAMDGPUMethodBOImport          = 53, // token -> reference in this client's BO table
+    kMacAMDGPUMethodHostWindow        = 54, // establish/query common CPU/GPU GART address range
 };
 
 // v0.1.28 — IP types accepted by CSCreate. Match the upstream
@@ -2934,6 +2935,30 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         return kIOReturnSuccess;
     }
 
+    case kMacAMDGPUMethodHostWindow: {
+        if (!arguments->scalarInput || arguments->scalarInputCount != 1 ||
+            !arguments->scalarOutput || arguments->scalarOutputCount < 3 ||
+            arguments->structureInput || arguments->structureInputDescriptor ||
+            arguments->structureOutputDescriptor || arguments->structureOutputMaximumSize)
+            return kIOReturnBadArgument;
+        auto &b = driver->ivars->bringup;
+        if (b.reached != amdgpu::BringupStage::SDMAInit) return kIOReturnNotReady;
+        auto &gart = b.gart;
+        const bool configured = gart.hostWindowConfigured;
+        if (arguments->scalarInput[0]) {
+            const auto status = amdgpu::gart_configure_host_window(b.device, gart, arguments->scalarInput[0]);
+            if (status != kIOReturnSuccess) {
+                if (!configured && gart.hostWindowConfigured) driver->ivars->shutdownBlocked = true;
+                return status;
+            }
+        }
+        arguments->scalarOutput[0] = gart.hostWindowConfigured ? gart.gartStart : 0;
+        arguments->scalarOutput[1] = gart.gartSize;
+        arguments->scalarOutput[2] = gart.reads_supported;
+        arguments->scalarOutputCount = 3;
+        return kIOReturnSuccess;
+    }
+
     case kMacAMDGPUMethodHostMemoryTest: {
         if (!arguments->scalarInput || arguments->scalarInputCount < 1 ||
             !arguments->scalarOutput || arguments->scalarOutputCount < 6)
@@ -3296,8 +3321,8 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             return kIOReturnBadArgument;
         auto *source = mac_amdgpu_bo_lookup(ivars, arguments->scalarInput[0]);
         auto *destination = mac_amdgpu_bo_lookup(ivars, arguments->scalarInput[2]);
-        if (!source || !destination || !amdgpu::buffer_vram_domain(source->domain) ||
-            !amdgpu::buffer_vram_domain(destination->domain)) return kIOReturnBadArgument;
+        if (!source || !destination || !amdgpu::buffer_copy_domain(source->domain) ||
+            !amdgpu::buffer_copy_domain(destination->domain)) return kIOReturnBadArgument;
         uint64_t src = 0, dst = 0;
         const auto bytes = arguments->scalarInput[4];
         if (!amdgpu::buffer_copy_ranges(source->gpu_va, source->size, arguments->scalarInput[1],

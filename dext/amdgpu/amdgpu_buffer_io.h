@@ -7,6 +7,10 @@ constexpr uint64_t kBufferIOChunkBytes = 4096;
 constexpr uint64_t kBufferCopyMaxBytes = 4 * 1024 * 1024;
 constexpr uint32_t kBufferVisibleVRAM = 1;
 constexpr uint32_t kBufferDeviceVRAM = 3;
+constexpr uint32_t kBufferGTT = 2;
+inline bool buffer_copy_domain(uint32_t domain) {
+    return domain == kBufferVisibleVRAM || domain == kBufferDeviceVRAM || domain == kBufferGTT;
+}
 
 inline bool buffer_vram_domain(uint32_t domain) {
     return domain == kBufferVisibleVRAM || domain == kBufferDeviceVRAM;

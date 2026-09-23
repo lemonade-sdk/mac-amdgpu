@@ -1,10 +1,26 @@
 #include "runtime_state.h"
 #include "code_object.h"
+#include <cerrno>
+#include <cstdio>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace mac_hsa::detail {
-struct CodeReader { std::vector<uint8_t> bytes; };
+std::recursive_mutex executableLifecycleMutex;
+struct CodeReader {
+    std::vector<uint8_t> bytes;
+    std::string path;
+    size_t offset = 0;
+    int fd = -1;
+    ~CodeReader() { if (fd >= 0) close(fd); }
+};
 struct LoadedImage {
     hsa_agent_t agent{};
+    hsa_executable_t executable{};
+    hsa_loaded_code_object_t handle{};
+    std::shared_ptr<CodeReader> reader;
+    std::string uri;
     std::shared_ptr<Connection> connection;
     DeviceBuffer buffer;
     CodeObject object;
@@ -24,6 +40,23 @@ struct ExecutableSymbol {
 std::unordered_map<uint64_t, std::shared_ptr<Executable>> executables;
 std::unordered_map<uint64_t, std::shared_ptr<ExecutableSymbol>> executableSymbols;
 std::unordered_map<uint64_t, std::shared_ptr<CodeReader>> codeReaders;
+static std::unordered_map<uint64_t, std::weak_ptr<LoadedImage>> loadedImages;
+void clearLoadedImages() { loadedImages.clear(); }
+
+static std::string readerURI(const CodeReader &reader) {
+    if (reader.fd < 0)
+        return "memory://" + std::to_string(getpid()) + "#offset=" +
+            std::to_string(reinterpret_cast<uintptr_t>(reader.bytes.data())) +
+            "&size=" + std::to_string(reader.bytes.size());
+    std::string result = "file://";
+    constexpr char hex[] = "0123456789ABCDEF";
+    for (unsigned char c : reader.path) {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || std::strchr("/_.~-", c)) result += char(c);
+        else { result += '%'; result += hex[c >> 4]; result += hex[c & 15]; }
+    }
+    return result + "#offset=" + std::to_string(reader.offset) + "&size=" + std::to_string(reader.bytes.size());
+}
 
 static hsa_status_t findExecutable(hsa_executable_t handle, std::shared_ptr<Executable> &out) {
     std::lock_guard lock(runtimeMutex);
@@ -37,6 +70,7 @@ using namespace mac_hsa::detail;
 extern "C" {
 hsa_status_t hsa_code_object_reader_create_from_memory(const void *data, size_t size,
                                                        hsa_code_object_reader_t *out) {
+    std::lock_guard lifecycle(executableLifecycleMutex);
     std::lock_guard lock(runtimeMutex);
     if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
     if (!out || !data || !size) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
@@ -53,12 +87,14 @@ hsa_status_t hsa_code_object_reader_create_from_memory(const void *data, size_t 
     } catch (const std::bad_alloc &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
 }
 hsa_status_t hsa_code_object_reader_destroy(hsa_code_object_reader_t reader) {
+    std::lock_guard lifecycle(executableLifecycleMutex);
     std::lock_guard lock(runtimeMutex);
     if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
     return codeReaders.erase(reader.handle) ? HSA_STATUS_SUCCESS : HSA_STATUS_ERROR_INVALID_CODE_OBJECT_READER;
 }
 hsa_status_t hsa_executable_create_alt(hsa_profile_t profile, hsa_default_float_rounding_mode_t rounding,
                                        const char *, hsa_executable_t *out) {
+    std::lock_guard lifecycle(executableLifecycleMutex);
     std::lock_guard lock(runtimeMutex);
     if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
     if (!out) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
@@ -75,6 +111,7 @@ hsa_status_t hsa_executable_create_alt(hsa_profile_t profile, hsa_default_float_
     } catch (const std::bad_alloc &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
 }
 hsa_status_t hsa_executable_destroy(hsa_executable_t handle) {
+    std::lock_guard lifecycle(executableLifecycleMutex);
     std::shared_ptr<Executable> executable;
     const auto status = findExecutable(handle, executable);
     if (status != HSA_STATUS_SUCCESS) return status;
@@ -82,10 +119,12 @@ hsa_status_t hsa_executable_destroy(hsa_executable_t handle) {
     std::lock_guard lock(runtimeMutex);
     if (!executables.erase(handle.handle)) return HSA_STATUS_ERROR_INVALID_EXECUTABLE;
     for (const auto symbol : executable->symbolHandles) executableSymbols.erase(symbol);
+    for (const auto &image : executable->images) loadedImages.erase(image->handle.handle);
     return HSA_STATUS_SUCCESS; // final GPU storage release occurs after both locks
 }
 hsa_status_t hsa_executable_load_agent_code_object(hsa_executable_t handle, hsa_agent_t agent,
     hsa_code_object_reader_t readerHandle, const char *, hsa_loaded_code_object_t *loaded) {
+    std::lock_guard lifecycle(executableLifecycleMutex);
     std::shared_ptr<Executable> executable;
     std::shared_ptr<CodeReader> reader;
     std::shared_ptr<mac_hsa::Connection> connection;
@@ -121,10 +160,12 @@ hsa_status_t hsa_executable_load_agent_code_object(hsa_executable_t handle, hsa_
         if (device.gfxMajor != 12 || device.gfxMinor != 0 || device.gfxRevision != 1)
             return HSA_STATUS_ERROR_INCOMPATIBLE_ARGUMENTS;
         image->connection = connection; image->agent = agent;
+        image->reader = reader; image->executable = handle; image->uri = readerURI(*reader);
         status = connection->allocateBuffer(image->object.image.size(), image->buffer);
         if (status != HSA_STATUS_SUCCESS) return status;
         if (!image->buffer.handle || !image->buffer.address || image->buffer.address % 16384 ||
-            image->buffer.size < image->object.image.size()) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+            image->buffer.size < image->object.image.size() || image->buffer.address >= (1ull << 48) ||
+            image->buffer.size > (1ull << 48) - image->buffer.address) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
         if (!mac_hsa::relocateCodeObject(image->object, image->buffer.address)) return HSA_STATUS_ERROR_INVALID_CODE_OBJECT;
         status = connection->writeBuffer(image->buffer, 0, image->object.image.data(), image->object.image.size());
         if (status != HSA_STATUS_SUCCESS) return status;
@@ -140,9 +181,18 @@ hsa_status_t hsa_executable_load_agent_code_object(hsa_executable_t handle, hsa_
             if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
             const auto current = executables.find(handle.handle);
             if (current == executables.end() || current->second != executable) return HSA_STATUS_ERROR_INVALID_EXECUTABLE;
+            for (const auto &[existingID, weak] : loadedImages) {
+                (void)existingID;
+                const auto existing = weak.lock();
+                if (existing && image->buffer.address < existing->buffer.address + existing->buffer.size &&
+                    existing->buffer.address < image->buffer.address + image->buffer.size)
+                    return HSA_STATUS_ERROR_OUT_OF_RESOURCES; // address-only loader queries must be unambiguous
+            }
             if (lastHandle == UINT64_MAX || prepared.size() > UINT64_MAX - lastHandle - 1)
                 return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
             try {
+                image->handle.handle = ++lastHandle;
+                loadedImages.emplace(image->handle.handle, image);
                 for (auto &symbol : prepared) {
                     const auto id = ++lastHandle;
                     executableSymbols.emplace(id, symbol);
@@ -150,17 +200,18 @@ hsa_status_t hsa_executable_load_agent_code_object(hsa_executable_t handle, hsa_
                 }
             } catch (...) {
                 for (const auto id : inserted) executableSymbols.erase(id);
+                loadedImages.erase(image->handle.handle);
                 throw;
             }
             executable->symbolHandles.insert(executable->symbolHandles.end(), inserted.begin(), inserted.end());
             executable->images.push_back(image);
-            const auto id = ++lastHandle;
-            if (loaded) loaded->handle = id;
+            if (loaded) *loaded = image->handle;
         }
         return HSA_STATUS_SUCCESS;
     } catch (const std::bad_alloc &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
 }
 hsa_status_t hsa_executable_freeze(hsa_executable_t handle, const char *) {
+    std::lock_guard lifecycle(executableLifecycleMutex);
     std::shared_ptr<Executable> executable;
     const auto status = findExecutable(handle, executable);
     if (status != HSA_STATUS_SUCCESS) return status;
@@ -170,6 +221,7 @@ hsa_status_t hsa_executable_freeze(hsa_executable_t handle, const char *) {
     return HSA_STATUS_SUCCESS;
 }
 hsa_status_t hsa_executable_validate_alt(hsa_executable_t handle, const char *, uint32_t *result) {
+    std::lock_guard lifecycle(executableLifecycleMutex);
     std::shared_ptr<Executable> executable;
     const auto status = findExecutable(handle, executable);
     if (status != HSA_STATUS_SUCCESS) return status;
@@ -181,6 +233,7 @@ hsa_status_t hsa_executable_validate_alt(hsa_executable_t handle, const char *, 
 }
 hsa_status_t hsa_executable_get_symbol_by_name(hsa_executable_t handle, const char *name,
     const hsa_agent_t *agent, hsa_executable_symbol_t *out) {
+    std::lock_guard lifecycle(executableLifecycleMutex);
     std::shared_ptr<Executable> executable;
     const auto status = findExecutable(handle, executable);
     if (status != HSA_STATUS_SUCCESS) return status;
@@ -202,6 +255,7 @@ hsa_status_t hsa_executable_get_symbol_by_name(hsa_executable_t handle, const ch
 }
 hsa_status_t hsa_executable_symbol_get_info(hsa_executable_symbol_t handle,
     hsa_executable_symbol_info_t attribute, void *value) {
+    std::lock_guard lifecycle(executableLifecycleMutex);
     std::shared_ptr<ExecutableSymbol> symbol;
     {
         std::lock_guard lock(runtimeMutex);
@@ -233,5 +287,202 @@ hsa_status_t hsa_executable_symbol_get_info(hsa_executable_symbol_t handle,
     case HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_DYNAMIC_CALLSTACK: return writeValue(value, kernel.dynamicStack);
     default: return HSA_STATUS_ERROR_INVALID_ARGUMENT;
     }
+}
+}
+
+namespace {
+// The caller holds runtimeMutex. Loaded images are published only after upload.
+std::shared_ptr<LoadedImage> imageAt(uintptr_t address, bool host = false) {
+    for (const auto &[id, weak] : loadedImages) {
+        (void)id;
+        const auto image = weak.lock();
+        if (!image) continue;
+        const auto base = host ? reinterpret_cast<uintptr_t>(image->object.image.data()) : image->buffer.address;
+        if (address < base) continue;
+        const auto offset = address - base;
+        for (const auto &segment : image->object.segments)
+            if (offset >= segment.offset && offset - segment.offset < segment.size) return image;
+    }
+    return {};
+}
+}
+extern "C" {
+HSA_API_EXPORT hsa_status_t hsa_ven_amd_loader_query_host_address(const void *device, const void **host) {
+    std::lock_guard lock(runtimeMutex);
+    if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+    if (!device || !host) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    *host = nullptr;
+    auto image = imageAt(reinterpret_cast<uintptr_t>(device));
+    if (image) {
+        *host = image->object.image.data() + (reinterpret_cast<uintptr_t>(device) - image->buffer.address);
+        return HSA_STATUS_SUCCESS;
+    }
+    if (imageAt(reinterpret_cast<uintptr_t>(device), true)) { *host = device; return HSA_STATUS_SUCCESS; }
+    return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+}
+HSA_API_EXPORT hsa_status_t hsa_ven_amd_loader_query_executable(const void *device, hsa_executable_t *out) {
+    std::lock_guard lock(runtimeMutex);
+    if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+    if (!device || !out) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    *out = {};
+    const auto image = imageAt(reinterpret_cast<uintptr_t>(device));
+    if (!image) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    *out = image->executable; return HSA_STATUS_SUCCESS;
+}
+HSA_API_EXPORT hsa_status_t hsa_ven_amd_loader_query_segment_descriptors(
+    hsa_ven_amd_loader_segment_descriptor_t *out, size_t *count) {
+    std::lock_guard lock(runtimeMutex);
+    if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+    if (!count || (!out != !*count)) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    size_t required = 0;
+    for (const auto &[id, weak] : loadedImages) {
+        (void)id;
+        const auto image = weak.lock();
+        if (!image) continue;
+        for (const auto &segment : image->object.segments) {
+            required += segment.fileSize != 0;
+            required += segment.size > segment.fileSize;
+        }
+    }
+    if (!out) { *count = required; return HSA_STATUS_SUCCESS; }
+    if (*count != required) return HSA_STATUS_ERROR_INCOMPATIBLE_ARGUMENTS;
+    size_t index = 0;
+    for (const auto &[id, weak] : loadedImages) {
+        (void)id;
+        const auto image = weak.lock();
+        if (!image) continue;
+        const auto &reader = *image->reader;
+        for (const auto &segment : image->object.segments) {
+            if (segment.fileSize) {
+                out[index++] = {image->agent, image->executable,
+                    reader.fd < 0 ? HSA_VEN_AMD_LOADER_CODE_OBJECT_STORAGE_TYPE_MEMORY : HSA_VEN_AMD_LOADER_CODE_OBJECT_STORAGE_TYPE_FILE,
+                    reader.fd < 0 ? static_cast<const void *>(reader.bytes.data()) : reader.path.c_str(),
+                    reader.fd < 0 ? reader.bytes.size() : reader.path.size() + 1,
+                    size_t(segment.fileOffset + reader.offset),
+                    reinterpret_cast<const void *>(image->buffer.address + segment.offset), size_t(segment.fileSize)};
+            }
+            if (segment.size > segment.fileSize) {
+                out[index++] = {image->agent, image->executable, HSA_VEN_AMD_LOADER_CODE_OBJECT_STORAGE_TYPE_NONE,
+                    nullptr, 0, 0, reinterpret_cast<const void *>(image->buffer.address + segment.offset + segment.fileSize),
+                    size_t(segment.size - segment.fileSize)};
+            }
+        }
+    }
+    return HSA_STATUS_SUCCESS;
+}
+HSA_API_EXPORT hsa_status_t hsa_ven_amd_loader_executable_iterate_loaded_code_objects(
+    hsa_executable_t handle, hsa_status_t (*callback)(hsa_executable_t, hsa_loaded_code_object_t, void *), void *data) {
+    std::lock_guard lifecycle(executableLifecycleMutex);
+    std::shared_ptr<Executable> executable;
+    const auto status = findExecutable(handle, executable);
+    if (status != HSA_STATUS_SUCCESS) return status;
+    if (!callback) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    // No runtime lock across callbacks: HRX queries agent and load metadata here.
+    for (const auto &image : executable->images) {
+        const auto result = callback(handle, image->handle, data);
+        if (result != HSA_STATUS_SUCCESS) return result;
+    }
+    return HSA_STATUS_SUCCESS;
+}
+HSA_API_EXPORT hsa_status_t hsa_ven_amd_loader_loaded_code_object_get_info(hsa_loaded_code_object_t handle,
+    hsa_ven_amd_loader_loaded_code_object_info_t attribute, void *value) {
+    std::lock_guard lifecycle(executableLifecycleMutex);
+    std::lock_guard lock(runtimeMutex);
+    if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+    const auto found = loadedImages.find(handle.handle);
+    const auto image = found == loadedImages.end() ? nullptr : found->second.lock();
+    if (!image) return HSA_STATUS_ERROR_INVALID_CODE_OBJECT;
+    if (!value) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    const auto executable = executables.find(image->executable.handle);
+    if (executable == executables.end()) return HSA_STATUS_ERROR_INVALID_CODE_OBJECT;
+    if (attribute >= HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_LOAD_DELTA &&
+        attribute <= HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_LOAD_SIZE && !executable->second->frozen)
+        return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    const auto &reader = *image->reader;
+    switch (attribute) {
+    case HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_EXECUTABLE: return writeValue(value, image->executable);
+    case HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_KIND: return writeValue(value, uint32_t(HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_KIND_AGENT));
+    case HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_AGENT: return writeValue(value, image->agent);
+    case HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_CODE_OBJECT_STORAGE_TYPE:
+        return writeValue(value, uint32_t(reader.fd < 0 ? HSA_VEN_AMD_LOADER_CODE_OBJECT_STORAGE_TYPE_MEMORY : HSA_VEN_AMD_LOADER_CODE_OBJECT_STORAGE_TYPE_FILE));
+    case HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_CODE_OBJECT_STORAGE_MEMORY_BASE:
+        if (reader.fd >= 0) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        return writeValue(value, uint64_t(reinterpret_cast<uintptr_t>(reader.bytes.data())));
+    case HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_CODE_OBJECT_STORAGE_MEMORY_SIZE:
+        if (reader.fd >= 0) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        return writeValue(value, uint64_t(reader.bytes.size()));
+    case HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_CODE_OBJECT_STORAGE_FILE:
+        if (reader.fd < 0) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        return writeValue(value, reader.fd);
+    case HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_LOAD_DELTA:
+        return writeValue(value, int64_t(image->buffer.address - image->object.virtualBase));
+    case HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_LOAD_BASE: return writeValue(value, image->buffer.address);
+    case HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_LOAD_SIZE: return writeValue(value, image->buffer.size);
+    case HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_URI_LENGTH: return writeValue(value, uint32_t(image->uri.size()));
+    case HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_URI:
+        std::memcpy(value, image->uri.c_str(), image->uri.size() + 1); return HSA_STATUS_SUCCESS;
+    default: return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    }
+}
+HSA_API_EXPORT hsa_status_t hsa_ven_amd_loader_code_object_reader_create_from_file_with_offset_size(
+    hsa_file_t file, size_t offset, size_t size, hsa_code_object_reader_t *out) {
+    std::lock_guard lifecycle(executableLifecycleMutex);
+    std::lock_guard lock(runtimeMutex);
+    if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+    if (!out) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    *out = {};
+    if (!size || size > (256ull << 20) || offset > INT64_MAX || size > INT64_MAX - offset)
+        return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    struct stat stat{};
+    if (fstat(file, &stat) != 0 || !S_ISREG(stat.st_mode) || stat.st_size < 0 ||
+        offset > uint64_t(stat.st_size) || size > uint64_t(stat.st_size) - offset)
+        return HSA_STATUS_ERROR_INVALID_FILE;
+    if (lastHandle == UINT64_MAX) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+    try {
+        auto reader = std::make_shared<CodeReader>();
+        reader->fd = fcntl(file, F_DUPFD_CLOEXEC, 0);
+        if (reader->fd < 0) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+        char path[PATH_MAX]{};
+        if (fcntl(reader->fd, F_GETPATH, path) != 0) return HSA_STATUS_ERROR_INVALID_FILE;
+        reader->path = path; reader->offset = offset; reader->bytes.resize(size);
+        size_t done = 0;
+        while (done < size) {
+            const auto bytes = pread(reader->fd, reader->bytes.data() + done, size - done, off_t(offset + done));
+            if (bytes < 0 && errno == EINTR) continue;
+            if (bytes <= 0) return HSA_STATUS_ERROR_INVALID_FILE;
+            done += size_t(bytes);
+        }
+        const auto handle = ++lastHandle;
+        codeReaders.emplace(handle, std::move(reader)); out->handle = handle;
+        return HSA_STATUS_SUCCESS;
+    } catch (const std::bad_alloc &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
+}
+HSA_API_EXPORT hsa_status_t hsa_ven_amd_loader_iterate_executables(
+    hsa_status_t (*callback)(hsa_executable_t, void *), void *data) {
+    std::lock_guard lifecycle(executableLifecycleMutex);
+    {
+        std::lock_guard lock(runtimeMutex);
+        if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+        if (!callback) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    }
+    // Creation/destruction is serialized for the entire traversal, as specified.
+    for (const auto &[handle, executable] : executables) {
+        (void)executable;
+        const auto status = callback({handle}, data);
+        if (status != HSA_STATUS_SUCCESS) return status;
+    }
+    return HSA_STATUS_SUCCESS;
+}
+}
+namespace mac_hsa::detail {
+hsa_status_t loaderExtensionTable(size_t size, void *table) {
+    const hsa_ven_amd_loader_1_03_pfn_t functions{
+        hsa_ven_amd_loader_query_host_address, hsa_ven_amd_loader_query_segment_descriptors,
+        hsa_ven_amd_loader_query_executable, hsa_ven_amd_loader_executable_iterate_loaded_code_objects,
+        hsa_ven_amd_loader_loaded_code_object_get_info,
+        hsa_ven_amd_loader_code_object_reader_create_from_file_with_offset_size,
+        hsa_ven_amd_loader_iterate_executables};
+    std::memcpy(table, &functions, std::min(size, sizeof(functions)));
+    return HSA_STATUS_SUCCESS;
 }
 }

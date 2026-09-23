@@ -113,6 +113,7 @@ hsa_status_t hsa_init() {
 }
 
 hsa_status_t hsa_shut_down() {
+    std::lock_guard lifecycle(executableLifecycleMutex);
     std::vector<Agent> retiredAgents;
     std::vector<std::unique_ptr<CopyJob>> retiredJobs;
     std::map<uintptr_t, std::shared_ptr<Allocation>> retiredAllocations;
@@ -129,6 +130,7 @@ hsa_status_t hsa_shut_down() {
             for (auto &job : copyJobs) job->worker.request_stop();
             retiredJobs.swap(copyJobs);
             retiredExecutables.swap(executables);
+            clearLoadedImages();
             executableSymbols.clear();
             codeReaders.clear();
             clearQueues();
@@ -247,26 +249,30 @@ hsa_status_t hsa_system_get_info(hsa_system_info_t attribute, void *value) {
         return writeValue(value, false); // GPU SVM/VA aliases are not supported
     case HSA_SYSTEM_INFO_EXTENSIONS:
         std::memset(value, 0, 128);
+        static_cast<uint8_t *>(value)[HSA_EXTENSION_AMD_LOADER / 8] |= uint8_t(1u << (HSA_EXTENSION_AMD_LOADER % 8));
         return HSA_STATUS_SUCCESS;
     default: return HSA_STATUS_ERROR_INVALID_ARGUMENT;
     }
 }
 
-hsa_status_t hsa_system_major_extension_supported(uint16_t extension, uint16_t,
+hsa_status_t hsa_system_major_extension_supported(uint16_t extension, uint16_t major,
                                                   uint16_t *minor, bool *result) {
     std::lock_guard lock(runtimeMutex);
     if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
     if (!minor || !result ||
         (extension > HSA_EXTENSION_STD_LAST &&
          (extension < HSA_AMD_FIRST_EXTENSION || extension > HSA_AMD_LAST_EXTENSION))) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
-    *minor = 0;
-    *result = false;
+    *result = extension == HSA_EXTENSION_AMD_LOADER && major == 1;
+    *minor = *result ? 3 : 0;
     return HSA_STATUS_SUCCESS;
 }
 
-hsa_status_t hsa_system_get_major_extension_table(uint16_t, uint16_t, size_t, void *) {
+hsa_status_t hsa_system_get_major_extension_table(uint16_t extension, uint16_t major, size_t size, void *table) {
     std::lock_guard lock(runtimeMutex);
-    return references ? HSA_STATUS_ERROR_INVALID_ARGUMENT : HSA_STATUS_ERROR_NOT_INITIALIZED;
+    if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+    if (extension != HSA_EXTENSION_AMD_LOADER || major != 1 || !size || !table)
+        return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    return loaderExtensionTable(size, table);
 }
 
 hsa_status_t hsa_queue_create(hsa_agent_t agent, uint32_t size, hsa_queue_type32_t type,

@@ -13,7 +13,8 @@ struct MemoryTransferTest {
 };
 struct MemoryTransferResult {
     uint32_t stage;          // 1=allocate, 2=upload, 3=GPU read, 4=verify VRAM,
-                             // 5=GPU write, 6=verify host, 7=unbind, 8=complete
+                             // 5=GPU write, 6=verify host, 7=unbind, 8=complete,
+                             // 9/10=direct CPU→GPU/verify, 11/12=GPU→CPU/verify
     uint32_t mismatches;
     uint32_t firstMismatch;  // byte offset, UINT32_MAX if none
     uint64_t hostGPUAddress;

@@ -9,19 +9,21 @@ constexpr int kIOReturnSuccess = 0, kIOReturnBusy = 1, kIOReturnBadArgument = 2,
               kIOReturnNotReady = 3, kIOReturnTimeout = 4, kIOReturnUnsupported = 5,
               kIOReturnNotOpen = 6, kIOReturnNoSpace = 7, kIOReturnNoResources = 8;
 constexpr int kMacAMDGPUMethodSubmitIB = 19;
-constexpr int kMacAMDGPUMethodHostMemoryTest = 44;
+constexpr int kMacAMDGPUMethodHostMemoryTest = 44, kMacAMDGPUMethodHostWindow = 54;
 constexpr int kMacAMDGPUMethodComputeTest = 45;
 constexpr int kMacAMDGPUMethodWaitInterrupt = 4, kMacAMDGPUMethodWaitFence = 20;
 constexpr int kMacAMDGPUMethodSubmitTestPM4 = 14, kMacAMDGPUMethodCPKIQSmoke = 35,
               kMacAMDGPUMethodSDMACopyTest = 15;
 constexpr int kMacAMDGPUCSIPTypeSDMA = 0, kMacAMDGPUCSIPTypeGFX = 1,
               kMacAMDGPUCSIPTypeCompute = 2, MACAMDGPU_IRQ_PENDING_WORDS = 4;
-namespace amdgpu { constexpr unsigned kSDMAInstanceCount = 2; }
+namespace amdgpu { constexpr unsigned kSDMAInstanceCount = 2; enum class BringupStage { None, SDMAInit }; }
 struct OSAction { unsigned references = 1; void retain() { ++references; } void release() { --references; } };
 struct Args {
     OSAction *completion = nullptr;
     uint64_t *scalarInput = nullptr, *scalarOutput = nullptr;
     unsigned scalarInputCount = 0, scalarOutputCount = 0;
+    void *structureInput = nullptr, *structureInputDescriptor = nullptr, *structureOutputDescriptor = nullptr;
+    uint64_t structureOutputMaximumSize = 0;
 };
 struct CSEntry {
     uint32_t last_fence = 0, ip_type = 0, ip_instance = 0;
@@ -43,7 +45,10 @@ struct DriverState {
     bool pciOpen = true, shutdownBlocked = false;
     struct {
         int device = 0, mes = 0, gmc = 0;
-        int gart = 0, gfx = 0;
+        int gfx = 0;
+        amdgpu::BringupStage reached = amdgpu::BringupStage::SDMAInit;
+        struct { bool hostWindowConfigured = false, reads_supported = false;
+            uint64_t gartStart = 0, gartSize = 1ull << 28; } gart;
         struct { bool active = false; } memoryTest;
         struct { bool active = false; } computeTest;
         struct { struct {
@@ -68,6 +73,10 @@ static bool appendOK = true, emitOK = true, cpReadOK = true;
 static int kickResult;
 static uint64_t gpuCPFence;
 namespace amdgpu {
+template<class GART> int gart_configure_host_window(int &, GART &gart, uint64_t base) {
+    if (advanceDiagnosticWptr) { gart.hostWindowConfigured = true; gart.gartStart = base; }
+    return diagnosticResult;
+}
 void cp_log_control(int &, const char *) {}
 struct ComputeTestResult {
     uint32_t stage = 0, mismatches = 0, firstMismatch = UINT32_MAX, fence = 0;
@@ -84,8 +93,8 @@ struct MemoryTransferResult {
     uint32_t stage = 0, mismatches = 0, firstMismatch = UINT32_MAX;
     uint64_t hostGPUAddress = 0, vramGPUAddress = 0;
 };
-template<class SDMA, class Test>
-int memory_transfer_test(int &, int &, int &, SDMA &, Test &test,
+template<class GART, class SDMA, class Test>
+int memory_transfer_test(int &, int &, GART &, SDMA &, Test &test,
                           uint32_t, MemoryTransferResult &result) {
     test.active = advanceDiagnosticWptr;
     result.stage = test.active ? 3 : 0;
@@ -282,6 +291,19 @@ int main() {
     advanceDiagnosticWptr = true;
     assert(client.call(kMacAMDGPUMethodComputeTest, &args) == 0);
     assert(memoryOutputs[1] == 3 && memoryOutputs[2] == 5 && state.shutdownBlocked);
+    // A failed aperture register publication blocks further submissions; a
+    // rejected request or a read-only query must not poison the session.
+    args.scalarOutputCount = 6; memoryInputs[0] = 0; state.shutdownBlocked = false;
+    assert(client.call(kMacAMDGPUMethodHostWindow, &args) == 0 && memoryOutputs[0] == 0 && memoryOutputs[1] == (1ull << 28));
+    memoryInputs[0] = 1ull << 36; advanceDiagnosticWptr = false; diagnosticResult = kIOReturnBadArgument;
+    assert(client.call(kMacAMDGPUMethodHostWindow, &args) == kIOReturnBadArgument && !state.shutdownBlocked);
+    advanceDiagnosticWptr = true; diagnosticResult = kIOReturnTimeout;
+    assert(client.call(kMacAMDGPUMethodHostWindow, &args) == kIOReturnTimeout && state.shutdownBlocked);
+    state.shutdownBlocked = false; diagnosticResult = 0;
+    assert(client.call(kMacAMDGPUMethodHostWindow, &args) == 0 && memoryOutputs[0] == memoryInputs[0]);
+    args.structureInput = &args;
+    assert(client.call(kMacAMDGPUMethodHostWindow, &args) == kIOReturnBadArgument);
+    args.structureInput = nullptr;
     // Failed diagnostics that queued packets require reset. Preflight failures
     // do not poison the session, and caller timeouts remain capped.
     uint64_t diagnosticInputs[5] = {0, 0, 16, 4, UINT64_MAX};

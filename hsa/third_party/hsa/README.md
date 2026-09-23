@@ -1,6 +1,6 @@
 # HSA ABI headers
 
-Unmodified core, AMD extension and AMD queue/signal layout headers from
+Unmodified core, AMD extension and AMD queue/signal layout and loader extension headers from
 https://github.com/iree-org/hsa-runtime-headers/tree/cc2b5f429de4d1cb2be96ed10e6f45246e408d0e
 with upstream license notices and LICENSE.txt. This is the header revision
 pinned by LSE's HRX System commit

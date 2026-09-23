@@ -4,6 +4,14 @@
 
 namespace amdgpu {
 
+inline bool gfx12_host_window_valid(uint64_t base, uint64_t size,
+                                     uint64_t fbStart, uint64_t fbEnd) {
+    constexpr uint64_t limit = 1ULL << 47;
+    return size && !(size & (size - 1)) && base >= (1ULL << 32) &&
+        !(base & (size - 1)) && base < limit && size <= limit - base &&
+        fbStart <= fbEnd && (base > fbEnd || base + size <= fbStart);
+}
+
 // GFX12 VRAM PDE address transform (gmc_v12_0_get_vm_pde).
 // Callers must supply an address inside VRAM. SYSTEM PTEs use DMA
 // addresses directly and must never pass through this transform.

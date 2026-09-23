@@ -1,5 +1,14 @@
 # Status
 
+**v0.1.82 — AMD loader extension and shared-memory transport (installation pending).**
+AMD loader extension 1.03 now returns real descriptor translations, loaded-code
+metadata and object/executable enumeration. The loader passed on the actual GPU,
+including descriptor lookup after reader destruction. The new driver enables
+GTT buffers only after bidirectional DMA/direct-CPU verification, and can place
+its GART window at CPU-mappable addresses. A fixed-address host/GPU transfer test
+is ready; that new hardware path still needs installation and validation.
+GPU-visible signals, hardware HSA queues and HRX inference remain unfinished.
+
 **v0.1.81 — HSA host services and shared GPU buffers (IPC hardware passed).**
 HSA now resolves all 119 symbols required by LSE's pinned HRX. New working paths
 include host virtual-memory aliases, page locking, CPU IPC signals and GPU
@@ -18,13 +27,6 @@ client quiesces and resets the GPU. Two simultaneous HSA clients passed full
 data/guard checks, including continued operation after a peer exited abruptly.
 Global Stop/Reset remains blocked while another participating client is active.
 
-**v0.1.79 — compiler-verified dispatch shader (hardware passed).**
-The multi-workgroup test now matches LLVM gfx1201 output byte-for-byte,
-including ttmp9 workgroup IDs and instruction dependencies. It reports the
-first mismatched result if validation fails. Build 179 passed both
-caller-uploaded launches: 128 and 256 outputs, all inputs/guards, increasing
-GPU fences, and successful buffer release.
-
 The native [amdgpu_mtop monitor](amdgpu_mtop/README.md) enumerates attached
 MacAMDGPU devices with GPU switching and JSON output. Live discovery and VRAM
 capacity queries work; dynamic firmware metrics require a verified interface-0x33 layout.
@@ -36,7 +38,7 @@ All 119 functions resolved by LSE’s pinned HRX are exported; seven platform
 paths explicitly fail, and several other families are currently host-only.
 A bounded gfx1201 ELF loader now uploads linked kernels and exposes their
 descriptors; a compiler-produced kernel passed hardware loading and symbol
-resolution. GPU-visible signals, HSA queue dispatch, loader extensions and
+resolution. GPU-visible signals, HSA queue dispatch, shared-memory hardware validation and
 HRX/LSE inference remain required. HRX inference has not run.
 
 Older release history and detailed hardware results are in [PROGRESS.md](PROGRESS.md).

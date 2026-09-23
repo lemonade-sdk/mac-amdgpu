@@ -20,8 +20,10 @@ struct Relocation {
     bool absolute;
 };
 struct CodeObject {
+    struct Segment { uint64_t offset, size, fileOffset, fileSize; uint32_t flags; };
     uint64_t virtualBase = 0;
     std::vector<uint8_t> image;
+    std::vector<Segment> segments;
     std::vector<KernelMetadata> kernels;
     std::vector<Relocation> relocations;
 };

@@ -3,7 +3,7 @@
     "gpu_visible_signals": false,
     "hardware_aql_queues": false,
     "gpu_host_shared_mapping": false,
-    "amd_loader_extension": false,
+    "amd_loader_extension": true,
     "hrx_inference_verified": false
   },
   "platform_unsupported": [

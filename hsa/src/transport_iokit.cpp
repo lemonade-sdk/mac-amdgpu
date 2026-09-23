@@ -1,6 +1,8 @@
 #include "device_init.h"
 #include <IOKit/IOKitLib.h>
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <atomic>
 #include <new>
 #include <array>
 #include <algorithm>
@@ -30,6 +32,10 @@ public:
     uint64_t registryID = 0;
     ~IOKitConnection() override {
         // FinishStop resets or quarantines resources before releasing backing.
+        for (const auto &[handle, buffer] : sharedBuffers) {
+            (void)handle;
+            IOConnectUnmapMemory64(ownerPort, buffer.memoryType, mach_task_self(), reinterpret_cast<uintptr_t>(buffer.host));
+        }
         if (ownerPort) IOServiceClose(ownerPort);
         if (service) IOObjectRelease(service);
     }
@@ -67,6 +73,7 @@ public:
     hsa_status_t freeBuffer(const DeviceBuffer &buffer) override {
         std::lock_guard lock(sessionMutex);
         if (state != State::Ready) return HSA_STATUS_ERROR;
+        if (sharedBuffers.contains(buffer.handle)) return HSA_STATUS_ERROR_INVALID_ALLOCATION;
         const auto status = scalar(17, {&buffer.handle, 1}, {});
         if (status != HSA_STATUS_SUCCESS) state = State::Faulted;
         return status;
@@ -78,6 +85,76 @@ public:
     hsa_status_t writeBuffer(const DeviceBuffer &buffer, uint64_t offset, const void *in, size_t bytes) override {
         std::lock_guard lock(sessionMutex);
         return transfer(buffer, offset, const_cast<void *>(in), bytes, true);
+    }
+    hsa_status_t allocateSharedBuffer(uint64_t bytes, SharedBuffer &out) override {
+        std::lock_guard lock(sessionMutex);
+        out = {};
+        auto status = ensureReady();
+        if (status != HSA_STATUS_SUCCESS) return status;
+        status = ensureHostWindow();
+        if (status != HSA_STATUS_SUCCESS) return status;
+        if (!bytes || bytes > hostWindowSize || bytes > UINT64_MAX - 16383)
+            return HSA_STATUS_ERROR_INVALID_ALLOCATION;
+        SharedBuffer buffer;
+        status = allocateRaw((bytes + 16383) & ~uint64_t(16383), 2, buffer.device);
+        if (status != HSA_STATUS_SUCCESS) return status;
+        std::array<uint64_t, 2> mapping{};
+        status = scalar(36, {&buffer.device.handle, 1}, mapping);
+        mach_vm_address_t address = buffer.device.address;
+        mach_vm_size_t size = 0;
+        if (status == HSA_STATUS_SUCCESS && mapping[0] <= UINT32_MAX && mapping[1] == buffer.device.size &&
+            address >= hostWindowBase && address - hostWindowBase <= hostWindowSize &&
+            buffer.device.size <= hostWindowSize - (address - hostWindowBase)) {
+            buffer.memoryType = uint32_t(mapping[0]);
+            // A placed mapping fails on collisions; never overwrite process memory.
+            if (IOConnectMapMemory64(ownerPort, buffer.memoryType, mach_task_self(), &address, &size, 0) == KERN_SUCCESS) {
+                if (address == buffer.device.address && size == buffer.device.size) {
+                    buffer.host = reinterpret_cast<void *>(address);
+                    try {
+                        sharedBuffers.emplace(buffer.device.handle, buffer);
+                        std::memset(buffer.host, 0, size);
+                        std::atomic_thread_fence(std::memory_order_seq_cst);
+                        out = buffer; return HSA_STATUS_SUCCESS;
+                    } catch (const std::bad_alloc &) { /* unmap before releasing backing */ }
+                }
+                if (IOConnectUnmapMemory64(ownerPort, buffer.memoryType, mach_task_self(), address) != KERN_SUCCESS) {
+                    state = State::Faulted; return HSA_STATUS_ERROR;
+                }
+            }
+        }
+        const auto cleanup = scalar(17, {&buffer.device.handle, 1}, {});
+        if (cleanup != HSA_STATUS_SUCCESS) { state = State::Faulted; return cleanup; }
+        return status != HSA_STATUS_SUCCESS ? status : HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+    }
+    hsa_status_t freeSharedBuffer(const SharedBuffer &buffer) override {
+        std::lock_guard lock(sessionMutex);
+        const auto found = sharedBuffers.find(buffer.device.handle);
+        if (found == sharedBuffers.end() || found->second.host != buffer.host ||
+            found->second.device.size != buffer.device.size || found->second.device.address != buffer.device.address ||
+            found->second.memoryType != buffer.memoryType)
+            return HSA_STATUS_ERROR_INVALID_ALLOCATION;
+        if (state != State::Ready) return HSA_STATUS_ERROR;
+        if (IOConnectUnmapMemory64(ownerPort, buffer.memoryType, mach_task_self(), reinterpret_cast<uintptr_t>(buffer.host)) != KERN_SUCCESS) {
+            state = State::Faulted; return HSA_STATUS_ERROR;
+        }
+        sharedBuffers.erase(found);
+        const auto status = scalar(17, {&buffer.device.handle, 1}, {});
+        if (status != HSA_STATUS_SUCCESS) state = State::Faulted;
+        return status;
+    }
+    hsa_status_t copyBuffers(const DeviceBuffer &source, uint64_t sourceOffset,
+        const DeviceBuffer &destination, uint64_t destinationOffset, size_t bytes) override {
+        std::lock_guard lock(sessionMutex);
+        if (state != State::Ready) return HSA_STATUS_ERROR;
+        if (!bytes || bytes > 4 * 1024 * 1024 || sourceOffset > source.size || bytes > source.size - sourceOffset ||
+            destinationOffset > destination.size || bytes > destination.size - destinationOffset ||
+            (source.handle == destination.handle && sourceOffset < destinationOffset + bytes &&
+             destinationOffset < sourceOffset + bytes))
+            return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        const auto status = copyRaw(source.handle, sourceOffset, destination.handle, destinationOffset, bytes);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        return status;
     }
     hsa_status_t exportBuffer(const DeviceBuffer &buffer, BufferToken &token) override {
         std::lock_guard lock(sessionMutex);
@@ -123,6 +200,8 @@ private:
     io_connect_t ownerPort = IO_OBJECT_NULL;
     uint64_t capacity = 0;
     DeviceBuffer staging;
+    uint64_t hostWindowBase = 0, hostWindowSize = 0;
+    std::map<uint64_t, SharedBuffer> sharedBuffers;
     std::map<std::string, std::vector<uint8_t>> firmware;
 
     hsa_status_t scalar(uint32_t selector, std::span<const uint64_t> input,
@@ -187,12 +266,50 @@ private:
         state = status == HSA_STATUS_SUCCESS ? State::Ready : State::Faulted;
         return status;
     }
+    hsa_status_t ensureHostWindow() {
+        if (hostWindowBase) return HSA_STATUS_SUCCESS;
+        std::array<uint64_t, 3> build{};
+        auto status = scalar(43, {}, build);
+        if (status != HSA_STATUS_SUCCESS) return status;
+        if (build[2] < 182) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+        uint64_t candidate = 0;
+        std::array<uint64_t, 3> window{};
+        status = scalar(54, {&candidate, 1}, window);
+        if (status != HSA_STATUS_SUCCESS) return status;
+        if (!window[1] || window[1] > (1ull << 30) || (window[1] & (window[1] - 1))) return HSA_STATUS_ERROR;
+        if (!window[0]) {
+            // Ask Mach for an unused aligned range. It is only a placement hint;
+            // each later IOKit mapping must independently succeed at its GPU VA.
+            mach_vm_address_t reservation = 0;
+            const auto result = mach_vm_map(mach_task_self(), &reservation, window[1], window[1] - 1,
+                VM_FLAGS_ANYWHERE, MACH_PORT_NULL, 0, false, VM_PROT_NONE, VM_PROT_NONE, VM_INHERIT_NONE);
+            if (result != KERN_SUCCESS) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+            candidate = reservation;
+            const auto reservedSize = window[1];
+            status = scalar(54, {&candidate, 1}, window);
+            const auto released = mach_vm_deallocate(mach_task_self(), reservation, reservedSize);
+            if (released != KERN_SUCCESS) return HSA_STATUS_ERROR;
+            if (status != HSA_STATUS_SUCCESS) return status;
+        }
+        if (window[0] < (1ull << 32) || (window[0] & (window[1] - 1)) ||
+            window[0] >= (1ull << 47) || window[1] > (1ull << 47) - window[0]) return HSA_STATUS_ERROR;
+        if (!window[2]) {
+            const uint64_t seed = arc4random();
+            std::array<uint64_t, 6> result{};
+            status = scalar(44, {&seed, 1}, result);
+            if (status != HSA_STATUS_SUCCESS || result[0] || result[1] != 8 || result[2]) {
+                state = State::Faulted; return status == HSA_STATUS_SUCCESS ? HSA_STATUS_ERROR : status;
+            }
+        }
+        hostWindowBase = window[0]; hostWindowSize = window[1];
+        return HSA_STATUS_SUCCESS;
+    }
     hsa_status_t allocateRaw(uint64_t bytes, uint64_t domain, DeviceBuffer &buffer) {
         const std::array<uint64_t, 4> input{bytes, domain, 16384, 0};
         std::array<uint64_t, 3> output{};
         const auto status = scalar(16, input, output);
         if (status != HSA_STATUS_SUCCESS) return status;
-        if (!output[0] || !output[1] || output[2] || output[1] > UINT64_MAX - bytes) {
+        if (!output[0] || !output[1] || (domain != 2 && output[2]) || output[1] > UINT64_MAX - bytes) {
             state = State::Faulted; return HSA_STATUS_ERROR;
         }
         buffer = {output[0], output[1], bytes};

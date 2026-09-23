@@ -190,8 +190,11 @@ bool parseCodeObject(std::span<const uint8_t> file, CodeObject &output) {
     if (!haveMetadata || begin == UINT64_MAX || end - begin > (256ull << 20) || begin % 16384) return false;
     object.virtualBase = begin;
     object.image.resize(end - begin, 0);
-    for (const auto &segment : segments)
+    for (const auto &segment : segments) {
         std::memcpy(object.image.data() + segment.address - begin, file.data() + segment.offset, segment.fileSize);
+        object.segments.push_back({segment.address - begin, segment.memorySize,
+                                   segment.offset, segment.fileSize, segment.flags});
+    }
     const auto loadedRange = [&](uint64_t address, uint64_t size, bool executable = false) {
         for (const auto &segment : segments)
             if ((!executable || (segment.flags & 1)) && address >= segment.address &&

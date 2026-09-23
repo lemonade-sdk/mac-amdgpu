@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <fstream>
 #include <iterator>
+#include <fcntl.h>
+#include <unistd.h>
 
 static unsigned allocated = 0, freed = 0, uploaded = 0;
 static bool failAllocation = false, failUpload = false, shortAllocation = false;
@@ -47,7 +49,17 @@ int main(int argc, char **argv) {
     std::vector<uint8_t> file{std::istreambuf_iterator<char>(stream), {}};
     mac_hsa::CodeObject expected;
     assert(mac_hsa::parseCodeObject(file, expected));
+    hsa_ven_amd_loader_1_03_pfn_t loader{};
+    assert(hsa_system_get_major_extension_table(HSA_EXTENSION_AMD_LOADER, 1, sizeof(loader), &loader) == HSA_STATUS_ERROR_NOT_INITIALIZED);
     assert(hsa_init() == 0);
+    assert(hsa_system_get_major_extension_table(HSA_EXTENSION_AMD_LOADER, 1, sizeof(loader), &loader) == 0);
+    // An older or oversized caller receives exactly the supported prefix.
+    std::array<uint8_t, sizeof(loader) + 8> table;
+    table.fill(0xa5);
+    assert(hsa_system_get_major_extension_table(HSA_EXTENSION_AMD_LOADER, 1, 3, table.data()) == 0);
+    assert(!std::memcmp(table.data(), &loader, 3) && table[3] == 0xa5);
+    assert(hsa_system_get_major_extension_table(HSA_EXTENSION_AMD_LOADER, 1, table.size(), table.data()) == 0);
+    assert(!std::memcmp(table.data(), &loader, sizeof(loader)) && table[sizeof(loader)] == 0xa5);
     assert(hsa_iterate_agents([](hsa_agent_t agent, void *) {
         hsa_device_type_t type;
         assert(hsa_agent_get_info(agent, HSA_AGENT_INFO_DEVICE, &type) == 0);
@@ -64,6 +76,12 @@ int main(int argc, char **argv) {
     assert(lastUpload == expected.image && allocated == 1 && uploaded == 1 && freed == 0);
     assert(hsa_executable_load_agent_code_object(exec, gpu, reader, nullptr, nullptr) == HSA_STATUS_ERROR_VARIABLE_ALREADY_DEFINED);
     assert(allocated == 1);
+    hsa_executable_t owner{};
+    assert(loader.hsa_ven_amd_loader_loaded_code_object_get_info(loaded,
+        HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_EXECUTABLE, &owner) == 0 && owner.handle == exec.handle);
+    uint64_t loadBase = 0;
+    assert(loader.hsa_ven_amd_loader_loaded_code_object_get_info(loaded,
+        HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_LOAD_BASE, &loadBase) == HSA_STATUS_ERROR_INVALID_ARGUMENT);
     hsa_executable_symbol_t symbol{};
     assert(hsa_executable_get_symbol_by_name(exec, "vector_add.kd", &gpu, &symbol) == 0);
     uint64_t address = 1;
@@ -75,6 +93,59 @@ int main(int argc, char **argv) {
     assert(hsa_executable_load_agent_code_object(exec, gpu, reader, nullptr, nullptr) == HSA_STATUS_ERROR_FROZEN_EXECUTABLE);
     assert(hsa_executable_symbol_get_info(symbol, HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT, &address) == 0);
     assert(address == 0x8010000000ull + expected.kernels[0].descriptor);
+    const void *descriptor = nullptr;
+    assert(loader.hsa_ven_amd_loader_query_host_address(reinterpret_cast<void *>(address), &descriptor) == 0);
+    assert(!std::memcmp(descriptor, lastUpload.data() + expected.kernels[0].descriptor, 64));
+    const void *same = nullptr;
+    assert(loader.hsa_ven_amd_loader_query_host_address(descriptor, &same) == 0 && same == descriptor);
+    assert(loader.hsa_ven_amd_loader_query_host_address(reinterpret_cast<void *>(0x8010000000ull + expected.image.size()), &same) == HSA_STATUS_ERROR_INVALID_ARGUMENT && !same);
+    assert(loader.hsa_ven_amd_loader_query_executable(reinterpret_cast<void *>(address), &owner) == 0 && owner.handle == exec.handle);
+    assert(loader.hsa_ven_amd_loader_loaded_code_object_get_info(loaded,
+        HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_LOAD_BASE, &loadBase) == 0 && loadBase == 0x8010000000ull);
+    uint64_t loadSize = 0;
+    int64_t loadDelta = 0;
+    assert(loader.hsa_ven_amd_loader_loaded_code_object_get_info(loaded,
+        HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_LOAD_SIZE, &loadSize) == 0 && loadSize == lastUpload.size());
+    assert(loader.hsa_ven_amd_loader_loaded_code_object_get_info(loaded,
+        HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_LOAD_DELTA, &loadDelta) == 0 && loadDelta == int64_t(loadBase - expected.virtualBase));
+    struct Iteration { hsa_loaded_code_object_t handle; unsigned calls = 0; } iteration{loaded};
+    assert(loader.hsa_ven_amd_loader_executable_iterate_loaded_code_objects(exec,
+        [](hsa_executable_t e, hsa_loaded_code_object_t l, void *p) {
+            auto &state = *static_cast<Iteration *>(p); ++state.calls;
+            assert(l.handle == state.handle.handle);
+            hsa_executable_t owner{};
+            assert(hsa_ven_amd_loader_loaded_code_object_get_info(l,
+                HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_EXECUTABLE, &owner) == 0 && owner.handle == e.handle);
+            return HSA_STATUS_INFO_BREAK;
+        }, &iteration) == HSA_STATUS_INFO_BREAK && iteration.calls == 1);
+    assert(loader.hsa_ven_amd_loader_iterate_executables([](hsa_executable_t e, void *p) {
+        assert(e.handle == static_cast<hsa_executable_t *>(p)->handle);
+        uint32_t validation;
+        assert(hsa_executable_validate_alt(e, nullptr, &validation) == 0);
+        return HSA_STATUS_INFO_BREAK;
+    }, &exec) == HSA_STATUS_INFO_BREAK);
+    size_t segmentCount = 0;
+    assert(loader.hsa_ven_amd_loader_query_segment_descriptors(nullptr, &segmentCount) == 0 && segmentCount >= 3);
+    std::vector<hsa_ven_amd_loader_segment_descriptor_t> segments(segmentCount + 1);
+    ++segmentCount;
+    assert(loader.hsa_ven_amd_loader_query_segment_descriptors(segments.data(), &segmentCount) == HSA_STATUS_ERROR_INCOMPATIBLE_ARGUMENTS);
+    --segmentCount;
+    assert(loader.hsa_ven_amd_loader_query_segment_descriptors(segments.data(), &segmentCount) == 0);
+    for (size_t i = 0; i < segmentCount; ++i) {
+        const auto &segment = segments[i];
+        assert(segment.executable.handle == exec.handle && segment.agent.handle == gpu.handle);
+        if (segment.code_object_storage_type == HSA_VEN_AMD_LOADER_CODE_OBJECT_STORAGE_TYPE_MEMORY) {
+            assert(segment.code_object_storage_size == file.size());
+            assert(!std::memcmp(segment.code_object_storage_base, "\177ELF", 4));
+        }
+    }
+    uint32_t uriSize = 0;
+    assert(loader.hsa_ven_amd_loader_loaded_code_object_get_info(loaded,
+        HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_URI_LENGTH, &uriSize) == 0);
+    std::vector<char> uri(uriSize + 2, '!');
+    assert(loader.hsa_ven_amd_loader_loaded_code_object_get_info(loaded,
+        HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_URI, uri.data()) == 0);
+    assert(std::string(uri.data()).starts_with("memory://") && uri[uriSize] == 0 && uri[uriSize + 1] == '!');
     uint32_t value;
     assert(hsa_executable_symbol_get_info(symbol, HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_KERNARG_SEGMENT_SIZE, &value) == 0 && value == 12);
     assert(hsa_executable_symbol_get_info(symbol, HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_KERNARG_SEGMENT_ALIGNMENT, &value) == 0 && value == 8);
@@ -84,9 +155,37 @@ int main(int argc, char **argv) {
     assert(std::memcmp(name, "vector_add.kd", 13) == 0 && name[13] == '!');
     assert(hsa_code_object_reader_destroy(reader) == 0);
     assert(hsa_code_object_reader_destroy(reader) == HSA_STATUS_ERROR_INVALID_CODE_OBJECT_READER);
+    // Reader destruction leaves storage and translated descriptor pointers alive.
+    assert(!std::memcmp(descriptor, expected.image.data() + expected.kernels[0].descriptor, 64));
     assert(hsa_executable_destroy(exec) == 0 && freed == 1);
+    assert(loader.hsa_ven_amd_loader_query_host_address(reinterpret_cast<void *>(address), &descriptor) == HSA_STATUS_ERROR_INVALID_ARGUMENT);
+    assert(loader.hsa_ven_amd_loader_loaded_code_object_get_info(loaded,
+        HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_LOAD_SIZE, &loadSize) == HSA_STATUS_ERROR_INVALID_CODE_OBJECT);
+    segmentCount = 0;
+    assert(loader.hsa_ven_amd_loader_query_segment_descriptors(nullptr, &segmentCount) == 0 && segmentCount == 0);
     assert(hsa_executable_destroy(exec) == HSA_STATUS_ERROR_INVALID_EXECUTABLE);
     assert(hsa_executable_symbol_get_info(symbol, HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT, &address) == HSA_STATUS_ERROR_INVALID_EXECUTABLE_SYMBOL);
+    // Embedded file code objects: pread must preserve the caller's file offset.
+    char temporary[] = "/tmp/mac-hsa-loader-XXXXXX";
+    const int fd = mkstemp(temporary); assert(fd >= 0);
+    stream.clear(); stream.seekg(0);
+    std::vector<uint8_t> original{std::istreambuf_iterator<char>(stream), {}};
+    std::array<uint8_t, 128> prefix{};
+    assert(write(fd, prefix.data(), prefix.size()) == ssize_t(prefix.size()));
+    assert(write(fd, original.data(), original.size()) == ssize_t(original.size()));
+    assert(lseek(fd, 17, SEEK_SET) == 17);
+    assert(loader.hsa_ven_amd_loader_code_object_reader_create_from_file_with_offset_size(fd, prefix.size(), original.size(), &reader) == 0);
+    assert(lseek(fd, 0, SEEK_CUR) == 17); close(fd);
+    exec = executable();
+    assert(hsa_executable_load_agent_code_object(exec, gpu, reader, nullptr, &loaded) == 0);
+    assert(hsa_code_object_reader_destroy(reader) == 0);
+    int retainedFD = -1;
+    assert(loader.hsa_ven_amd_loader_loaded_code_object_get_info(loaded,
+        HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_CODE_OBJECT_STORAGE_FILE, &retainedFD) == 0);
+    char magic[4]; assert(pread(retainedFD, magic, 4, prefix.size()) == 4 && !std::memcmp(magic, "\177ELF", 4));
+    assert(hsa_executable_destroy(exec) == 0 && fcntl(retainedFD, F_GETFD) == -1);
+    unlink(temporary);
+    assert(loader.hsa_ven_amd_loader_code_object_reader_create_from_file_with_offset_size(-1, 0, 1, &reader) == HSA_STATUS_ERROR_INVALID_FILE);
     // Rejected images and backend failures leave no published symbols or buffers.
     assert(hsa_code_object_reader_create_from_memory(file.data(), file.size(), &reader) == 0);
     exec = executable();
@@ -104,6 +203,10 @@ int main(int argc, char **argv) {
     assert(allocated == freed);
     assert(hsa_executable_get_symbol_by_name(exec, "vector_add.kd", &gpu, &symbol) == HSA_STATUS_ERROR_INVALID_SYMBOL_NAME);
     assert(hsa_executable_load_agent_code_object(exec, gpu, reader, nullptr, nullptr) == 0);
+    // Two images cannot publish an ambiguous address-only loader translation.
+    auto collision = executable();
+    assert(hsa_executable_load_agent_code_object(collision, gpu, reader, nullptr, nullptr) == HSA_STATUS_ERROR_OUT_OF_RESOURCES);
+    assert(hsa_executable_destroy(collision) == 0);
     assert(hsa_init() == 0 && hsa_shut_down() == 0 && allocated == freed + 1);
     assert(hsa_shut_down() == 0 && allocated == freed);
     assert(hsa_executable_freeze(exec, nullptr) == HSA_STATUS_ERROR_NOT_INITIALIZED);

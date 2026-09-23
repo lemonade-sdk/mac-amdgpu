@@ -15,6 +15,10 @@ uint64_t stage = 15, nextHandle = 0;
 uint64_t driverBuild = 179, exportedBuffer = 0, exportToken[2]{};
 std::map<uint64_t, Buffer> buffers;
 std::vector<uint8_t> dma(32 << 20);
+alignas(16384) uint8_t sharedStorage[65536];
+bool sharedMapFailure = false;
+uint64_t sharedBase = reinterpret_cast<uintptr_t>(sharedStorage) & ~uint64_t((1ull << 28) - 1);
+unsigned hostChecks = 0, sharedMaps = 0, sharedUnmaps = 0;
 kern_return_t mockOpen(io_service_t, task_port_t, uint32_t, io_connect_t *port) { *port = ++opens; return KERN_SUCCESS; }
 kern_return_t mockClose(io_connect_t) { ++closes; return KERN_SUCCESS; }
 kern_return_t mockRelease(io_object_t) { return KERN_SUCCESS; }
@@ -41,10 +45,21 @@ kern_return_t mockScalar(mach_port_t, uint32_t selector, const uint64_t *in, uin
         assert(count == 4 && *outCount == 3 && in[2] == 16384 && in[3] == 0);
         auto handle = ++nextHandle;
         buffers.emplace(handle, Buffer{std::vector<uint8_t>(in[0], 0x91), in[1]});
-        out[0] = handle; out[1] = 0x8001000000ull + handle * 0x100000; out[2] = 0;
+        out[0] = handle;
+        out[1] = in[1] == 2 ? reinterpret_cast<uintptr_t>(sharedStorage) : 0x8001000000ull + handle * 0x100000;
+        out[2] = in[1] == 2 ? 0x12340000 : 0;
         break;
     }
     case 17: assert(buffers.erase(in[0]) == 1); break;
+    case 54:
+        assert(count == 1 && *outCount == 3 && in[0] == 0);
+        out[0] = sharedBase; out[1] = 1ull << 28; out[2] = 0; break;
+    case 44:
+        assert(count == 1 && *outCount == 6); ++hostChecks;
+        out[0] = 0; out[1] = 8; out[2] = 0; break;
+    case 36:
+        assert(count == 1 && *outCount == 2 && buffers.at(in[0]).domain == 2);
+        out[0] = 1000 + in[0]; out[1] = buffers.at(in[0]).bytes.size(); break;
     case 52:
         assert(count == 3 && *outCount == 3 && buffers.at(in[0]).domain == 3 && (in[1] || in[2]));
         exportedBuffer = in[0]; exportToken[0] = out[0] = in[1]; exportToken[1] = out[1] = in[2];
@@ -61,7 +76,9 @@ kern_return_t mockScalar(mach_port_t, uint32_t selector, const uint64_t *in, uin
         auto &src = buffers.at(in[0]).bytes, &dst = buffers.at(in[2]).bytes;
         assert(in[1] + in[4] <= src.size() && in[3] + in[4] <= dst.size());
         assert(in[4] && !(in[1] % 4) && !(in[3] % 4) && !(in[4] % 4));
-        std::memmove(dst.data() + in[3], src.data() + in[1], in[4]); out[0] = 0;
+        auto *source = buffers.at(in[0]).domain == 2 ? sharedStorage : src.data();
+        auto *destination = buffers.at(in[2]).domain == 2 ? sharedStorage : dst.data();
+        std::memmove(destination + in[3], source + in[1], in[4]); out[0] = 0;
         break;
     }
     default: assert(false);
@@ -70,10 +87,18 @@ kern_return_t mockScalar(mach_port_t, uint32_t selector, const uint64_t *in, uin
 }
 kern_return_t mockMap(io_connect_t, uint32_t memory, task_port_t, mach_vm_address_t *address,
                       mach_vm_size_t *size, IOOptionBits options) {
+    if (memory >= 1000) {
+        assert(options == 0 && *address == reinterpret_cast<uintptr_t>(sharedStorage));
+        if (sharedMapFailure) return KERN_NO_SPACE;
+        ++sharedMaps; *size = buffers.at(memory - 1000).bytes.size(); return KERN_SUCCESS;
+    }
     assert(memory == 6 && options == kIOMapAnywhere);
     ++maps; *address = reinterpret_cast<mach_vm_address_t>(dma.data()); *size = dma.size(); return KERN_SUCCESS;
 }
 kern_return_t mockUnmap(io_connect_t, uint32_t memory, task_port_t, mach_vm_address_t address) {
+    if (memory >= 1000) {
+        assert(address == reinterpret_cast<uintptr_t>(sharedStorage)); ++sharedUnmaps; return KERN_SUCCESS;
+    }
     assert(memory == 6 && address == reinterpret_cast<uintptr_t>(dma.data())); ++unmaps; return KERN_SUCCESS;
 }
 kern_return_t mockMethod(mach_port_t, uint32_t selector, const uint64_t *in, uint32_t count,
@@ -146,6 +171,28 @@ int main() {
             assert(stopped.importBuffer(token, imported) == HSA_STATUS_ERROR_INVALID_ARGUMENT && resets == beforeResets);
             stage = 15;
         }
+        mac_hsa::SharedBuffer shared;
+        assert(connection.allocateSharedBuffer(16384, shared) == HSA_STATUS_ERROR_OUT_OF_RESOURCES && !hostChecks);
+        driverBuild = 182;
+        assert(connection.allocateSharedBuffer(16384, shared) == 0 && hostChecks == 1);
+        assert(shared.host == sharedStorage && shared.device.address == reinterpret_cast<uintptr_t>(shared.host));
+        for (size_t i = 0; i < shared.device.size; ++i) assert(sharedStorage[i] == 0);
+        std::memset(sharedStorage, 0x79, shared.device.size);
+        assert(connection.copyBuffers(shared.device, 0, device, 0, shared.device.size) == 0);
+        assert(buffers.at(device.handle).bytes[16383] == 0x79);
+        std::memset(sharedStorage, 0, shared.device.size);
+        assert(connection.copyBuffers(device, 0, shared.device, 0, shared.device.size) == 0 && sharedStorage[16383] == 0x79);
+        assert(connection.freeBuffer(shared.device) == HSA_STATUS_ERROR_INVALID_ALLOCATION);
+        assert(connection.copyBuffers(shared.device, 0, shared.device, 4, 16) == HSA_STATUS_ERROR_INVALID_ARGUMENT);
+        auto stale = shared;
+        assert(connection.freeSharedBuffer(shared) == 0 && sharedMaps == sharedUnmaps);
+        assert(connection.freeSharedBuffer(stale) == HSA_STATUS_ERROR_INVALID_ALLOCATION);
+        sharedMapFailure = true;
+        const auto priorBuffers = buffers.size();
+        assert(connection.allocateSharedBuffer(16384, shared) == HSA_STATUS_ERROR_OUT_OF_RESOURCES && buffers.size() == priorBuffers);
+        sharedMapFailure = false;
+        // Restore device guards for the independent unaligned-copy test below.
+        std::fill(buffers.at(device.handle).bytes.begin(), buffers.at(device.handle).bytes.end(), 0x91);
         driverBuild = 179;
         std::vector<uint8_t> source(12003), destination(source.size());
         for (size_t i = 0; i < source.size(); ++i) source[i] = uint8_t(i * 113);

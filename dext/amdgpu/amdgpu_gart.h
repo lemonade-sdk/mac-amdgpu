@@ -76,6 +76,7 @@ struct GARTContext {
     // GTT allocations stay gated until a data-verified GPU host-memory
     // read passes. This is independent of BAR2 doorbell delivery.
     bool        reads_supported;
+    bool        hostWindowConfigured; // immutable until the verified session reset
 };
 
 //
@@ -98,6 +99,10 @@ kern_return_t gart_bind_sysmem(DeviceContext &dev, GARTContext &gart,
 // teardown reclaims the range regardless of allocation order.
 //
 kern_return_t gart_unbind(DeviceContext &dev, GARTContext &gart, GARTBinding *binding);
+
+// Establish one process-mappable GPU VA window before any GTT allocations.
+// A second caller adopts the first caller's window; live mappings never move.
+kern_return_t gart_configure_host_window(DeviceContext &dev, GARTContext &gart, uint64_t base);
 // Only after verified GPU reset/PCI isolation; performs no GPU register access.
 void gart_release_after_reset(GARTBinding &binding);
 

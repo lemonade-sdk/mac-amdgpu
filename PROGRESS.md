@@ -1741,3 +1741,40 @@ updates and cleanup after a SIGKILLed peer. All 28 non-runtime regression script
 pass, including extracted production driver export/import/free/close paths.
 GPU-visible signals, hardware AQL queues, shared host/GPU mappings, AMD loader
 extension support and actual HRX inference remain incomplete.
+
+
+## Build 182: AMD loader and equal-address host-memory transport — 2026-09-23
+
+Implemented the complete AMD loader 1.03 extension table: host address queries,
+segment/executable/loaded-object enumeration, loaded metadata and embedded-file
+readers. ELF load segments are retained, including file/BSS distinctions.
+Executable lifetimes retain source storage and descriptor translations after
+reader destruction. File readers duplicate descriptors and use bounded pread
+without changing the caller's file position. Loader enumeration serializes
+executable mutations while allowing metadata callbacks outside the runtime lock.
+Stale handles, allocation failures, address collisions and truncated/oversized
+extension table requests are covered by sanitizer tests.
+
+On installed build 181, the real loader probe uploaded vector_add.kd,
+queried descriptor 0x8010000580 through the extension after destroying its reader,
+and verified kernarg metadata and the 16 KiB GPU allocation. This proves loader
+behavior, not kernel dispatch. A separate host-memory test passed 16 KiB each
+way with zero mismatches and completed DMA unmapping at 2026-09-23T17:51:13Z.
+The earlier unverified assertion that the platform could not perform host reads
+is not a current blocker.
+
+Build 182 extends the memory test with independent direct-CPU read/write patterns,
+without PerformOperation, before enabling GTT BO allocation. SDMA copy accepts
+owned GTT or VRAM BOs. Selector 54 establishes one immutable process-mappable
+GART address window per GPU session, refuses live reservations, verifies both
+hubs and retains a failed register update for reset recovery. The transport maps
+GTT at the exact GPU address and refuses CPU address collisions without replacing
+existing memory. Its diagnostic checks 64,003 unaligned bytes each way plus all
+128 KiB shared bytes and device guard bytes. New hardware behavior awaits user
+installation of 0.1.82; shared HSA pools, GPU-visible atomic signals and hardware
+AQL queues are not advertised yet. HRX inference has not run.
+
+The app/dext build and strict signature verification passed with unchanged
+installer code and entitlements. Eight HSA sanitizer suites and 29 driver
+regression scripts pass, including window programming/fault retention, direct
+DMA data verification, mapping collision cleanup and loader lifetimes.

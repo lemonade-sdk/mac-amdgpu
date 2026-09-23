@@ -568,6 +568,28 @@ hub_init_gart_aperture_regs(const DeviceContext &dev,
            (uint32_t)(gmc.gart_end >> 44));
 }
 
+// Only the empty context-zero aperture changes. Keep firmware, system-domain
+// cache settings and user VM contexts intact. Verify both hubs before admission.
+kern_return_t
+gmc_program_gart_window(DeviceContext &dev, GMCContext &gmc)
+{
+    const HubContext *hubs[] = {&gmc.mmhub, &gmc.gfxhub};
+    for (const HubContext *hub : hubs) {
+        if (!hub->inited || !dev.ip.isResolved(hub->ip)) return kIOReturnNotReady;
+        hub_init_gart_aperture_regs(dev, gmc, *hub);
+        const uint32_t registers[] = {hub->ctx0_pt_start_lo, hub->ctx0_pt_start_hi,
+                                      hub->ctx0_pt_end_lo, hub->ctx0_pt_end_hi};
+        const uint32_t expected[] = {uint32_t(gmc.gart_start >> 12), uint32_t(gmc.gart_start >> 44),
+                                     uint32_t(gmc.gart_end >> 12), uint32_t(gmc.gart_end >> 44)};
+        for (unsigned i = 0; i < 4; ++i)
+            if (RREG32(dev, SOC15_REG_OFFSET(dev, hub->ip, registers[i])) != expected[i])
+                return kIOReturnIOError;
+        const auto status = gmc_flush_gpu_tlb(dev, gmc, *hub, 0, 0);
+        if (status != kIOReturnSuccess) return status;
+    }
+    return kIOReturnSuccess;
+}
+
 // init_system_aperture_regs — port of:
 //   mmhub_v4_1_0_init_system_aperture_regs  (mmhub_v4_1_0.c:152)
 //   gfxhub_v12_0_init_system_aperture_regs  (gfxhub_v12_0.c:158)

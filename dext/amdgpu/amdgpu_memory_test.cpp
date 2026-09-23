@@ -25,6 +25,7 @@ kern_return_t memory_transfer_test(DeviceContext &dev, GMCContext &gmc,
     result.firstMismatch = UINT32_MAX;
     if (test.active) return kIOReturnBusy;
     if (!gart.enabled || !sdma.inited || !sdma.enabled) return kIOReturnNotReady;
+    gart.reads_supported = false;
     test.active = true;
     result.stage = 1;
     auto r = gart_bind_sysmem(dev, gart, 2 * kTransferBytes, kASPageSize, &test.host);
@@ -95,6 +96,52 @@ kern_return_t memory_transfer_test(DeviceContext &dev, GMCContext &gmc,
         }
     }
     if (result.mismatches) return kIOReturnIOError;
+    // Repeat without PerformOperation: CPU mappings must refer to the DMA
+    // pages themselves, rather than a bounce-buffer snapshot. Each direction
+    // uses a fresh pattern and is ordered with a system-scope CPU fence.
+    auto *direct = static_cast<volatile uint32_t *>(test.host.cpuAddr);
+    if (!direct) return kIOReturnNotReady;
+    seed ^= 0xc36a5987u;
+    result.stage = 9;
+    for (uint32_t i = 0; i < kTransferBytes / 4; ++i) direct[i] = memory_test_word(i, seed);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    r = vram_clear_verified(dev, offset, kTransferBytes);
+    if (r != kIOReturnSuccess) return r;
+    amdgpu_hdp_flush(dev);
+    r = sdma_copy_linear_test(dev, sdma, test.host.gartMCAddr, test.vram.gpu_va, kTransferBytes, 100000);
+    if (r != kIOReturnSuccess) return r;
+    result.stage = 10;
+    for (uint32_t i = 0; i < kTransferBytes / 4; ++i) {
+        uint32_t observed = UINT32_MAX;
+        dev.pci->MemoryRead32(dev.bar0MemIndex, offset + i * 4, &observed);
+        if (observed != memory_test_word(i, seed)) {
+            if (!result.mismatches) result.firstMismatch = i * 4;
+            ++result.mismatches;
+        }
+    }
+    if (result.mismatches) return kIOReturnIOError;
+    seed ^= 0x1e79ac63u;
+    for (uint32_t i = 0; i < kTransferBytes / 4; ++i) {
+        words[i] = memory_test_word(i, seed);
+        direct[kTransferBytes / 4 + i] = ~words[i];
+    }
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    r = vram_write_verified(dev, offset, words, kTransferBytes);
+    if (r != kIOReturnSuccess) return r;
+    amdgpu_hdp_flush(dev);
+    result.stage = 11;
+    r = sdma_copy_linear_test(dev, sdma, test.vram.gpu_va,
+        test.host.gartMCAddr + kTransferBytes, kTransferBytes, 100000);
+    if (r != kIOReturnSuccess) return r;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    result.stage = 12;
+    for (uint32_t i = 0; i < kTransferBytes / 4; ++i) {
+        if (direct[kTransferBytes / 4 + i] != memory_test_word(i, seed)) {
+            if (!result.mismatches) result.firstMismatch = i * 4;
+            ++result.mismatches;
+        }
+    }
+    if (result.mismatches) return kIOReturnIOError;
     result.stage = 7;
     r = gart_unbind(dev, gart, &test.host);
     if (r != kIOReturnSuccess) return r;
@@ -102,7 +149,9 @@ kern_return_t memory_transfer_test(DeviceContext &dev, GMCContext &gmc,
     gmc.vram_alloc.free(test.vram);
     test = {};
     result.stage = 8;
-    // A controlled transfer does not yet enable general GTT BO allocation.
+    // Both DMA access methods, both directions and unbinding have passed.
+    // This is a copy capability, not proof of GPU system-scope atomic support.
+    gart.reads_supported = true;
     return kIOReturnSuccess;
 }
 }

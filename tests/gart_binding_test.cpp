@@ -8,6 +8,7 @@
 #include "amdgpu_ip.h"
 #include "amdgpu_vram.h"
 #include "amdgpu_gart_allocator.h"
+#include "amdgpu_gmc_address.h"
 using namespace amdgpu;
 using kern_return_t = int;
 enum { kIOReturnSuccess, kIOReturnNotReady, kIOReturnBadArgument,
@@ -100,6 +101,7 @@ struct DeviceContext { FakePCI *pci; uint64_t bar0Size = 0x10000000; uint8_t bar
 struct GMCContext {
     bool inited = true;
     uint64_t vram_start = 0x8000000000, gart_pt_bus = 0x8000700000;
+    uint64_t fb_start = 0x8000000000, fb_end = 0x87ffffffff, gart_end = 0xffff;
     uint64_t gart_start = 0, gart_size = 0x10000, gart_pt_size = 4096;
     GARTApertureAllocator gart_allocator;
     VRAMBumpAllocator vram_alloc;
@@ -119,6 +121,9 @@ static int gmc_flush_gpu_tlb(DeviceContext &, const GMCContext &, const GMCConte
 }
 #define GART_LOG(...) do {} while (0)
 #define GMC_LOG(...) do {} while (0)
+static int windowStatus = 0;
+static unsigned windowCalls = 0;
+static int gmc_program_gart_window(DeviceContext &, GMCContext &) { ++windowCalls; return windowStatus; }
 #include "gart_binding_under_test.inc"
 #include "memory_test_context.inc"
 struct SDMAInstance { bool inited = true, enabled = true; };
@@ -277,19 +282,22 @@ int main() {
     fresh();
     assert(memory_transfer_test(dev, gmc, gart, sdma, transfer, 0x12345678, result) == 0);
     assert(result.stage == 8 && result.mismatches == 0 && result.firstMismatch == UINT32_MAX);
-    assert(copies == 2 && performCount == 3 && !transfer.active && !gart.reads_supported);
+    assert(copies == 4 && performCount == 3 && !transfer.active && gart.reads_supported);
     assert(!liveBuffers && !liveDMA && !gmc.gart_allocator.bytes_used() && !gmc.vram_alloc.bytes_used());
     assert(memory_transfer_test(dev, gmc, gart, sdma, transfer, 0x76543210, result) == 0);
-    for (unsigned failure = 0; failure < 8; ++failure) {
+    for (unsigned failure = 0; failure < 12; ++failure) {
         fresh();
         if (failure < 2) failCopyAt = failure + 1;
         else if (failure < 4) corruptCopyAt = failure - 1;
         else if (failure == 4) failUnbind = true;
-        else failPerformAt = failure - 4;
+        else if (failure < 8) failPerformAt = failure - 4;
+        else if (failure < 10) failCopyAt = failure - 5;
+        else corruptCopyAt = failure - 7;
         assert(memory_transfer_test(dev, gmc, gart, sdma, transfer, 0x98765432, result) != 0);
+        assert(!gart.reads_supported);
         assert(transfer.active && liveBuffers == 2 && liveDMA == 1);
         assert(gmc.vram_alloc.bytes_used() == 16384 && gmc.gart_allocator.bytes_used() == 32768);
-        const unsigned stages[] = {3,5,4,6,7,2,2,6};
+        const unsigned stages[] = {3,5,4,6,7,2,2,6,9,11,10,12};
         assert(result.stage == stages[failure]);
         if (failure == 2 || failure == 3) {
             assert(result.mismatches == 1 && result.firstMismatch == 16380);
@@ -299,6 +307,20 @@ int main() {
         memory_transfer_release_after_reset(transfer);
         assert(!liveBuffers && !liveDMA && !transfer.active);
     }
+    fresh();
+    assert(gart_configure_host_window(dev, gart, 0) == kIOReturnBadArgument);
+    assert(gart_bind_sysmem(dev, gart, 16384, 16384, &owned) == 0);
+    assert(gart_configure_host_window(dev, gart, 1ull << 36) == kIOReturnBusy && !windowCalls);
+    assert(gart_unbind(dev, gart, &owned) == 0);
+    gart.reads_supported = true;
+    assert(gart_configure_host_window(dev, gart, 1ull << 36) == 0 && windowCalls == 1);
+    assert(gart.hostWindowConfigured && !gart.reads_supported && gmc.gart_start == (1ull << 36));
+    assert(gart.allocator->base == gart.gartStart && gmc.gart_end == gart.gartEnd);
+    assert(gart_configure_host_window(dev, gart, 1ull << 37) == 0 && windowCalls == 1 && gart.gartStart == (1ull << 36));
+    assert(gart_bind_sysmem(dev, gart, 16384, 16384, &owned) == 0 && owned.gartMCAddr == (1ull << 36));
+    assert(gart_unbind(dev, gart, &owned) == 0);
+    gart.hostWindowConfigured = false; windowStatus = kIOReturnTimeout;
+    assert(gart_configure_host_window(dev, gart, 1ull << 37) == kIOReturnTimeout && gart.hostWindowConfigured);
     puts("GART: shared allocation, checked PTE ranges/publication, both-hub invalidation, DMA cleanup ordering and failure retention pass");
     puts("Host transfer: two 16 KiB patterns, every PTE, full readback, both copy failures, mismatches, API/cleanup failures and reset retention pass");
 }

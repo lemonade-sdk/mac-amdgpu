@@ -20,11 +20,29 @@ The 29 symbols added with build 181 have these behaviors:
 | SVM attribute get/set and prefetch | 3 | Unsupported until GPU fault servicing and shared virtual-memory migration exist. Calls fail without changing attributes or falsely decrementing completion signals. SVM capability queries return false. |
 
 The existing executable loader accepts a bounded subset of linked gfx1201 ELF
-images; the AMD loader extension, global linking, GPU-visible signals,
-hardware AQL queues and shared host/GPU address mappings remain incomplete.
+images. AMD loader extension 1.03 now provides all seven table entries:
+address translation, segment/executable/object enumeration, object metadata,
+and embedded-file readers. Original storage and relocated descriptor copies
+remain alive until executable destruction, even after reader destruction.
+General global linking, GPU-visible signals and hardware AQL queues remain
+incomplete. Build 182 implements equal-address CPU/GPU host-buffer mappings
+in the transport, but the new hardware path is awaiting installation and
+validation; it is not yet advertised as an HSA pool or signal capability.
 No HRX/LSE inference has run.
 
 ## Validation
+
+- The loader extension passed on the actual GPU with driver 181: a linked
+  kernel uploaded/froze successfully and its translated descriptor matched
+  kernarg metadata after reader destruction.
+- Driver 181 passed 16 KiB host → VRAM → host, zero mismatches, with DMA
+  unmapping complete. This validates the existing PerformOperation path.
+- Build 182 adds direct CPU-mapping checks before allowing GTT allocation,
+  an immutable session GART window, fixed CPU mappings that fail on address
+  collisions, and GTT/VRAM SDMA copies. `mac-hsa-shared-test --run` verifies
+  64,003 unaligned bytes each way plus the complete 128 KiB shared allocation
+  and VRAM guards. Its hardware result is pending; concurrent CPU/GPU atomics
+  and hardware AQL queues require separate tests.
 
 - Eight ASan/UBSan runtime suites, including native host virtual memory and
   separate-process IPC signal updates. A SIGKILL test verifies cleanup by a

@@ -1964,7 +1964,8 @@ final class DriverController: NSObject, ObservableObject,
             return
         }
         let stages = ["preflight", "allocate/map", "upload", "GPU read",
-                      "verify VRAM", "GPU write", "verify host", "unbind", "complete"]
+                      "verify VRAM", "GPU write", "verify host", "unbind", "complete",
+                      "direct CPU upload", "verify direct GPU read", "direct GPU write", "verify direct CPU read"]
         let stage = out[1] < UInt64(stages.count) ? stages[Int(out[1])] : "unknown"
         append(String(format: "Host Memory Copy: status=%#llx stage=%@ mismatches=%llu",
                       out[0], stage, out[2]))
@@ -1973,7 +1974,7 @@ final class DriverController: NSObject, ObservableObject,
             append(String(format: "  first mismatch at byte offset=%#llx", out[3]))
         }
         if out[0] == 0 && out[1] == 8 {
-            append("Host Memory Copy: GPU read and write verified; mappings released")
+            append("Host Memory Copy: DMA and direct CPU mappings verified both ways; GTT enabled; test mappings released")
         } else if out[1] != 0 {
             append("Host Memory Copy: session retained for recovery — Stop GPU before retry")
         }

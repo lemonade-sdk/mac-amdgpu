@@ -3,6 +3,7 @@
 #include "transport.h"
 #include "signal_state.h"
 #include <hsa/hsa_ext_amd.h>
+#include <hsa/hsa_ven_amd_loader.h>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -47,6 +48,9 @@ struct CopyJob {
 };
 
 extern std::mutex runtimeMutex;
+extern std::recursive_mutex executableLifecycleMutex;
+void clearLoadedImages(); // caller holds runtimeMutex and executableLifecycleMutex
+hsa_status_t loaderExtensionTable(size_t size, void *table);
 extern uint32_t references;
 extern uint64_t lastHandle;
 extern std::vector<Agent> agents;

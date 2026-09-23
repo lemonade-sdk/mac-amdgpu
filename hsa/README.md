@@ -281,11 +281,11 @@ kernel symbol lookup/info. The loader accepts bounded ELF64 AMDHSA ET_DYN images
 for gfx1201, checks load segments, MessagePack metadata and kernel descriptors,
 then applies ABS64/RELATIVE64 relocations and uploads into owned GPU storage.
 Unresolved imports, TLS, other relocation types and descriptor-changing
-relocations are rejected. AMD loader extension tables and general global-symbol
-linking remain unfinished. Symbol coverage does not establish HSA conformance.
+relocations are rejected. AMD loader extension 1.03 is implemented; general
+global-symbol linking remains unfinished. Symbol coverage does not establish HSA conformance.
 
 `bash scripts/test-hsa-runtime.sh` builds a linked fixture using LLVM/LLD and
-runs six ASan/UBSan suites plus parser truncation/mutation checks. The shader
+runs eight ASan/UBSan suites plus parser truncation/mutation checks. The shader
 fixture remains pinned to the available LLVM 21.1.8 compiler; an explicit
 `AMDGPU_LLVM_BIN` overrides that selection.
 
@@ -330,3 +330,37 @@ called `_exit` without HSA cleanup. Imported writes/readback also matched and
 final detach/shutdown returned the device to stage 0. Eight ASan/UBSan runtime
 suites and all 28 non-runtime regression scripts passed. This result establishes
 shared GPU buffer lifetime and transfer correctness, not HSA GPU dispatch.
+
+
+## AMD loader and equal-address host memory
+
+All seven AMD loader 1.03 table entries operate on live executables. Loaded
+objects retain the source ELF, file descriptor when applicable, relocated host
+image and GPU buffer until executable destruction. Address queries reject
+unloaded addresses and holes between ELF segments. Iteration allows callbacks
+to query metadata without holding the runtime mutex. Extension table copies
+support old/smaller callers without writing beyond the requested size.
+The real-GPU loader probe verifies descriptor translation after reader destruction.
+
+Driver build 182 adds a session-wide GART host window (selector 54). The first
+caller proposes an unused aligned virtual range; subsequent callers adopt that
+window. It cannot move once configured, and configuration is refused while
+GART reservations exist. Register readback and both-hub TLB acknowledgments are
+required; partial failure blocks further work until verified reset.
+
+The shared-buffer transport creates GTT BOs and requests a placed IOKit mapping
+at the GPU VA, without overwrite flags. Address conflicts return allocation
+errors. CPU mappings are retired before their BOs; failed GPU operations retain
+DMA backing through driver quarantine. Both PerformOperation and direct CPU
+access must pass a two-way transfer test before the driver enables GTT BOs.
+
+```sh
+build/hsa/mac-hsa-shared-test --run
+```
+
+This requires build 182 installed. It initializes/joins the GPU, verifies equal
+CPU/GPU pointers, transfers two independent 64,003-byte patterns at unaligned
+offsets, checks every shared byte and VRAM guard, and releases the mappings.
+Hardware validation of this new path is pending. It is not yet exposed as an
+HSA fine-grained pool or GPU signal: concurrent CPU/GPU system atomics and
+hardware AQL queues still require implementation and verification.

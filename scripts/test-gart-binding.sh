@@ -12,7 +12,7 @@ Path('build/tests/gart_context_under_test.inc').write_text(
 s = Path('dext/amdgpu/amdgpu_gart.cpp').read_text()
 functions = []
 for name in ['gart_bus_range', 'gart_table_range', 'gart_invalidate', 'gart_init',
-             'gart_bind_range', 'gart_bind_existing', 'gart_unbind', 'gart_bind_sysmem', 'gart_release_after_reset']:
+             'gart_configure_host_window', 'gart_bind_range', 'gart_bind_existing', 'gart_unbind', 'gart_bind_sysmem', 'gart_release_after_reset']:
     # Helpers place their return type/name on one line.
     import re
     match = re.search(r'^(?:static (?:bool|kern_return_t) )?' + name + r'\(', s, re.M)

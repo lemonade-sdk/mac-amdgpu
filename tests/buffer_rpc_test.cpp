@@ -97,8 +97,13 @@ int main() {
     Args args; args.scalarInput=input; args.scalarInputCount=5; args.scalarOutput=output; args.scalarOutputCount=1;
     assert(call(&driver,&pci,&client,48,&args)==0 && output[0]==0 && amdgpu::copies==1);
     assert(amdgpu::copySource==0 && amdgpu::copyDestination==0x10000000ull+(22ull<<30)-4096);
+    entries[0].domain = 2;
+    assert(call(&driver,&pci,&client,48,&args)==0 && output[0]==0 && amdgpu::copies==2);
+    entries[0].domain = 0;
+    assert(call(&driver,&pci,&client,48,&args)==kIOReturnBadArgument && amdgpu::copies==2);
+    entries[0].domain = 1;
     input[3]=(22ull<<30)-4095;
-    assert(call(&driver,&pci,&client,48,&args)==kIOReturnBadArgument && amdgpu::copies==1);
+    assert(call(&driver,&pci,&client,48,&args)==kIOReturnBadArgument && amdgpu::copies==2);
     input[3]=UINT64_MAX;
     assert(call(&driver,&pci,&client,48,&args)==kIOReturnBadArgument);
     input[2]=1; input[3]=4;
