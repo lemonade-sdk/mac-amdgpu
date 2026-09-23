@@ -1,10 +1,12 @@
 # Status
 
-**v0.1.79 — compiler-verified dispatch shader (hardware retest pending).**
+**v0.1.79 — compiler-verified dispatch shader (hardware passed).**
 The multi-workgroup test now matches LLVM gfx1201 output byte-for-byte,
 including ttmp9 workgroup IDs and instruction dependencies. It reports the
 first mismatched result if validation fails. The native dispatch interface
-and allocation accounting from 178 are unchanged.
+and allocation accounting from 178 are unchanged. Build 179 passed both
+caller-uploaded launches: 128 and 256 outputs, all inputs/guards, increasing
+GPU fences, and successful buffer release.
 
 **v0.1.78 — native compute dispatch and allocation monitoring (dispatch data fix pending).**
 The owning client can upload kernel code, kernargs and data into BOs, then
@@ -30,10 +32,12 @@ MacAMDGPU devices with GPU switching and JSON output. Live discovery and VRAM
 capacity queries work; dynamic firmware metrics require a verified interface-0x33 layout.
 
 The current target is AI compute and model inference. The initial [HSA runtime](hsa/README.md)
-discovers the live GPU through IOKit and implements tested CPU signal operations.
-It exports 48 of the 119 functions resolved by LSE’s pinned HRX; 71 are missing.
+now initializes the GPU and provides data-verified device allocations, copies,
+asynchronous completion, host pools, CPU signals and software queues.
+It exports 79 of the 119 functions resolved by LSE’s pinned HRX; 40 are missing.
 GPU-visible signals, HSA dispatch, queues, executable loading and HRX/LSE inference
-remain required; the fixed diagnostic is not an HSA dispatch interface.
+remain required. The HSA memory test passed on the GPU, but HRX inference has
+not run. Shared-client lifecycle support is in progress.
 
 Older release history and detailed hardware results are in [PROGRESS.md](PROGRESS.md).
 

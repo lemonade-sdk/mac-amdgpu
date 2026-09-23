@@ -1,0 +1,64 @@
+#pragma once
+
+#include "transport.h"
+#include "signal_state.h"
+#include <hsa/hsa_ext_amd.h>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+
+namespace mac_hsa::detail {
+struct Agent {
+    hsa_agent_t handle;
+    std::shared_ptr<Connection> connection; // null for host CPU
+};
+struct Pool {
+    uint64_t handle;
+    hsa_agent_t owner;
+    size_t capacity;
+    std::shared_ptr<Connection> connection;
+};
+struct Allocation {
+    void *base = nullptr;
+    size_t size = 0;
+    hsa_agent_t owner{};
+    void *userData = nullptr;
+    std::shared_ptr<Connection> connection;
+    DeviceBuffer buffer;
+    hsa_status_t release() {
+        if (!connection || !buffer.handle) return HSA_STATUS_SUCCESS;
+        const auto status = connection->freeBuffer(buffer);
+        if (status == HSA_STATUS_SUCCESS) { buffer = {}; base = nullptr; }
+        return status;
+    }
+    ~Allocation() {
+        if (connection) { if (buffer.handle) release(); }
+        else std::free(base);
+    }
+};
+struct CopyJob {
+    std::atomic<bool> done{false};
+    std::jthread worker;
+};
+
+extern std::mutex runtimeMutex;
+extern uint32_t references;
+extern uint64_t lastHandle;
+extern std::vector<Agent> agents;
+extern std::unordered_map<uint64_t, std::shared_ptr<Signal>> signals;
+extern std::vector<Pool> pools;
+extern std::map<uintptr_t, std::shared_ptr<Allocation>> allocations;
+extern std::vector<std::unique_ptr<CopyJob>> copyJobs;
+
+// Caller holds runtimeMutex. IDs are never reused across runtime sessions.
+Agent *findAgent(hsa_agent_t handle);
+Pool *findPool(uint64_t handle);
+std::shared_ptr<Allocation> findAllocation(const void *pointer);
+std::shared_ptr<Signal> findSignal(hsa_signal_t handle);
+void clearQueues(); // caller holds runtimeMutex; CPU software queues only
+
+template<typename T> hsa_status_t writeValue(void *output, T value) {
+    std::memcpy(output, &value, sizeof(value));
+    return HSA_STATUS_SUCCESS;
+}
+} // namespace mac_hsa::detail

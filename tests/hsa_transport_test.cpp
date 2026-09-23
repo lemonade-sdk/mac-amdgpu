@@ -1,0 +1,138 @@
+#include <IOKit/IOKitLib.h>
+#include <mach/mach.h>
+#include <cassert>
+#include <array>
+#include <map>
+#include <vector>
+#include <cstring>
+#include <thread>
+
+namespace {
+struct Buffer { std::vector<uint8_t> bytes; uint64_t domain; };
+unsigned opens = 0, closes = 0, resets = 0, uploads = 0, maps = 0, unmaps = 0;
+bool busy = true, copyFailure = false, malformedRead = false;
+uint64_t stage = 15, nextHandle = 0;
+std::map<uint64_t, Buffer> buffers;
+std::vector<uint8_t> dma(32 << 20);
+kern_return_t mockOpen(io_service_t, task_port_t, uint32_t, io_connect_t *port) { *port = ++opens; return KERN_SUCCESS; }
+kern_return_t mockClose(io_connect_t) { ++closes; return KERN_SUCCESS; }
+kern_return_t mockRelease(io_object_t) { return KERN_SUCCESS; }
+kern_return_t mockScalar(mach_port_t, uint32_t selector, const uint64_t *in, uint32_t count,
+                         uint64_t *out, uint32_t *outCount) {
+    switch (selector) {
+    case 43: assert(*outCount == 3); out[0] = 0x414d444750554142ull; out[1] = 1; out[2] = 179; break;
+    case 1:
+        if (busy) return kIOReturnBusy;
+        assert(*outCount == 7); out[3] = 0x1002; out[4] = 0x7551; out[6] = 0xc0; break;
+    case 21:
+        assert(count == 1);
+        if (in[0] == 4) out[0] = stage;
+        else if (in[0] == 1) { out[0] = 12; out[1] = 0; out[2] = 1; }
+        else if (in[0] == 2) { out[0] = 256ull << 20; out[1] = 32ull << 30; }
+        else if (in[0] == 3) { out[0] = 0; out[1] = 0x070001; out[2] = out[3] = 0x0e0003; }
+        else { assert(in[0] == 5); out[0] = out[1] = 1; out[10] = 31ull << 30; }
+        break;
+    case 6: out[0] = 1; out[1] = 0x80000000; break;
+    case 8: ++resets; break;
+    case 9: stage = in[0]; out[0] = stage; break;
+    case 10: ++uploads; assert(maps == unmaps + 1 && in[1] > 0); out[0] = 0; break;
+    case 16: {
+        assert(count == 4 && *outCount == 3 && in[2] == 16384 && in[3] == 0);
+        auto handle = ++nextHandle;
+        buffers.emplace(handle, Buffer{std::vector<uint8_t>(in[0], 0x91), in[1]});
+        out[0] = handle; out[1] = 0x8001000000ull + handle * 0x100000; out[2] = 0;
+        break;
+    }
+    case 17: assert(buffers.erase(in[0]) == 1); break;
+    case 48: {
+        assert(count == 5 && *outCount == 1);
+        if (copyFailure) { out[0] = kIOReturnTimeout; break; }
+        auto &src = buffers.at(in[0]).bytes, &dst = buffers.at(in[2]).bytes;
+        assert(in[1] + in[4] <= src.size() && in[3] + in[4] <= dst.size());
+        assert(in[4] && !(in[1] % 4) && !(in[3] % 4) && !(in[4] % 4));
+        std::memmove(dst.data() + in[3], src.data() + in[1], in[4]); out[0] = 0;
+        break;
+    }
+    default: assert(false);
+    }
+    return KERN_SUCCESS;
+}
+kern_return_t mockMap(io_connect_t, uint32_t memory, task_port_t, mach_vm_address_t *address,
+                      mach_vm_size_t *size, IOOptionBits options) {
+    assert(memory == 6 && options == kIOMapAnywhere);
+    ++maps; *address = reinterpret_cast<mach_vm_address_t>(dma.data()); *size = dma.size(); return KERN_SUCCESS;
+}
+kern_return_t mockUnmap(io_connect_t, uint32_t memory, task_port_t, mach_vm_address_t address) {
+    assert(memory == 6 && address == reinterpret_cast<uintptr_t>(dma.data())); ++unmaps; return KERN_SUCCESS;
+}
+kern_return_t mockMethod(mach_port_t, uint32_t selector, const uint64_t *in, uint32_t count,
+    const void *structureIn, size_t inSize, uint64_t *, uint32_t *, void *structureOut, size_t *outSize) {
+    assert(count == 3 && in[1] == 0 && in[2] && in[2] <= 4096 && in[2] % 4 == 0);
+    auto &buffer = buffers.at(in[0]); assert(buffer.domain == 1);
+    if (selector == 49) { assert(inSize == in[2]); std::memcpy(buffer.bytes.data(), structureIn, inSize); }
+    else {
+        assert(selector == 50 && *outSize == in[2]);
+        std::memcpy(structureOut, buffer.bytes.data(), *outSize);
+        if (malformedRead) --*outSize;
+    }
+    return KERN_SUCCESS;
+}
+}
+#define IOServiceOpen mockOpen
+#define IOServiceClose mockClose
+#define IOObjectRelease mockRelease
+#define IOConnectCallScalarMethod mockScalar
+#define IOConnectMapMemory64 mockMap
+#define IOConnectUnmapMemory64 mockUnmap
+#define IOConnectCallMethod mockMethod
+#include "transport_iokit.cpp"
+#undef IOServiceOpen
+#undef IOServiceClose
+#undef IOObjectRelease
+#undef IOConnectCallScalarMethod
+#undef IOConnectMapMemory64
+#undef IOConnectUnmapMemory64
+#undef IOConnectCallMethod
+
+int main() {
+    {
+        mac_hsa::IOKitConnection connection; connection.service = 123;
+        mac_hsa::DeviceSnapshot snapshot;
+        assert(connection.read(snapshot) == 0 && snapshot.stage == 15);
+        assert(opens == closes && resets == 0 && uploads == 0);
+        uint64_t capacity = 0;
+        assert(connection.memoryCapacity(capacity) == HSA_STATUS_ERROR_OUT_OF_RESOURCES);
+        assert(opens == closes && resets == 0 && uploads == 0);
+        busy = false; stage = 0;
+        std::vector<std::thread> threads;
+        for (unsigned i = 0; i < 4; ++i) threads.emplace_back([&] {
+            uint64_t local = 0;
+            assert(connection.memoryCapacity(local) == 0 && local == 31ull << 30);
+        });
+        for (auto &thread : threads) thread.join();
+        assert(resets == 1 && uploads == 10 && maps == 10 && unmaps == maps);
+        assert(opens == closes + 1);
+        const auto priorOpens = opens;
+        assert(connection.read(snapshot) == 0 && snapshot.stage == 15 && opens == priorOpens);
+        mac_hsa::DeviceBuffer device;
+        assert(connection.allocateBuffer(16385, device) == 0 && device.size == 32768);
+        std::vector<uint8_t> source(12003), destination(source.size());
+        for (size_t i = 0; i < source.size(); ++i) source[i] = uint8_t(i * 113);
+        assert(connection.writeBuffer(device, 3, source.data(), source.size()) == 0);
+        assert(connection.readBuffer(device, 3, destination.data(), destination.size()) == 0 && source == destination);
+        const auto &stored = buffers.at(device.handle).bytes;
+        for (unsigned i = 0; i < 3; ++i) assert(stored[i] == 0x91);
+        for (size_t i = 3 + source.size(); i < stored.size(); ++i) assert(stored[i] == 0x91);
+        assert(connection.writeBuffer(device, device.size - 1, source.data(), 2) == HSA_STATUS_ERROR_INVALID_ARGUMENT);
+        assert(connection.freeBuffer(device) == 0);
+        assert(connection.allocateBuffer(16384, device) == 0);
+        copyFailure = true;
+        assert(connection.writeBuffer(device, 0, source.data(), 4) != 0);
+        const auto retained = buffers.size();
+        assert(connection.freeBuffer(device) != 0 && buffers.size() == retained);
+        assert(connection.readBuffer(device, 0, destination.data(), 4) != 0);
+        assert(connection.memoryCapacity(capacity) != 0 && resets == 1);
+    }
+    assert(opens == closes);
+    puts("HSA: transient observers, owner Busy without reset, single concurrent initialization, firmware mapping, unaligned SDMA staging/guards and fault retention pass");
+}

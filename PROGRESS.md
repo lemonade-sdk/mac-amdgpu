@@ -1629,3 +1629,45 @@ storage through reset and PCI close. The signed build-179 app is open for the
 next installation. Hardware retesting is deferred while runtime software work
 continues; the completed-fence/bad-data result from 178 is still the latest
 authoritative native-dispatch result.
+
+
+## Build 179 hardware acceptance — 2026-09-23 15:23 UTC
+
+Installed runtime identity verified build 179. Initialization completed all
+stages at 15:23:11 UTC. At 15:23:38, Dispatch Test passed four workgroups
+(128 results, fence 1, seed 0x25d2b85b) and eight workgroups (256 results,
+fence 2, seed 0x265c6eea), including all inputs and guards. The host then
+released code, kernargs and data. This supersedes the build-178 bad-data result.
+It validates the native caller-uploaded compute interface, not HSA queues or
+HRX inference.
+
+
+## Native HSA memory and software queues — 2026-09-23
+
+Added host/device pool and region APIs, allocation/access metadata, checked
+synchronous copies, dependency-gated asynchronous copies, fill and pointer info.
+Added CPU software queues with pinned AMD metadata layout, invalid initial
+packets, monotonically assigned IDs, and the complete index atomic family.
+The pinned HRX audit advanced from 48 to 79 exported functions (40 missing).
+This is symbol coverage, not HSA conformance or GPU queue completion.
+
+Temporary observer probes replace persistent idle connections, removing a
+source of Host Stop Busy errors. Lazy native sessions reproduce the verified
+R9700 firmware ordering; no reset occurs after failed ownership acquisition.
+GPU buffers use the existing driver BO ABI and 4 KiB visible staging with
+unaligned-edge preservation. Transfer failures fault the session and retain
+staging. No driver or installer changes were needed for this memory milestone.
+
+At 15:48 UTC, Host Stop completed, then the actual dylib's memory test initialized
+the GPU independently, reported 33,939,259,392 bytes in the device pool, verified
+12,003 payload bytes and all 4,381 surrounding guards, observed asynchronous
+completion, and freed both device buffers. After final HSA shutdown a separate
+observer reported driver179/stage0. An earlier live run while Host owned the
+GPU returned OutOfResources before initialization, as expected for build179.
+
+Five ASan/UBSan suites pass, covering callbacks, lifetimes, cancellation, packet
+publication, atomic contention, exact firmware transcript and each injected
+initialization failure, plus production transport staging and owner conflicts.
+GPU-visible atomics, hardware AQL queues, executable loading and HRX/LSE
+inference remain unfinished. The next lifecycle change must let multiple
+clients share one driver-owned GPU session without resetting each other's work.

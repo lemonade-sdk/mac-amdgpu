@@ -3,6 +3,7 @@
 #include <hsa/hsa.h>
 #include <memory>
 #include <vector>
+#include <string>
 
 namespace mac_hsa {
 
@@ -15,10 +16,20 @@ struct DeviceSnapshot {
     uint32_t gfxMajor = 0, gfxMinor = 0, gfxRevision = 0;
 };
 
+struct DeviceBuffer {
+    uint64_t handle = 0, address = 0, size = 0;
+};
+
 class Connection {
 public:
     virtual ~Connection() = default;
     virtual hsa_status_t read(DeviceSnapshot &snapshot) = 0;
+    virtual bool supportsBuffers() const { return false; }
+    virtual hsa_status_t memoryCapacity(uint64_t &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
+    virtual hsa_status_t allocateBuffer(uint64_t, DeviceBuffer &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
+    virtual hsa_status_t freeBuffer(const DeviceBuffer &) { return HSA_STATUS_ERROR; }
+    virtual hsa_status_t readBuffer(const DeviceBuffer &, uint64_t, void *, size_t) { return HSA_STATUS_ERROR; }
+    virtual hsa_status_t writeBuffer(const DeviceBuffer &, uint64_t, const void *, size_t) { return HSA_STATUS_ERROR; }
 };
 
 // Only opens observer clients and calls RuntimeBuild/QueryInfo. No ownership,

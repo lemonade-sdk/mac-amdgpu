@@ -1,4 +1,4 @@
-#include "transport.h"
+#include "runtime_state.h"
 #include "mac_hsa.h"
 #include "signal_state.h"
 #include <hsa/hsa_ext_amd.h>
@@ -8,16 +8,16 @@
 #include <limits>
 #include <mutex>
 #include <new>
+#include <sys/sysctl.h>
 
-namespace {
-struct Agent {
-    hsa_agent_t handle;
-    std::shared_ptr<mac_hsa::Connection> connection; // null for host CPU
-};
+namespace mac_hsa::detail {
 std::mutex runtimeMutex;
 uint32_t references = 0;
 uint64_t lastHandle = 0;
 std::vector<Agent> agents;
+std::vector<Pool> pools;
+std::map<uintptr_t, std::shared_ptr<Allocation>> allocations;
+std::vector<std::unique_ptr<CopyJob>> copyJobs;
 std::unordered_map<uint64_t, std::shared_ptr<mac_hsa::Signal>> signals;
 std::shared_ptr<mac_hsa::Signal> findSignal(hsa_signal_t handle) {
     std::lock_guard lock(runtimeMutex);
@@ -75,11 +75,9 @@ uint32_t waitSignals(bool all, uint32_t count, hsa_signal_t *handles,
     } catch (const std::bad_alloc &) { return UINT32_MAX; }
 }
 
-template<typename T> hsa_status_t writeValue(void *output, T value) {
-    std::memcpy(output, &value, sizeof(value));
-    return HSA_STATUS_SUCCESS;
-}
-} // namespace
+} // namespace mac_hsa::detail
+
+using namespace mac_hsa::detail;
 
 extern "C" {
 hsa_status_t hsa_init() {
@@ -90,13 +88,22 @@ hsa_status_t hsa_init() {
         std::vector<std::shared_ptr<mac_hsa::Connection>> connections;
         const auto status = mac_hsa::discover(connections);
         if (status != HSA_STATUS_SUCCESS) return status;
-        if (connections.size() >= UINT64_MAX - lastHandle)
+        if (lastHandle >= UINT64_MAX - 2 || connections.size() > (UINT64_MAX - lastHandle - 2) / 2)
             return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
         std::vector<Agent> fresh;
         fresh.reserve(connections.size() + 1);
         fresh.push_back({{++lastHandle}, nullptr});
         for (auto &connection : connections)
             fresh.push_back({{++lastHandle}, std::move(connection)});
+        uint64_t capacity = 0;
+        size_t capacitySize = sizeof(capacity);
+        if (sysctlbyname("hw.memsize", &capacity, &capacitySize, nullptr, 0) || !capacity)
+            return HSA_STATUS_ERROR;
+        std::vector<Pool> freshPools{{++lastHandle, fresh.front().handle, size_t(capacity), nullptr}};
+        for (const auto &agent : fresh)
+            if (agent.connection && agent.connection->supportsBuffers())
+                freshPools.push_back({++lastHandle, agent.handle, 0, agent.connection});
+        pools.swap(freshPools);
         agents.swap(fresh);
         references = 1;
         return HSA_STATUS_SUCCESS;
@@ -106,17 +113,30 @@ hsa_status_t hsa_init() {
 }
 
 hsa_status_t hsa_shut_down() {
-    std::lock_guard lock(runtimeMutex);
-    if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
-    if (!--references) {
-        for (auto &[handle, signal] : signals) {
-            (void)handle;
-            signal->alive.store(false);
-            signal->changed.notify_all();
+    std::vector<Agent> retiredAgents;
+    std::vector<std::unique_ptr<CopyJob>> retiredJobs;
+    std::map<uintptr_t, std::shared_ptr<Allocation>> retiredAllocations;
+    {
+        std::lock_guard lock(runtimeMutex);
+        if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+        if (!--references) {
+            for (auto &[handle, signal] : signals) {
+                (void)handle;
+                signal->alive.store(false);
+                signal->changed.notify_all();
+            }
+            for (auto &job : copyJobs) job->worker.request_stop();
+            retiredJobs.swap(copyJobs);
+            clearQueues();
+            signals.clear();
+            pools.clear();
+            retiredAllocations.swap(allocations);
+            retiredAgents.swap(agents);
         }
-        signals.clear();
-        agents.clear();
     }
+    // Joining workers or closing a future owning connection must never run
+    // under the global lock. Jobs retain every runtime-owned buffer they use.
+    retiredJobs.clear();
     return HSA_STATUS_SUCCESS;
 }
 

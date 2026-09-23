@@ -6,8 +6,8 @@ The library executes inside the client process; the DriverKit extension owns
 PCI access, firmware, DMA mappings and hardware queues.
 
 This is an incomplete runtime, not an HSA-conformant implementation or a
-working HRX backend. The initial implementation provides live discovery and
-runtime lifecycle and CPU signal operations. It does not execute kernels. ABI version queries describe
+working HRX backend. It provides live discovery, runtime lifecycle, CPU signals, software queues,
+and CPU/GPU memory allocation and copies. It does not execute HSA kernels. ABI version queries describe
 the targeted HSA 1.2 interface, not conformance certification.
 
 ## Build and verify
@@ -19,21 +19,23 @@ build/hsa/mac-hsa-info
 
 The build uses Apple Clang, CMake, IOKit/CoreFoundation, and vendored core HSA
 headers with their upstream license. No ROCm installation is needed for this
-discovery library. The selected design is a focused, native HSA-compatible
+library. The selected design is a focused, native HSA-compatible
 interface for LSE’s pinned HRX backend, backed by DriverKit. ROCr is a source
 reference; porting or shipping the full ROCr runtime is outside this approach. The C probe links the actual dylib and prints CPU/GPU names,
 the responding driver build, cached bringup stage and VRAM sizes. Run it outside
 a sandbox that denies IOKit user-client access. The installed DriverKit
 extension must permit the client to connect.
 
-The transport opens observer clients and uses only RuntimeBuild and QueryInfo.
-It never initializes/resets the GPU, acquires PCI ownership or submits work.
+Discovery and agent queries use temporary observer clients and only
+RuntimeBuild/QueryInfo. GPU pool capacity queries and first allocation lazily
+acquire a session, initialize firmware, and retain that connection until final
+shutdown. Device copies use the synchronous DriverKit BO/SDMA APIs.
 No GPU attached is a valid CPU-only discovery result. An attached service that
 cannot be opened or validated causes initialization to fail rather than silently
 being hidden. Driver identity ABI 1 and build 172 or later are required.
 
 Agent handles survive nested hsa_init/hsa_shut_down references and are never
-reused within a process. Final shutdown closes observer clients; enumeration
+reused within a process. Final shutdown cancels/joins copy workers and closes the device session; enumeration
 callbacks run outside the runtime lock. Live GPU info queries propagate
 transport failures rather than returning stale cached success. Reinitializing
 after final shutdown rebuilds the device list.
@@ -56,6 +58,12 @@ after final shutdown rebuilds the device list.
 - mac_hsa_agent_get_driver_info, a separate diagnostic ABI exposing the live
   DriverKit snapshot. Bringup stage is historical and is not a readiness claim.
 
+CPU pools are fine-grained for CPU access only; device pools are coarse-grained
+VRAM with no CPU mapping. Access queries do not claim CPU/GPU coherent memory.
+Software queues allocate real AMD-layout queue metadata and AQL packet storage,
+but the application is responsible for consuming them. Hardware kernel queues
+remain separate.
+
 No dispatch features or extensions are advertised. hsa_queue_create explicitly
 rejects queue creation. This is intentional until hardware compute dispatch,
 queue teardown and resource lifetime are implemented; there are no fake
@@ -65,7 +73,7 @@ completion signals or successful no-op dispatches.
 
 LSE commit `b5637a7109d409c21f75586edb75e7631277bce8` pins HRX System to
 `5927b0e0fafdefb5c8b41aa71bca8fd28791ad7c`. This revision requires 119 dynamic
-HSA symbols; the current library supplies 48 of them, leaving 71 missing. Symbol presence
+HSA symbols; the current library supplies 79 of them, leaving 40 missing. Symbol presence
 is not equivalent to full behavior: queue creation still rejects requests, and
 signals currently require CPU-only consumers. It
 creates hardware queues through `hsa_queue_create`, then casts those queues to
@@ -74,7 +82,7 @@ requires the AMD loader extension, memory pools, signals and code objects.
 The existing driver command/fence tests do not satisfy those contracts.
 
 The separately reviewed HRX main revision
-`437e789eaea207a036c197cf3398a6ca473d6534` requires 121 symbols (48 exported, 73 missing) and uses
+`437e789eaea207a036c197cf3398a6ca473d6534` requires 121 symbols (79 exported, 42 missing) and uses
 `hsa_amd_queue_create`. Keep these baselines distinct; LSE's pinned revision
 and its patches are the initial integration target.
 
@@ -116,7 +124,7 @@ an HRX workload and model inference have not passed yet.
 
 ## Driver buffer ABI (build 177)
 
-This is the native transport foundation, not yet wired to HSA memory pools.
+This transport now backs the HSA device memory pool.
 Calls require the existing owning driver connection; observers cannot acquire
 that initialized session simply by requesting a copy.
 
@@ -171,7 +179,8 @@ The host Dispatch Test uploads a separate kernarg-loading shader and checks
 four/eight workgroups, changing arguments and all data/guard words. Build 178 completed the first
 fence but failed its 128-word output check. Build 179 corrects the test kernel
 to compiler-generated gfx1201 workgroup IDs and dependency instructions;
-hardware retesting remains pending.
+hardware passed both launches on 2026-09-23 at 15:23 UTC: 128 and 256
+outputs plus all input/guard words, fences 1 and 2, followed by buffer release.
 
 ## Signal implementation and verification
 
@@ -191,3 +200,59 @@ The vendored declarations now match LSE's exact pinned header revision
 runtime implementation remains native. These CPU tests do not establish
 CPU/GPU atomic coherence, device-side signal access, AQL completion semantics
 or an HRX workload. Those remain hardware/integration acceptance requirements.
+
+
+## Memory and software queues
+
+The memory family implements region/pool enumeration and attributes, aligned
+CPU allocation, device-only VRAM allocation, ownership/access queries, pointer
+metadata, fill, synchronous copy and dependency-gated asynchronous copy. GPU
+addresses are opaque to the CPU: copies resolve allocation ownership and use
+DriverKit staging rather than dereferencing those addresses. Unknown pointers
+are treated as caller-owned host pointers. Known allocations have bounds checks
+and remain alive during asynchronous operations. Distinct GPU allocations that
+would collide in the process pointer namespace are rejected until separate GPU
+virtual address spaces exist.
+
+Each device session serializes transfers through a retained 16 KiB visible
+staging BO. Transfers currently use at most 4 KiB per chunk; partial dwords
+use read/modify/write to preserve neighbors. GPU-to-GPU copies currently pass
+through CPU staging. This is correctness plumbing, not a throughput claim.
+A failed submission faults the session and retains staging until driver teardown.
+The CPU completion signal is decremented with release ordering only after a
+successful copy; asynchronous failures set a negative value. It is not a
+GPU-visible signal implementation. Final shutdown cancels pending dependencies,
+joins workers outside the runtime lock, then retires allocations and the session.
+
+Software queues implement create/destroy/inactivate and all required read/write
+index load/store/add/CAS ordering variants. Packet headers start invalid and
+queue IDs are never reused. The caller supplies and retains its doorbell signal.
+These CPU queues do not advertise a GPU packet processor.
+
+`initializeDevice` validates build 179 or newer, acquires PCI through GetIdentity,
+and follows the tested R9700 firmware sequence. All firmware files are read
+before reset. The default firmware directory is the installed host app's
+`Contents/Resources/firmware`; `MAC_AMDGPU_FIRMWARE_DIR` overrides it. C0 and C8
+firmware selection is explicit. Every stage and firmware RPC must acknowledge
+success before the next is issued. Readiness is not inferred from another
+client's cached stage. The current build-179 driver requires exclusive ownership;
+shared-client lifecycle support is being implemented.
+
+After Stop GPU in the host app, run:
+
+```sh
+build/hsa/mac-hsa-memory-test --run
+```
+
+On 2026-09-23 this test acquired and initialized the actual GPU, reported a
+33,939,259,392-byte device pool, and passed 12,003 unaligned payload bytes plus
+4,381 guards through fill, upload, device copy, and asynchronous download.
+After freeing buffers and final shutdown, a separate observer probe confirmed
+bringup stage 0. The ownership-busy test also correctly refused access while
+the host app still owned the GPU.
+
+Five ASan/UBSan suites cover lifecycle, CPU signals, memory/software queues,
+every initialization failure point, and the production IOKit transport with
+mocked calls. They check temporary observer closure, single concurrent
+initialization, firmware map/unmap, staged transfer guards and failure retention.
+The export test checks the built dylib, not just unit-test linkage.
