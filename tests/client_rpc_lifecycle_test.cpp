@@ -68,6 +68,7 @@ static bool appendOK = true, emitOK = true, cpReadOK = true;
 static int kickResult;
 static uint64_t gpuCPFence;
 namespace amdgpu {
+void cp_log_control(int &, const char *) {}
 struct ComputeTestResult {
     uint32_t stage = 0, mismatches = 0, firstMismatch = UINT32_MAX, fence = 0;
     uint64_t gpuAddress = 0;

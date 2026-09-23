@@ -1,13 +1,21 @@
 # Status
 
-**v0.1.74 — bounded compute shader diagnostic (hardware acceptance pending).**
+**v0.1.75 — separate compute completion checkpoints.**
+Cache preparation, compute register programming and shader dispatch each have
+a bounded completion fence. Failures capture CP/GFXHUB state before recovery;
+the app explicitly reports when results were not checked. Compute/lifecycle
+regressions, the Debug build and strict signatures pass. Hardware validation of
+these checkpoints is pending; this does not claim a fix for shader execution.
+
+**v0.1.74 — bounded compute shader diagnostic (dispatch timed out).**
 The new Compute Smoke test dispatches one 32-thread gfx1201 workgroup through
 the existing GFX queue. It reads input values, adds a changing seed and writes
 32 results. Readback checks every result, the unchanged inputs and surrounding
 guard words after compute completion and cache flush. Failures retain storage
 and require Stop GPU before retry. All 21 regression suites, the Debug build
-and strict signature verification pass. Shader execution has not yet been
-verified on hardware; HSA dispatch and HRX/LSE inference remain unavailable.
+and strict signature verification pass. The first hardware dispatch timed out before its fence; output was not checked.
+Stop GPU recovered without a power cycle, and reinitialization plus GFX CS
+passed. HSA dispatch and HRX/LSE inference remain unavailable.
 
 **v0.1.73 — reusable, aligned GART reservations.**
 GMC and GTT now share a bounded range allocator. Successful unbind reclaims
@@ -19,23 +27,13 @@ passes the two-way host-memory test with zero mismatches, and completes GFX
 command submission. Non-trailing reuse is covered offline; general GTT
 allocation is still gated.
 
+The native [amdgpu_mtop monitor](amdgpu_mtop/README.md) enumerates attached
+MacAMDGPU devices with GPU switching and JSON output. Live discovery and VRAM
+capacity queries work; dynamic GPU/UMC/clocks/power metrics remain pending.
+
 The current target is AI compute and model inference. The initial [HSA runtime](hsa/README.md)
 discovers the live GPU through IOKit and passes lifecycle tests. HRX integration,
 shader dispatch and a working inference runtime remain required.
-
-**v0.1.72 — checked GART teardown and two-way host-memory diagnostic.**
-The new Host Memory Copy button verifies distinct 16 KiB patterns from host
-memory to VRAM and back through SDMA/GART. It uses DriverKit's prepared-DMA
-access API, checks every word, and retains failed-test storage until Stop GPU.
-Bindings verify PTE writes, invalidate both hubs, and clear/invalidate PTEs
-before releasing DMA mappings. GART/transfer, client lifecycle, shutdown,
-GMC flush and CP startup tests pass, as do the signed build and signature
-verification. Verified runtime 172 passes five two-way host-memory tests with
-zero mismatches, including mapping reuse and a software restart with firmware
-reload. CP register/fence, GFX CS and VRAM SDMA copy also pass; all 23 captured
-GFXHUB fault snapshots are zero. General GTT remains disabled and arbitrary
-freed aperture holes are not yet reclaimed. These bounded tests do not yet
-establish long-running stability or shader execution.
 
 Older release history and detailed hardware results are in [PROGRESS.md](PROGRESS.md).
 

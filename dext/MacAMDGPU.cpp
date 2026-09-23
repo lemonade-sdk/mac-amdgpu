@@ -2854,6 +2854,8 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         amdgpu::ComputeTestResult result{};
         const auto r = amdgpu::compute_test(b.device, b.gmc, b.cp, b.gfx,
             b.computeTest, static_cast<uint32_t>(arguments->scalarInput[0]), result);
+        if (r != kIOReturnSuccess && result.stage >= 3)
+            amdgpu::cp_log_control(b.device, "compute diagnostic failure");
         if (r != kIOReturnSuccess && b.computeTest.active)
             driver->ivars->shutdownBlocked = true;
         arguments->scalarOutput[0] = static_cast<uint32_t>(r);

@@ -39,7 +39,8 @@ kern_return_t compute_test(DeviceContext &dev, GMCContext &gmc, CPContext &cp,
     const uint64_t dataVA = codeVA + 4096;
     result.gpuAddress = dataVA;
     uint32_t packets[kComputeSmokePacketCapacity]{};
-    const auto count = compute_smoke_packets(packets, codeVA, dataVA, seed, masks);
+    uint32_t dispatchOffset = 0;
+    const auto count = compute_smoke_packets(packets, codeVA, dataVA, seed, masks, &dispatchOffset);
     if (!count) return kIOReturnBadArgument;
     if (codeVA < gmc.vram_start) return kIOReturnBadArgument;
     const uint64_t offset = codeVA - gmc.vram_start;
@@ -58,11 +59,23 @@ kern_return_t compute_test(DeviceContext &dev, GMCContext &gmc, CPContext &cp,
     r = vram_write_verified(dev, offset + 4096, words, sizeof(words));
     if (r != kIOReturnSuccess) return r;
     amdgpu_hdp_flush(dev);
+    // Verify cache preparation and register programming independently before
+    // launching the shader. A timeout now identifies the first uncompleted
+    // phase instead of attributing every stalled packet to shader execution.
+    auto submit = [&](uint32_t start, uint32_t length) -> kern_return_t {
+        if (cp_ring_write(cp, packets + start, length) != length) return kIOReturnNoSpace;
+        return cp_submit_eop_test(dev, cp, 100000, &result.fence);
+    };
     result.stage = 3;
-    if (cp_ring_write(cp, packets, count) != count) return kIOReturnNoSpace;
-    r = cp_submit_eop_test(dev, cp, 100000, &result.fence);
+    r = submit(0, kComputeSmokeAcquireDwords);
     if (r != kIOReturnSuccess) return r;
     result.stage = 4;
+    r = submit(kComputeSmokeAcquireDwords, dispatchOffset - kComputeSmokeAcquireDwords);
+    if (r != kIOReturnSuccess) return r;
+    result.stage = 5;
+    r = submit(dispatchOffset, count - dispatchOffset);
+    if (r != kIOReturnSuccess) return r;
+    result.stage = 6;
     for (uint32_t i = 0; i < kComputeSmokeLanes; ++i)
         words[kComputeSmokeOutputOffset / 4 + i] = compute_input(i, seed) + seed;
     for (uint32_t i = 0; i < kComputeSmokeDataBytes / 4; ++i) {
@@ -76,7 +89,7 @@ kern_return_t compute_test(DeviceContext &dev, GMCContext &gmc, CPContext &cp,
     if (result.mismatches) return kIOReturnIOError;
     gmc.vram_alloc.free(test.storage);
     test = {};
-    result.stage = 5;
+    result.stage = 7;
     return kIOReturnSuccess;
 }
 }

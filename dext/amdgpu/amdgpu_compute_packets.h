@@ -13,13 +13,16 @@ constexpr uint32_t kComputeSmokeLanes = 32;
 constexpr uint32_t kComputeSmokeOutputOffset = 256;
 constexpr uint32_t kComputeSmokeDataBytes = 4096;
 constexpr uint32_t kComputeSmokePacketCapacity = 192;
+constexpr uint32_t kComputeSmokeAcquireDwords = 8;
 
 // Register byte addresses and fields follow Mesa gfx12_init_compute_preamble_state
 // and si_emit_dispatch_packets; packets are executed on the kernel GFX queue.
 // This is a fixed diagnostic program, not an HSA AQL queue or arbitrary launcher.
 inline uint32_t compute_smoke_packets(uint32_t (&out)[kComputeSmokePacketCapacity],
-    uint64_t codeVA, uint64_t dataVA, uint32_t seed, const uint32_t (&cuMask)[4])
+    uint64_t codeVA, uint64_t dataVA, uint32_t seed, const uint32_t (&cuMask)[4],
+    uint32_t *dispatchOffset = nullptr)
 {
+    if (dispatchOffset) *dispatchOffset = 0;
     if ((codeVA & 255) || (codeVA >> 48) || (dataVA & 3) ||
         dataVA > ((1ull << 48) - kComputeSmokeDataBytes) ||
         !(cuMask[0] | cuMask[1] | cuMask[2] | cuMask[3])) return 0;
@@ -69,6 +72,7 @@ inline uint32_t compute_smoke_packets(uint32_t (&out)[kComputeSmokePacketCapacit
     sh(0xb900, static_cast<uint32_t>(dataVA));
     sh(0xb904, static_cast<uint32_t>(dataVA >> 32));
     sh(0xb908, seed);
+    if (dispatchOffset) *dispatchOffset = n;
     out[n++] = pm4_header(0x15, 3) | 2; // DISPATCH_DIRECT, compute
     out[n++] = 1; out[n++] = 1; out[n++] = 1;
     out[n++] = 0x8045; // enable, start 000, order mode, wave32

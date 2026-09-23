@@ -11,7 +11,8 @@ struct ComputeTest {
     VRAMAllocation storage;
 };
 struct ComputeTestResult {
-    uint32_t stage; // 0=preflight, 1=allocate, 2=upload, 3=submit, 4=verify, 5=complete
+    uint32_t stage; // 0=preflight, 1=allocate, 2=upload, 3=cache, 4=registers,
+                    // 5=shader, 6=verify, 7=complete
     uint32_t mismatches;
     uint32_t firstMismatch;
     uint32_t fence;

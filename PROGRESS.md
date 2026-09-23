@@ -1411,3 +1411,38 @@ affine, about 21.21 GiB of weights), suitable as a later LSE acceptance target
 based on LSE's dense Qwen family and 6-bit group-affine source support. This is
 format compatibility only: device allocation for the full model, runtime and
 context memory, kernel execution and inference correctness remain unverified.
+
+
+## v0.1.74 first compute attempt and recovery
+
+Build 174 was verified through the responding driver at 06:00:59 UTC on
+September 23. Initialization passed at 06:01:08. Compute Smoke at 06:01:17 timed
+out after 100 ms waiting for EOP fence 1 (observed 0), status 0xe00002d6 at stage 3.
+No output readback ran; zero reported mismatches was not a correctness result.
+Storage remained retained and subsequent normal operations were blocked.
+Log: /tmp/mac-amdgpu-174-compute.log.
+
+Stop GPU completed a function reset, PCI close and session release at 06:01:47.
+Reinitialization passed at 06:02:23, followed by GFX CS at 06:02:30. No enclosure
+power cycle was needed for this recovery. Shader execution remains unverified.
+
+## v0.1.75 compute checkpoints and native monitor foundation
+
+The fixed test now verifies three submissions separately: initial cache
+preparation, compute register setup, and shader execution/flush. Each has a
+100 ms fence deadline. A failed phase logs the existing CP controls, queue state
+and GFXHUB fault snapshot. The host distinguishes unperformed readback from a
+zero-mismatch comparison. Tests inject failure at each phase and continue to
+cover retained storage, poisoning and guard corruption. Compute and client
+lifecycle tests pass, as do the signed Debug build and strict signatures.
+Hardware acceptance of 175 is pending; installer behavior is unchanged.
+
+Added standalone amdgpu_mtop, a macOS terminal dashboard organized like
+amdgpu_top with per-attachment registry identity selection, n/p switching,
+list/JSON/watch modes and observer-only IOKit transport. Its first live JSON
+snapshot found registry 0x100339c27, build 174, stage 15, total VRAM 34208743424
+and CPU-visible VRAM 268435456 bytes. Dynamic statistics are explicitly null
+until firmware collection is integrated. Offline selection and SMU decoder
+checks pass; multiple physical GPUs have not been tested. The decoder is
+version-gated to SMU 14.0.3 interface 0x2e and checked against local Linux table
+layout definitions; passing these tests does not verify firmware telemetry.

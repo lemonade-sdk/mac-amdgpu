@@ -17,7 +17,7 @@ constexpr int kIOReturnSuccess = 0, kIOReturnBusy = 1, kIOReturnNotReady = 2,
     kIOReturnIOError = 6, kIOReturnNoSpace = 7, kIOReturnTimeout = 8,
     kIOReturnNotAttached = 9;
 static int mode;
-static unsigned reads, writes, submits, failWrite;
+static unsigned reads, writes, submits, failWrite, phase;
 static std::vector<uint32_t> stream;
 struct PCI {
     uint32_t memory[16384 / 4]{};
@@ -44,7 +44,7 @@ struct GFXConfig {
 static void amdgpu_hdp_flush(DeviceContext &) {}
 static uint32_t cp_ring_write(CPContext &cp, const uint32_t *p, uint32_t n) {
     if (mode == 1) return 0;
-    stream.assign(p, p+n); cp.wptr += n; return n;
+    stream.insert(stream.end(), p, p+n); cp.wptr += n; return n;
 }
 static std::map<uint32_t, uint32_t> decode(const std::vector<uint32_t> &p) {
     std::map<uint32_t, uint32_t> sh;
@@ -87,7 +87,11 @@ static std::map<uint32_t, uint32_t> decode(const std::vector<uint32_t> &p) {
 }
 static int cp_submit_eop_test(DeviceContext &dev, CPContext &, uint64_t timeout, uint32_t *fence) {
     assert(timeout == 100000); ++submits;
-    if (mode == 2) return kIOReturnTimeout;
+    ++phase;
+    if (mode == 2 || (mode == 7 && phase == 2) || (mode == 8 && phase == 3))
+        return kIOReturnTimeout;
+    if (phase < 3) { *fence = phase; return 0; }
+    assert(phase == 3);
     auto sh = decode(stream);
     assert(sh.at(0xb900) == 4096 && sh.at(0xb904) == 0x80);
     if (mode != 3) { // Model successful shader stores; mode 3 is fence-only completion.
@@ -129,19 +133,24 @@ int main() {
     assert(compute_smoke_packets(packets, 0, 0, 0, masks)); // VA zero is valid.
     const uint32_t disabled[4]{};
     assert(!compute_smoke_packets(packets, 0, 0, 0, disabled));
-    for (mode = 0; mode <= 6; ++mode) {
+    for (mode = 0; mode <= 8; ++mode) {
+        stream.clear(); phase = 0;
         PCI pci{}; DeviceContext dev{&pci}; GMCContext gmc; CPContext cp; GFXConfig gfx;
         dev.ip.version[0] = {12, 0, 1}; gmc.vram_alloc.init(gmc.vram_start, 16384);
         ComputeTest test{}; ComputeTestResult result{};
         const auto r = compute_test(dev, gmc, cp, gfx, test, 0xabcd7654, result);
         if (!mode) {
-            assert(r == 0 && !test.active && result.stage == 5 && !result.mismatches);
+            assert(r == 0 && !test.active && result.stage == 7 && !result.mismatches);
             assert(result.fence == 17 && gmc.vram_alloc.bytes_used() == 0);
+            stream.clear(); phase = 0;
             assert(compute_test(dev, gmc, cp, gfx, test, 0x13572468, result) == 0);
         } else {
             assert(r != 0 && test.active && gmc.vram_alloc.bytes_used() == 16384);
             if (mode == 3) assert(result.mismatches == 32 && result.firstMismatch == 256);
-            if (mode >= 4) assert(result.mismatches == 1);
+            if (mode >= 4 && mode <= 6) assert(result.mismatches == 1);
+            if (mode == 2) assert(result.stage == 3);
+            if (mode == 7) assert(result.stage == 4);
+            if (mode == 8) assert(result.stage == 5);
             const auto oldWrites = writes, oldSubmits = submits;
             assert(compute_test(dev, gmc, cp, gfx, test, 0, result) == kIOReturnBusy);
             assert(writes == oldWrites && submits == oldSubmits);

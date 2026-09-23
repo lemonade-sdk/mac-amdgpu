@@ -1697,7 +1697,8 @@ final class DriverController: NSObject, ObservableObject,
             append(String(format: "Compute Smoke: RPC failed kr=%#x", kr))
             return
         }
-        let stages = ["preflight", "allocate", "upload", "dispatch/fence", "verify", "complete"]
+        let stages = ["preflight", "allocate", "upload", "cache/fence", "registers/fence",
+                      "shader/fence", "verify", "complete"]
         let stage = out[1] < UInt64(stages.count) ? stages[Int(out[1])] : "unknown"
         append(String(format: "Compute Smoke: status=%#llx stage=%@ mismatches=%llu fence=%llu",
                       out[0], stage, out[2], out[4]))
@@ -1705,7 +1706,10 @@ final class DriverController: NSObject, ObservableObject,
         if out[2] != 0 {
             append(String(format: "  first mismatch at data byte offset=%#llx", out[3]))
         }
-        if out[0] == 0 && out[1] == 5 {
+        if out[1] < 6 {
+            append("  results not checked — dispatch completion has not been verified")
+        }
+        if out[0] == 0 && out[1] == 7 {
             append("Compute Smoke: all 32 results, input and guard words verified; storage released")
         } else if out[1] != 0 {
             append("Compute Smoke: session retained for recovery — Stop GPU before retry")
