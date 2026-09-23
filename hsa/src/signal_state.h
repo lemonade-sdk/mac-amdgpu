@@ -6,6 +6,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -13,8 +14,8 @@
 
 namespace mac_hsa {
 // AMD's 64-byte signal layout (amd_hsa_signal.h). This backing currently
-// supports CPU consumers only. GPU access needs a coherent shared mapping;
-// ordinary host addresses must never be presented as GPU signal addresses.
+// uses CPU atomics for host-only signals. GPU-backed signals route all value
+// changes through the GPU atomic domain; CPU access is acquire observation.
 struct alignas(64) SignalABI {
     int64_t kind = 1;
     int64_t value = 0;
@@ -33,11 +34,46 @@ struct Signal {
     SignalABI *sharedABI = nullptr;
     std::shared_ptr<void> sharedStorage;
     uint64_t ipcToken[4]{};
+    std::function<bool(unsigned,int64_t,int64_t,int64_t &)> gpuAtomic;
+    std::function<void(int64_t)> storeHook; // Runtime-owned queue doorbell.
     std::atomic<bool> alive{true};
     std::mutex waitMutex;
     std::condition_variable changed;
     SignalABI *address() { return sharedABI ? sharedABI : &abi; }
-    std::atomic_ref<int64_t> value() { return std::atomic_ref<int64_t>(address()->value); }
+    struct AtomicValue {
+        Signal &signal;
+        auto host() const { return std::atomic_ref<int64_t>(signal.address()->value); }
+        int64_t load(std::memory_order order=std::memory_order_seq_cst) const {return host().load(order);}
+        int64_t gpu(unsigned operation,int64_t value,int64_t compare=0) const {
+            int64_t result=INT64_MIN;
+            if (!signal.alive.load() || !signal.gpuAtomic(operation,value,compare,result)) {
+                signal.alive=false;signal.changed.notify_all();return INT64_MIN;
+            }
+            return result;
+        }
+        void store(int64_t value,std::memory_order order=std::memory_order_seq_cst) const {
+            if (signal.gpuAtomic) gpu(1,value);else host().store(value,order);
+        }
+        int64_t exchange(int64_t value,std::memory_order order=std::memory_order_seq_cst) const {
+            return signal.gpuAtomic ? gpu(7,value) : host().exchange(value,order);
+        }
+        bool compare_exchange_strong(int64_t &expected,int64_t value,std::memory_order success,std::memory_order failure) const {
+            if (!signal.gpuAtomic) return host().compare_exchange_strong(expected,value,success,failure);
+            const auto old=gpu(8,value,expected);const bool equal=signal.alive.load() && old==expected;
+            expected=old;return equal;
+        }
+#define MAC_HSA_SIGNAL_FETCH(name,operation) \
+        int64_t fetch_##name(int64_t value,std::memory_order order=std::memory_order_seq_cst) const { \
+            return signal.gpuAtomic ? gpu(operation,value) : host().fetch_##name(value,order); \
+        }
+        MAC_HSA_SIGNAL_FETCH(add,2)
+        MAC_HSA_SIGNAL_FETCH(sub,3)
+        MAC_HSA_SIGNAL_FETCH(and,4)
+        MAC_HSA_SIGNAL_FETCH(or,5)
+        MAC_HSA_SIGNAL_FETCH(xor,6)
+#undef MAC_HSA_SIGNAL_FETCH
+    };
+    AtomicValue value() { return {*this}; }
 };
 inline bool signalCondition(int64_t value, hsa_signal_condition_t condition, int64_t compare) {
     switch (condition) {

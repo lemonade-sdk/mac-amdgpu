@@ -116,7 +116,11 @@ static hsa_status_t dispatchExecutable(bool aql, hsa_executable_symbol_t handle,
     request.rsrc1 = kernel.rsrc1; request.rsrc2 = kernel.rsrc2;
     request.rsrc3 = kernel.rsrc3;
     request.userSGPRCount = 2; request.timeoutUS = 100000;
-    if (!amdgpu::compute_dispatch_shape(request)) return HSA_STATUS_ERROR_INCOMPATIBLE_ARGUMENTS;
+    auto validatedRequest=request;
+    // AQL firmware reads the compiler's SGPR allocation field from the kernel
+    // descriptor. The older native PM4 ABI deliberately restricts that field.
+    if (aql) validatedRequest.rsrc1 &= ~0x000003c0u;
+    if (!amdgpu::compute_dispatch_shape(validatedRequest)) return HSA_STATUS_ERROR_INCOMPATIBLE_ARGUMENTS;
     struct Arguments {
         std::shared_ptr<mac_hsa::Connection> connection;
         mac_hsa::DeviceBuffer buffer;

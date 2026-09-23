@@ -10,7 +10,7 @@ namespace=h[h.index('namespace AQLMQDOff {'):h.index('// DWORD doorbell')]
 fields=re.findall(r'(\w+)\s*=\s*\d+',namespace)
 Path('build/tests/aql_mqd_offsets.inc').write_text('\n'.join(f'static_assert(AQLMQDOff::{f}*4==offsetof(v12_compute_mqd,{f}));' for f in fields))
 h=Path('dext/amdgpu/amdgpu_aql.h').read_text()
-Path('build/tests/aql_context.inc').write_text(h[h.index('struct AQLLaunch {'):h.index('kern_return_t aql_launch')])
+Path('build/tests/aql_context.inc').write_text(h[h.index('struct AQLLaunch {'):h.index('kern_return_t aql_launch')]+h[h.index('constexpr unsigned kPersistentAQLQueues'):h.index('kern_return_t aql_queue_open')])
 s=Path('dext/amdgpu/amdgpu_aql.cpp').read_text()
 Path('build/tests/aql_launch.inc').write_text(s[s.index('kern_return_t aql_launch'):s.rindex('\n}')])
 PY

@@ -3,7 +3,7 @@
 #include <cstdio>
 #include <vector>
 using kern_return_t = int;
-constexpr int kIOReturnSuccess = 0, kIOReturnBadArgument = 1, kIOReturnNoResources = 2;
+constexpr int kIOReturnSuccess = 0, kIOReturnBadArgument = 1, kIOReturnNoResources = 2, kIOReturnBusy = 3;
 constexpr int kMacAMDGPUMethodBOExport = 52, kMacAMDGPUMethodBOImport = 53, kMacAMDGPUMethodBOFree = 17;
 constexpr uint32_t kBODomainVRAM = 1, kBODomainGTT = 2, kBODomainDeviceVRAM = 3, MACAMDGPU_MAX_BO = 64;
 namespace amdgpu {
@@ -36,6 +36,7 @@ struct State {
     struct {
         struct { uint64_t vram_start = 0x8000000000; Allocator vram_alloc, device_vram_alloc; } gmc;
         int device = 0, gart = 0;
+        struct {void *owner=nullptr;uint64_t ringHandle=0,metadataHandle=0;} aqlQueues[7];
     } bringup;
 };
 struct IOService {};
@@ -74,6 +75,9 @@ int main() {
     assert(!mac_amdgpu_bo_lookup(&first, firstHandle));
     assert(state.bringup.gmc.device_vram_alloc.freed.empty());
     input[0] = secondHandle; args.scalarInputCount = 1;
+    state.bringup.aqlQueues[0]={&second,secondHandle,0};
+    assert(call(&driver,&second,17,&args)==kIOReturnBusy && second.bos[0].in_use);
+    state.bringup.aqlQueues[0]={};
     assert(call(&driver, &second, 17, &args) == 0);
     assert(state.bringup.gmc.device_vram_alloc.freed == std::vector<uint64_t>{0x8010000000});
     assert(call(&driver, &second, 17, &args) == kIOReturnBadArgument);

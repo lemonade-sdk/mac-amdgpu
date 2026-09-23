@@ -71,7 +71,9 @@ Agent *findAgent(hsa_agent_t handle);
 Pool *findPool(uint64_t handle);
 std::shared_ptr<Allocation> findAllocation(const void *pointer);
 std::shared_ptr<Signal> findSignal(hsa_signal_t handle);
-void clearQueues(); // caller holds runtimeMutex; CPU software queues only
+struct RuntimeQueue;
+using RetiredQueueSet=std::unordered_map<const hsa_queue_t *,std::shared_ptr<RuntimeQueue>>;
+RetiredQueueSet clearQueues(); // retire under runtimeMutex; destroy after unlocking
 size_t hostPageSize();
 void clearVirtualMemory(); // caller holds runtimeMutex; allocation pins retain mappings
 void clearHostLocks();
@@ -80,6 +82,7 @@ void clearCaches();
 void reapCopyJobs();
 void clearSystemEvents();
 hsa_status_t deliverSystemEvent(const hsa_amd_event_t &event);
+hsa_status_t createGPUSignalBacking(const std::shared_ptr<Connection> &, int64_t, const std::shared_ptr<Signal> &);
 hsa_status_t createIPCSignal(hsa_signal_value_t initial, uint32_t count, const hsa_agent_t *consumers, hsa_signal_t *out);
 
 template<typename T> hsa_status_t writeValue(void *output, T value) {

@@ -117,6 +117,9 @@ enum {
     kMacAMDGPUMethodComputeDispatch    = 51, // owned code BO + launch parameters
     kMacAMDGPUMethodBOExport          = 52, // owned device VRAM -> random sharing token
     kMacAMDGPUMethodBOImport          = 53, // token -> reference in this client's BO table
+    kMacAMDGPUMethodAQLQueueCreate    = 56,
+    kMacAMDGPUMethodAQLQueueKick      = 57,
+    kMacAMDGPUMethodAQLQueueDestroy   = 58,
     kMacAMDGPUMethodAQLDispatch       = 55, // bounded owned AQL queue, dispatch and verified unmap
     kMacAMDGPUMethodHostWindow        = 54, // establish/query common CPU/GPU GART address range
 };
@@ -335,6 +338,7 @@ struct MacAMDGPU_IVars {
     IOPCIDevice *retainedPCI;     // outlives superclass Stop until final free
     MacAMDGPUUserClient_IVars *quarantinedClient; // backing retained after failed reset
     amdgpu::ClientSubmission submission;
+    uint64_t nextAQLHandle; // Never reset with the bringup arena.
 
     // Phase 1B: per-device bringup state shared across user clients.
     // Populated lazily when PCI is opened. Stages run on demand via
@@ -1364,6 +1368,17 @@ mac_amdgpu_release_client_storage(MacAMDGPUUserClient_IVars *state, MacAMDGPU *d
         if (cs.in_use) mac_amdgpu_cs_free_slot(&cs);
 }
 
+static bool
+mac_amdgpu_retire_client_queues(MacAMDGPUUserClient_IVars *owner, MacAMDGPU *driver)
+{
+    auto &b=driver->ivars->bringup;
+    for (auto &q:b.aqlQueues) {
+        if (q.owner!=owner) continue;
+        if (amdgpu::aql_queue_close(b.device,b.gmc,b.mes,q)!=kIOReturnSuccess) return false;
+    }
+    return true;
+}
+
 // Called only with no pending/failed work on the shared serial queue.
 // GTT mappings need live page-table removal; bulk release is reset-only.
 static bool
@@ -1596,7 +1611,8 @@ MacAMDGPUUserClient::FinishStop(IOService *provider)
         // Do not reset another application's session or release uncertain DMA.
         quarantine = state->shutdownBlocked || !state->submission.poll();
         if (!quarantine) {
-            storageReleased = mac_amdgpu_retire_client_storage(ivars, driver);
+            storageReleased = mac_amdgpu_retire_client_queues(ivars, driver) &&
+                mac_amdgpu_retire_client_storage(ivars, driver);
             quarantine = !storageReleased;
         }
         if (quarantine) state->shutdownBlocked = true;
@@ -3275,6 +3291,64 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         return r;
     }
 
+    case kMacAMDGPUMethodAQLQueueCreate: {
+        if (!arguments->scalarInput || arguments->scalarInputCount!=3 ||
+            !arguments->scalarOutput || arguments->scalarOutputCount<2 || arguments->structureInput ||
+            arguments->structureInputDescriptor || arguments->structureOutputDescriptor ||
+            arguments->structureOutputMaximumSize) return kIOReturnBadArgument;
+        const auto *in=arguments->scalarInput;
+        const uint64_t packets=in[2];
+        if (in[0]==in[1] || packets<64 || packets>4096 || (packets&(packets-1))) return kIOReturnBadArgument;
+        auto *ring=mac_amdgpu_bo_lookup(ivars,in[0]);
+        auto *metadata=mac_amdgpu_bo_lookup(ivars,in[1]);
+        if (!ring || !metadata || ring->domain!=kBODomainGTT || metadata->domain!=kBODomainGTT ||
+            !ring->gttBinding.ready || !metadata->gttBinding.ready || ring->size<packets*64 ||
+            metadata->size<512 || !metadata->cpu_addr || !ring->cpu_addr) return kIOReturnBadArgument;
+        auto &b=driver->ivars->bringup;
+        if (b.reached!=amdgpu::BringupStage::SDMAInit) return kIOReturnNotReady;
+        // Queue storage cannot be reused by another queue while firmware owns it.
+        amdgpu::PersistentAQLQueue *slot=nullptr;
+        unsigned slotIndex=0;
+        for (unsigned i=0;i<amdgpu::kPersistentAQLQueues;++i) {
+            auto &q=b.aqlQueues[i];
+            if (q.owner==ivars && (q.ringHandle==in[0] || q.metadataHandle==in[0] ||
+                q.ringHandle==in[1] || q.metadataHandle==in[1])) return kIOReturnBusy;
+            if (!q.owner && !slot) {slot=&q;slotIndex=i+1;}
+        }
+        if (!slot || driver->ivars->nextAQLHandle==UINT64_MAX) return kIOReturnNoResources;
+        auto *words=static_cast<uint32_t *>(ring->cpu_addr);
+        for (uint64_t i=0;i<packets;++i)
+            if ((__atomic_load_n(words+i*16,__ATOMIC_ACQUIRE)&255)!=1) return kIOReturnBadArgument;
+        slot->owner=ivars;slot->ringHandle=in[0];slot->metadataHandle=in[1];
+        const auto status=amdgpu::aql_queue_open(b.device,b.gmc,b.mes,b.gfx,*slot,
+            ring->gpu_va,metadata->gpu_va,metadata->cpu_addr,uint32_t(packets),slotIndex);
+        if (status==kIOReturnSuccess) slot->handle=++driver->ivars->nextAQLHandle;
+        else if (slot->retained) driver->ivars->shutdownBlocked=true;
+        else *slot={};
+        arguments->scalarOutput[0]=uint32_t(status);arguments->scalarOutput[1]=slot->handle;
+        arguments->scalarOutputCount=2;
+        MACAMDGPU_LOG("persistent AQL create: status=%#x handle=%llu slot=%u",status,slot->handle,slotIndex);
+        return kIOReturnSuccess;
+    }
+    case kMacAMDGPUMethodAQLQueueKick:
+    case kMacAMDGPUMethodAQLQueueDestroy: {
+        const bool kick=selector==kMacAMDGPUMethodAQLQueueKick;
+        if (!arguments->scalarInput || arguments->scalarInputCount!=(kick ? 2u : 1u) ||
+            !arguments->scalarOutput || arguments->scalarOutputCount<1 || arguments->structureInput ||
+            arguments->structureInputDescriptor || arguments->structureOutputDescriptor ||
+            arguments->structureOutputMaximumSize) return kIOReturnBadArgument;
+        auto &b=driver->ivars->bringup;
+        amdgpu::PersistentAQLQueue *queue=nullptr;
+        for (auto &q:b.aqlQueues)
+            if (q.owner==ivars && q.handle==arguments->scalarInput[0] && q.handle) queue=&q;
+        if (!queue) return kIOReturnBadArgument;
+        const auto status=kick ? amdgpu::aql_queue_kick(b.device,*queue,arguments->scalarInput[1]) :
+            amdgpu::aql_queue_close(b.device,b.gmc,b.mes,*queue);
+        if (queue->retained) driver->ivars->shutdownBlocked=true;
+        arguments->scalarOutput[0]=uint32_t(status);arguments->scalarOutputCount=1;
+        return kIOReturnSuccess;
+    }
+
     case kMacAMDGPUMethodAQLDispatch: {
         if (arguments->scalarInputCount || !arguments->scalarOutput ||
             arguments->scalarOutputCount < 5 || !arguments->structureInput ||
@@ -3655,6 +3729,10 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         uint64_t handle = arguments->scalarInput[0];
         BOEntry *e = mac_amdgpu_bo_lookup(ivars, handle);
         if (e == nullptr) return kIOReturnBadArgument;
+
+        for (const auto &queue:driver->ivars->bringup.aqlQueues)
+            if (queue.owner==ivars && (queue.ringHandle==handle || queue.metadataHandle==handle))
+                return kIOReturnBusy; // Firmware owns this backing until unmap/reset.
 
         // Release domain-specific storage.
         if (amdgpu::buffer_vram_domain(e->domain)) {

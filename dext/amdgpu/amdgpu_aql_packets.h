@@ -30,6 +30,36 @@ constexpr uint32_t kAQLMetadataOffset = 12416;
 static_assert(kAQLMetadataOffset + sizeof(amd_queue_t) <= kAQLStorageBytes);
 static_assert(sizeof(amd_signal_t) == 64 && sizeof(hsa_kernel_dispatch_packet_t) == 64);
 
+inline bool aql_build_mqd(AQLComputeMQD &mqd, uint64_t base, uint64_t ring,
+    uint64_t metadata, uint32_t packets, uint32_t doorbell, const uint32_t masks[4]) {
+    if (!base || (base & 16383) || base>(1ull<<48)-kAQLStorageBytes ||
+        !ring || (ring & 255) || ring >= (1ull<<48) || !metadata || (metadata & 63) ||
+        metadata>(1ull<<48)-sizeof(amd_queue_t) || !masks || packets<64 || packets>4096 ||
+        (packets & (packets-1)) || (doorbell & 1) || doorbell>0x3fffffe) return false;
+    uint32_t queueSize=0;
+    for (auto dw=packets*16;dw>2;dw>>=1) ++queueSize;
+    memset(&mqd,0,sizeof(mqd));
+    auto *w = mqd.words;
+    using namespace AQLMQDOff;
+    w[header]=0xc0310800; w[compute_pipelinestat_enable]=1;
+    w[compute_static_thread_mgmt_se0]=masks[0]; w[compute_static_thread_mgmt_se1]=masks[1];
+    w[compute_static_thread_mgmt_se2]=masks[2]; w[compute_static_thread_mgmt_se3]=masks[3];
+    const auto pair = [&](unsigned lo, uint64_t value) { w[lo]=uint32_t(value); w[lo+1]=uint32_t(value>>32); };
+    pair(cp_mqd_base_addr_lo,base); w[cp_mqd_control]=0x100;
+    w[cp_hqd_active]=1; w[cp_hqd_persistent_state]=0x5501; w[cp_hqd_quantum]=0x111;
+    pair(cp_hqd_pq_base_lo,(ring)>>8);
+    pair(cp_hqd_pq_rptr_report_addr_lo,metadata+offsetof(amd_queue_t,read_dispatch_id));
+    pair(cp_hqd_pq_wptr_poll_addr_lo,metadata+offsetof(amd_queue_t,write_dispatch_id));
+    w[cp_hqd_pq_doorbell_control]=0x40000002 | (doorbell<<2);
+    w[cp_hqd_pq_control]=queueSize | (5<<8) | (1<<28) | (1<<27) | (2<<18) | (1<<14);
+    w[cp_hqd_ib_control]=3<<20;
+    // Do not enable PCIe system atomics (bit 29) on this host path.
+    w[cp_hqd_hq_status0]=1<<14;
+    pair(cp_hqd_eop_base_addr_lo,(base+kAQLEOPOffset)>>8);
+    w[cp_hqd_eop_control]=9; w[cp_hqd_aql_control]=1;
+    return true;
+}
+
 inline bool aql_build_storage(void *storage, uint64_t base, uint64_t descriptor,
     uint64_t kernarg, const AQLDispatchRequest &r, const uint32_t masks[4], uint32_t cuCount) {
     if (!storage || !aql_dispatch_shape(r) || !base || (base & 16383) ||
@@ -39,24 +69,8 @@ inline bool aql_build_storage(void *storage, uint64_t base, uint64_t descriptor,
     memset(storage, 0, kAQLStorageBytes);
     auto *bytes = static_cast<uint8_t *>(storage);
     auto &mqd = *reinterpret_cast<AQLComputeMQD *>(bytes);
-    auto *w = mqd.words;
-    using namespace AQLMQDOff;
-    w[header]=0xc0310800; w[compute_pipelinestat_enable]=1;
-    w[compute_static_thread_mgmt_se0]=masks[0]; w[compute_static_thread_mgmt_se1]=masks[1];
-    w[compute_static_thread_mgmt_se2]=masks[2]; w[compute_static_thread_mgmt_se3]=masks[3];
-    const auto pair = [&](unsigned lo, uint64_t value) { w[lo]=uint32_t(value); w[lo+1]=uint32_t(value>>32); };
-    pair(cp_mqd_base_addr_lo,base); w[cp_mqd_control]=0x100;
-    w[cp_hqd_active]=1; w[cp_hqd_persistent_state]=0x5501; w[cp_hqd_quantum]=0x111;
-    pair(cp_hqd_pq_base_lo,(base+kAQLRingOffset)>>8);
-    pair(cp_hqd_pq_rptr_report_addr_lo,base+kAQLMetadataOffset+offsetof(amd_queue_t,read_dispatch_id));
-    pair(cp_hqd_pq_wptr_poll_addr_lo,base+kAQLMetadataOffset+offsetof(amd_queue_t,write_dispatch_id));
-    w[cp_hqd_pq_doorbell_control]=0x40000002 | (kAQLDoorbell<<2);
-    w[cp_hqd_pq_control]=9 | (5<<8) | (1<<28) | (1<<27) | (2<<18) | (1<<14);
-    w[cp_hqd_ib_control]=3<<20;
-    // Do not enable PCIe system atomics (bit 29) on this host path.
-    w[cp_hqd_hq_status0]=1<<14;
-    pair(cp_hqd_eop_base_addr_lo,(base+kAQLEOPOffset)>>8);
-    w[cp_hqd_eop_control]=9; w[cp_hqd_aql_control]=1;
+    if (!aql_build_mqd(mqd,base,base+kAQLRingOffset,base+kAQLMetadataOffset,
+        kAQLRingBytes/64,kAQLDoorbell,masks)) return false;
     auto &metadata=*reinterpret_cast<amd_queue_t *>(bytes+kAQLMetadataOffset);
     metadata.hsa_queue.type=HSA_QUEUE_TYPE_SINGLE;
     metadata.hsa_queue.features=HSA_QUEUE_FEATURE_KERNEL_DISPATCH;

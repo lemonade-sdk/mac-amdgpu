@@ -16,6 +16,8 @@ constexpr int kIOReturnSuccess=0,kIOReturnBusy=1,kIOReturnBadArgument=2,
     kIOReturnIOError=6,kIOReturnTimeout=7,kIOReturnNotAttached=8;
 static unsigned mode, maps, unmaps, bells, writes;
 static uint64_t now;
+static bool persistent=false;
+static unsigned persistentSlot=1;
 struct PCI {
     alignas(64) uint8_t memory[16384]{};
     void MemoryWrite32(unsigned bar,uint64_t offset,uint32_t value) {
@@ -30,6 +32,7 @@ struct PCI {
         if (mode==8 && bells) *value=UINT64_MAX;
     }
     void MemoryWrite64(unsigned bar,uint64_t offset,uint64_t value) {
+        if (persistent) {assert(bar==1 && offset==uint64_t(0x80+persistentSlot*2)*4);++bells;return;}
         assert(bar==1 && offset==0x200 && value==0); ++bells;
         uint64_t wptr; memcpy(&wptr,memory+kAQLMetadataOffset+offsetof(amd_queue_t,write_dispatch_id),8);
         assert(wptr==1); // doorbell 0 publishes first packet, shadow counts 1
@@ -50,6 +53,11 @@ struct GFXConfig { unsigned max_shader_engines=4,max_sh_per_se=1,num_active_cus=
 #include "aql_context.inc"
 static int mes_map_legacy_queue(DeviceContext &dev,MESContext &,unsigned type,unsigned pipe,unsigned queue,
     unsigned doorbell,uint64_t base,uint64_t wptr) {
+    if (persistent) {
+        assert(type==1 && pipe==0 && queue==persistentSlot && doorbell==0x80+persistentSlot*2);
+        assert(wptr==0x110000000ull+offsetof(amd_queue_t,write_dispatch_id));
+        ++maps;return mode==2 ? kIOReturnTimeout : 0;
+    }
     assert(type==1 && pipe==0 && queue==0 && doorbell==0x80 && base==0x8000000000);
     assert(wptr==base+kAQLMetadataOffset+offsetof(amd_queue_t,write_dispatch_id));
     const auto *q=reinterpret_cast<const amd_queue_t *>(dev.pci->memory+kAQLMetadataOffset);
@@ -57,7 +65,7 @@ static int mes_map_legacy_queue(DeviceContext &dev,MESContext &,unsigned type,un
     ++maps; return mode==2 ? kIOReturnTimeout : 0;
 }
 static int mes_unmap_legacy_queue(DeviceContext &,MESContext &,unsigned type,unsigned pipe,unsigned queue,unsigned doorbell) {
-    assert(type==1 && !pipe && !queue && doorbell==0x80); ++unmaps;
+    assert(type==1 && !pipe && queue==(persistent ? persistentSlot : 0) && doorbell==0x80+queue*2); ++unmaps;
     return mode==6 ? kIOReturnTimeout : 0;
 }
 static void amdgpu_hdp_flush(DeviceContext &) {}
@@ -130,6 +138,33 @@ int main() {
         } else assert(!launch.retained && gmc.vram_alloc.bytes_used()==0);
         if (mode==4) assert(now==100000000);
         if (mode>=2 && mode<=5) assert(unmaps==0);
+    }
+    persistent=true;
+    for (persistentSlot=1;persistentSlot<=7;++persistentSlot) {
+        for (mode=0;mode<=6;++mode) {
+            if (mode==3 || mode==4 || mode==5) continue;
+            PCI pci;DeviceContext dev{&pci};dev.ip.version[0]={12,0,1};
+            GMCContext gmc;gmc.vram_alloc.init(base,16384);MESContext mes;GFXConfig gfx;
+            alignas(64) amd_queue_t metadata{};
+            metadata.hsa_queue.base_address=reinterpret_cast<void *>(0x110004000ull);metadata.hsa_queue.size=64;
+            metadata.queue_properties=2;metadata.read_dispatch_id_field_base_byte_offset=offsetof(amd_queue_t,read_dispatch_id);
+            PersistentAQLQueue q{};maps=unmaps=bells=writes=0;
+            auto status=aql_queue_open(dev,gmc,mes,gfx,q,0x110004000,0x110000000,&metadata,64,persistentSlot);
+            if (mode==1) {assert(status!=0 && !q.retained && !gmc.vram_alloc.bytes_used() && !maps);continue;}
+            if (mode==2) {assert(status!=0 && q.retained && gmc.vram_alloc.bytes_used()==16384);continue;}
+            assert(status==0 && q.mapped && !q.retained && maps==1);
+            assert(aql_queue_kick(dev,q,0)==kIOReturnBadArgument && !bells);
+            metadata.write_dispatch_id=70;metadata.read_dispatch_id=64;
+            assert(aql_queue_kick(dev,q,69)==0 && bells==1);
+            assert(aql_queue_kick(dev,q,63)==0 && bells==1); // stale multi-producer doorbell
+            assert(aql_queue_kick(dev,q,70)==kIOReturnBadArgument && bells==1);
+            assert(aql_queue_kick(dev,q,UINT64_MAX)==kIOReturnBadArgument && bells==1);
+            status=aql_queue_close(dev,gmc,mes,q);
+            if (mode==6) {
+                assert(status==kIOReturnTimeout && q.retained && q.mapped && gmc.vram_alloc.bytes_used()==16384);
+                assert(aql_queue_kick(dev,q,69)==kIOReturnNotReady);
+            } else assert(status==0 && !q.mapped && !gmc.vram_alloc.bytes_used() && unmaps==1);
+        }
     }
     puts("AQL: Linux MQD/register layout, ROCr packet/metadata, publication, completion, unmap and failure retention passed");
 }

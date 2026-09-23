@@ -115,6 +115,8 @@ hsa_status_t hsa_init() {
 hsa_status_t hsa_shut_down() {
     std::lock_guard lifecycle(executableLifecycleMutex);
     std::vector<Agent> retiredAgents;
+    RetiredQueueSet retiredQueues;
+    std::unordered_map<uint64_t,std::shared_ptr<mac_hsa::Signal>> retiredSignals;
     std::vector<std::unique_ptr<CopyJob>> retiredJobs;
     std::map<uintptr_t, std::shared_ptr<Allocation>> retiredAllocations;
     std::unordered_map<uint64_t, std::shared_ptr<Executable>> retiredExecutables;
@@ -133,12 +135,12 @@ hsa_status_t hsa_shut_down() {
             clearLoadedImages();
             executableSymbols.clear();
             codeReaders.clear();
-            clearQueues();
+            retiredQueues=clearQueues();
             clearVirtualMemory();
             clearHostLocks();
             clearCaches();
             clearSystemEvents();
-            signals.clear();
+            retiredSignals.swap(signals);
             pools.clear();
             retiredAllocations.swap(allocations);
             retiredAgents.swap(agents);
@@ -147,6 +149,8 @@ hsa_status_t hsa_shut_down() {
     // Joining workers or closing a future owning connection must never run
     // under the global lock. Jobs retain every runtime-owned buffer they use.
     retiredJobs.clear();
+    retiredQueues.clear();
+    retiredSignals.clear();
     return HSA_STATUS_SUCCESS;
 }
 
@@ -275,43 +279,42 @@ hsa_status_t hsa_system_get_major_extension_table(uint16_t extension, uint16_t m
     return loaderExtensionTable(size, table);
 }
 
-hsa_status_t hsa_queue_create(hsa_agent_t agent, uint32_t size, hsa_queue_type32_t type,
-                             void (*)(hsa_status_t, hsa_queue_t *, void *), void *,
-                             uint32_t, uint32_t, hsa_queue_t **queue) {
-    std::lock_guard lock(runtimeMutex);
-    if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
-    if (!queue) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
-    *queue = nullptr;
-    if (!findAgent(agent)) return HSA_STATUS_ERROR_INVALID_AGENT;
-    if (!size || (size & (size - 1)) || (type != HSA_QUEUE_TYPE_SINGLE && type != HSA_QUEUE_TYPE_MULTI))
-        return HSA_STATUS_ERROR_INVALID_ARGUMENT;
-    return HSA_STATUS_ERROR_INVALID_QUEUE_CREATION;
-}
 
-hsa_status_t hsa_signal_create(hsa_signal_value_t initial, uint32_t count,
-                               const hsa_agent_t *consumers, hsa_signal_t *out) {
-    std::lock_guard lock(runtimeMutex);
-    if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
-    if (!out || (count && !consumers)) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
-    *out = {};
-    bool needsGPU = false;
-    if (!count) for (const auto &agent : agents) needsGPU |= bool(agent.connection);
-    for (uint32_t i = 0; i < count; ++i) {
-        const auto *agent = findAgent(consumers[i]);
-        if (!agent) return HSA_STATUS_ERROR_INVALID_AGENT;
-        for (uint32_t j = 0; j < i; ++j)
-            if (consumers[i].handle == consumers[j].handle) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
-        needsGPU |= bool(agent->connection);
+hsa_status_t hsa_signal_create(hsa_signal_value_t initial,uint32_t count,
+    const hsa_agent_t *consumers,hsa_signal_t *out) {
+    std::lock_guard lifecycle(executableLifecycleMutex);
+    std::shared_ptr<mac_hsa::Connection> gpu;
+    {
+        std::lock_guard lock(runtimeMutex);
+        if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+        if (!out || (count && !consumers)) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        *out={};
+        const auto select=[&](const Agent &agent) {
+            if (!agent.connection) return true;
+            if (gpu && gpu!=agent.connection) return false;
+            gpu=agent.connection;return true;
+        };
+        if (!count) for (const auto &agent:agents)
+            if (!select(agent)) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+        for (uint32_t i=0;i<count;++i) {
+            const auto *agent=findAgent(consumers[i]);
+            if (!agent) return HSA_STATUS_ERROR_INVALID_AGENT;
+            for (uint32_t j=0;j<i;++j) if (consumers[j].handle==consumers[i].handle) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+            if (!select(*agent)) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+        }
     }
-    if (needsGPU) return HSA_STATUS_ERROR_OUT_OF_RESOURCES; // shared GPU signal backing pending
     try {
-        auto signal = std::make_shared<mac_hsa::Signal>();
-        signal->abi.value = initial;
-        const uint64_t handle = reinterpret_cast<uintptr_t>(&signal->abi);
-        signals.emplace(handle, std::move(signal));
-        out->handle = handle;
-        return HSA_STATUS_SUCCESS;
-    } catch (const std::bad_alloc &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
+        auto signal=std::make_shared<mac_hsa::Signal>();
+        signal->abi.value=initial;
+        if (gpu) {
+            const auto status=createGPUSignalBacking(gpu,initial,signal);
+            if (status!=HSA_STATUS_SUCCESS) return status;
+        }
+        const uint64_t handle=reinterpret_cast<uintptr_t>(signal->address());
+        std::lock_guard lock(runtimeMutex);
+        if (!signals.emplace(handle,signal).second) return HSA_STATUS_ERROR;
+        out->handle=handle;return HSA_STATUS_SUCCESS;
+    } catch (const std::bad_alloc &) {return HSA_STATUS_ERROR_OUT_OF_RESOURCES;}
 }
 
 HSA_API_EXPORT hsa_status_t hsa_amd_signal_create(hsa_signal_value_t initial, uint32_t count,
@@ -322,8 +325,6 @@ HSA_API_EXPORT hsa_status_t hsa_amd_signal_create(hsa_signal_value_t initial, ui
         if (!out || (attributes & ~(uint64_t(HSA_AMD_SIGNAL_AMD_GPU_ONLY) | HSA_AMD_SIGNAL_IPC)))
             return HSA_STATUS_ERROR_INVALID_ARGUMENT;
         *out = {};
-        if (!count && (attributes & HSA_AMD_SIGNAL_AMD_GPU_ONLY))
-            return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
     }
     if (attributes & HSA_AMD_SIGNAL_IPC) return createIPCSignal(initial, count, consumers, out);
     // GPU_ONLY is ignored when an explicit consumer list is supplied.
@@ -342,14 +343,16 @@ HSA_API_EXPORT uint32_t hsa_amd_signal_wait_any(uint32_t count, hsa_signal_t *ha
 }
 
 hsa_status_t hsa_signal_destroy(hsa_signal_t handle) {
-    std::lock_guard lock(runtimeMutex);
-    if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
-    if (!handle.handle) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
-    const auto entry = signals.find(handle.handle);
-    if (entry == signals.end()) return HSA_STATUS_ERROR_INVALID_SIGNAL;
-    entry->second->alive.store(false);
-    entry->second->changed.notify_all();
-    signals.erase(entry);
+    std::shared_ptr<mac_hsa::Signal> retired;
+    {
+        std::lock_guard lock(runtimeMutex);
+        if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+        if (!handle.handle) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        const auto entry=signals.find(handle.handle);
+        if (entry==signals.end()) return HSA_STATUS_ERROR_INVALID_SIGNAL;
+        retired=std::move(entry->second);signals.erase(entry);
+        retired->alive=false;retired->changed.notify_all();
+    }
     return HSA_STATUS_SUCCESS;
 }
 
@@ -374,24 +377,28 @@ hsa_signal_value_t hsa_signal_wait_scacquire(hsa_signal_t handle, hsa_signal_con
 void hsa_signal_store_relaxed(hsa_signal_t handle, hsa_signal_value_t value) {
     const auto signal = findSignal(handle);
     if (!signal) return;
-    signal->value().store(value, std::memory_order_relaxed);
+    if (signal->storeHook) signal->storeHook(value);
+    else signal->value().store(value, std::memory_order_relaxed);
     signal->changed.notify_all();
 }
 void hsa_signal_silent_store_relaxed(hsa_signal_t handle, hsa_signal_value_t value) {
     const auto signal = findSignal(handle);
     if (!signal) return;
-    signal->value().store(value, std::memory_order_relaxed);
+    if (signal->storeHook) signal->storeHook(value);
+    else signal->value().store(value, std::memory_order_relaxed);
 }
 void hsa_signal_store_screlease(hsa_signal_t handle, hsa_signal_value_t value) {
     const auto signal = findSignal(handle);
     if (!signal) return;
-    signal->value().store(value, std::memory_order_release);
+    if (signal->storeHook) signal->storeHook(value);
+    else signal->value().store(value, std::memory_order_release);
     signal->changed.notify_all();
 }
 void hsa_signal_silent_store_screlease(hsa_signal_t handle, hsa_signal_value_t value) {
     const auto signal = findSignal(handle);
     if (!signal) return;
-    signal->value().store(value, std::memory_order_release);
+    if (signal->storeHook) signal->storeHook(value);
+    else signal->value().store(value, std::memory_order_release);
 }
 // Keep all atomic variants on the same 64-bit storage, with the ordering
 // specified by each HSA entry point. Fetch arithmetic uses atomic wraparound.

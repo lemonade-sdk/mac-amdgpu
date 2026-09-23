@@ -134,6 +134,11 @@ public:
             found->second.memoryType != buffer.memoryType)
             return HSA_STATUS_ERROR_INVALID_ALLOCATION;
         if (state != State::Ready) return HSA_STATUS_ERROR;
+        for (const auto &[queue,handles]:hardwareQueues) {
+            (void)queue;
+            if (handles[0]==buffer.device.handle || handles[1]==buffer.device.handle)
+                return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+        }
         if (IOConnectUnmapMemory64(ownerPort, buffer.memoryType, mach_task_self(), reinterpret_cast<uintptr_t>(buffer.host)) != KERN_SUCCESS) {
             state = State::Faulted; return HSA_STATUS_ERROR;
         }
@@ -141,6 +146,60 @@ public:
         const auto status = scalar(17, {&buffer.device.handle, 1}, {});
         if (status != HSA_STATUS_SUCCESS) state = State::Faulted;
         return status;
+    }
+    hsa_status_t createQueue(const SharedBuffer &ring,const SharedBuffer &metadata,uint32_t packets,uint64_t &handle) override {
+        std::lock_guard lock(sessionMutex); handle=0;
+        if (state!=State::Ready) return HSA_STATUS_ERROR;
+        for (const auto *buffer:{&ring,&metadata}) {
+            const auto found=sharedBuffers.find(buffer->device.handle);
+            if (found==sharedBuffers.end() || found->second.host!=buffer->host ||
+                found->second.device.address!=buffer->device.address || found->second.device.size!=buffer->device.size)
+                return HSA_STATUS_ERROR_INVALID_ALLOCATION;
+        }
+        if (packets<64 || packets>4096 || (packets&(packets-1)) ||
+            ring.device.size<uint64_t(packets)*64 || metadata.device.size<512 || ring.device.handle==metadata.device.handle)
+            return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        std::array<uint64_t,3> build{};
+        auto status=scalar(43,{},build);
+        if (status!=HSA_STATUS_SUCCESS) return status;
+        if (build[2]<185) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+        // Reserve bookkeeping before firmware can own the shared buffers.
+        auto [record,inserted]=hardwareQueues.emplace(0,std::array<uint64_t,2>{ring.device.handle,metadata.device.handle});
+        if (!inserted) return HSA_STATUS_ERROR;
+        const std::array<uint64_t,3> input={ring.device.handle,metadata.device.handle,packets};
+        std::array<uint64_t,2> output{};
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        status=scalar(56,input,output);
+        // These RPC errors are returned before any queue map is attempted.
+        // Exhausting the seven queue slots must not poison existing queues.
+        if (status==HSA_STATUS_ERROR_OUT_OF_RESOURCES || status==HSA_STATUS_ERROR_INVALID_ARGUMENT) {
+            hardwareQueues.erase(record);return status;
+        }
+        if (status!=HSA_STATUS_SUCCESS || output[0] || !output[1] || hardwareQueues.contains(output[1])) {
+            state=State::Faulted;return HSA_STATUS_ERROR;
+        }
+        auto node=hardwareQueues.extract(record);node.key()=output[1];hardwareQueues.insert(std::move(node));
+        handle=output[1];return HSA_STATUS_SUCCESS;
+    }
+    hsa_status_t kickQueue(uint64_t handle,uint64_t packet) override {
+        std::lock_guard lock(sessionMutex);
+        if (state!=State::Ready) return HSA_STATUS_ERROR;
+        if (!hardwareQueues.contains(handle) || !handle || packet==UINT64_MAX) return HSA_STATUS_ERROR_INVALID_QUEUE;
+        const std::array<uint64_t,2> input={handle,packet};std::array<uint64_t,1> output{};
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        const auto status=scalar(57,input,output);
+        if (status!=HSA_STATUS_SUCCESS || output[0]) {state=State::Faulted;return HSA_STATUS_ERROR;}
+        return HSA_STATUS_SUCCESS;
+    }
+    hsa_status_t destroyQueue(uint64_t handle) override {
+        std::lock_guard lock(sessionMutex);
+        if (state!=State::Ready) return HSA_STATUS_ERROR;
+        if (!handle || !hardwareQueues.contains(handle)) return HSA_STATUS_ERROR_INVALID_QUEUE;
+        std::array<uint64_t,1> output{};
+        const auto status=scalar(58,{&handle,1},output);
+        if (status!=HSA_STATUS_SUCCESS || output[0]) {state=State::Faulted;return HSA_STATUS_ERROR;}
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        hardwareQueues.erase(handle);return HSA_STATUS_SUCCESS;
     }
     hsa_status_t dispatchAQL(const amdgpu::AQLDispatchRequest &request, uint64_t &completion) override {
         std::lock_guard lock(sessionMutex);
@@ -296,6 +355,7 @@ public:
 private:
     enum class State { Unclaimed, Initializing, Ready, Faulted } state = State::Unclaimed;
     std::mutex sessionMutex;
+    std::map<uint64_t,std::array<uint64_t,2>> hardwareQueues;
     io_connect_t ownerPort = IO_OBJECT_NULL;
     uint64_t lastComputeFence = 0;
     uint64_t capacity = 0;

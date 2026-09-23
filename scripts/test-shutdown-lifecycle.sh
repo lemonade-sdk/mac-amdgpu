@@ -14,7 +14,7 @@ Path('build/tests/finish_stop_under_test.inc').write_text(source[start:end])
 start = source.index('static void\nmac_amdgpu_release_quarantine(')
 end = source.index('// Keep all DMA backing pinned', start)
 Path('build/tests/release_quarantine_under_test.inc').write_text(source[start:end])
-start = source.index('static bool\nmac_amdgpu_retire_client_storage(')
+start = source.index('static bool\nmac_amdgpu_retire_client_queues(')
 end = source.index('static void\nmac_amdgpu_release_quarantine(', start)
 Path('build/tests/retire_client_under_test.inc').write_text(source[start:end])
 PY

@@ -14,4 +14,19 @@ struct AQLLaunchResult {
 kern_return_t aql_launch(DeviceContext &, GMCContext &, MESContext &, const GFXConfig &,
     AQLLaunch &, uint64_t descriptorVA, uint64_t kernargVA,
     const AQLDispatchRequest &, AQLLaunchResult &);
+constexpr unsigned kPersistentAQLQueues=7;
+struct PersistentAQLQueue {
+    VRAMAllocation storage;
+    void *owner, *metadataCPU;
+    uint64_t handle, ringHandle, metadataHandle, metadataVA;
+    uint64_t lastDoorbell;
+    uint32_t packets, slot;
+    bool mapped, retained, published;
+};
+kern_return_t aql_queue_open(DeviceContext &, GMCContext &, MESContext &, const GFXConfig &,
+    PersistentAQLQueue &, uint64_t ringVA, uint64_t metadataVA, void *metadataCPU,
+    uint32_t packets, uint32_t slot);
+kern_return_t aql_queue_kick(DeviceContext &, PersistentAQLQueue &, uint64_t lastPacket);
+kern_return_t aql_queue_close(DeviceContext &, GMCContext &, MESContext &, PersistentAQLQueue &);
+
 }

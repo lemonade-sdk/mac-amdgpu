@@ -1056,12 +1056,12 @@ mes_init_full(DeviceContext &dev, PSPContext &psp,
     // VMIDs 1..7 are MES-scheduled compute VMIDs. We keep GFX HQD 0
     // for the direct CP_RB0 path (used by SubmitIB/SubmitTestPM4)
     // so gfx_hqd_mask[0] = 0xFE — MES owns 1..7. Compute HQDs are
-    // owned by MES except pipe 0/queue 0 for bounded native AQL; SDMA HQDs likewise.
+    // owned by MES except pipe 0 for native AQL queues; SDMA HQDs likewise.
     MESSetHwResourcesInput in{};
     in.vmid_mask_mmhub  = 0xFE;
     in.vmid_mask_gfxhub = 0xFE;
     for (int i = 0; i < 8; i++) in.compute_hqd_mask[i] = 0xFF;
-    in.compute_hqd_mask[0] = 0xFE; // reserve the bounded legacy compute queue
+    in.compute_hqd_mask[0] = 0; // queue 0 bounded; queues 1..7 persistent AQL
     in.gfx_hqd_mask[0]  = 0xFE;
     in.gfx_hqd_mask[1]  = 0x00;
     in.sdma_hqd_mask[0] = 0x0F;

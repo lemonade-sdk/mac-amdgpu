@@ -26,6 +26,7 @@ unsigned hostChecks = 0, sharedMaps = 0, sharedUnmaps = 0;
 std::vector<std::array<uint64_t, 10>> atomicPackets;
 bool atomicTimeout = false, streamLive = false;
 unsigned submittedStreams = 0;
+unsigned queueCreates=0,queueKicks=0,queueDestroys=0,queueFault=0;
 unsigned computeCalls = 0, computeFault = 0, aqlCalls = 0, aqlFault = 0;
 kern_return_t mockOpen(io_service_t, task_port_t, uint32_t, io_connect_t *port) { *port = ++opens; return KERN_SUCCESS; }
 kern_return_t mockClose(io_connect_t) { ++closes; return KERN_SUCCESS; }
@@ -33,6 +34,23 @@ kern_return_t mockRelease(io_object_t) { return KERN_SUCCESS; }
 kern_return_t mockScalar(mach_port_t, uint32_t selector, const uint64_t *in, uint32_t count,
                          uint64_t *out, uint32_t *outCount) {
     switch (selector) {
+    case 56:
+        assert(count==3 && *outCount==2 && in[0]!=in[1] && in[2]==64);
+        assert(buffers.at(in[0]).domain==2 && buffers.at(in[1]).domain==2);++queueCreates;
+        if (queueFault==1) return kIOReturnNoResources;
+        out[0]=queueFault==2 ? kIOReturnTimeout : 0;out[1]=queueFault==3 ? 0 : 97;
+        if (queueFault==4) *outCount=1;
+        return queueFault==5 ? kIOReturnTimeout : KERN_SUCCESS;
+    case 57:
+        assert(count==2 && *outCount==1 && in[0]==97 && in[1]==0);++queueKicks;
+        out[0]=queueFault==6 ? kIOReturnTimeout : 0;
+        if (queueFault==7) *outCount=0;
+        return KERN_SUCCESS;
+    case 58:
+        assert(count==1 && *outCount==1 && in[0]==97);++queueDestroys;
+        out[0]=queueFault==8 ? kIOReturnTimeout : 0;
+        if (queueFault==9) *outCount=0;
+        return KERN_SUCCESS;
     case 37:
         assert(count == 2 && *outCount == 1 && in[0] == 0 && in[1] == 0 && !streamLive);
         streamLive = true; atomicPackets.clear(); out[0] = 77; break;
@@ -352,6 +370,47 @@ int main() {
         } else {
             assert(result==0 && done==0);
             assert(connection.freeBuffer(code)==0 && connection.freeBuffer(args)==0);
+        }
+    }
+    for (queueFault=0;queueFault<=9;++queueFault) {
+        mac_hsa::IOKitConnection connection;connection.service=123;connection.registryID=456;
+        mac_hsa::SharedBuffer ring,metadata;
+        driverBuild=184;
+        assert(connection.allocateSharedBuffer(16384,ring)==0 && connection.allocateSharedBuffer(16384,metadata)==0);
+        uint64_t handle=123;const auto before=queueCreates;
+        assert(connection.createQueue(ring,metadata,64,handle)==HSA_STATUS_ERROR_OUT_OF_RESOURCES && !handle && queueCreates==before);
+        driverBuild=185;
+        auto wrong=ring;wrong.device.address+=16384;
+        assert(connection.createQueue(wrong,metadata,64,handle)==HSA_STATUS_ERROR_INVALID_ALLOCATION && !handle);
+        assert(connection.createQueue(ring,ring,64,handle)==HSA_STATUS_ERROR_INVALID_ARGUMENT);
+        assert(connection.createQueue(ring,metadata,63,handle)==HSA_STATUS_ERROR_INVALID_ARGUMENT);
+        const auto created=connection.createQueue(ring,metadata,64,handle);
+        const auto oldUnmaps=sharedUnmaps;
+        if (queueFault==1) {
+            assert(created==HSA_STATUS_ERROR_OUT_OF_RESOURCES && !handle);
+            assert(connection.freeSharedBuffer(ring)==0 && connection.freeSharedBuffer(metadata)==0);
+        } else if (queueFault>=2 && queueFault<=5) {
+            assert(created==HSA_STATUS_ERROR && !handle);
+            assert(connection.freeSharedBuffer(ring)==HSA_STATUS_ERROR && sharedUnmaps==oldUnmaps);
+        } else {
+            assert(created==0 && handle==97);
+            assert(connection.freeSharedBuffer(ring)==HSA_STATUS_ERROR_OUT_OF_RESOURCES && sharedUnmaps==oldUnmaps);
+            assert(connection.freeSharedBuffer(metadata)==HSA_STATUS_ERROR_OUT_OF_RESOURCES && sharedUnmaps==oldUnmaps);
+            assert(connection.kickQueue(98,0)==HSA_STATUS_ERROR_INVALID_QUEUE);
+            assert(connection.kickQueue(handle,UINT64_MAX)==HSA_STATUS_ERROR_INVALID_QUEUE);
+            const auto kicked=connection.kickQueue(handle,0);
+            if (queueFault==6 || queueFault==7) {
+                assert(kicked==HSA_STATUS_ERROR && connection.destroyQueue(handle)==HSA_STATUS_ERROR);
+            } else {
+                assert(kicked==0);
+                const auto destroyed=connection.destroyQueue(handle);
+                if (queueFault>=8) assert(destroyed==HSA_STATUS_ERROR);
+                else {
+                    assert(destroyed==0 && connection.destroyQueue(handle)==HSA_STATUS_ERROR_INVALID_QUEUE);
+                    assert(connection.freeSharedBuffer(ring)==0 && connection.freeSharedBuffer(metadata)==0);
+                }
+            }
+            if (queueFault) assert(connection.freeSharedBuffer(ring)==HSA_STATUS_ERROR && sharedUnmaps==oldUnmaps);
         }
     }
     assert(opens==closes);

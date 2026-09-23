@@ -71,13 +71,19 @@ struct IOPCIDevice {
 struct CS { bool in_use = true; };
 constexpr uint32_t kBODomainGTT = 2;
 struct TestBinding { bool mapped = true; };
-static bool retireSucceeds = true;
+static bool retireSucceeds = true, unmapSucceeds=true;
 struct BO { bool in_use = false; uint32_t domain = kBODomainGTT; TestBinding gttBinding;
     void *gtt_buf = nullptr, *gtt_dma = nullptr, *cpu_addr = nullptr; };
 namespace amdgpu {
 enum class BringupStage { None, SDMAInit };
-struct Bringup { bool initialized = true, metrics = true; BringupStage reached = BringupStage::SDMAInit;
+struct TestAQLQueue {void *owner=nullptr;};
+struct Bringup { TestAQLQueue aqlQueues[7]; int gmc=0,mes=0; bool initialized = true, metrics = true; BringupStage reached = BringupStage::SDMAInit;
     int device = 0, gart = 0; };
+static int aql_queue_close(int &,int &,int &,TestAQLQueue &queue) {
+    events.push_back("unmap AQL");
+    if (!unmapSucceeds) return kIOReturnNotReady;
+    queue={};return 0;
+}
 static int gart_unbind(int &, int &, TestBinding *binding) {
     events.push_back("unbind");
     if (!retireSucceeds) return kIOReturnNotReady;
@@ -236,6 +242,26 @@ int main() {
             assert(f.pci.resets == 1);
         }
         assert(f.state.connectedClients == 0);
+    }
+
+    // Another participant remains: owned queues must unmap before GTT backing
+    // can be retired. An unmap failure retains the entire departing client.
+    for (bool fail:{false,true}) {
+        Fixture f;IODispatchQueue queue;
+        f.client.ivars=new ClientState(f.clientState);f.client.ivars->stopQueue=&queue;
+        assert(f.state.sessions.attach(&f.client,f.client.ivars->claimed,true));
+        f.state.sessions.participants=2;f.state.connectedClients=2;
+        f.state.bringup.aqlQueues[0].owner=f.client.ivars;
+        unmapSucceeds=!fail;
+        f.client.FinishStop(&f.driver);
+        auto unmapped=std::find(events.begin(),events.end(),"unmap AQL");
+        assert(unmapped!=events.end() && !f.pci.closed && !f.pci.resets);
+        if (fail) {
+            assert(f.state.quarantinedClient && f.state.shutdownBlocked);
+            assert(std::find(events.begin(),events.end(),"free client")==events.end());
+            delete f.state.quarantinedClient;f.state.quarantinedClient=nullptr;
+        } else assert(unmapped<std::find(events.begin(),events.end(),"free client"));
+        unmapSucceeds=true;
     }
 
     // Ordinary owner exit uses the reset barrier before freeing its storage.

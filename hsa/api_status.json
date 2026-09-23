@@ -15,5 +15,5 @@
     "hsa_amd_svm_attributes_set",
     "hsa_amd_svm_prefetch_async"
   ],
-  "notes": "Symbol presence is not behavioral completion. Native coarse shared allocations and synchronous executable dispatch do not provide the fine-grained pools, GPU signals or hardware AQL queues required by HRX. See API_STATUS.md for verified hardware behavior."
+  "notes": "Symbol presence is not behavioral completion. GPU-backed HSA signal primitives passed sequential hardware tests; CPU updates execute GPU atomics. Driver 185 adds persistent queues, pending hardware validation of wraparound, dependencies and concurrent signal updates. Fine-grained HSA pools and HRX inference remain incomplete. See API_STATUS.md."
 }

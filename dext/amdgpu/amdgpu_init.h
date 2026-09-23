@@ -101,6 +101,7 @@ struct BringupContext {
     GARTContext   gart;        // GART page-table state + bindings (DMA fix)
     MemoryTransferTest memoryTest;
     ComputeTest computeTest; // VRAM arena retains failed dispatch storage until reset.
+    PersistentAQLQueue aqlQueues[kPersistentAQLQueues];
     AQLLaunch aqlLaunch; // Bounded AQL backing retained on uncertain completion/unmap.
     ComputeLaunch computeLaunch; // General launch IB retained until completion/reset.
     IMUContext    imu;         // IMU microcode-loaded gate

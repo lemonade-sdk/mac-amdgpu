@@ -1877,3 +1877,35 @@ successfully after cleanup. No hardware AQL queue or HRX inference is claimed.
   dispatch observed completion 0, inactive/error signal 0, read index 1 and
   successful MES removal before queue storage was freed. Queues were recreated
   between dispatches. Public HSA queues and HRX inference remain incomplete.
+
+## Build 185 — persistent queues and GPU-backed signal operations
+
+- Added owned persistent AQL create/kick/destroy RPCs, seven legacy compute
+  slots, monotonic doorbell publication and shared AMD queue metadata. Reserved
+  MEC pipe 0 from the MES scheduler; bounded AQL retains slot 0.
+- Client cleanup removes its queues before freeing memory while other clients
+  continue. Failed mapping or removal retains backing until reset. Queue-owned
+  ring/metadata BOs cannot be freed, and queue resource exhaustion does not
+  fault an otherwise healthy runtime connection.
+- Added public HSA queue creation, shared read/write indices, CPU doorbell
+  hooks, inactivation/destruction, owning-agent queries and kick-error callbacks.
+- Added pooled shared AMD signal storage and an embedded gfx1201 atomic kernel.
+  CPU HSA value changes execute on the GPU, while CPU loads observe shared
+  values. A failed executor wakes all affected signal waiters; new signals
+  cannot reuse that faulted executor.
+- Hardware on installed driver 184: shader-only atomic adds produced 4,096;
+  release publication verified 1,024 payloads with live CPU observation. Native
+  concurrent CPU/GPU RMWs failed (2,671,460 observed versus 2,704,434 expected).
+  The GPU-backed HSA API then passed stores, arithmetic, bitwise operations,
+  exchange, CAS success/failure, signed wraparound, waits and direct ABI reads.
+- Added persistent hardware tests for 192 dispatches, ring wraparound, two-queue
+  barriers, CPU signal release, concurrent GPU/CPU-HSA updates and shared CP
+  completion decrements. These tests await installation of build 185; they are
+  not recorded as passed. No HRX inference is claimed.
+- Validation: ten HSA ASan/UBSan suites passed, including queue lifetime,
+  reentrant error callbacks, signal fault propagation, malformed RPC replies
+  and resource exhaustion. Driver packet, shared-buffer and shutdown tests
+  passed; a new production-RPC test covers shapes, ownership, stale handles,
+  seven-slot exhaustion and failed-unmap retention. Xcode build and strict
+  code-signature verification passed for host and driver 185. Stop GPU completed
+  successfully before the new host app was opened for user installation.

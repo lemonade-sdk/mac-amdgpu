@@ -2,15 +2,51 @@
 #include <hsa/amd_hsa_queue.h>
 
 namespace mac_hsa::detail {
-namespace {
-struct SoftQueue {
-    amd_queue_t abi{};
+struct RuntimeQueue {
+    amd_queue_t hostABI{};
+    amd_queue_t *abi=&hostABI;
+    std::shared_ptr<Connection> connection;
+    SharedBuffer ring, metadata;
+    hsa_agent_t agent{};
+    uint64_t hardwareHandle=0;
+    std::mutex mutex;
+    void (*errorCallback)(hsa_status_t,hsa_queue_t *,void *)=nullptr;
+    void *errorData=nullptr;
+    bool errorDelivered=false;
+    hsa_status_t inactivate() {
+        std::lock_guard lock(mutex);
+        if (!active) return HSA_STATUS_SUCCESS;
+        if (hardwareHandle) {
+            const auto status=connection->destroyQueue(hardwareHandle);
+            if (status!=HSA_STATUS_SUCCESS) return status;
+            hardwareHandle=0;
+        }
+        active=false;return HSA_STATUS_SUCCESS;
+    }
+    void ringDoorbell(int64_t value) {
+        bool notify=false;
+        {
+            std::lock_guard lock(mutex);
+            if (!active || !hardwareHandle || errorDelivered) return;
+            if (connection->kickQueue(hardwareHandle,uint64_t(value))!=HSA_STATUS_SUCCESS) {
+                errorDelivered=true;notify=true;
+            }
+        }
+        if (notify && errorCallback) errorCallback(HSA_STATUS_ERROR,&abi->hsa_queue,errorData);
+    }
     std::shared_ptr<Signal> doorbell;
     bool active = true;
-    ~SoftQueue() { std::free(abi.hsa_queue.base_address); }
+    ~RuntimeQueue() {
+        if (connection) {
+            if (inactivate()!=HSA_STATUS_SUCCESS) return; // driver retains backing until reset
+            if (ring.host) connection->freeSharedBuffer(ring);
+            if (metadata.host) connection->freeSharedBuffer(metadata);
+        } else std::free(abi->hsa_queue.base_address);
+    }
 };
-std::unordered_map<const hsa_queue_t *, std::shared_ptr<SoftQueue>> queues;
-std::shared_ptr<SoftQueue> findQueue(const hsa_queue_t *pointer) {
+namespace {
+RetiredQueueSet queues;
+std::shared_ptr<RuntimeQueue> findQueue(const hsa_queue_t *pointer) {
     std::lock_guard lock(runtimeMutex);
     if (!references) return {};
     const auto entry = queues.find(pointer);
@@ -20,18 +56,85 @@ auto index(volatile uint64_t &value) { return std::atomic_ref<uint64_t>(const_ca
 static_assert(offsetof(amd_queue_t, write_dispatch_id) % std::atomic_ref<uint64_t>::required_alignment == 0);
 static_assert(offsetof(amd_queue_t, read_dispatch_id) % std::atomic_ref<uint64_t>::required_alignment == 0);
 }
-void clearQueues() { queues.clear(); }
+RetiredQueueSet clearQueues() {
+    RetiredQueueSet retired;
+    retired.swap(queues);return retired;
+}
+
 } // namespace mac_hsa::detail
 using namespace mac_hsa::detail;
 
 extern "C" {
+hsa_status_t hsa_queue_create(hsa_agent_t agent,uint32_t size,hsa_queue_type32_t type,
+    void (*callback)(hsa_status_t,hsa_queue_t *,void *),void *data,
+    uint32_t privateBytes,uint32_t groupBytes,hsa_queue_t **out) {
+    std::lock_guard lifecycle(executableLifecycleMutex);
+    std::shared_ptr<mac_hsa::Connection> connection;
+    uint64_t id=0;
+    {
+        std::lock_guard lock(runtimeMutex);
+        if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+        if (!out) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        *out=nullptr;
+        const auto found=findAgent(agent);
+        if (!found) return HSA_STATUS_ERROR_INVALID_AGENT;
+        if (!size || (size&(size-1)) || (type!=HSA_QUEUE_TYPE_SINGLE && type!=HSA_QUEUE_TYPE_MULTI))
+            return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        if (!found->connection || size<64 || size>4096 ||
+            (privateBytes && privateBytes!=UINT32_MAX) || (groupBytes && groupBytes!=UINT32_MAX))
+            return HSA_STATUS_ERROR_INVALID_QUEUE_CREATION;
+        if (lastHandle==UINT64_MAX) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+        connection=found->connection;id=++lastHandle;
+    }
+    mac_hsa::DeviceSnapshot info{};
+    auto status=connection->read(info);
+    if (status!=HSA_STATUS_SUCCESS) return status;
+    if (info.build<185) return HSA_STATUS_ERROR_INVALID_QUEUE_CREATION;
+    try {
+        auto queue=std::make_shared<RuntimeQueue>();
+        queue->connection=connection;queue->agent=agent;queue->errorCallback=callback;queue->errorData=data;
+        status=connection->allocateSharedBuffer(size_t(size)*64,queue->ring);
+        if (status!=HSA_STATUS_SUCCESS) return status;
+        status=connection->allocateSharedBuffer(16384,queue->metadata);
+        if (status!=HSA_STATUS_SUCCESS) return status;
+        if (!queue->ring.host || !queue->metadata.host || queue->ring.device.size<uint64_t(size)*64 ||
+            queue->metadata.device.size<sizeof(amd_queue_t) ||
+            queue->ring.device.address!=reinterpret_cast<uintptr_t>(queue->ring.host) ||
+            queue->metadata.device.address!=reinterpret_cast<uintptr_t>(queue->metadata.host)) return HSA_STATUS_ERROR;
+        std::memset(queue->metadata.host,0,queue->metadata.device.size);
+        std::memset(queue->ring.host,0,uint64_t(size)*64);
+        queue->abi=static_cast<amd_queue_t *>(queue->metadata.host);
+        auto &q=*queue->abi;
+        q.hsa_queue.type=type;q.hsa_queue.features=HSA_QUEUE_FEATURE_KERNEL_DISPATCH;
+        q.hsa_queue.base_address=queue->ring.host;q.hsa_queue.size=size;q.hsa_queue.id=id;
+        q.queue_properties=AMD_QUEUE_PROPERTIES_IS_PTR64;
+        q.read_dispatch_id_field_base_byte_offset=offsetof(amd_queue_t,read_dispatch_id);
+        auto *packets=static_cast<uint16_t *>(queue->ring.host);
+        for (uint32_t i=0;i<size;++i) packets[size_t(i)*32]=HSA_PACKET_TYPE_INVALID;
+        queue->doorbell=std::make_shared<mac_hsa::Signal>();
+        const std::weak_ptr<RuntimeQueue> weak=queue;
+        queue->doorbell->storeHook=[weak](int64_t value) {if (auto q=weak.lock()) q->ringDoorbell(value);};
+        q.hsa_queue.doorbell_signal.handle=reinterpret_cast<uintptr_t>(queue->doorbell->address());
+        status=connection->createQueue(queue->ring,queue->metadata,size,queue->hardwareHandle);
+        if (status!=HSA_STATUS_SUCCESS) return status;
+        if (!queue->hardwareHandle) return HSA_STATUS_ERROR;
+        auto *pointer=&q.hsa_queue;
+        {
+            std::lock_guard lock(runtimeMutex);
+            signals.emplace(q.hsa_queue.doorbell_signal.handle,queue->doorbell);
+            try {queues.emplace(pointer,queue);}
+            catch (...) {signals.erase(q.hsa_queue.doorbell_signal.handle);throw;}
+        }
+        *out=pointer;return HSA_STATUS_SUCCESS;
+    } catch (const std::bad_alloc &) {return HSA_STATUS_ERROR_OUT_OF_RESOURCES;}
+}
 HSA_API_EXPORT hsa_status_t hsa_amd_profiling_set_profiler_enabled(hsa_queue_t *pointer, int enable) {
     std::lock_guard lock(runtimeMutex);
     if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
     if (!pointer || (enable != 0 && enable != 1)) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
     const auto queue = queues.find(pointer);
     if (queue == queues.end()) return HSA_STATUS_ERROR_INVALID_QUEUE;
-    auto properties = std::atomic_ref<uint32_t>(queue->second->abi.queue_properties);
+    auto properties = std::atomic_ref<uint32_t>(queue->second->abi->queue_properties);
     constexpr uint32_t mask = AMD_QUEUE_PROPERTIES_ENABLE_PROFILING;
     if (enable) properties.fetch_or(mask, std::memory_order_release);
     else properties.fetch_and(~mask, std::memory_order_release);
@@ -42,8 +145,8 @@ HSA_API_EXPORT hsa_status_t hsa_amd_queue_cu_set_mask(const hsa_queue_t *pointer
     if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
     if (!queues.contains(pointer)) return HSA_STATUS_ERROR_INVALID_QUEUE;
     if (bits % 32 || (bits && !mask)) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
-    // ROCr HostQueue also rejects CU affinity and scheduling priority: a
-    // software queue has no hardware scheduler or compute-unit mask to set.
+    // Software queues have no CU affinity; the initial persistent-queue ABI
+    // also has no synchronized MQD update operation.
     return HSA_STATUS_ERROR_INVALID_QUEUE;
 }
 HSA_API_EXPORT hsa_status_t hsa_amd_queue_set_priority(hsa_queue_t *pointer, hsa_amd_queue_priority_t priority) {
@@ -58,7 +161,11 @@ HSA_API_EXPORT hsa_status_t hsa_amd_queue_get_info(hsa_queue_t *pointer, hsa_que
     if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
     if (!queues.contains(pointer)) return HSA_STATUS_ERROR_INVALID_QUEUE;
     if (!value || (attribute != HSA_AMD_QUEUE_INFO_AGENT && attribute != HSA_AMD_QUEUE_INFO_DOORBELL_ID)) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
-    return HSA_STATUS_ERROR_INVALID_QUEUE; // no underlying hardware queue/doorbell
+    const auto &queue=queues.at(pointer);
+    if (!queue->connection) return HSA_STATUS_ERROR_INVALID_QUEUE;
+    if (attribute==HSA_AMD_QUEUE_INFO_AGENT) return writeValue(value,queue->agent);
+    // The handle is a lifetime nonce, not the physical doorbell index.
+    return HSA_STATUS_ERROR_INVALID_ARGUMENT;
 }
 hsa_status_t hsa_soft_queue_create(hsa_region_t region, uint32_t size, hsa_queue_type32_t type,
     uint32_t features, hsa_signal_t doorbell, hsa_queue_t **out) {
@@ -77,47 +184,57 @@ hsa_status_t hsa_soft_queue_create(hsa_region_t region, uint32_t size, hsa_queue
     if (lastHandle == UINT64_MAX || uint64_t(size) * 64 > pool->capacity)
         return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
     try {
-        auto queue = std::make_shared<SoftQueue>();
-        if (posix_memalign(&queue->abi.hsa_queue.base_address, 4096, (size_t(size) * 64 + 4095) & ~size_t(4095)))
+        auto queue = std::make_shared<RuntimeQueue>();
+        if (posix_memalign(&queue->abi->hsa_queue.base_address, 4096, (size_t(size) * 64 + 4095) & ~size_t(4095)))
             return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
-        std::memset(queue->abi.hsa_queue.base_address, 0, size_t(size) * 64);
-        auto packets = static_cast<uint16_t *>(queue->abi.hsa_queue.base_address);
+        std::memset(queue->abi->hsa_queue.base_address, 0, size_t(size) * 64);
+        auto packets = static_cast<uint16_t *>(queue->abi->hsa_queue.base_address);
         for (uint32_t i = 0; i < size; ++i) packets[size_t(i) * 32] = HSA_PACKET_TYPE_INVALID;
-        queue->abi.hsa_queue.type = type;
-        queue->abi.hsa_queue.features = features;
-        queue->abi.hsa_queue.doorbell_signal = doorbell;
-        queue->abi.hsa_queue.size = size;
-        queue->abi.hsa_queue.id = ++lastHandle;
-        queue->abi.queue_properties = AMD_QUEUE_PROPERTIES_IS_PTR64;
-        queue->abi.read_dispatch_id_field_base_byte_offset = offsetof(amd_queue_t, read_dispatch_id);
+        queue->abi->hsa_queue.type = type;
+        queue->abi->hsa_queue.features = features;
+        queue->abi->hsa_queue.doorbell_signal = doorbell;
+        queue->abi->hsa_queue.size = size;
+        queue->abi->hsa_queue.id = ++lastHandle;
+        queue->abi->queue_properties = AMD_QUEUE_PROPERTIES_IS_PTR64;
+        queue->abi->read_dispatch_id_field_base_byte_offset = offsetof(amd_queue_t, read_dispatch_id);
         queue->doorbell = signal->second;
-        auto pointer = &queue->abi.hsa_queue;
+        auto pointer = &queue->abi->hsa_queue;
         queues.emplace(pointer, std::move(queue));
         *out = pointer;
         return HSA_STATUS_SUCCESS;
     } catch (const std::bad_alloc &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
 }
-hsa_status_t hsa_queue_destroy(hsa_queue_t *queue) {
-    std::lock_guard lock(runtimeMutex);
-    if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
-    if (!queues.erase(queue)) return HSA_STATUS_ERROR_INVALID_QUEUE;
-    // The application supplied this software queue's doorbell; retain its
-    // public signal until the application destroys it explicitly.
+hsa_status_t hsa_queue_destroy(hsa_queue_t *pointer) {
+    const auto queue=findQueue(pointer);
+    if (!queue) {
+        std::lock_guard lock(runtimeMutex);
+        return references ? HSA_STATUS_ERROR_INVALID_QUEUE : HSA_STATUS_ERROR_NOT_INITIALIZED;
+    }
+    const auto status=queue->inactivate();
+    if (status!=HSA_STATUS_SUCCESS) return status;
+    {
+        std::lock_guard lock(runtimeMutex);
+        if (!queues.erase(pointer)) return HSA_STATUS_ERROR_INVALID_QUEUE;
+        if (queue->connection) {
+            queue->doorbell->alive=false;
+            signals.erase(queue->abi->hsa_queue.doorbell_signal.handle);
+        }
+    }
     return HSA_STATUS_SUCCESS;
 }
-hsa_status_t hsa_queue_inactivate(hsa_queue_t *queue) {
-    std::lock_guard lock(runtimeMutex);
-    if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
-    const auto found = queues.find(queue);
-    if (found == queues.end()) return HSA_STATUS_ERROR_INVALID_QUEUE;
-    found->second->active = false;
-    return HSA_STATUS_SUCCESS;
+hsa_status_t hsa_queue_inactivate(hsa_queue_t *pointer) {
+    const auto queue=findQueue(pointer);
+    if (!queue) {
+        std::lock_guard lock(runtimeMutex);
+        return references ? HSA_STATUS_ERROR_INVALID_QUEUE : HSA_STATUS_ERROR_NOT_INITIALIZED;
+    }
+    return queue->inactivate();
 }
 
 #define QUEUE_LOAD(which, suffix, order) \
 uint64_t hsa_queue_load_##which##_index_##suffix(const hsa_queue_t *pointer) { \
     const auto queue = findQueue(pointer); \
-    return queue ? index(queue->abi.which##_dispatch_id).load(order) : 0; \
+    return queue ? index(queue->abi->which##_dispatch_id).load(order) : 0; \
 }
 QUEUE_LOAD(read, relaxed, std::memory_order_relaxed)
 QUEUE_LOAD(read, scacquire, std::memory_order_acquire)
@@ -127,7 +244,7 @@ QUEUE_LOAD(write, scacquire, std::memory_order_acquire)
 #define QUEUE_STORE(which, suffix, order) \
 void hsa_queue_store_##which##_index_##suffix(const hsa_queue_t *pointer, uint64_t value) { \
     const auto queue = findQueue(pointer); \
-    if (queue) index(queue->abi.which##_dispatch_id).store(value, order); \
+    if (queue) index(queue->abi->which##_dispatch_id).store(value, order); \
 }
 QUEUE_STORE(read, relaxed, std::memory_order_relaxed)
 QUEUE_STORE(read, screlease, std::memory_order_release)
@@ -137,12 +254,12 @@ QUEUE_STORE(write, screlease, std::memory_order_release)
 #define QUEUE_RMW(suffix, order, failure) \
 uint64_t hsa_queue_add_write_index_##suffix(const hsa_queue_t *pointer, uint64_t value) { \
     const auto queue = findQueue(pointer); \
-    return queue ? index(queue->abi.write_dispatch_id).fetch_add(value, order) : 0; \
+    return queue ? index(queue->abi->write_dispatch_id).fetch_add(value, order) : 0; \
 } \
 uint64_t hsa_queue_cas_write_index_##suffix(const hsa_queue_t *pointer, uint64_t expected, uint64_t value) { \
     const auto queue = findQueue(pointer); \
     if (!queue) return 0; \
-    index(queue->abi.write_dispatch_id).compare_exchange_strong(expected, value, order, failure); \
+    index(queue->abi->write_dispatch_id).compare_exchange_strong(expected, value, order, failure); \
     return expected; \
 }
 QUEUE_RMW(relaxed, std::memory_order_relaxed, std::memory_order_relaxed)
