@@ -34,10 +34,32 @@ std::string id(uint64_t value) {
     return out.str();
 }
 std::string gib(uint64_t value) {
-    if (!value) return "unavailable";
     std::ostringstream out;
     out << std::fixed << std::setprecision(2) << double(value) / (1ull << 30) << " GiB";
     return out.str();
+}
+std::string accountingValue(const mtop::Device &d, amdgpu::vram_accounting::Field field) {
+    return mtop::hasAccounting(d) ? std::to_string(d.accounting.values[field]) : "null";
+}
+std::string accountingSize(const mtop::Device &d, amdgpu::vram_accounting::Field field) {
+    return mtop::hasAccounting(d) ? gib(d.accounting.values[field]) : "unavailable";
+}
+std::string quote(const std::string &value);
+void accountingJson(const mtop::Device &d) {
+    using namespace amdgpu::vram_accounting;
+    std::cout << ",\"vram_accounting\":{\"status\":"
+              << quote(mtop::hasAccounting(d) ? "available" :
+                       (d.accountingSupported || !d.accountingError.empty() ? "unavailable" : "unsupported"))
+              << ",\"error\":" << (d.accountingError.empty() ? "null" : quote(d.accountingError));
+    constexpr const char *names[] = {"usable_bytes", "cpu_visible_bytes", "excluded_bytes",
+        "visible_pool_capacity_bytes", "visible_pool_used_bytes", "visible_pool_free_bytes",
+        "visible_pool_largest_free_span_bytes", "visible_pool_allocation_count",
+        "device_pool_capacity_bytes", "device_pool_used_bytes", "device_pool_free_bytes",
+        "device_pool_largest_free_span_bytes", "device_pool_allocation_count"};
+    static_assert(sizeof(names) / sizeof(names[0]) == Count - UsableBytes);
+    for (unsigned i = UsableBytes; i < Count; ++i)
+        std::cout << ',' << quote(names[i - UsableBytes]) << ':' << accountingValue(d, Field(i));
+    std::cout << '}';
 }
 std::string quote(const std::string &value) {
     std::ostringstream out;
@@ -95,6 +117,7 @@ void json(const std::vector<mtop::Device> &devices, const mtop::Selection &selec
                       << ",\"vram_total_bytes\":" << (d.total ? std::to_string(d.total) : "null")
                       << ",\"vram_cpu_visible_bytes\":" << (d.visible ? std::to_string(d.visible) : "null");
         }
+        accountingJson(d);
         using namespace amdgpu::metrics;
         const auto reason = telemetryReason(d);
         std::cout << ",\"telemetry_status\":" << quote(telemetryStatus(d))
@@ -148,10 +171,19 @@ void dashboard(const std::vector<mtop::Device> &devices, const mtop::Selection &
         };
         std::cout << '\n';
         row("GPU ACTIVITY", "MEMORY");
-        row("GFX     " + metric(*d, GfxActivityPercent, 1, "%"), "VRAM total        " + gib(d->total));
-        row("UMC     " + metric(*d, UmcActivityPercent, 1, "%"), "CPU-visible VRAM  " + gib(d->visible));
-        row("Media   " + metric(*d, MediaActivityPercent, 1, "%"), "VRAM used         unavailable");
+        row("GFX     " + metric(*d, GfxActivityPercent, 1, "%"), "VRAM usable       " + (d->total ? gib(d->total) : "unavailable"));
+        row("UMC     " + metric(*d, UmcActivityPercent, 1, "%"), "CPU-visible VRAM  " + (d->visible ? gib(d->visible) : "unavailable"));
+        row("Media   " + metric(*d, MediaActivityPercent, 1, "%"), "Outside pools     " + accountingSize(*d, amdgpu::vram_accounting::ExcludedBytes));
         row("", "GTT used          unavailable");
+        std::cout << "\n VRAM ALLOCATORS               capacity / used / free / largest free span\n";
+        using namespace amdgpu::vram_accounting;
+        row("CPU-visible pool", accountingSize(*d, VisibleCapacity) + " / " +
+            accountingSize(*d, VisibleUsed) + " / " + accountingSize(*d, VisibleFree) +
+            " / " + accountingSize(*d, VisibleLargestSpan));
+        row("GPU-only pool", accountingSize(*d, DeviceCapacity) + " / " +
+            accountingSize(*d, DeviceUsed) + " / " + accountingSize(*d, DeviceFree) +
+            " / " + accountingSize(*d, DeviceLargestSpan));
+        if (!d->accountingError.empty()) std::cout << " " << d->accountingError << '\n';
         std::cout << '\n';
         row("CLOCKS", "SENSORS");
         row("GFX     " + metric(*d, GfxClockMHz, 1, " MHz"),
@@ -169,7 +201,8 @@ void dashboard(const std::vector<mtop::Device> &devices, const mtop::Selection &
                                            << "  driver status " << id(d->metrics.status);
         const auto reason = telemetryReason(*d);
         if (!reason.empty()) std::cout << "\n " << reason;
-        std::cout << "\n UMC activity measures memory-controller work; VRAM used measures allocations.\n";
+        std::cout << "\n Pool use includes rounded client and driver allocations, not all firmware memory.\n"
+                     " Outside pools includes fixed reservations/gaps; UMC activity measures controller work.\n";
     }
     if (interactive) std::cout << "\n [n] next GPU  [p] previous GPU  [q] quit  | refresh 1 s\n";
 }
@@ -193,7 +226,8 @@ int main(int argc, char **argv) {
                          "Terminal mode refreshes each second; n/p switch devices, q quits.\n"
                          "Non-terminal output is one snapshot unless --watch is specified.\n"
                          "Observer only: never initializes, resets or changes the GPU.\n"
-                         "Reads cached dynamic telemetry from driver 176+ when collected by its owner.\n";
+                         "Reads cached dynamic telemetry from driver 176+ when collected by its owner.\n"
+                         "Reads CPU-side VRAM allocator accounting from driver 178+.\n";
             return 0;
         } else if (arg == "--json" || arg == "-J") jsonMode = true;
         else if (arg == "--list") listOnly = true;

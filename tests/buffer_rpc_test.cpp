@@ -1,11 +1,13 @@
 #include "amdgpu_buffer_io.h"
+#include "amdgpu_dispatch_abi.h"
+#define MACAMDGPU_LOG(...) ((void)0)
 #include <cassert>
 #include <cstring>
 #include <vector>
 using kern_return_t = int;
 constexpr int kIOReturnSuccess=0, kIOReturnBadArgument=1, kIOReturnNotReady=2,
     kIOReturnNoMemory=3, kIOReturnTimeout=4, kIOReturnIOError=5, kIOReturnNotAttached=6;
-constexpr int kMacAMDGPUMethodBOCopy=48, kMacAMDGPUMethodBOWrite=49, kMacAMDGPUMethodBORead=50;
+constexpr int kMacAMDGPUMethodBOCopy=48, kMacAMDGPUMethodBOWrite=49, kMacAMDGPUMethodBORead=50, kMacAMDGPUMethodComputeDispatch=51;
 constexpr int kBODomainVRAM=1;
 struct OSData {
     std::vector<uint8_t> data;
@@ -35,6 +37,18 @@ struct DeviceContext { PCI *pci; uint64_t bar0Size=32768; uint8_t bar0MemIndex=0
 namespace amdgpu {
 enum class BringupStage { None, SDMAInit };
 struct SDMA { uint32_t wptr=0; };
+struct ComputeLaunch { bool retained=false; };
+struct ComputeLaunchResult { uint32_t fence=0,stage=0; };
+static unsigned launches;
+static uint64_t launchCode;
+static int launchStatus;
+static bool retainLaunch;
+template<class G> static int compute_launch(DeviceContext &,G &,int &,int &,
+    ComputeLaunch &launch,uint64_t code,const ComputeDispatchRequest &r,ComputeLaunchResult &out) {
+    assert(compute_dispatch_shape(r)); ++launches; launchCode=code;
+    launch.retained=retainLaunch; out.fence=42; out.stage=launchStatus ? 2 : 3;
+    return launchStatus;
+}
 static unsigned copies, flushes;
 static int copyStatus;
 static bool publish=true;
@@ -60,6 +74,7 @@ struct State {
         amdgpu::BringupStage reached=amdgpu::BringupStage::SDMAInit;
         struct { uint64_t vram_start=0; } gmc;
         struct { amdgpu::SDMA instance[1]; } sdma;
+        int cp=0,gfx=0; amdgpu::ComputeLaunch computeLaunch;
     } bringup;
 };
 struct Driver { State *ivars; };
@@ -114,4 +129,32 @@ int main() {
     input[1]=0;input[2]=4097;
     assert(call(&driver,&pci,&client,50,&args)==kIOReturnBadArgument);
     delete upload;
+    amdgpu::ComputeDispatchRequest request{};
+    request.version=1;request.codeHandle=1;request.codeBytes=64;request.timeoutUS=100000;
+    request.groups[0]=4; request.groups[1]=request.groups[2]=1;
+    request.threads[0]=32; request.threads[1]=request.threads[2]=1;
+    request.rsrc1=0xc0000; request.buffers[0]=3;
+    uint64_t dispatchOut[3]{};
+    auto dispatch=[&]() {
+        auto *data=OSData::withBytes(&request,sizeof(request));
+        Args dispatchArgs;dispatchArgs.structureInput=data;dispatchArgs.scalarOutput=dispatchOut;
+        dispatchArgs.scalarOutputCount=3;
+        const auto status=call(&driver,&pci,&client,51,&dispatchArgs);
+        delete data;return status;
+    };
+    state.shutdownBlocked=false;
+    assert(dispatch()==0 && dispatchOut[1]==42 && dispatchOut[2]==3 && amdgpu::launches==1);
+    assert(amdgpu::launchCode==entries[0].gpu_va);
+    request.codeOffset=16384;
+    assert(dispatch()==kIOReturnBadArgument && amdgpu::launches==1);
+    request.codeOffset=0;request.buffers[0]=99;
+    assert(dispatch()==kIOReturnBadArgument && amdgpu::launches==1);
+    request.buffers[0]=3;request.codeBytes=UINT64_MAX-3;
+    assert(dispatch()==kIOReturnBadArgument && amdgpu::launches==1);
+    request.codeBytes=64;request.codeHandle=2;entries[1].domain=2;
+    assert(dispatch()==kIOReturnBadArgument && amdgpu::launches==1);
+    entries[1].domain=1;request.codeHandle=3;request.codeOffset=(22ull<<30)-256;
+    assert(dispatch()==0 && amdgpu::launchCode==entries[2].gpu_va+request.codeOffset);
+    amdgpu::launchStatus=kIOReturnTimeout;amdgpu::retainLaunch=true;
+    assert(dispatch()==0 && dispatchOut[0]==kIOReturnTimeout && state.shutdownBlocked);
 }

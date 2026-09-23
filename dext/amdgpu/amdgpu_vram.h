@@ -1,5 +1,5 @@
 //
-//  amdgpu_vram.h — Allocator for the visible VRAM aperture (BAR0-LOW).
+//  amdgpu_vram.h — Allocator for visible and GPU-only VRAM pools.
 //
 //  v0.1.27 upgrade: from "top-down bump, no free" to a first-fit
 //  free-list allocator that actually supports free()/coalesce. Used
@@ -10,10 +10,12 @@
 //
 //  Apple Silicon + TB5 specifics still apply:
 //    - On our R9700 setup BAR0 (framebuffer aperture) maps the LOW
-//      256 MB of VRAM; allocations from this allocator are guaranteed
-//      to live inside that BAR0-mapped window (the allocator is pinned
+//      256 MB of VRAM; GMCContext::vram_alloc serves only that window,
+//      with its range pinned
 //      to [vram_start + 24 MB, vram_start + visible_vram_size) by
 //      gmc_vram_alloc_init).
+//    - GMCContext::device_vram_alloc uses the same allocator class for
+//      the GPU-only range above BAR0. Its allocations are not CPU mapped.
 //    - PSP-reserved hardcoded slots (fwPri / ring / cmd / fence / TMR /
 //      fwBuf) occupy [0..24 MB] of VRAM and are NOT served by this
 //      allocator — they're managed at fixed offsets by psp_v14_0.cpp.
@@ -92,6 +94,17 @@ public:
     uint64_t bytes_used() const { return m_bytes_used; }
     uint64_t bytes_free() const { return m_size - m_bytes_used; }
     uint32_t alloc_count() const { return m_alloc_count; }
+
+    // Raw contiguous span, not a guarantee that an allocation with a requested
+    // alignment fits. Read on the same serialized queue as alloc/free.
+    uint64_t largest_free_span() const {
+        if (!m_inited) return 0;
+        uint64_t largest = 0;
+        for (uint16_t cur = m_head; cur != kInvalid; cur = m_pool[cur].next) {
+            if (m_pool[cur].length > largest) largest = m_pool[cur].length;
+        }
+        return largest;
+    }
 
     // Allocate. alignment must be a power of two (we coerce up to
     // amdgpu::kASPageSize = 16 KB to keep DART happy on any future

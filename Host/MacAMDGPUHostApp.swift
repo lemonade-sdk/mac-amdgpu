@@ -71,6 +71,7 @@ private let kSelMetricsSnapshot:     UInt32 = 47
 private let kSelBOCopy:              UInt32 = 48
 private let kSelBOWrite:             UInt32 = 49
 private let kSelBORead:              UInt32 = 50
+private let kSelComputeDispatch:     UInt32 = 51
 private let kSelDisableSmuFeatures:  UInt32 = 33
 // v0.1.25 — VRAM->VRAM SDMA copy smoke test.
 private let kSelSDMACopyVRAM:        UInt32 = 34
@@ -370,6 +371,7 @@ struct ContentView: View {
                     Button("Host Memory Copy") { controller.testHostMemoryTransfer() }
                         .help("Verify 16 KB in each direction between host memory and VRAM through GART, then unbind the DMA mapping.")
                     Button("Compute Smoke") { controller.testCompute() }
+                    Button("Dispatch Test") { controller.testNativeDispatch() }
                         .help("Run a 32-thread shader that reads, adds and writes values; verify every result and surrounding guard words.")
                     Button("Sample Metrics") { controller.sampleMetrics() }
                         .help("Request one firmware telemetry snapshot for amdgpu_mtop. Requires an initialized GPU; stale samples are marked unavailable.")
@@ -1823,6 +1825,99 @@ final class DriverController: NSObject, ObservableObject,
         } else {
             append("Sample Metrics: unavailable; a failed firmware transfer requires Stop GPU before collection can resume")
         }
+    }
+
+    func testNativeDispatch() {
+        guard openUserClient() else { return }
+        // Assembled from tests/shaders/dispatch_gfx1201.s; verified by the test script.
+        let dispatchCode: [UInt32] = [0xf4004100, 0xf8000000, 0xbfc70000, 0x84038502, 0x4a020003, 0x30020282, 0xee050004, 0x00000002, 0x00000001, 0xbfc00000, 0x4a040406, 0xee068004, 0x01000000, 0x00040001, 0xbfc10000, 0xbfb00000]
+        var handles: [UInt64] = [], addresses: [UInt64] = []
+        var canFree = true
+        defer {
+            if canFree {
+                for handle in handles.reversed() {
+                    let (kr, _) = callScalar(kSelBOFree, input: [handle], outCount: 0)
+                    if kr != KERN_SUCCESS { append(String(format: "Dispatch: free failed kr=%#x", kr)) }
+                }
+            } else { append("Dispatch: storage retained — Stop GPU before retry") }
+        }
+        for _ in 0..<2 {
+            let (kr, out) = callScalar(kSelBOAlloc, input: [16384, 1, 16384, 0], outCount: 3)
+            guard kr == KERN_SUCCESS, out.count == 3 else {
+                append(String(format: "Dispatch: allocation failed kr=%#x", kr)); return
+            }
+            handles.append(out[0]); addresses.append(out[1])
+        }
+        func upload(_ handle: UInt64, _ offset: UInt64, _ words: [UInt32]) -> kern_return_t {
+            let inputs = [handle, offset, UInt64(words.count * 4)]
+            return inputs.withUnsafeBufferPointer { scalars in
+                words.withUnsafeBytes { bytes in
+                    IOConnectCallMethod(ucConn, kSelBOWrite, scalars.baseAddress, 3,
+                                        bytes.baseAddress, bytes.count, nil, nil, nil, nil)
+                }
+            }
+        }
+        guard upload(handles[0], 0, dispatchCode) == KERN_SUCCESS else {
+            append("Dispatch: code upload failed"); return
+        }
+        var previousFence: UInt64 = 0
+        for groups: UInt32 in [4, 8] {
+            let seed = UInt32(truncatingIfNeeded: DispatchTime.now().uptimeNanoseconds)
+            let count = Int(groups) * 32
+            var expected = (0..<1024).map { UInt32($0) &* 0x01010101 ^ 0xd39c8a71 }
+            for i in 0..<count { expected[i] = UInt32(i) &* 0x9e3779b9 ^ seed }
+            var initial = expected
+            for i in 0..<count {
+                expected[256 + i] = expected[i] &+ seed
+                initial[256 + i] = ~expected[256 + i]
+            }
+            let args: [UInt32] = [UInt32(truncatingIfNeeded: addresses[1]),
+                                 UInt32(addresses[1] >> 32), seed, 0]
+            guard upload(handles[0], 4096, args) == KERN_SUCCESS,
+                  upload(handles[1], 0, initial) == KERN_SUCCESS else {
+                append("Dispatch: argument/data upload failed"); return
+            }
+            var request = Data()
+            func u32(_ value: UInt32) { var le = value.littleEndian; withUnsafeBytes(of: &le) { request.append(contentsOf: $0) } }
+            func u64(_ value: UInt64) { var le = value.littleEndian; withUnsafeBytes(of: &le) { request.append(contentsOf: $0) } }
+            u32(1); u32(0); u64(handles[0]); u64(0); u64(UInt64(dispatchCode.count * 4))
+            u32(groups); u32(1); u32(1); u32(32); u32(1); u32(1)
+            u32(0xc0000); u32((2 << 1) | (1 << 7)); u32(2); u32(100000)
+            let kernarg = addresses[0] + 4096
+            u32(UInt32(truncatingIfNeeded: kernarg)); u32(UInt32(kernarg >> 32))
+            for _ in 2..<16 { u32(0) }
+            u64(handles[0]); u64(handles[1]); for _ in 2..<16 { u64(0) }
+            guard request.count == 264 else { append("Dispatch: invalid request layout"); return }
+            var output = [UInt64](repeating: 0, count: 3), outputCount: UInt32 = 3
+            canFree = false
+            let kr = request.withUnsafeBytes { bytes in
+                IOConnectCallMethod(ucConn, kSelComputeDispatch, nil, 0, bytes.baseAddress,
+                                    bytes.count, &output, &outputCount, nil, nil)
+            }
+            guard kr == KERN_SUCCESS, outputCount == 3, output[0] == 0,
+                  output[2] == 3, output[1] > previousFence else {
+                append(String(format: "Dispatch: failed kr=%#x status=%#llx stage=%llu fence=%llu",
+                              kr, output[0], output[2], output[1])); return
+            }
+            previousFence = output[1]
+            var observed = [UInt32](repeating: 0, count: 1024), bytesOut = 4096
+            let inputs = [handles[1], UInt64(0), UInt64(4096)]
+            let readKR = inputs.withUnsafeBufferPointer { scalars in
+                observed.withUnsafeMutableBytes { bytes in
+                    IOConnectCallMethod(ucConn, kSelBORead, scalars.baseAddress, 3,
+                                        nil, 0, nil, nil, bytes.baseAddress, &bytesOut)
+                }
+            }
+            guard readKR == KERN_SUCCESS, bytesOut == 4096, observed == expected else {
+                let mismatches = zip(observed, expected).filter { $0 != $1 }.count
+                append(String(format: "Dispatch: readback failed kr=%#x mismatches=%llu", readKR, UInt64(mismatches)))
+                return
+            }
+            canFree = true
+            append(String(format: "Dispatch: %u groups, %u results + inputs/guards verified, fence=%llu seed=%#x",
+                          groups, groups * 32, output[1], seed))
+        }
+        append("Dispatch: both caller-uploaded launches passed; releasing code, kernargs and data")
     }
 
     func testCompute() {

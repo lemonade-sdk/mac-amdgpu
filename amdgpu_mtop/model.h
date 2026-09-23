@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include "../dext/amdgpu/amdgpu_metrics_state.h"
+#include "../dext/amdgpu/amdgpu_vram_accounting.h"
 
 namespace mtop {
 struct Device {
@@ -14,7 +15,16 @@ struct Device {
     bool telemetrySupported = false;
     std::string telemetryError;
     amdgpu::SMUMetricsSnapshot metrics{};
+    bool accountingSupported = false;
+    std::string accountingError;
+    amdgpu::vram_accounting::Snapshot accounting{};
 };
+
+inline bool hasAccounting(const Device &d) {
+    return d.error.empty() && d.accountingSupported && d.accountingError.empty() &&
+        amdgpu::vram_accounting::valid(d.accounting) &&
+        (d.accounting.values[amdgpu::vram_accounting::Flags] & amdgpu::vram_accounting::kValid);
+}
 
 inline bool validSnapshot(const amdgpu::SMUMetricsSnapshot &s) {
     constexpr uint32_t flags = amdgpu::kSMUMetricsValid | amdgpu::kSMUMetricsFaulted |

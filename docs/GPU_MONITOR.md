@@ -33,7 +33,7 @@ statistics on this card remain unavailable until that layout is established.
 | Board power | Implemented; hardware validation pending | SMU AverageTotalBoardPower; confirm board reporting on hardware |
 | Edge/hotspot/memory temperature | Implemented; hardware validation pending | SMU AvgTemperature, degrees Celsius |
 | Fan speed | Implemented; hardware validation pending | SMU AvgFanRpm and AvgFanPwm |
-| VRAM allocated / free | Unavailable; not a firmware load percentage | Driver allocation accounting, with reserved storage separately identified |
+| VRAM allocator used / free / largest span | Build 178 CPU-side observer accounting for visible and GPU-only pools | Both GMC allocators; fixed reservations/gaps separate |
 | GTT allocated / free | Unavailable | Shared GART allocator accounting; aperture reservation differs from resident host memory |
 | Per-process memory and engine use | Unavailable | Per-client BO/queue ownership and scheduler accounting |
 | PCIe throughput, per-engine busy and ECC | Unavailable | Separate counters/interfaces, not inferred from this table |
@@ -43,6 +43,65 @@ allocated and not a measured bandwidth in GB/s. Similarly, a current GRBM busy b
 is not a time-averaged GPU utilization percentage. The monitor keeps those
 concepts separate. Total VRAM in QueryInfo is the driver's usable capacity after
 firmware reservation and may be less than the board's marketed capacity.
+
+## VRAM accounting (build 178)
+
+QueryInfo selector **21**, tag **5**, returns 15 scalars. This is a CPU-only
+snapshot on the existing serialized driver queue. It does not open PCI, read
+VRAM, submit firmware messages or claim ownership. The standalone monitor only
+requests this tag on build 178 or newer. Its availability is independent of the
+SMU firmware-interface gate.
+
+| Scalar | Meaning |
+| --- | --- |
+| 0 | ABI version, 1 |
+| 1 | Flags; bit 0 means the complete accounting snapshot is valid |
+| 2, 3 | Firmware-reported usable capacity, CPU-visible aperture, bytes |
+| 4 | Usable bytes outside both allocator pools |
+| 5–9 | Visible pool capacity, used, free, largest free span (bytes), allocation count |
+| 10–14 | GPU-only pool capacity, used, free, largest free span (bytes), allocation count |
+
+`amdgpu_vram_accounting.h` validates each pool's bounds and rejects overlap,
+overflow and inconsistent accounting. `snapshot(ready, base, usable, visible,
+lowAllocator, highAllocator)` returns version 1 and otherwise zero when not
+ready. Integration supplies readiness only while GMC and full bringup are
+initialized, PCI is open, and shutdown/stopping/blocking flags are clear. It
+copies all 15 scalars and sets the returned scalar count explicitly. The
+caller must invoke the helper on the same queue as allocator mutations.
+
+Used bytes are the allocator's charged sizes, including alignment rounding.
+They include client BOs and driver allocations such as rings, writeback storage,
+MQDs and smoke-test storage in that pool. Retained failed-work storage remains
+charged until actually freed or the allocator is reset. A failed free due to
+free-list metadata exhaustion also remains charged. These are allocation
+accounts, not a measure of GPU accesses, resident host memory, bandwidth or
+total hardware occupancy. Per-client attribution is not part of this ABI.
+
+On the current small BAR layout, the low 24 MiB fixed bootstrap arena is outside
+the visible allocator, and the high pool leaves its final MiB reserved. Any
+alignment gaps are also excluded. The low arena covers the driver's fixed PSP
+firmware/ring/command/fence/TMR and GMC storage; the retained SMU table resides
+inside that firmware arena and is not counted twice. These exclusions describe
+reserved address ranges, not how much firmware actually uses. Firmware's own
+top reservation already excluded from GMC usable capacity has unknown size
+relative to installed physical VRAM and is not guessed. The snapshot computes
+actual excluded bytes from the pool layout rather than assuming 25 MiB for
+every BAR configuration.
+
+Largest free span reports the raw contiguous range. It is not an allocation
+guarantee: requested alignment, rounded size and available free-list metadata
+can still limit an allocation. An absent GPU-only pool with a full BAR is a
+valid zero-sized pool. Valid zero usage displays zero; stopped, unavailable,
+malformed or unsupported accounting displays unavailable/null. Capacity and
+each pool's used/free values are published together in `vram_accounting` JSON;
+the old `vram_used_bytes` stays null because it represented unmeasured total
+occupancy. UMC activity is unchanged and remains separately gated telemetry.
+
+`scripts/test-vram-accounting.sh` checks rounding, >4 GiB allocations, fragmented
+free ranges, coalescing, duplicate frees, metadata-exhausted frees, full-BAR
+layouts, invalid bounds and stopped-state suppression under ASan/UBSan. The
+monitor's synthetic renderer test checks real zero versus null and does not
+connect to hardware.
 
 ## Firmware decoder
 

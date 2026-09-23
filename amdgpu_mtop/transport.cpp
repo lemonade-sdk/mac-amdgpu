@@ -50,6 +50,17 @@ void read(io_service_t service, Device &d) {
     for (unsigned i = 0; i < 3; ++i) d.gfx[i] = uint32_t(gfx[i]);
     d.visible = vram[0];
     d.total = vram[1];
+    if (d.build >= 178) {
+        tag = 5;
+        uint32_t count = amdgpu::vram_accounting::Count;
+        kr = IOConnectCallScalarMethod(connection.value, 21, &tag, 1,
+                                       d.accounting.values, &count);
+        if (kr != KERN_SUCCESS) d.accountingError = failure("VRAM accounting", kr);
+        else if (count != amdgpu::vram_accounting::Count ||
+                 !amdgpu::vram_accounting::valid(d.accounting))
+            d.accountingError = "Invalid VRAM accounting ABI";
+        else d.accountingSupported = true;
+    }
     if (d.build >= 176) {
         size_t bytes = sizeof(d.metrics);
         kr = IOConnectCallStructMethod(connection.value, 47, nullptr, 0, &d.metrics, &bytes);

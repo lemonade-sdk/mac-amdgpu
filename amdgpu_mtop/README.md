@@ -18,6 +18,14 @@ layout verification. The monitor names this compatibility mismatch explicitly
 and includes both interface versions in JSON; it does not treat it as proof of
 a firmware crash.
 
+Build 178 adds live CPU-side VRAM accounting independently of the SMU metrics
+layout. The memory panel separates CPU-visible and GPU-only allocator capacity,
+used bytes, free bytes and largest contiguous free span. Used bytes include
+rounded allocations for client buffers and driver resources, including retained
+allocations after unsuccessful work. “Outside pools” identifies fixed
+reservations and gaps excluded from both allocators; it is not a measurement of
+firmware memory consumption. UMC activity remains a separate load statistic.
+
 ```sh
 cmake -S amdgpu_mtop -B build/amdgpu_mtop -DCMAKE_BUILD_TYPE=Release
 cmake --build build/amdgpu_mtop --parallel 4
@@ -44,6 +52,11 @@ Non-terminal output and `--json` default to a single snapshot. `--watch` emits
 one snapshot per second. JSON uses `null` for unsupported statistics, byte units
 for capacities, and explicit unit suffixes for dynamic statistics.
 Zero-sized capacities before initialization are also shown as unavailable.
+The `vram_accounting` JSON object contains the corresponding named byte/count
+fields and status. A valid empty pool reports zero; unavailable accounting
+reports null. The legacy `vram_used_bytes` remains null because total hardware
+occupancy, including firmware-private storage, is not measured. Accounting is
+hidden while stopped or after failed shutdown, even if allocations are retained.
 
 The tool requires driver build 172 or newer and permission to open its user
 client. It only invokes observer selectors 43 (runtime build), 21 (cached
@@ -58,6 +71,7 @@ Offline checks:
 ```sh
 bash scripts/test-amdgpu-mtop.sh
 bash scripts/test-metrics.sh
+bash scripts/test-vram-accounting.sh
 ```
 
 The decoder test also requires this repository's local `upstream/linux` reference

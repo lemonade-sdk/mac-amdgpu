@@ -1542,3 +1542,51 @@ then succeeded at 06:40:20 UTC: FLR, PCI close and all session resources release
 Version 177 host and extension passed independent strict signature validation.
 The signed candidate opened at 06:41:15 UTC with bundled177/installed176;
 installation and hardware validation remain pending.
+
+
+## v0.1.77 hardware buffer acceptance
+
+Responding build 177 verified at 06:42:40 UTC on September 23. Initialization
+completed at 06:42:49. Large VRAM Test at 06:42:58 allocated two visible staging
+BOs at 0x8001878000 and 0x800187c000, and one 23622320128-byte (22 GiB)
+GPU-only BO at 0x8010000000. Verified 4096-byte upload/copy/download round-trips
+at device-BO offsets 0, 0x40000000 and 0x57ffff000, then released all three BOs.
+The last region's GPU address is 0x858ffff000, well above BAR0's visible range.
+Only those sampled regions were touched; the full allocation was not filled.
+
+Compute Smoke afterward at 06:43:27 passed all 32 results, inputs and guards,
+seed 0x368ac04f, fence 3, data address 0x8001879000. The shader reused the
+released visible staging range successfully. The session remains initialized.
+Driver log: /tmp/mac-amdgpu-177-hardware.log.
+
+These results establish owned-buffer staging, SDMA access beyond BAR0 and
+continued fixed shader execution. They do not establish general kernel
+dispatch, HSA signals/AQL queues, code-object loading or HRX/LSE inference.
+
+
+## Build 178: native dispatch and live allocation accounting
+
+Added owner-only selector 51 with versioned code-BO/range validation,
+workgroup dimensions, user SGPRs and bounded fence waits. General launches
+reuse the verified VMID0 GFX indirect-buffer path. Failed staged submissions
+retain their IB and all owner storage until reset. Added a host dispatch test
+with independently assembled code and explicit kernargs, plus packet, RPC and
+allocation-lifetime regressions. All 27 suites and the signed Debug build pass.
+
+Build 178 was installed and runtime-verified at 2026-09-23 07:00:12 UTC.
+Initialization completed at 07:00:48. The first four-workgroup dispatch at
+07:01:08 completed fence 1 (1136 microseconds polling interval reported), but
+readback had 128 mismatched words. This is not a successful data test. Two
+16 KiB BOs were retained by the host for recovery; the completed IB was freed.
+Compiling the equivalent OpenCL kernel with LLVM 21.1.8 showed gfx1201 uses
+ttmp9 for workgroup X, while the handwritten shader incorrectly read s2.
+The compiler also emits instruction-delay handling missing from that shader.
+The follow-up replaces the test sequence with compiler-verified instructions.
+
+amdgpu_mtop's new observer QueryInfo tag 5 successfully reported real allocator
+accounting: usable VRAM 34,208,743,424 bytes; visible pool capacity 243,269,632;
+GPU-only pool 33,939,259,392; excluded fixed reservations/gaps 26,214,400.
+Visible usage rose from 491,520 bytes / 24 allocations after initialization to
+524,288 bytes / 26 allocations after the retained test buffers. GPU-only usage
+remained zero. Firmware interface 0x33 remains unsupported by the 0x2e metrics
+decoder; no utilization, frequency, power or fan values are fabricated.

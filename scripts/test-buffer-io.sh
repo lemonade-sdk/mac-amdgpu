@@ -5,7 +5,7 @@ mkdir -p build/tests
 python3 - <<'EXTRACT'
 from pathlib import Path
 s=Path('dext/MacAMDGPU.cpp').read_text()
-a=s.index('    case kMacAMDGPUMethodBOCopy:')
+a=s.index('    case kMacAMDGPUMethodComputeDispatch:')
 b=s.index('    case kMacAMDGPUMethodBOAlloc:',a)
 Path('build/tests/buffer_rpc_under_test.inc').write_text(s[a:b])
 EXTRACT

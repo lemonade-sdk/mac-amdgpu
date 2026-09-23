@@ -42,6 +42,7 @@
 #include "amdgpu/amdgpu_pci_rebar.h"
 #include "amdgpu/amdgpu_client_lifecycle.h"
 #include "amdgpu/amdgpu_buffer_io.h"
+#include "amdgpu/amdgpu_vram_accounting.h"
 #include "amdgpu/amdgpu_vram_io.h"
 
 #define MACAMDGPU_LOG(fmt, ...) \
@@ -112,6 +113,7 @@ enum {
     kMacAMDGPUMethodBOCopy             = 48, // bounded synchronous SDMA, owned BOs
     kMacAMDGPUMethodBOWrite            = 49, // verified BAR0 staging upload
     kMacAMDGPUMethodBORead             = 50, // BAR0 staging readback
+    kMacAMDGPUMethodComputeDispatch    = 51, // owned code BO + launch parameters
 };
 
 // v0.1.28 — IP types accepted by CSCreate. Match the upstream
@@ -3200,6 +3202,43 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         return r;
     }
 
+    case kMacAMDGPUMethodComputeDispatch: {
+        if (arguments->scalarInputCount || !arguments->scalarOutput ||
+            arguments->scalarOutputCount < 3 || !arguments->structureInput ||
+            arguments->structureInput->getLength() != sizeof(amdgpu::ComputeDispatchRequest) ||
+            arguments->structureInputDescriptor || arguments->structureOutputDescriptor ||
+            arguments->structureOutputMaximumSize) return kIOReturnBadArgument;
+        amdgpu::ComputeDispatchRequest request{};
+        memcpy(&request, arguments->structureInput->getBytesNoCopy(), sizeof(request));
+        if (!amdgpu::compute_dispatch_shape(request)) return kIOReturnBadArgument;
+        auto *code = mac_amdgpu_bo_lookup(ivars, request.codeHandle);
+        uint64_t codeVA = 0;
+        if (!code || !amdgpu::buffer_vram_domain(code->domain) ||
+            !amdgpu::buffer_gpu_range(code->gpu_va, code->size, request.codeOffset,
+                                      request.codeBytes, codeVA) || (codeVA & 255))
+            return kIOReturnBadArgument;
+        for (const auto handle : request.buffers) {
+            if (!handle) continue;
+            auto *buffer = mac_amdgpu_bo_lookup(ivars, handle);
+            if (!buffer || !amdgpu::buffer_vram_domain(buffer->domain)) return kIOReturnBadArgument;
+        }
+        auto &b = driver->ivars->bringup;
+        if (b.reached != amdgpu::BringupStage::SDMAInit) return kIOReturnNotReady;
+        amdgpu::ComputeLaunchResult result{};
+        const auto status = amdgpu::compute_launch(b.device, b.gmc, b.cp, b.gfx,
+            b.computeLaunch, codeVA, request, result);
+        if (b.computeLaunch.retained) driver->ivars->shutdownBlocked = true;
+        arguments->scalarOutput[0] = static_cast<uint32_t>(status);
+        arguments->scalarOutput[1] = result.fence;
+        arguments->scalarOutput[2] = result.stage;
+        arguments->scalarOutputCount = 3;
+        MACAMDGPU_LOG("compute dispatch: status=%#x stage=%u fence=%u code=%#llx groups=%u,%u,%u threads=%u,%u,%u retained=%d",
+            status, result.stage, result.fence, codeVA,
+            request.groups[0], request.groups[1], request.groups[2],
+            request.threads[0], request.threads[1], request.threads[2], b.computeLaunch.retained);
+        return kIOReturnSuccess;
+    }
+
     case kMacAMDGPUMethodBOCopy: {
         // [src handle, src offset, dst handle, dst offset, bytes]. The owning
         // connection and shared submission gate serialize copies with frees.
@@ -3752,6 +3791,19 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             arguments->scalarOutput[1] = pack(amdgpu::kIP_SDMA);
             arguments->scalarOutput[2] = pack(amdgpu::kIP_PSP);
             arguments->scalarOutput[3] = pack(amdgpu::kIP_SMU);
+            return kIOReturnSuccess;
+        }
+        case 5: { // CPU-side allocator accounting; safe for observer clients.
+            using namespace amdgpu::vram_accounting;
+            if (arguments->scalarOutputCount < Count) return kIOReturnBadArgument;
+            const auto &state = *driver->ivars;
+            const bool ready = state.pciOpen && !state.stopping &&
+                !state.shutdownInProgress && !state.shutdownBlocked &&
+                b.reached == amdgpu::BringupStage::SDMAInit;
+            const auto accounting = snapshot(ready, b.gmc.vram_start, b.gmc.real_vram_size,
+                b.gmc.visible_vram_size, b.gmc.vram_alloc, b.gmc.device_vram_alloc);
+            for (unsigned i = 0; i < Count; ++i) arguments->scalarOutput[i] = accounting.values[i];
+            arguments->scalarOutputCount = Count;
             return kIOReturnSuccess;
         }
         case kMacAMDGPUInfoBringupReached:

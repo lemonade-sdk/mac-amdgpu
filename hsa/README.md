@@ -128,4 +128,37 @@ larger device buffers, write a visible staging BO and copy its contents to a
 subrange of the device BO; reverse the sequence to download. Keep staging alive
 until completion. A published transfer failure retains allocations and blocks
 normal mutation until Stop/reset. Calls are serialized and synchronous; this is
-not yet an asynchronous HSA copy implementation. Hardware acceptance is pending.
+not yet an asynchronous HSA copy implementation. Build 177 passed 4 KiB
+round-trips at offsets 0, 1 GiB and 22 GiB minus 4 KiB in one 22 GiB allocation,
+followed by successful buffer release and the fixed compute test. This does
+not verify every byte, arbitrary copy lengths, throughput or HSA semantics.
+
+
+## Native compute dispatch (build 178)
+
+Selector 51 accepts the 264-byte version-1 `ComputeDispatchRequest` in
+`dext/amdgpu/amdgpu_dispatch_abi.h`, no input scalars, and three output scalars:
+operation status, completed GPU fence, and stage (0 preflight, 1 upload,
+2 submit/wait, 3 complete). A transport success does not imply GPU success.
+The code handle/range and every nonzero referenced buffer handle must belong
+to the owning connection and use a VRAM domain. Code entries are 256-byte
+aligned. The request supplies group counts, local dimensions (at most 1024
+threads total), resource registers and up to 16 user SGPRs. Timeout is 1 through
+1,000,000 microseconds. Unused SGPR words and reserved flags must be zero.
+
+This initial transport supports gfx1201 wave32/CU-mode launches, workgroup IDs
+and up to 64 KiB LDS. Scratch, dynamic VGPR allocation, traps, wave64 and
+privileged modes are rejected. The caller must supply correct machine code,
+register allocation and argument layout. VMID0 and caller-supplied instructions
+make this a trusted single-owner interface, not GPU process isolation. Buffer
+handles validate declared resources; they do not constrain addresses embedded
+in instructions or arguments.
+
+Calls execute on the serial lifecycle queue and return only after completion
+or bounded failure. All owner BOs remain alive during the call. A failed
+staged/published submission retains the command IB and blocks mutation until
+Stop/reset, including failures that precede the doorbell. Successful calls free
+the IB. The HSA runtime does not yet call this selector or advertise dispatch.
+The host Dispatch Test uploads a separate kernarg-loading shader and checks
+four/eight workgroups, changing arguments and all data/guard words. Hardware
+acceptance of this new path remains pending.

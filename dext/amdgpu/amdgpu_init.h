@@ -51,6 +51,7 @@
 #include "amdgpu_gart.h"
 #include "amdgpu_memory_test.h"
 #include "amdgpu_compute_test.h"
+#include "amdgpu_dispatch.h"
 #include "amdgpu_discovery.h"
 #include "amdgpu_imu.h"
 #include "amdgpu_gfx.h"
@@ -99,6 +100,7 @@ struct BringupContext {
     GARTContext   gart;        // GART page-table state + bindings (DMA fix)
     MemoryTransferTest memoryTest;
     ComputeTest computeTest; // VRAM arena retains failed dispatch storage until reset.
+    ComputeLaunch computeLaunch; // General launch IB retained until completion/reset.
     IMUContext    imu;         // IMU microcode-loaded gate
     GFXConfig     gfx;         // gfx_constants_init harvest + caps
     DoorbellState doorbell;    // BAR2 doorbell index map + state

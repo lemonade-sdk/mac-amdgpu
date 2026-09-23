@@ -1,12 +1,23 @@
 # Status
 
+**v0.1.78 — native compute dispatch and allocation monitoring (dispatch data fix pending).**
+The owning client can upload kernel code, kernargs and data into BOs, then
+submit variable workgroups with a GPU completion fence. The new Dispatch Test
+checks 128 and 256 outputs plus inputs/guards through this API. The first
+hardware launch completed its fence but failed 128 output words; the shader
+used an incorrect gfx1201 workgroup-ID register. Failed queued
+work retains storage until reset. Scratch, wave64, AQL queues and executable
+loading remain unfinished. `amdgpu_mtop` now reports visible and GPU-only
+allocator usage, free space and fragmentation separately from firmware load.
+
 **v0.1.77 — GPU-only buffers and bounded transfers.**
 A separate allocator covers usable VRAM above BAR0, keeping firmware and visible
 staging storage separate. Owner-only buffer upload/readback and SDMA copy APIs
 validate handles, ranges and transfer limits. Large VRAM Test reserves 22 GiB
 and checks 4 KiB transfers at three offsets, including its end; it does not
 validate every byte. All 25 regression suites and the Debug build pass.
-Hardware acceptance of these new APIs is pending.
+Verified build 177 initialized and passed all three sampled regions in the
+22 GiB allocation, released its buffers, then passed Compute Smoke again.
 
 **v0.1.76 — compute shader execution verified.**
 Two consecutive runs passed all 32 shader results, input words and guards,
@@ -15,12 +26,6 @@ VMID 0 in Linux-style GFX indirect-buffer submission fixed the observed shader
 instruction-fetch fault. Firmware telemetry is unavailable: the board reports
 interface 0x33, while the verified decoder covers 0x2e. No telemetry transfer
 is issued for an unverified interface.
-
-**v0.1.75 — compute fault isolated to shader instruction fetch.**
-Cache preparation and register-programming fences passed. Shader completion
-timed out with a GFXHUB VMID-3 fault at the shader code address, while the queue
-itself used VMID 0. Output was not checked. Stop GPU recovered through function
-reset and session release without an enclosure power cycle.
 
 The native [amdgpu_mtop monitor](amdgpu_mtop/README.md) enumerates attached
 MacAMDGPU devices with GPU switching and JSON output. Live discovery and VRAM
