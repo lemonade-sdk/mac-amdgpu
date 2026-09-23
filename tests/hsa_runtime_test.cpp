@@ -55,12 +55,35 @@ int main() {
     discoveryStatus = HSA_STATUS_SUCCESS;
     assert(hsa_init() == HSA_STATUS_SUCCESS);
     assert(hsa_init() == HSA_STATUS_SUCCESS && discovered == 2);
+    // HRX queries all five platform capabilities even when they are disabled.
+    // Unsupported capability is a successful false query, not an invalid enum;
+    // none of these booleans may overwrite the adjacent caller storage.
+    const hsa_system_info_t capabilities[]={HSA_AMD_SYSTEM_INFO_SVM_SUPPORTED,
+        HSA_AMD_SYSTEM_INFO_SVM_ACCESSIBLE_BY_DEFAULT,HSA_AMD_SYSTEM_INFO_XNACK_ENABLED,
+        HSA_AMD_SYSTEM_INFO_DMABUF_SUPPORTED,HSA_AMD_SYSTEM_INFO_VIRTUAL_MEM_API_SUPPORTED};
+    for (const auto attribute:capabilities) {
+        struct {unsigned char before;bool supported;unsigned char after;} value{0xa5,true,0x5a};
+        assert(hsa_system_get_info(attribute,&value.supported)==HSA_STATUS_SUCCESS && !value.supported);
+        assert(value.before==0xa5 && value.after==0x5a);
+        assert(hsa_system_get_info(attribute,nullptr)==HSA_STATUS_ERROR_INVALID_ARGUMENT);
+    }
     assert(hsa_iterate_agents(nullptr, nullptr) == HSA_STATUS_ERROR_INVALID_ARGUMENT);
     assert(hsa_iterate_agents(collect, nullptr) == HSA_STATUS_SUCCESS && observed.size() == 2);
     const auto cpu = observed[0], gpu = observed[1];
     uint32_t property=99;
     assert(hsa_agent_get_info(cpu,HSA_AGENT_INFO_NODE,&property)==0 && property==0);
     assert(hsa_agent_get_info(gpu,HSA_AGENT_INFO_NODE,&property)==0 && property==1);
+    // HRX enumerates product names before constructing its physical devices.
+    // Honor the exact 64-byte ABI, including zero-fill and caller guards, and
+    // use discovered ASIC identity when a board marketing name is unavailable.
+    char productName[65];std::memset(productName,'!',sizeof(productName));
+    assert(hsa_agent_get_info(gpu,hsa_agent_info_t(HSA_AMD_AGENT_INFO_PRODUCT_NAME),productName)==0);
+    assert(!std::strcmp(productName,"gfx1201") && productName[64]=='!');
+    for (size_t i=7;i<64;++i) assert(productName[i]==0);
+    std::memset(productName,'!',sizeof(productName));
+    assert(hsa_agent_get_info(cpu,hsa_agent_info_t(HSA_AMD_AGENT_INFO_PRODUCT_NAME),productName)==0);
+    assert(!std::strcmp(productName,"Mac host CPU") && productName[63]==0 && productName[64]=='!');
+    assert(hsa_agent_get_info(gpu,hsa_agent_info_t(HSA_AMD_AGENT_INFO_PRODUCT_NAME),nullptr)==HSA_STATUS_ERROR_INVALID_ARGUMENT);
     hsa_agent_t nearest{};
     assert(hsa_agent_get_info(gpu,hsa_agent_info_t(HSA_AMD_AGENT_INFO_NEAREST_CPU),&nearest)==0 && nearest.handle==cpu.handle);
     char uuid[21];std::memset(uuid,'!',sizeof(uuid));
@@ -116,6 +139,9 @@ int main() {
     // Live transport failures propagate instead of returning cached success.
     readStatus = HSA_STATUS_ERROR_INVALID_AGENT;
     assert(hsa_agent_get_info(gpu, HSA_AGENT_INFO_NAME, name) == readStatus);
+    std::memset(productName,'!',sizeof(productName));
+    assert(hsa_agent_get_info(gpu,hsa_agent_info_t(HSA_AMD_AGENT_INFO_PRODUCT_NAME),productName)==readStatus);
+    for (char byte:productName) assert(byte=='!');
     assert(mac_hsa_agent_get_driver_info(gpu, &info, sizeof(info)) == readStatus);
     readStatus = HSA_STATUS_SUCCESS;
     hsa_queue_t *queue = reinterpret_cast<hsa_queue_t *>(1);
@@ -150,6 +176,10 @@ int main() {
     assert(discovered == 2 && closed == 1);
     assert(hsa_shut_down() == HSA_STATUS_SUCCESS && closed == 1);
     assert(hsa_shut_down() == HSA_STATUS_SUCCESS && closed == 2);
+    for (const auto attribute:capabilities) {
+        bool value=true;
+        assert(hsa_system_get_info(attribute,&value)==HSA_STATUS_ERROR_NOT_INITIALIZED && value);
+    }
     assert(hsa_init() == HSA_STATUS_SUCCESS);
     assert(hsa_agent_get_info(gpu, HSA_AGENT_INFO_NAME, name) == HSA_STATUS_ERROR_INVALID_AGENT);
     assert(hsa_isa_get_info_alt(isa, HSA_ISA_INFO_NAME, name) == HSA_STATUS_ERROR_INVALID_ISA);

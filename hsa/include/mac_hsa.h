@@ -55,6 +55,24 @@ hsa_status_t mac_hsa_executable_dispatch_aql(hsa_executable_symbol_t symbol,
 __attribute__((visibility("default")))
 hsa_status_t mac_hsa_memory_allocate_shared(hsa_agent_t agent, size_t size, void **out);
 
+// Driver190+: read-only snapshot for the aligned 64-bit word at shared_pointer
+// and an owned live hardware queue on the same GPU. This does not submit work,
+// initialize the device or change mappings/PCIe/MQD policy. Caller keeps the
+// queue idle while sampling; MQD backing is NOT a live selected HQD register.
+// valid_fields bits: 1=PTE, 2=MQD backing, 4=PCIe endpoint, 8=GFXHUB context.
+// CPU map options are the requested policy; actual CPU cache/MAIR attributes
+// have no public query and remain UINT64_MAX. Output is unchanged on failure.
+typedef struct mac_hsa_shared_atomic_diagnostics_s {
+    uint64_t version, valid_fields, gpu_address, dma_address, pte_vram_offset;
+    uint64_t pte_actual, pte_expected, mqd_gpu_address, mqd_backing_hq_status0;
+    uint64_t pcie_capability_offset, pcie_device_capabilities2, pcie_device_control2;
+    uint64_t gfxhub_page_table_base, gfxhub_context0_control;
+    uint64_t cpu_mapping_options, cpu_cache_attributes;
+} mac_hsa_shared_atomic_diagnostics_t;
+__attribute__((visibility("default")))
+hsa_status_t mac_hsa_shared_atomic_diagnostics(const void *shared_pointer,
+    const hsa_queue_t *queue, mac_hsa_shared_atomic_diagnostics_t *out, size_t out_size);
+
 #ifdef __cplusplus
 }
 #endif

@@ -18,6 +18,16 @@ branch=sw[sw.index('case IP_VERSION(12, 0, 1):'):sw.index('default:')]
 pipes=int(re.search(r'num_pipe_per_mec\s*=\s*(\d+)',branch)[1])
 queues=int(re.search(r'num_queue_per_pipe\s*=\s*(\d+)',branch[branch.index('adev->gfx.mec.num_mec'):])[1])
 Path('build/tests/aql_topology.inc').write_text(f'static_assert(kGFX1201ComputePipes=={pipes});\nstatic_assert(kGFX1201QueuesPerPipe=={queues});\n')
+# GFX11+ WAVESIZE uses 256-byte units; the old ROCr method comment still
+# says kilobytes, so verify the constructor's actual resource configuration.
+rocr=Path('upstream/rocm-systems/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp').read_text()
+unit=int(re.search(r'GetMajorVersion\(\) >= 11\)\s*queue_scratch_\.mem_alignment_size = (\d+)',rocr)[1])
+with Path('build/tests/aql_topology.inc').open('a') as f:
+    f.write(f'static_assert(scratch_architecture({{12,0,1}})->waveSizeUnitBytes=={unit});\n')
+    f.write(f'static_assert(scratch_architecture({{11,0,0}})->waveSizeUnitBytes=={unit});\n')
+    legacy=int(re.search(r'mem_alignment_size = '+str(unit)+r';\s*else\s*queue_scratch_\.mem_alignment_size = (\d+)',rocr)[1])
+    f.write(f'static_assert(scratch_architecture({{10,3,0}})->waveSizeUnitBytes=={legacy});\n')
+    f.write(f'static_assert(scratch_architecture({{9,0,0}})->waveSizeUnitBytes=={legacy});\n')
 s=Path('dext/amdgpu/amdgpu_aql.cpp').read_text()
 Path('build/tests/aql_launch.inc').write_text(s[s.index('kern_return_t aql_launch'):s.rindex('\n}')])
 PY

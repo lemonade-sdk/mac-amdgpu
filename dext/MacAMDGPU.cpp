@@ -46,6 +46,7 @@
 #include "amdgpu/amdgpu_vram_accounting.h"
 #include "amdgpu/amdgpu_vram_io.h"
 #include "amdgpu/amdgpu_clock.h"
+#include "amdgpu/amdgpu_atomic_diagnostics.h"
 
 #define MACAMDGPU_LOG(fmt, ...) \
     os_log(OS_LOG_DEFAULT, "mac.amdgpu: " fmt, ##__VA_ARGS__)
@@ -849,7 +850,7 @@ mac_amdgpu_allocate_dma_buffer(MacAMDGPUUserClient *client,
 
     IODMACommandSpecification spec = {};
     spec.options        = kIODMACommandSpecificationNoOptions;
-    spec.maxAddressBits = 64;
+    spec.maxAddressBits = 44; // GFX12 Linux DMA_BIT_MASK(44), including firmware buffers.
 
     IODMACommand *cmd = nullptr;
     ret = IODMACommand::Create(pci, kIODMACommandCreateNoOptions,
@@ -4093,6 +4094,74 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             arguments->scalarOutput[8]=b.gfx.max_waves_per_simd*2;
             arguments->scalarOutput[9]=b.gfx.wave_front_size;
             arguments->scalarOutputCount=10;return kIOReturnSuccess;
+        }
+        case 7: { // Owned shared-memory atomic configuration snapshot, driver190.
+            using namespace amdgpu::atomic_diag;
+            if (arguments->scalarInputCount!=4 || arguments->scalarOutputCount<Count ||
+                arguments->structureInput || arguments->structureInputDescriptor ||
+                arguments->structureOutputDescriptor || arguments->structureOutputMaximumSize)
+                return kIOReturnBadArgument;
+            if (!ivars->claimed || !driver->ivars->pciOpen || driver->ivars->stopping ||
+                driver->ivars->shutdownBlocked || driver->ivars->shutdownInProgress ||
+                b.reached!=amdgpu::BringupStage::SDMAInit || !b.gfx.inited || !b.gart.enabled)
+                return kIOReturnNotReady;
+            const auto *in=arguments->scalarInput;
+            auto *bo=mac_amdgpu_bo_lookup(ivars,in[1]);
+            if (!bo || bo->domain!=kBODomainGTT || !bo->gtt_buf || !bo->gtt_dma || !bo->cpu_addr)
+                return kIOReturnBadArgument;
+            const auto &binding=bo->gttBinding;
+            if (!binding.ready || !binding.dmaPrepared || binding.owner!=&b.gart ||
+                binding.sysmemBuffer!=bo->gtt_buf || binding.dmaCommand!=bo->gtt_dma ||
+                binding.sizeBytes!=bo->size || binding.gartMCAddr!=bo->gpu_va ||
+                binding.busAddr!=bo->gtt_bus_addr) return kIOReturnBadArgument;
+            amdgpu::PersistentAQLQueue *queue=nullptr;
+            for (auto &candidate:b.aqlQueues)
+                if (candidate.owner==ivars && candidate.handle && candidate.handle==in[3]) queue=&candidate;
+            if (!queue || !queue->mapped || queue->retained ||
+                queue->storage.gpu_va<b.gmc.vram_start || queue->storage.size<164*4)
+                return kIOReturnBadArgument;
+            Snapshot snapshot{};
+            if (!mapping_addresses(bo->gpu_va,binding.busAddr,bo->size,binding.gartOffset,
+                b.gart.pageTableVRAMOffset,b.gart.pageTableSize,in[2],snapshot)) return kIOReturnBadArgument;
+            auto *values=snapshot.values;
+            auto result=amdgpu::vram_read_fence64(b.device,values[PTEVRAMOffset],&values[PTEActual]);
+            if (result!=kIOReturnSuccess) return result;
+            values[MQDGPUAddress]=queue->storage.gpu_va;
+            // v12_compute_mqd.cp_hqd_hq_status0 is dword160. This is the
+            // firmware MQD backing image, not a selected/live CP HQD register.
+            uint32_t hqStatus=UINT32_MAX;
+            result=amdgpu::vram_read_fence32(b.device,
+                queue->storage.gpu_va-b.gmc.vram_start+160*4,&hqStatus);
+            if (result!=kIOReturnSuccess) return result;
+            values[MQDBackingHQStatus0]=hqStatus;values[ValidFields]=kPTEValid|kMQDValid;
+            uint64_t cap=0;
+            auto *pci=b.device.pci;
+            if (pci && pci->FindPCICapability(kIOPCICapabilityIDPCIExpress,0,&cap)==kIOReturnSuccess &&
+                cap>=0x40 && cap<=0xd4 && !(cap&3)) {
+                uint16_t header=UINT16_MAX,flags=UINT16_MAX,control=UINT16_MAX;
+                uint32_t capabilities=UINT32_MAX;
+                pci->ConfigurationRead16(cap,&header);pci->ConfigurationRead16(cap+2,&flags);
+                if ((header&255)==kIOPCICapabilityIDPCIExpress && (flags&15)>=2 && flags!=UINT16_MAX) {
+                    pci->ConfigurationRead32(cap+0x24,&capabilities);pci->ConfigurationRead16(cap+0x28,&control);
+                    if (capabilities!=UINT32_MAX && control!=UINT16_MAX) {
+                        values[PCIeCapabilityOffset]=cap;values[PCIeDeviceCapabilities2]=capabilities;
+                        values[PCIeDeviceControl2]=control;values[ValidFields]|=kPCIeValid;
+                    }
+                }
+            }
+            const auto &hub=b.gmc.gfxhub;
+            if (hub.inited) {
+                const uint32_t lo=amdgpu::RREG32(b.device,amdgpu::SOC15_REG_OFFSET(b.device,hub.ip,hub.ctx0_pt_base_lo));
+                const uint32_t hi=amdgpu::RREG32(b.device,amdgpu::SOC15_REG_OFFSET(b.device,hub.ip,hub.ctx0_pt_base_hi));
+                const uint32_t control=amdgpu::RREG32(b.device,amdgpu::SOC15_REG_OFFSET(b.device,hub.ip,hub.ctx0_cntl));
+                if (lo!=UINT32_MAX && hi!=UINT32_MAX && control!=UINT32_MAX) {
+                    values[GFXHUBPageTableBase]=(uint64_t(hi)<<32)|lo;values[GFXHUBContext0Control]=control;
+                    values[ValidFields]|=kGFXHUBValid;
+                }
+            }
+            if (!snapshot_valid(snapshot,bo->gpu_va+in[2])) return kIOReturnIOError;
+            for (unsigned i=0;i<Count;++i) arguments->scalarOutput[i]=values[i];
+            arguments->scalarOutputCount=Count;return kIOReturnSuccess;
         }
         default:
             return kIOReturnUnsupported;

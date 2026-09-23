@@ -1203,6 +1203,10 @@ gmc_bind_existing(DeviceContext &dev, GMCContext &gmc, uint64_t busAddr,
     if (sizeBytes > UINT64_MAX - (kASPageSize - 1)) return kIOReturnBadArgument;
     const uint64_t rounded = (sizeBytes + kASPageSize - 1) &
                             ~((uint64_t)kASPageSize - 1);
+    // Firmware buffers use the same 44-bit DMA contract as GTT BOs.
+    // Reject the complete rounded range before reserving or publishing PTEs.
+    constexpr uint64_t dmaLimit = uint64_t(1) << 44;
+    if (busAddr >= dmaLimit || rounded > dmaLimit - busAddr) return kIOReturnBadArgument;
     if (!gmc.gart_allocator.init(gmc.gart_start, gmc.gart_size)) return kIOReturnNotReady;
     // This legacy firmware API has no unbind token. Its reservation remains
     // pinned until full session reset, sharing the same allocator as GTT.

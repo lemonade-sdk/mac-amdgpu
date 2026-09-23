@@ -4,6 +4,8 @@ cd "$(dirname "$0")/.."
 mkdir -p build/tests
 python3 - <<'PY'
 from pathlib import Path
+legacy = Path('dext/MacAMDGPU.cpp').read_text()
+assert 'spec.maxAddressBits = 44; // GFX12 Linux DMA_BIT_MASK(44)' in legacy
 h = Path('dext/amdgpu/amdgpu_gart.h').read_text()
 a = h.index('struct GARTBinding {')
 b = h.index('\n};', h.index('struct GARTContext {')) + 3

@@ -9,6 +9,7 @@ hrx_source="$repo_root/upstream/hrx-lse-pin"
 hrx_copy="$repo_root/build/hrx-macos-source"
 hrx_build="$repo_root/build/hrx-macos-adapter"
 hrx_patch="$repo_root/patches/hrx/macos-coarse-host-adapter.patch"
+python3 "$repo_root/scripts/audit-hrx-query-contract.py"
 [[ "$(uname -s)" == Darwin ]] || { echo 'This adapter targets macOS.' >&2; exit 1; }
 [[ "$(git -C "$hrx_source" rev-parse HEAD)" == "$hrx_revision" ]] || {
   echo 'HRX pin changed: re-audit the adapter before building.' >&2; exit 1;

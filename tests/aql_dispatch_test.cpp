@@ -216,9 +216,9 @@ int main() {
         rsrc.bits.DST_SEL_Z=SQ_SEL_Z;rsrc.bits.DST_SEL_W=SQ_SEL_W;
         rsrc.bits.FORMAT=BUF_FORMAT_32_UINT;rsrc.bits.ADD_TID_ENABLE=1;rsrc.bits.OOB_SELECT=2;
         assert(metadata.scratch_resource_descriptor[3]==rsrc.u32All);
-        COMPUTE_TMPRING_SIZE_GFX12 tmpring{};tmpring.bits.WAVES=512;tmpring.bits.WAVESIZE=17;
+        COMPUTE_TMPRING_SIZE_GFX12 tmpring{};tmpring.bits.WAVES=512;tmpring.bits.WAVESIZE=68;
         assert(metadata.compute_tmpring_size==tmpring.u32All);
-        assert(metadata.compute_tmpring_size==(512u|(17u<<12)));
+        assert(metadata.compute_tmpring_size==0x44200);
         const auto original=queue.scratch;
         signal.value=4;
         assert(aql_queue_service(dev,gmc,gfx,queue,packets,inactive)==kIOReturnIOError && inactive==4 && signal.value==4);
@@ -248,10 +248,36 @@ int main() {
     }
     {
         amd_queue_t metadata{};uint32_t aligned,waves;uint64_t bytes;
-        assert(!aql_scratch_geometry(262129,32,4,32,aligned,waves,bytes));
-        assert(aql_scratch_geometry(1,33,4,32,aligned,waves,bytes) && aligned==16 && waves==288);
-        assert(!aql_scratch_metadata(metadata,base,UINT64_MAX,16,4,32));
-        assert(!aql_scratch_metadata(metadata,base,16384,16,4,32));
+        assert(!aql_scratch_geometry({12,0,1},262129,32,4,32,aligned,waves,bytes));
+        assert(aql_scratch_geometry({12,0,1},1,33,4,32,aligned,waves,bytes) && aligned==16 && waves==288);
+        assert(!aql_scratch_metadata({12,0,1},metadata,base,UINT64_MAX,16,4,32));
+        assert(!aql_scratch_metadata({12,0,1},metadata,base,16384,16,4,32));
+        COMPUTE_TMPRING_SIZE legacy{};legacy.u32All=UINT32_MAX;
+        COMPUTE_TMPRING_SIZE_GFX11 gfx11{};gfx11.u32All=UINT32_MAX;
+        COMPUTE_TMPRING_SIZE_GFX12 gfx12{};gfx12.u32All=UINT32_MAX;
+        assert(legacy.bits.WAVESIZE==((1u<<scratch_architecture({9,0,0})->waveSizeBits)-1));
+        assert(legacy.bits.WAVESIZE==((1u<<scratch_architecture({10,3,0})->waveSizeBits)-1));
+        assert(gfx11.bits.WAVESIZE==((1u<<scratch_architecture({11,0,0})->waveSizeBits)-1));
+        assert(gfx12.bits.WAVESIZE==((1u<<scratch_architecture({12,0,1})->waveSizeBits)-1));
+        assert(gfx12.bits.WAVES==((1u<<scratch_architecture({12,0,1})->wavesBits)-1));
+        assert(!scratch_architecture({0,0,0}) && !scratch_architecture({13,0,0}));
+        assert(!scratch_architecture({8,0,0})); // No capability entry, no guessed fallback.
+        const IPVersion unsupportedVersions[]={{9,0,0},{10,3,0},{11,0,0},{12,0,0},{12,1,0},{13,0,0}};
+        for (const auto unsupported:unsupportedVersions) {
+            assert(!aql_scratch_geometry(unsupported,272,64,4,32,aligned,waves,bytes));
+            std::memset(&metadata,0xa5,sizeof(metadata));
+            amd_queue_t before=metadata;
+            assert(!aql_scratch_metadata(unsupported,metadata,base,34ull<<20,272,4,512));
+            assert(!std::memcmp(&metadata,&before,sizeof(metadata)));
+        }
+        assert(aql_scratch_geometry({12,0,1},262128,64,4,32,aligned,waves,bytes));
+        assert(aligned==262128 && waves==512);
+        assert(aql_scratch_metadata({12,0,1},metadata,base,uint64_t(262128)*64*4*32,262128,4,32));
+        assert((metadata.compute_tmpring_size>>12)==65532);
+        assert(!aql_scratch_metadata({12,0,1},metadata,base,1ull<<32,16,4,32));
+        assert(!aql_scratch_metadata({12,0,1},metadata,1ull<<48,1ull<<20,16,4,32));
+        assert(aql_scratch_metadata({12,0,1},metadata,base,1ull<<24,16,4,4095));
+        assert(!aql_scratch_metadata({12,0,1},metadata,base,1ull<<24,16,4,4096));
     }
     puts("AQL: Linux MQD/register layout, ROCr packet/metadata, publication, completion, unmap and failure retention passed");
 }

@@ -5,12 +5,16 @@ working GPU operations or a runtime ready for HRX inference. The seven
 platform-unsupported APIs below deliberately return errors. Several other
 families currently support host behavior only.
 
-The driver 189 candidate adds public GPU-backed coarse/kernarg host pools,
+The driver 190 candidate includes public GPU-backed coarse/kernarg host pools,
 discovery-based device properties, dynamic queue scratch/LDS support and loading
 of the actual gfx12-generic HRX helper image. Queue service failures wake signal
 waiters and report an error without changing completion values. Hardware queue
 profiling enablement explicitly fails until CP property refresh is implemented.
-These additions have software coverage, not yet installed-driver validation.
+Installed driver 189 passed public pools, device properties, GPU-backed signals
+and multi-process queues. Scratch/LDS dispatch completed but output validation
+failed; driver 190 corrects the scratch wave-size unit and awaits hardware
+validation. HRX startup queries now include product name, XNACK and dma-buf
+capability responses; actual HRX compute remains unverified.
 The [macOS HRX adapter and combined test procedure](../docs/HRX_MACOS_VALIDATION.md)
 describe the supported host AQL path and the remaining exclusions. LSE's native macOS CLI now builds against HRX/Loom and passes selected CPU
 suites; GPU execution and model inference remain unverified. Symbol resolution

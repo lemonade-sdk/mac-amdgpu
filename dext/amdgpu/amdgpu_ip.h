@@ -1,19 +1,11 @@
 //
-//  amdgpu_ip.h — IP version pinning + IP base-address table.
+//  amdgpu_ip.h — discovered IP versions and register base-address tables.
 //
-//  In upstream Linux, IP base addresses come from the runtime IP
-//  discovery table on the GPU (see amdgpu_discovery.c) because one
-//  driver supports dozens of ASICs. We support exactly one ASIC
-//  (Radeon AI PRO R9700, gfx1201) so we pin the versions at compile
-//  time and either:
-//      (a) hardcode the base offsets once we know them, or
-//      (b) read them from the discovery binary on first init and
-//          stash them in the global IPBaseTable.
-//
-//  Initial commit uses placeholder 0xFFFFFFFFu sentinels for any
-//  base address we haven't read off real hardware yet. The PSP /
-//  SMU / GFX bringup code asserts the bases are filled before use,
-//  so a missing entry fails loud rather than reading register 0.
+//  amdgpu_discovery.cpp reads per-block versions, register bases and GC
+//  geometry from the device's discovery binary. Select register layouts
+//  and capabilities from those versions; the reference constants below
+//  are not a substitute for discovery or a support claim for another ASIC.
+//  Unresolved register bases use sentinels and must be checked before use.
 //
 
 #pragma once

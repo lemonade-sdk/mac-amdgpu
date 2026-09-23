@@ -3,7 +3,7 @@
     "gpu_visible_signals": true,
     "hardware_aql_queues": true,
     "gpu_host_shared_mapping": true,
-    "gpu_accessible_hsa_host_pools": false,
+    "gpu_accessible_hsa_host_pools": true,
     "general_kernel_resources": false,
     "amd_loader_extension": true,
     "hrx_inference_verified": false
@@ -17,5 +17,5 @@
     "hsa_amd_svm_attributes_set",
     "hsa_amd_svm_prefetch_async"
   ],
-  "notes": "Symbol presence is not behavioral completion. Driver 187 on gfx1201 passed persistent queues, wraparound, multi-producer submission, two-process sharing and concurrent shader/CP/CPU-HSA signals. Driver 189 adds software-tested public coarse/kernarg pools, dynamic scratch/LDS and device topology/clock queries. The actual pinned HRX dylib builds with an explicit macOS host-AQL adapter. New hardware paths and HRX inference remain unverified. Native CPU/GPU additions and CAS contention are separate bounded experiments; no general fine-grained atomic capability is advertised. See API_STATUS.md and docs/HRX_MACOS_VALIDATION.md."
+  "notes": "Symbol presence is not behavioral completion. Driver 187 on gfx1201 passed persistent queues, wraparound, multi-producer submission, two-process sharing and concurrent shader/CP/CPU-HSA signals. Driver 189 passed public coarse/kernarg pools, 64-CU topology and 100 MHz ATOM timestamp queries on hardware. Its resource test completed dispatches but found a scratch/LDS output mismatch; general kernel resources remain unverified. The actual pinned HRX dylib builds with an explicit macOS host-AQL adapter. HRX execution and model inference remain unverified. Native CPU/GPU additions and CAS contention are separate bounded experiments; no general fine-grained atomic capability is advertised. See API_STATUS.md and docs/HRX_MACOS_VALIDATION.md."
 }

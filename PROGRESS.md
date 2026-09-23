@@ -1991,3 +1991,39 @@ successfully after cleanup. No hardware AQL queue or HRX inference is claimed.
   The ATOM clock query also rejected actual NBIO 6.3.1; its ROM-offset handling
   now matches Linux NBIF bank selection, with bounded diagnostic logging. No new HRX or atomic dispatch
   result was produced by the stopped run.
+
+
+## Driver 189 hardware results and driver 190 corrections
+
+- Driver 189 passed discovered 64-CU topology and 100 MHz clock properties,
+  public coarse/kernarg pools, GPU-backed HSA signal operations, all seven
+  persistent queue slots, concurrent producers and two-process queue sharing.
+- Scratch/LDS dispatch retired but had 272 wrong output words per queue with
+  intact guards. Review found GFX12 scratch wave size encoded in 1024-byte units
+  instead of ROCr's 256-byte units. Driver 190 changes the example TMPRING value
+  from 0x11200 to 0x44200. Scratch units, register widths, SRD layout and
+  per-engine wave policy now come from a capability table selected by discovered
+  GC IP. The table records GFX9/10/11/12 properties; unimplemented queue layouts
+  and unknown families remain rejected. Resource probes isolate IDs, scratch
+  and LDS. Hardware validation remains pending.
+- Native single-agent controls passed 10 million additions and 1 million CAS
+  lock cycles each. Mixed addition completed 10 million operations per processor
+  but returned 10,169,561 instead of 20 million. Mixed CAS stopped after six
+  completed CPU cycles and an ownership error during the seventh; GPU completed
+  one million and the payload was 1,000,007. This incomplete CAS trial does not
+  represent two million completed operations. Queue cleanup returned to stage 0.
+- Actual HRX startup exposed missing product-name and XNACK capability queries.
+  The runtime now supplies gfx1201 identification, XNACK=false and dma-buf=false;
+  a source audit covers 50 pinned HRX query attributes, including explicit
+  optional exceptions. Real HRX compute and model inference are still unverified.
+- Driver 190 exposes owned shared-buffer PTE/DMA and saved MQD diagnostics plus
+  live endpoint PCIe controls and GFXHUB state. CPU cache attributes remain
+  unknown; no AtomicOp or cache-policy registers are changed. GTT and firmware
+  DMA allocations/bindings now honor Linux GFX12's 44-bit limit. Earlier DMA
+  addresses already fit that limit, so this does not explain the atomic failure.
+- Added serialized atomic handoff, returned-old sums, unequal CPU/GPU counts,
+  staggered phase checkpoints and host timestamps. These test current mapping
+  and configuration; failed contention does not prove hardware impossibility.
+- Candidate 190 passed 34 driver/ABI scripts, 12 HSA ASan/UBSan suites, nine
+  PCIe diagnostic tests, the HRX query audit, Xcode build and strict signature
+  verification. Installation and new hardware validation remain pending.

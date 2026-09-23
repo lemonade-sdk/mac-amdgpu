@@ -19,7 +19,7 @@ struct ServiceConnection final:Connection {
     std::atomic<bool> fail{false};
     bool supportsBuffers() const override {return true;}
     hsa_status_t read(DeviceSnapshot &snapshot) override {
-        snapshot={1,189,15,256ull<<20,32ull<<30,12,0,1};return HSA_STATUS_SUCCESS;
+        snapshot={1,190,15,256ull<<20,32ull<<30,12,0,1};return HSA_STATUS_SUCCESS;
     }
     hsa_status_t allocateSharedBuffer(uint64_t bytes,SharedBuffer &out) override {
         std::lock_guard lock(mutex);void *pointer=nullptr;

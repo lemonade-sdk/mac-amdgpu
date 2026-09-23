@@ -8,7 +8,7 @@
 - Native synchronous compute: HSA-loaded kernels passed with 128 and 256 results in both VRAM and shared host memory, including every byte of the input/output guards.
 - Bounded hardware AQL dispatch: kernels passed in VRAM and shared host memory, with firmware-acknowledged queue removal and recreation between launches.
 - Persistent HSA compute queues: all seven slots, ring wraparound, four CPU producers, shared completion/barrier signals and two processes sharing the GPU passed hardware tests. One process can exit while the other continues on its existing queues.
-- Coarse shared allocations with identical CPU/GPU addresses. CPU access is allowed between completed GPU operations.
+- Public CPU-owned coarse/kernarg HSA pools with GPU access and identical CPU/GPU addresses. CPU access is allowed between completed GPU operations.
 - GPU-backed HSA signal operations: stores, arithmetic, bitwise operations, exchange, compare-and-swap and waits passed hardware checks. CPU HSA updates execute GPU atomics; earlier native CPU/GPU contention tests lost updates, so that interoperability is not advertised.
 - HSA host services, CPU signals and software queues. All 119 entry points required by LSE’s pinned HRX resolve; the [behavior status](hsa/API_STATUS.md) explains their limits.
 - [amdgpu_mtop](amdgpu_mtop/README.md) device enumeration, GPU selection, capacity queries and JSON output.
@@ -16,9 +16,9 @@
 
 ## Not working yet
 
-- General fine-grained CPU/GPU atomic interoperability. GPU-accessible coarse/kernarg HSA pools are implemented and software-tested; their public hardware path awaits validation.
+- General fine-grained CPU/GPU atomic interoperability; native add/CAS contention is being tested separately.
 - HRX/LSE model inference. No end-to-end AI workload has run.
-- Full HSA conformance and general executable linking. Scratch/LDS resource handling and gfx12-generic HRX helper loading are implemented and software-tested, pending the new hardware checks. Hardware profiling and some platform-specific APIs explicitly return errors.
+- Full HSA conformance and general executable linking. The scratch/LDS hardware check completed dispatches but found an output mismatch under investigation. The gfx12-generic HRX helper loader passes software tests. Hardware profiling and some platform-specific APIs explicitly return errors.
 - Live firmware telemetry in amdgpu_mtop: usage, clocks, temperature and power need a verified firmware metrics layout.
 - Larger PCIe BAR allocation through a public Apple API, and Mesa/Vulkan integration.
 
@@ -67,14 +67,15 @@ slices of the Linux `amdgpu` kernel driver into a DriverKit system extension.
 
 Primary target hardware is the **AMD Radeon AI PRO R9700** (RDNA4, gfx1201,
 PCI `0x1002:0x7551`) connected via Thunderbolt 5 to an Apple Silicon Mac.
-Other RDNA4 / gfx1201 cards should work with the same firmware images.
+Hardware validation currently covers this card. IP discovery selects device
+geometry and architecture properties; other cards still require their own
+firmware, initialization and queue validation before support is claimed.
 
 ## Hardware requirements
 
 - Apple Silicon Mac. Developed on M5 Pro / Max / Ultra; M1+ likely fine.
 - Thunderbolt 5 to an external GPU enclosure. TB4 may work but is untested.
-- AMD GPU: Radeon AI PRO R9700 (`0x1002:0x7551`). Other RDNA4 / gfx1201
-  cards should work with the same firmware blobs.
+- AMD GPU: Radeon AI PRO R9700 (`0x1002:0x7551`). Other cards are unverified.
 - macOS **Tahoe 26.2** or newer.
 - **SIP disabled.** The development entitlements we use require it. To
   disable: boot to Recovery (hold the power button on Apple Silicon),

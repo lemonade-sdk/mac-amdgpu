@@ -176,6 +176,29 @@ public:
         if (status != HSA_STATUS_SUCCESS) state = State::Faulted;
         return status;
     }
+    hsa_status_t sharedAtomicDiagnostics(const SharedBuffer &buffer,uint64_t offset,
+        uint64_t queue,amdgpu::atomic_diag::Snapshot &out) override {
+        std::lock_guard lock(sessionMutex);
+        // Observational only: never initialize or recover a session here.
+        if (state!=State::Ready || !ownerPort) return HSA_STATUS_ERROR;
+        const auto found=sharedBuffers.find(buffer.device.handle);
+        if (found==sharedBuffers.end() || found->second.host!=buffer.host ||
+            found->second.device.address!=buffer.device.address || found->second.device.size!=buffer.device.size ||
+            found->second.memoryType!=buffer.memoryType || (offset&7) ||
+            offset>buffer.device.size || 8>buffer.device.size-offset)
+            return HSA_STATUS_ERROR_INVALID_ALLOCATION;
+        if (!queue || !hardwareQueues.contains(queue)) return HSA_STATUS_ERROR_INVALID_QUEUE;
+        std::array<uint64_t,3> build{};
+        auto status=scalar(43,{},build);
+        if (status!=HSA_STATUS_SUCCESS) return status;
+        if (build[2]<190) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        const std::array<uint64_t,4> input={7,buffer.device.handle,offset,queue};
+        amdgpu::atomic_diag::Snapshot snapshot{};
+        status=scalar(21,input,{snapshot.values,amdgpu::atomic_diag::Count});
+        if (status!=HSA_STATUS_SUCCESS) return status;
+        if (!amdgpu::atomic_diag::snapshot_valid(snapshot,buffer.device.address+offset)) return HSA_STATUS_ERROR;
+        out=snapshot;return HSA_STATUS_SUCCESS;
+    }
     hsa_status_t createQueue(const SharedBuffer &ring,const SharedBuffer &metadata,uint32_t packets,uint64_t &handle) override {
         std::lock_guard lock(sessionMutex); handle=0;
         if (state!=State::Ready) return HSA_STATUS_ERROR;

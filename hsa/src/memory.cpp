@@ -330,7 +330,7 @@ HSA_API_EXPORT hsa_status_t hsa_amd_agent_memory_pool_get_info(hsa_agent_t agent
             return HSA_STATUS_SUCCESS; // zero-hop array: do not write caller storage
         hsa_amd_memory_pool_link_info_t link{};
         link.link_type = HSA_AMD_LINK_INFO_TYPE_PCIE;
-        // PCIe/Thunderbolt host AtomicOp completion is not supported. Unknown
+        // PCIe/Thunderbolt host AtomicOp interoperability is not established. Unknown
         // bandwidth/latency stay zero instead of inventing a direct PCIe rate.
         return writeValue(value, link);
     }

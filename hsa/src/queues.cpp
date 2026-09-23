@@ -1,4 +1,5 @@
 #include "runtime_state.h"
+#include "mac_hsa.h"
 #include <hsa/amd_hsa_queue.h>
 #include <chrono>
 #include <condition_variable>
@@ -127,6 +128,35 @@ void stopQueueServices(RetiredQueueSet &retired) {
 using namespace mac_hsa::detail;
 
 extern "C" {
+hsa_status_t mac_hsa_shared_atomic_diagnostics(const void *pointer,const hsa_queue_t *q,
+    mac_hsa_shared_atomic_diagnostics_t *out,size_t outSize) {
+    std::shared_ptr<Allocation> allocation;
+    std::shared_ptr<RuntimeQueue> queue;
+    uint64_t offset=0;
+    {
+        std::lock_guard lock(runtimeMutex);
+        if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+        if (!pointer || !q || !out || outSize!=sizeof(*out) || (reinterpret_cast<uintptr_t>(pointer)&7))
+            return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        const auto found=queues.find(q);
+        if (found==queues.end()) return HSA_STATUS_ERROR_INVALID_QUEUE;
+        queue=found->second;allocation=findAllocation(pointer);
+        if (!allocation || !allocation->shared.host || !allocation->connection ||
+            allocation->connection!=queue->connection || allocation->base!=allocation->shared.host ||
+            allocation->shared.device.address!=reinterpret_cast<uintptr_t>(allocation->base))
+            return HSA_STATUS_ERROR_INVALID_ALLOCATION;
+        offset=reinterpret_cast<uintptr_t>(pointer)-reinterpret_cast<uintptr_t>(allocation->base);
+        if (offset>allocation->size || 8>allocation->size-offset) return HSA_STATUS_ERROR_INVALID_ALLOCATION;
+    }
+    std::lock_guard lock(queue->mutex);
+    if (!queue->active || !queue->hardwareHandle || queue->errorDelivered) return HSA_STATUS_ERROR_INVALID_QUEUE;
+    amdgpu::atomic_diag::Snapshot snapshot{};
+    const auto status=queue->connection->sharedAtomicDiagnostics(allocation->shared,offset,queue->hardwareHandle,snapshot);
+    if (status!=HSA_STATUS_SUCCESS) return status;
+    if (!amdgpu::atomic_diag::snapshot_valid(snapshot,reinterpret_cast<uintptr_t>(pointer))) return HSA_STATUS_ERROR;
+    static_assert(sizeof(snapshot)==sizeof(*out));
+    std::memcpy(out,&snapshot,sizeof(*out));return HSA_STATUS_SUCCESS;
+}
 hsa_status_t hsa_queue_create(hsa_agent_t agent,uint32_t size,hsa_queue_type32_t type,
     void (*callback)(hsa_status_t,hsa_queue_t *,void *),void *data,
     uint32_t privateBytes,uint32_t groupBytes,hsa_queue_t **out) {

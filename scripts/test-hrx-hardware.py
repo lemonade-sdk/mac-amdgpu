@@ -27,7 +27,7 @@ if not args.skip_atomics:
 for name, command, timeout in steps:
     print(f"{name}: {' '.join(command)} (outer timeout {timeout}s)", flush=True)
 if not args.run:
-    print("No GPU work submitted. Use --run after installing driver 189 or newer.")
+    print("No GPU work submitted. Use --run after installing driver 190 or newer.")
     raise SystemExit(0)
 for _, command, _ in steps:
     for item in command:
@@ -40,8 +40,8 @@ probe = subprocess.run([str(root / "build/hsa/mac-hsa-info")], cwd=root,
                        capture_output=True, text=True, timeout=30, env=environment)
 print(probe.stdout, end="", flush=True)
 builds = re.findall(r"driver=(\d+)", probe.stdout)
-if probe.returncode or len(builds) != 1 or int(builds[0]) < 189:
-    parser.error("This HRX adapter test requires exactly one responding GPU with driver 189 or newer")
+if probe.returncode or len(builds) != 1 or int(builds[0]) < 190:
+    parser.error("This HRX adapter test requires exactly one responding GPU with driver 190 or newer")
 logs = root / "build/tests" / ("hrx-hardware-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
 logs.mkdir(parents=True)
 (logs / "driver-info.log").write_text(probe.stdout + probe.stderr)

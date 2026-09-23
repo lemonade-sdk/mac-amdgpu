@@ -49,8 +49,11 @@ void drain(hsa_queue_t *queue) {
 }
 }
 int main(int argc,char **argv) {
-    if (argc!=3 || std::strcmp(argv[1],"--run")) {
-        std::fprintf(stderr,"Usage: %s --run build/tests/hsa-resource-object.hsaco\n",argv[0]);return 2;
+    const char *probe=argc==5 && !std::strcmp(argv[3],"--probe") ? argv[4] : "combined";
+    const bool scratchOnly=!std::strcmp(probe,"scratch"),ldsOnly=!std::strcmp(probe,"lds"),idsOnly=!std::strcmp(probe,"ids");
+    if ((argc!=3 && argc!=5) || std::strcmp(argv[1],"--run") ||
+        (argc==5 && (!std::strcmp(probe,"combined") || !(scratchOnly||ldsOnly||idsOnly)))) {
+        std::fprintf(stderr,"Usage: %s --run build/tests/hsa-resource-object.hsaco [--probe ids|scratch|lds]\n",argv[0]);return 2;
     }
     std::setvbuf(stdout,nullptr,_IONBF,0);
     std::ifstream file(argv[2],std::ios::binary);std::vector<char> bytes{std::istreambuf_iterator<char>(file),{}};
@@ -69,18 +72,22 @@ int main(int argc,char **argv) {
             return status;
         },&agents),"enumerate");require(gpu.handle && cpu.handle,"missing GPU or CPU");
         mac_hsa_device_info_t info{};check(mac_hsa_agent_get_driver_info(gpu,&info,sizeof(info)),"driver build");
-        require(info.driver_build>=189,"Install driver 189 before scratch/LDS validation");
+        require(info.driver_build>=190,"Install driver 190 before scratch/LDS validation");
         check(hsa_code_object_reader_create_from_memory(bytes.data(),bytes.size(),&reader),"reader");
         check(hsa_executable_create_alt(HSA_PROFILE_BASE,HSA_DEFAULT_FLOAT_ROUNDING_MODE_DEFAULT,nullptr,&executable),"executable");
         check(hsa_executable_load_agent_code_object(executable,gpu,reader,nullptr,nullptr),"load kernel");
         check(hsa_executable_freeze(executable,nullptr),"freeze");
         hsa_executable_symbol_t symbol{};uint64_t kernel=0;uint32_t priv=0,group=0,kernarg=0;
-        check(hsa_executable_get_symbol_by_name(executable,"scratch_lds.kd",&gpu,&symbol),"symbol");
+        const char *symbolName=scratchOnly ? "resource_scratch.kd" : ldsOnly ? "resource_lds.kd" : idsOnly ? "resource_ids.kd" : "scratch_lds.kd";
+        check(hsa_executable_get_symbol_by_name(executable,symbolName,&gpu,&symbol),"symbol");
         check(hsa_executable_symbol_get_info(symbol,HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT,&kernel),"descriptor");
         check(hsa_executable_symbol_get_info(symbol,HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_PRIVATE_SEGMENT_SIZE,&priv),"private size");
         check(hsa_executable_symbol_get_info(symbol,HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_GROUP_SEGMENT_SIZE,&group),"group size");
         check(hsa_executable_symbol_get_info(symbol,HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_KERNARG_SEGMENT_SIZE,&kernarg),"kernarg size");
-        require(priv>=256 && priv<4096 && group==128 && kernarg==12,"resource shader metadata");
+        const bool usesScratch=!ldsOnly && !idsOnly;
+        require((usesScratch ? priv>=256 && priv<4096 : priv==0) &&
+            group==((scratchOnly||idsOnly) ? 0u : 128u) && kernarg==12,"resource shader metadata");
+        std::printf("resource probe=%s private=%u group=%u kernarg=%u\n",probe,priv,group,kernarg);
         struct PoolSelection {hsa_agent_t gpu;hsa_amd_memory_pool_t pool{};} selection{gpu};
         check(hsa_amd_agent_iterate_memory_pools(cpu,[](hsa_amd_memory_pool_t pool,void *opaque) {
             auto &out=*static_cast<PoolSelection *>(opaque);uint32_t flags=0;
@@ -110,7 +117,7 @@ int main(int argc,char **argv) {
             require(metadata.scratch_wave64_lane_byte_size==(q ? 64u : 0u),"initial scratch request");
         }
         std::vector<uint32_t> expected(4096);uint64_t retainedScratch[2]{};
-        for (unsigned pass=0;pass<3;++pass) {
+        for (unsigned pass=0;pass<(usesScratch ? 3u : 1u);++pass) {
             const uint32_t packetPrivate=pass ? 4096 : priv;
             const uint32_t guard=0xd15ea500u+pass;
             std::fill(expected.begin(),expected.end(),guard);
@@ -122,7 +129,10 @@ int main(int argc,char **argv) {
                 std::memcpy(args,&address,8);std::memcpy(args+8,&seed,4);
                 for (unsigned i=0;i<512;++i) {
                     const auto lane=i&31,neighbor=(lane+1)&31;
-                    expected[64+q*1024+i]=2*seed+neighbor+((neighbor+7)&63)+lane+((lane+11)&63);
+                    expected[64+q*1024+i]=idsOnly ? 0xa5000000u|((i/32)<<8)|lane :
+                        scratchOnly ? seed+(i/32)*1024+lane+((lane+11)&63) :
+                        ldsOnly ? seed+(i/32)*1024+neighbor :
+                        2*seed+neighbor+((neighbor+7)&63)+lane+((lane+11)&63);
                 }
                 hsa_signal_store_screlease(done[q],1);
                 hsa_kernel_dispatch_packet_t packet{};
@@ -137,20 +147,58 @@ int main(int argc,char **argv) {
             for (unsigned q=0;q<2;++q) {
                 wait(done[q],"scratch/LDS completion timeout");drain(queues[q]);
                 const auto &metadata=*reinterpret_cast<amd_queue_t *>(queues[q]);
-                require(metadata.scratch_wave64_lane_byte_size>=packetPrivate && metadata.compute_tmpring_size,"scratch service growth");
-                require(metadata.scratch_backing_memory_location && metadata.scratch_resource_descriptor[2],"scratch GPU backing");
+                if (usesScratch) {
+                    require(metadata.scratch_wave64_lane_byte_size>=packetPrivate && metadata.compute_tmpring_size,"scratch service growth");
+                    require(metadata.scratch_backing_memory_location && metadata.scratch_resource_descriptor[2],"scratch GPU backing");
+                }
                 if (pass==2) require(metadata.scratch_backing_memory_location==retainedScratch[q],"scratch reuse");
                 retainedScratch[q]=metadata.scratch_backing_memory_location;
                 std::printf("queue%u pass%u private=%u backing=%#llx tmpring=%#x\n",q,pass,
                     metadata.scratch_wave64_lane_byte_size,(unsigned long long)retainedScratch[q],metadata.compute_tmpring_size);
             }
-            require(!std::memcmp(data,expected.data(),16384),"scratch/LDS result or guard mismatch");
+            const auto *observed=static_cast<const uint32_t *>(data);
+            unsigned mismatches=0,outputMismatches[2]{},guardMismatches=0;
+            for (unsigned i=0;i<4096;++i) {
+                if (observed[i]==expected[i]) continue;
+                const int owner=(i>=64 && i<64+512) ? 0 : (i>=1088 && i<1088+512) ? 1 : -1;
+                if (owner<0) ++guardMismatches; else ++outputMismatches[owner];
+                if (mismatches<16) {
+                    if (owner<0)
+                        std::fprintf(stderr,"pass%u guard word%u byte%#x expected=%#010x observed=%#010x\n",
+                            pass,i,i*4,expected[i],observed[i]);
+                    else {
+                        const auto item=i-(64+unsigned(owner)*1024);
+                        std::fprintf(stderr,"pass%u queue%d group%u lane%u word%u expected=%#010x observed=%#010x delta=%lld\n",
+                            pass,owner,item/32,item%32,i,expected[i],observed[i],
+                            static_cast<long long>(observed[i])-expected[i]);
+                    }
+                }
+                ++mismatches;
+            }
+            if (mismatches) {
+                std::fprintf(stderr,"pass%u mismatch summary: total=%u queue0=%u/512 queue1=%u/512 guards=%u\n",
+                    pass,mismatches,outputMismatches[0],outputMismatches[1],guardMismatches);
+                for (unsigned q=0;q<2;++q) {
+                    const auto &metadata=*reinterpret_cast<amd_queue_t *>(queues[q]);
+                    std::fprintf(stderr,"queue%u SRD=%08x:%08x:%08x:%08x maxCU=%u maxWave=%u read=%llu write=%llu\n",
+                        q,metadata.scratch_resource_descriptor[0],metadata.scratch_resource_descriptor[1],
+                        metadata.scratch_resource_descriptor[2],metadata.scratch_resource_descriptor[3],
+                        metadata.max_cu_id,metadata.max_wave_id,
+                        (unsigned long long)hsa_queue_load_read_index_scacquire(queues[q]),
+                        (unsigned long long)hsa_queue_load_write_index_scacquire(queues[q]));
+                }
+                throw std::runtime_error("scratch/LDS result or guard mismatch");
+            }
             const auto *args=static_cast<const uint8_t *>(arguments);
             for (unsigned i=0;i<16384;++i)
-                if (!((i<12)||(i>=16 && i<28))) require(args[i]==0xa5,"kernarg guard corruption");
+                if (!((i<12)||(i>=16 && i<28)) && args[i]!=0xa5) {
+                    std::fprintf(stderr,"pass%u kernarg guard byte%#x expected=a5 observed=%02x\n",pass,i,args[i]);
+                    throw std::runtime_error("kernarg guard corruption");
+                }
             std::printf("PASS: both queues, pass%u, all16384 data bytes and kernarg guards\n",pass);
         }
-        require(retainedScratch[0]!=retainedScratch[1],"queues share scratch backing");passed=true;
+        if (usesScratch) require(retainedScratch[0]!=retainedScratch[1],"queues share scratch backing");
+        passed=true;
     } catch (const std::exception &e) {std::fprintf(stderr,"FAIL: %s\n",e.what());}
     for (auto *queue:queues) if (queue && hsa_queue_destroy(queue)) {safe=false;passed=false;}
     if (safe) {
@@ -160,6 +208,7 @@ int main(int argc,char **argv) {
     } else std::fputs("Queue removal unconfirmed; backing retained for reset\n",stderr);
     if (reader.handle && hsa_code_object_reader_destroy(reader)) passed=false;
     if (initialized && hsa_shut_down()) passed=false;
-    std::puts(passed ? "PASS: persistent scratch growth/reuse, LDS and independent queue cleanup" : "FAIL: resource test");
+    std::printf("%s: resource probe=%s; guarded output and independent queue cleanup%s\n",
+        passed ? "PASS" : "FAIL",probe,(!idsOnly && !ldsOnly) ? "; scratch growth/reuse" : "");
     return passed ? 0 : 1;
 }

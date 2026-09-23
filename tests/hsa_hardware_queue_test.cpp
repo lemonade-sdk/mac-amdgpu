@@ -1,4 +1,5 @@
 #include "runtime_state.h"
+#include "mac_hsa.h"
 #include <hsa/amd_hsa_queue.h>
 #include <cassert>
 #include <cstdio>
@@ -8,6 +9,7 @@ static unsigned creates,kicks,destroys,atomics,callbacks;
 static bool failKick=false,failAtomic=false;
 static uint64_t driverBuild=187;
 static uint32_t gfxRevision=1;
+static unsigned diagnosticMode=0,diagnosticCalls=0;
 namespace mac_hsa {
 struct TestConnection:Connection {
     uint64_t next=0;bool fault=false;
@@ -41,6 +43,23 @@ struct TestConnection:Connection {
     }
     hsa_status_t writeBuffer(const DeviceBuffer &buffer,uint64_t offset,const void *data,size_t bytes) override {
         assert(offset+bytes<=buffer.size);std::memcpy(device.at(buffer.handle).data()+offset,data,bytes);return HSA_STATUS_SUCCESS;
+    }
+    hsa_status_t sharedAtomicDiagnostics(const SharedBuffer &buffer,uint64_t offset,uint64_t queue,
+        amdgpu::atomic_diag::Snapshot &out) override {
+        using namespace amdgpu::atomic_diag;
+        ++diagnosticCalls;
+        uint64_t now;assert(hsa_system_get_info(HSA_SYSTEM_INFO_TIMESTAMP,&now)==0); // no global lock
+        assert(queues.contains(queue) && shared.at(buffer.device.handle)==buffer.host);
+        assert(mapping_addresses(buffer.device.address,0x81000000,buffer.device.size,0,0x700000,4096,offset,out));
+        out.values[ValidFields]=kPTEValid|kMQDValid;
+        out.values[PTEActual]=out.values[PTEExpected];
+        out.values[MQDGPUAddress]=0x8001800000ull;out.values[MQDBackingHQStatus0]=1u<<29;
+        if(diagnosticMode==1) return HSA_STATUS_ERROR;
+        if(diagnosticMode==2) ++out.values[Version];
+        if(diagnosticMode==3) ++out.values[GPUAddress];
+        if(diagnosticMode==4) out.values[ValidFields]|=16;
+        if(diagnosticMode==5) out.values[DMAAddress]=1ull<<44;
+        return HSA_STATUS_SUCCESS;
     }
     hsa_status_t createQueue(const SharedBuffer &ring,const SharedBuffer &metadata,uint32_t size,uint64_t &handle) override {
         auto *q=static_cast<amd_queue_t *>(metadata.host);
@@ -110,6 +129,32 @@ int main() {
     assert(hsa_queue_create(gpu,64,HSA_QUEUE_TYPE_MULTI,[](hsa_status_t status,hsa_queue_t *,void *) {
         assert(status==HSA_STATUS_ERROR);uint64_t now;assert(hsa_system_get_info(HSA_SYSTEM_INFO_TIMESTAMP,&now)==0);++callbacks;
     },nullptr,UINT32_MAX,UINT32_MAX,&queue)==0 && queue);
+    void *diagnosticMemory=nullptr;
+    assert(mac_hsa_memory_allocate_shared(gpu,16384,&diagnosticMemory)==0);
+    mac_hsa_shared_atomic_diagnostics_t diagnostic{};
+    assert(mac_hsa_shared_atomic_diagnostics(static_cast<char *>(diagnosticMemory)+16376,queue,&diagnostic,sizeof(diagnostic))==0);
+    assert(diagnostic.gpu_address==reinterpret_cast<uintptr_t>(diagnosticMemory)+16376 &&
+        diagnostic.dma_address==0x81003ff8 && diagnostic.pte_actual==diagnostic.pte_expected &&
+        diagnostic.mqd_backing_hq_status0==(1u<<29) && diagnostic.cpu_cache_attributes==UINT64_MAX);
+    std::memset(&diagnostic,0xa5,sizeof(diagnostic));const auto unchanged=diagnostic;
+    const auto before=diagnosticCalls;
+    assert(mac_hsa_shared_atomic_diagnostics(diagnosticMemory,queue,&diagnostic,sizeof(diagnostic)-1)==HSA_STATUS_ERROR_INVALID_ARGUMENT);
+    assert(mac_hsa_shared_atomic_diagnostics(static_cast<char *>(diagnosticMemory)+1,queue,&diagnostic,sizeof(diagnostic))==HSA_STATUS_ERROR_INVALID_ARGUMENT);
+    assert(mac_hsa_shared_atomic_diagnostics(static_cast<char *>(diagnosticMemory)+16384,queue,&diagnostic,sizeof(diagnostic))==HSA_STATUS_ERROR_INVALID_ALLOCATION);
+    uint64_t stack=0;
+    assert(mac_hsa_shared_atomic_diagnostics(&stack,queue,&diagnostic,sizeof(diagnostic))==HSA_STATUS_ERROR_INVALID_ALLOCATION);
+    assert(mac_hsa_shared_atomic_diagnostics(diagnosticMemory,reinterpret_cast<hsa_queue_t *>(&stack),&diagnostic,sizeof(diagnostic))==HSA_STATUS_ERROR_INVALID_QUEUE);
+    auto allocation=mac_hsa::detail::findAllocation(diagnosticMemory);
+    auto connection=allocation->connection;
+    allocation->connection=std::make_shared<mac_hsa::TestConnection>();
+    assert(mac_hsa_shared_atomic_diagnostics(diagnosticMemory,queue,&diagnostic,sizeof(diagnostic))==HSA_STATUS_ERROR_INVALID_ALLOCATION);
+    allocation->connection=connection;allocation.reset();connection.reset();
+    assert(diagnosticCalls==before && std::memcmp(&diagnostic,&unchanged,sizeof(diagnostic))==0);
+    for(diagnosticMode=1;diagnosticMode<=5;++diagnosticMode) {
+        assert(mac_hsa_shared_atomic_diagnostics(diagnosticMemory,queue,&diagnostic,sizeof(diagnostic))==HSA_STATUS_ERROR);
+        assert(std::memcmp(&diagnostic,&unchanged,sizeof(diagnostic))==0);
+    }
+    diagnosticMode=0;
     const auto propertiesBefore=reinterpret_cast<amd_queue_t *>(queue)->queue_properties;
     assert(hsa_amd_profiling_set_profiler_enabled(queue,1)==HSA_STATUS_ERROR);
     assert(reinterpret_cast<amd_queue_t *>(queue)->queue_properties==propertiesBefore);
@@ -125,6 +170,8 @@ int main() {
     auto *abi=reinterpret_cast<amd_queue_t *>(queue);abi->read_dispatch_id=8;
     assert(hsa_queue_load_read_index_scacquire(queue)==8);
     assert(hsa_queue_inactivate(queue)==0 && destroys==1);
+    assert(mac_hsa_shared_atomic_diagnostics(diagnosticMemory,queue,&diagnostic,sizeof(diagnostic))==HSA_STATUS_ERROR_INVALID_QUEUE);
+    assert(hsa_memory_free(diagnosticMemory)==0);
     hsa_signal_store_relaxed(queue->doorbell_signal,7);assert(kicks==1);
     assert(hsa_queue_destroy(queue)==0 && destroys==1 && mac_hsa::connection->buffers.empty());
     hsa_signal_t first{},second{};

@@ -76,10 +76,11 @@ kern_return_t aql_launch(DeviceContext &dev, GMCContext &gmc, MESContext &mes,
 // CP requests scratch only after prior scratch users on this queue have retired.
 // Mirror ROCr's non-async HandleInsufficientScratch path; no CPU/GPU atomic RMW
 // is needed because CP waits for a release store of zero to the inactive signal.
-static kern_return_t aql_queue_allocate_scratch(GMCContext &gmc,const GFXConfig &gfx,
+static kern_return_t aql_queue_allocate_scratch(DeviceContext &dev,GMCContext &gmc,const GFXConfig &gfx,
     PersistentAQLQueue &q,amd_queue_t &metadata,uint32_t laneBytes) {
     uint32_t aligned=0,waves=0;uint64_t bytes=0;
-    if (!aql_scratch_geometry(laneBytes,gfx.num_active_cus,gfx.max_shader_engines,
+    const auto ip=dev.ip.version[static_cast<int>(IPBlock::GC)];
+    if (!aql_scratch_geometry(ip,laneBytes,gfx.num_active_cus,gfx.max_shader_engines,
         gfx.max_scratch_waves_per_cu,aligned,waves,bytes)) return kIOReturnBadArgument;
     // Retain enough slots for every legal 1024-thread workgroup, including
     // wave32. Reducing occupancy in whole 32-wave steps preserves that bound.
@@ -89,7 +90,7 @@ static kern_return_t aql_queue_allocate_scratch(GMCContext &gmc,const GFXConfig 
         if (bytes<=UINT32_MAX && gmc.device_vram_alloc.alloc(bytes,16384,&replacement)) break;
     }
     if (!replacement.size) return kIOReturnNoMemory;
-    if (!aql_scratch_metadata(metadata,replacement.gpu_va,bytes,aligned,
+    if (!aql_scratch_metadata(ip,metadata,replacement.gpu_va,bytes,aligned,
         gfx.max_shader_engines,waves)) {
         gmc.device_vram_alloc.free(replacement);return kIOReturnBadArgument;
     }
@@ -137,7 +138,7 @@ kern_return_t aql_queue_open(DeviceContext &dev,GMCContext &gmc,MESContext &mes,
     metadata.group_segment_aperture_base_hi=kAQLGroupApertureHi;
     metadata.private_segment_aperture_base_hi=kAQLPrivateApertureHi;
     if (requestedScratch) {
-        const auto scratchStatus=aql_queue_allocate_scratch(gmc,gfx,q,metadata,requestedScratch);
+        const auto scratchStatus=aql_queue_allocate_scratch(dev,gmc,gfx,q,metadata,requestedScratch);
         if (scratchStatus!=kIOReturnSuccess) {
             gmc.vram_alloc.free(q.storage);q.storage={};return scratchStatus;
         }
@@ -200,7 +201,7 @@ kern_return_t aql_queue_service(DeviceContext &dev,GMCContext &gmc,const GFXConf
         required=packet.private_segment_size;break;
     }
     if (!required || required>kAQLMaxPrivateBytes) return kIOReturnBadArgument;
-    status=aql_queue_allocate_scratch(gmc,gfx,q,metadata,required);
+    status=aql_queue_allocate_scratch(dev,gmc,gfx,q,metadata,required);
     if (status!=kIOReturnSuccess) return status;
     __atomic_thread_fence(__ATOMIC_RELEASE);amdgpu_hdp_flush(dev);
     const uint64_t zero=0;

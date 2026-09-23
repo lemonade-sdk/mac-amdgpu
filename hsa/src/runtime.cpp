@@ -198,6 +198,10 @@ hsa_status_t hsa_agent_get_info(hsa_agent_t handle, hsa_agent_info_t attribute, 
     };
     switch (uint32_t(attribute)) {
     case HSA_AGENT_INFO_NAME:
+    case HSA_AMD_AGENT_INFO_PRODUCT_NAME:
+        // The transport reports discovered ASIC identity, not a board marketing
+        // string. Use that identity as the display-name fallback; do not infer
+        // a retail product from a PCI ID shared by multiple board variants.
         std::memset(value, 0, 64);
         if (agent->connection)
             std::snprintf(static_cast<char *>(value), 64, "gfx%u%u%x",
@@ -310,6 +314,10 @@ hsa_status_t hsa_system_get_info(hsa_system_info_t attribute, void *value) {
     case HSA_AMD_SYSTEM_INFO_SVM_ACCESSIBLE_BY_DEFAULT:
     case HSA_AMD_SYSTEM_INFO_VIRTUAL_MEM_API_SUPPORTED:
         return writeValue(value, false); // GPU SVM/VA aliases are not supported
+    case HSA_AMD_SYSTEM_INFO_XNACK_ENABLED:
+        return writeValue(value, false); // No recoverable GPU page-fault path.
+    case HSA_AMD_SYSTEM_INFO_DMABUF_SUPPORTED:
+        return writeValue(value, false); // No Linux dma-buf import/export ABI.
     case HSA_SYSTEM_INFO_EXTENSIONS:
         std::memset(value, 0, 128);
         static_cast<uint8_t *>(value)[HSA_EXTENSION_AMD_LOADER / 8] |= uint8_t(1u << (HSA_EXTENSION_AMD_LOADER % 8));

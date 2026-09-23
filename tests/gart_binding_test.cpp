@@ -43,7 +43,7 @@ struct IOBufferMemoryDescriptor {
 static IOBufferMemoryDescriptor *preparedBuffer;
 struct IODMACommand {
     static int Create(void *, unsigned, IODMACommandSpecification *spec, IODMACommand **out) {
-        assert(spec->maxAddressBits == 48); *out = new IODMACommand; ++liveDMA; return 0;
+        assert(spec->maxAddressBits == 44); *out = new IODMACommand; ++liveDMA; return 0;
     }
     int PrepareForDMA(unsigned, IOBufferMemoryDescriptor *buffer, uint64_t, uint64_t size,
                       uint64_t *, uint32_t *count, IOAddressSegment *out) {
@@ -156,6 +156,15 @@ static size_t event(const char *name) {
 }
 int main() {
     FakePCI pci; DeviceContext dev{&pci}; GMCContext gmc; GARTContext gart{};
+    GMCContext boundaryGMC;
+    uint64_t boundaryOutput=UINT64_MAX;
+    for (const auto base:{1ull<<44,(1ull<<44)-16384}) {
+        events.clear();
+        assert(gmc_bind_existing(dev,boundaryGMC,base,16385,&boundaryOutput)==kIOReturnBadArgument);
+        assert(boundaryOutput==UINT64_MAX && boundaryGMC.gart_allocator.bytes_used()==0 && events.empty());
+    }
+    assert(gmc_bind_existing(dev,boundaryGMC,(1ull<<44)-16384,16384,&boundaryOutput)==0);
+    assert(boundaryOutput==0 && entries[3]==(((1ull<<44)-4096)|PTEFlags::SYSMEM_RW));
     uint64_t firmware = UINT64_MAX;
     assert(gmc_bind_existing(dev, gmc, 0x81000000, 16384, &firmware) == 0);
     assert(firmware == 0 && gmc.gart_allocator.bytes_used() == 16384);
@@ -217,10 +226,13 @@ int main() {
         assert(gart_bind_existing(dev, gart, 0x81000000, size, &invalid) == kIOReturnBadArgument);
         assert(events.empty() && !invalid.owner && gmc.gart_allocator.bytes_used() == 0);
     }
-    for (uint64_t base : {uint64_t(1), uint64_t(1) << 48, UINT64_MAX - 4095}) {
+    for (uint64_t base : {uint64_t(1), uint64_t(1) << 44, UINT64_MAX - 4095}) {
         GARTBinding invalid{};
         assert(gart_bind_existing(dev, gart, base, 4096, &invalid) == kIOReturnBadArgument);
     }
+    assert(gart_bind_existing(dev, gart, (1ull<<44)-4096, 8192, &external) == kIOReturnBadArgument);
+    assert(gart_bind_existing(dev, gart, (1ull<<44)-4096, 4096, &external) == 0);
+    assert(gart_unbind(dev, gart, &external) == 0);
     assert(gart_bind_sysmem(dev, gart, UINT64_MAX, 16384, &owned) == kIOReturnBadArgument);
     assert(gart_bind_sysmem(dev, gart, 4096, 16385, &owned) == kIOReturnBadArgument);
     assert(gart_bind_existing(dev, gart, 0x81000000, 4096, &external) == 0 && external.gartMCAddr == 0);

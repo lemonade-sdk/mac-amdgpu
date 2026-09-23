@@ -1,8 +1,11 @@
 # macOS HRX implementation candidate
 
-Driver 189 and the companion HSA runtime add the contracts needed by an explicit
-macOS adapter for the pinned HRX host AQL path. The implementation has software
-coverage; hardware results from driver 187 do not validate these new paths.
+Driver 190 and the companion HSA runtime target an explicit macOS adapter for
+the pinned HRX host AQL path. Installed driver 189 passed public coarse/kernarg
+pools, topology/clock queries, shared HSA signals and multi-process queues.
+Scratch/LDS output validation failed; driver 190 corrects the GFX12 scratch
+wave-size unit and awaits hardware validation. Actual HRX compute and model
+inference remain unverified.
 
 ## Implemented candidate
 
@@ -10,6 +13,9 @@ coverage; hardware results from driver 187 do not validate these new paths.
   buffers, equal CPU/GPU addresses, truthful access and pointer metadata, and
   capacity from the negotiated GART window. CPU-only fine pools do not falsely
   advertise GPU access. Same-GPU VRAM copies use bounded SDMA chunks.
+- Architecture-selected scratch units/register limits from discovered GC IP,
+  with GFX9/10/11/12 reference properties and explicit queue-layout support gates.
+  Current hardware support remains gfx1201.
 - Dynamic queue scratch allocation, CP inactive-signal servicing, growth/reuse,
   LDS/private apertures, retained backing on uncertain removal, and error
   callbacks that wake signal waiters without inventing completion. Background
@@ -29,6 +35,27 @@ memory, SVM or GPU virtual-memory aliases. GPU-driven enqueue, ASAN/TSAN/feedbac
 hostcalls and PM4 replay are rejected. Hardware profiling is unavailable until
 the driver can safely refresh CP queue properties. This is an explicit port,
 not full ROCr/HSA conformance or unmodified HRX support.
+
+## Architecture selection
+
+Scratch encoding uses the discovered GC IP version, not the PCI marketing name
+or host CPU architecture. `amdgpu_arch_capabilities.h` records the properties
+used for each known family:
+
+| GC family | Bytes per scratch wave-size unit | WAVESIZE bits | Wave count |
+| --- | ---: | ---: | --- |
+| GFX9 | 1024 | 13 | Total per XCC |
+| GFX10 | 1024 | 13 | Total per XCC |
+| GFX11 | 256 | 15 | Per shader engine |
+| GFX12 | 256 | 18 | Per shader engine |
+
+The table also identifies scratch SRD layout and address/record limits. Actual
+CU count, shader-engine count and scratch slots come from device discovery.
+Initial allocation and later scratch growth use the same lookup. Unknown
+families fail lookup; known families without implemented queue layouts remain
+unsupported. The current queue implementation is still gated to GC 12.0.1.
+Adding a family requires its firmware, queue mapping, SRD encoder and hardware
+validation, not just a table row.
 
 ## Build without GPU submissions
 
@@ -53,7 +80,7 @@ initializing HSA or submitting work.
 
 ## Hardware validation
 
-After installing driver 189, run:
+After installing driver 190, run:
 
 ```sh
 python3 scripts/test-hrx-hardware.py --run

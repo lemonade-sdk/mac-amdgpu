@@ -433,7 +433,7 @@ int main() {
     }
     assert(opens==closes);
     {
-        driverBuild=189;queueFault=0;
+        driverBuild=190;queueFault=0;
         mac_hsa::IOKitConnection connection;connection.service=123;connection.registryID=456;
         mac_hsa::SharedBuffer ring,metadata;
         assert(connection.allocateSharedBuffer(16384,ring)==0 && connection.allocateSharedBuffer(16384,metadata)==0);
@@ -451,7 +451,7 @@ int main() {
         assert(connection.freeSharedBuffer(ring)==0 && connection.freeSharedBuffer(metadata)==0);
     }
     {
-        driverBuild=189;queueFault=0;serviceFault=3;
+        driverBuild=190;queueFault=0;serviceFault=3;
         mac_hsa::IOKitConnection connection;connection.service=123;connection.registryID=456;
         mac_hsa::SharedBuffer ring,metadata;
         assert(connection.allocateSharedBuffer(16384,ring)==0 && connection.allocateSharedBuffer(16384,metadata)==0);

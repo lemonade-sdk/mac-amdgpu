@@ -27,10 +27,11 @@
 
 namespace amdgpu {
 
-// GFX12 PTE physical addresses occupy bits 47:12 (gmc_v12_0.c).
+// Linux gmc_v12_0.c requests DMA_BIT_MASK(44). PTE address width is wider
+// than the device DMA contract, so constrain the DART mapping itself.
 static bool gart_bus_range(uint64_t address, uint64_t bytes)
 {
-    constexpr uint64_t limit = uint64_t(1) << 48;
+    constexpr uint64_t limit = uint64_t(1) << 44;
     return bytes && !(address & 4095) && !(bytes & 4095) &&
         address < limit && bytes <= limit - address;
 }
@@ -200,7 +201,7 @@ gart_bind_sysmem(DeviceContext &dev, GARTContext &gart,
     }
     IODMACommandSpecification spec{};
     spec.options = kIODMACommandSpecificationNoOptions;
-    spec.maxAddressBits = 48; // the GFX12 PTE format, not the CPU address width
+    spec.maxAddressBits = 44; // Linux GFX12 DMA mask, not PTE/CPU address width
     IODMACommand *dma = nullptr;
     r = IODMACommand::Create(dev.pci, kIODMACommandCreateNoOptions, &spec, &dma);
     if (r != kIOReturnSuccess || !dma) {
