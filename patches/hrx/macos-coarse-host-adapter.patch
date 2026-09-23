@@ -11,6 +11,50 @@ index 95e8bbf2..a5e6218f 100644
  _hrx_stream_retain
  _hrx_stream_release
  _hrx_stream_synchronize
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/access_policy.c b/runtime/src/iree/hal/drivers/amdgpu/access_policy.c
+index 48b80aa0..605ae8ee 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/access_policy.c
++++ b/runtime/src/iree/hal/drivers/amdgpu/access_policy.c
+@@ -85,6 +85,39 @@ iree_status_t iree_hal_amdgpu_access_allow_agent_list(
+   IREE_ASSERT_ARGUMENT(libhsa);
+   IREE_ASSERT_ARGUMENT(agent_list);
+   IREE_ASSERT_ARGUMENT(ptr);
++#if defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
++  // The topology list includes the nearest CPU even for device-only slabs.
++  // This transport's VRAM pointers have no CPU mapping. Do not ask HSA to
++  // grant a mapping it cannot provide; mapped host/GTT allocations retain
++  // their full list, and unsupported peer-GPU requests must still fail.
++  hsa_amd_pointer_info_t info = {0};
++  info.size = sizeof(info);
++  IREE_RETURN_IF_ERROR(iree_hsa_amd_pointer_info(
++      IREE_LIBHSA(libhsa), ptr, &info, NULL, NULL, NULL));
++  iree_hal_amdgpu_access_agent_list_t filtered = {0};
++  if (info.type == HSA_EXT_POINTER_TYPE_HSA && !info.hostBaseAddress) {
++    hsa_device_type_t owner_type = HSA_DEVICE_TYPE_CPU;
++    IREE_RETURN_IF_ERROR(iree_hsa_agent_get_info(
++        IREE_LIBHSA(libhsa), info.agentOwner, HSA_AGENT_INFO_DEVICE,
++        &owner_type));
++    if (owner_type == HSA_DEVICE_TYPE_GPU) {
++      for (uint32_t i = 0; i < agent_list->count; ++i) {
++        hsa_device_type_t type = HSA_DEVICE_TYPE_CPU;
++        IREE_RETURN_IF_ERROR(iree_hsa_agent_get_info(
++            IREE_LIBHSA(libhsa), agent_list->values[i], HSA_AGENT_INFO_DEVICE,
++            &type));
++        if (type != HSA_DEVICE_TYPE_CPU) {
++          filtered.values[filtered.count++] = agent_list->values[i];
++        }
++      }
++      if (!filtered.count) {
++        return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
++                                "device-only VRAM has no requested GPU agent");
++      }
++      agent_list = &filtered;
++    }
++  }
++#endif
+   return iree_hsa_amd_agents_allow_access(IREE_LIBHSA(libhsa),
+                                           agent_list->count, agent_list->values,
+                                           /*flags=*/NULL, ptr);
 diff --git a/runtime/src/iree/hal/drivers/amdgpu/logical_device.c b/runtime/src/iree/hal/drivers/amdgpu/logical_device.c
 index be7c4cfc..1728323a 100644
 --- a/runtime/src/iree/hal/drivers/amdgpu/logical_device.c

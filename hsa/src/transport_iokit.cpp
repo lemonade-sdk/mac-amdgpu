@@ -176,6 +176,22 @@ public:
         if (status != HSA_STATUS_SUCCESS) state = State::Faulted;
         return status;
     }
+    hsa_status_t atomicRequesterExperiment(bool enable,amdgpu::atomic_requester::Snapshot &out) override {
+        std::lock_guard lock(sessionMutex);
+        auto status=enable ? ensureReady() : (ownerPort ? HSA_STATUS_SUCCESS : HSA_STATUS_ERROR);
+        if (status!=HSA_STATUS_SUCCESS) return status;
+        if (!hardwareQueues.empty()) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+        std::array<uint64_t,3> build{};status=scalar(43,{},build);
+        if (status!=HSA_STATUS_SUCCESS) return status;
+        if (build[2]<191) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        const uint64_t input=enable ? 1 : 0;amdgpu::atomic_requester::Snapshot snapshot{};
+        status=scalar(60,{&input,1},{snapshot.values,amdgpu::atomic_requester::Count});
+        if (status!=HSA_STATUS_SUCCESS) return status;
+        if (!amdgpu::atomic_requester::valid(snapshot)) return HSA_STATUS_ERROR;
+        out=snapshot;
+        if (snapshot.values[amdgpu::atomic_requester::Status]) return HSA_STATUS_ERROR;
+        return HSA_STATUS_SUCCESS;
+    }
     hsa_status_t sharedAtomicDiagnostics(const SharedBuffer &buffer,uint64_t offset,
         uint64_t queue,amdgpu::atomic_diag::Snapshot &out) override {
         std::lock_guard lock(sessionMutex);

@@ -11,13 +11,13 @@ of the actual gfx12-generic HRX helper image. Queue service failures wake signal
 waiters and report an error without changing completion values. Hardware queue
 profiling enablement explicitly fails until CP property refresh is implemented.
 Installed driver 189 passed public pools, device properties, GPU-backed signals
-and multi-process queues. Scratch/LDS dispatch completed but output validation
-failed; driver 190 corrects the scratch wave-size unit and awaits hardware
-validation. HRX startup queries now include product name, XNACK and dma-buf
-capability responses; actual HRX compute remains unverified.
+and multi-process queues. Driver 190 passed scratch/LDS output and guard validation on two queues
+through initial allocation, scratch growth and reuse after correcting the
+architecture-specific wave-size unit. HRX startup queries now include product name, XNACK and dma-buf
+capability responses; actual HRX compute now passes exact guarded vector and matrix outputs.
 The [macOS HRX adapter and combined test procedure](../docs/HRX_MACOS_VALIDATION.md)
 describe the supported host AQL path and the remaining exclusions. LSE's native macOS CLI now builds against HRX/Loom and passes selected CPU
-suites; GPU execution and model inference remain unverified. Symbol resolution
+suites; actual HRX GPU compute passes, while LSE model inference remains unverified. Symbol resolution
 or successful host compilation alone does not establish either.
 
 The 29 symbols added with build 181 have these behaviors:

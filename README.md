@@ -5,9 +5,11 @@
 - GPU discovery, firmware loading and initialization on the Radeon AI PRO R9700 (`gfx1201`) over Thunderbolt.
 - Verified SDMA transfers, VRAM allocations and cross-process GPU-buffer sharing.
 - Loading linked gfx1201 HSA code objects, freezing executables and resolving kernel descriptors.
+- Actual HRX initialization, streams, 64 KiB copy/fill, 4,093-result FP32 vector compute and 16×16 FP32 matrix multiplication, with exact results and full input/output guards.
 - Native synchronous compute: HSA-loaded kernels passed with 128 and 256 results in both VRAM and shared host memory, including every byte of the input/output guards.
 - Bounded hardware AQL dispatch: kernels passed in VRAM and shared host memory, with firmware-acknowledged queue removal and recreation between launches.
 - Persistent HSA compute queues: all seven slots, ring wraparound, four CPU producers, shared completion/barrier signals and two processes sharing the GPU passed hardware tests. One process can exit while the other continues on its existing queues.
+- Scratch/LDS compute on gfx1201: two independent queues passed full data/guard checks through initial scratch allocation, growth and reuse.
 - Public CPU-owned coarse/kernarg HSA pools with GPU access and identical CPU/GPU addresses. CPU access is allowed between completed GPU operations.
 - GPU-backed HSA signal operations: stores, arithmetic, bitwise operations, exchange, compare-and-swap and waits passed hardware checks. CPU HSA updates execute GPU atomics; earlier native CPU/GPU contention tests lost updates, so that interoperability is not advertised.
 - HSA host services, CPU signals and software queues. All 119 entry points required by LSE’s pinned HRX resolve; the [behavior status](hsa/API_STATUS.md) explains their limits.
@@ -18,14 +20,14 @@
 
 - General fine-grained CPU/GPU atomic interoperability; native add/CAS contention is being tested separately.
 - HRX/LSE model inference. No end-to-end AI workload has run.
-- Full HSA conformance and general executable linking. The scratch/LDS hardware check completed dispatches but found an output mismatch under investigation. The gfx12-generic HRX helper loader passes software tests. Hardware profiling and some platform-specific APIs explicitly return errors.
+- Full HSA conformance and general executable linking. The gfx12-generic HRX helper loader passes software tests. Hardware profiling and some platform-specific APIs explicitly return errors.
 - Live firmware telemetry in amdgpu_mtop: usage, clocks, temperature and power need a verified firmware metrics layout.
 - Larger PCIe BAR allocation through a public Apple API, and Mesa/Vulkan integration.
 
 ## Upcoming
 
 - Run the [combined HRX validation suite](docs/HRX_MACOS_VALIDATION.md): public pools, discovered topology, scratch/LDS, real HRX operations and native CPU/GPU addition/CAS contention.
-- Validate the native LSE/HRX/Loom build on the GPU, then verify a real model inference workload.
+- Validate LSE model execution through the tested HRX compute path, then verify a real inference workload.
 - Finish the firmware telemetry path for amdgpu_mtop.
 
 Detailed changes and hardware results are in [PROGRESS.md](PROGRESS.md).

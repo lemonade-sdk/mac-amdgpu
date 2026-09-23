@@ -4,6 +4,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include "../dext/amdgpu/amdgpu_atomic_requester.h"
 using kern_return_t = int;
 constexpr int kIOReturnSuccess = 0, kIOReturnNotAttached = 1,
     kIOReturnUnsupported = 2, kIOReturnNotReady = 3, kIOReturnTimeout = 4,
@@ -26,7 +27,8 @@ struct IODispatchQueue { void release() {} };
 static std::vector<std::string> events;
 static bool metricsInvalidated;
 struct IOPCIDevice {
-    uint16_t command = 6;
+    uint16_t command = 6, control2=0x20;
+    bool refuseRestore=false, resetRequester=false;
     bool absent = false, supportsFLR = true, refusesBM = false;
     bool failsReset = false, reenabledBM = false;
     uint64_t pendingUntil = 0;
@@ -37,12 +39,22 @@ struct IOPCIDevice {
         if (absent) { *out = 0xFFFF; return; }
         if (reg == 0) *out = 0x1002;
         else if (reg == 4) *out = command;
+        else if (reg == 0x40) *out=0x10;
+        else if (reg == 0x42) *out=0x12;
+        else if (reg == 0x68) *out=control2;
         else { assert(reg == 0x4A); *out = timeNS < pendingUntil ? 0x20 : 0; }
     }
     void ConfigurationRead32(uint32_t reg, uint32_t *out) {
+        if (reg==0) {*out=absent ? UINT32_MAX : 0x75511002;return;}
         assert(reg == 0x44); *out = supportsFLR ? 1u << 28 : 0;
     }
     void ConfigurationWrite16(uint32_t reg, uint16_t value) {
+        if(reg==0x68) {
+            assert(!((value^control2)&~0x40));
+            const bool restore=!(value&0x40);events.push_back(restore ? "restore requester" : "enable requester");
+            if(!restore || !refuseRestore) control2=value;
+            return;
+        }
         assert(reg == 4); assert(!(value & 4));
         events.push_back("disable BM");
         if (!refusesBM) command = value;
@@ -59,6 +71,7 @@ struct IOPCIDevice {
         if (failsReset) return kIOReturnTimeout;
         resetDone = true;
         if (reenabledBM) command |= 4;
+        if (resetRequester) control2|=0x40;
         return 0;
     }
     int Open(IOService *client, int) { assert(client == expectedOwner); events.push_back("open"); return 0; }
@@ -101,6 +114,7 @@ struct DriverState {
     bool shutdownInProgress = false, shutdownBlocked = false, pciOpen = true;
     uint32_t connectedClients = 1;
     amdgpu::ClientSessions sessions;
+    amdgpu::atomic_requester::Experiment atomicRequester;
     IOPCIDevice *retainedPCI = nullptr;
     amdgpu::Bringup bringup;
     amdgpu::ClientSubmission submission;
@@ -176,6 +190,43 @@ int main() {
         // Observers do not count as reset-blocking application participants.
         Fixture f; f.state.connectedClients = 20;
         assert(f.stop() == 0 && f.state.sessions.participants == 0);
+    }
+    // An explicit experiment is restored after DMA drain, before the reset
+    // saves PCI configuration. Reset readback must verify the original bit.
+    for(unsigned failure=0;failure<4;++failure) {
+        Fixture f;amdgpu::atomic_requester::Snapshot snapshot{};
+        assert(f.state.atomicRequester.begin(f.pci,&f.client,snapshot));
+        assert(f.pci.control2==0x60 && f.state.atomicRequester.pending);
+        f.pci.control2|=0x400; // unrelated live setting must survive restoration
+        f.pci.refuseRestore=failure==1;f.pci.resetRequester=failure==2;
+        f.pci.absent=failure==3;f.pci.pendingUntil=5000000;
+        const auto status=f.stop();
+        if(!failure) {
+            assert(status==0 && f.pci.control2==0x420 && !f.state.atomicRequester.owner);
+            assert(std::find(events.begin(),events.end(),"disable BM")<std::find(events.begin(),events.end(),"restore requester"));
+            assert(std::find(events.begin(),events.end(),"restore requester")<std::find(events.begin(),events.end(),"reset"));
+        } else {
+            assert(status!=0 && f.state.shutdownBlocked && f.state.atomicRequester.pending);
+            assert(std::find(events.begin(),events.end(),"free DMA")==events.end());
+            assert(failure!=1 || !f.pci.resets);
+            f.pci.refuseRestore=f.pci.resetRequester=f.pci.absent=false;
+            assert(f.stop()==0 && f.pci.control2==0x420 && !f.state.atomicRequester.owner);
+        }
+    }
+    for(bool failRestore:{false,true}) {
+        Fixture f;IODispatchQueue queue;
+        f.client.ivars=new ClientState(f.clientState);f.client.ivars->stopQueue=&queue;
+        amdgpu::atomic_requester::Snapshot snapshot{};
+        assert(f.state.atomicRequester.begin(f.pci,&f.client,snapshot));
+        f.pci.refuseRestore=failRestore;
+        f.client.FinishStop(&f.driver);
+        assert(!f.client.ivars && f.pci.closed);
+        if(failRestore) {
+            assert(f.state.shutdownBlocked && f.state.quarantinedClient && f.state.atomicRequester.pending);
+            assert(std::find(events.begin(),events.end(),"free client")==events.end());
+            f.pci.refuseRestore=false;f.client.ivars=&f.clientState;f.clientState.claimed=false;
+            assert(f.stop()==0 && !f.state.quarantinedClient && !f.state.atomicRequester.owner);
+        } else assert(!f.state.atomicRequester.owner && f.pci.control2==0x20);
     }
     for (int retirementMode : {0, 1, 2, 3}) {
         const bool healthy = retirementMode == 0;

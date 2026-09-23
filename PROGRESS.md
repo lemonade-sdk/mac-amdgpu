@@ -2027,3 +2027,51 @@ successfully after cleanup. No hardware AQL queue or HRX inference is claimed.
 - Candidate 190 passed 34 driver/ABI scripts, 12 HSA ASan/UBSan suites, nine
   PCIe diagnostic tests, the HRX query audit, Xcode build and strict signature
   verification. Installation and new hardware validation remain pending.
+
+
+## Driver 190 installed validation
+
+- Live R9700 readback confirmed DEVCAP2=0x0073099f, DEVCTL2=0x0000:
+  AtomicOp Requester Enable is off. Actual shared PTE matched expected,
+  saved MQD policy stayed 0x4000 and GFXHUB PTBASE was 0x700001. CPU cache
+  attributes and live upstream bridge controls remain unknown.
+- All 32 serialized native atomic handoff rounds passed. Unequal-count tests
+  completed but returned 1,191,166 (CPU 10M/GPU 1M) and 10,025,715 (CPU 1M/GPU 10M),
+  each expecting 11M. Staggered A returned 6,124,524; its 2.5M CPU prefix and 2.5M
+  CPU tail were exact, while the middle phase returned 1,124,524 of 6M.
+  Returning-add also lost updates with failed old-value sums. Single-agent
+  controls, data guards, completion and cleanup passed. See the atomic policy
+  document for exact timing/count interpretation; no PCI configuration changed.
+- The architecture-selected scratch fix passed two queues through initial
+  allocation, growth and reuse, with all output and guard bytes checked.
+- Actual HRX initialization exposed an adapter access-list assumption: CPU
+  access was requested for GPU-only VRAM. Filtering that CPU request only for
+  confirmed unmapped VRAM fixes startup without weakening runtime permissions.
+- Actual HRX then passed streams, 64 KiB copy/fill, 4,093 exact FP32 affine outputs,
+  256 exact FP32 matmul outputs, unchanged inputs/full guards and shutdown.
+  No model inference result is implied.
+
+
+## Driver 191 requester experiment candidate
+
+- Added a dedicated endpoint-only AtomicOp Requester Enable begin/end API.
+  The transition requires an initialized sole participant, exclusive lease,
+  no queues/submissions, no BAR/IRQ ownership and no pending PCIe transactions.
+  It saves recovery state before a 16-bit RMW of bit 6 and verifies readback.
+- Explicit end and driver/client shutdown restore the original requester bit
+  while preserving unrelated bits. Shutdown restores after transaction drain
+  and before reset, then verifies after reset. Failed restoration retains
+  backing/recovery state and blocks submissions; physical unplug can prevent
+  rollback. No upstream configuration or ordinary capability advertisement changes.
+- The explicit A/B harness reuses its allocations, kernel and completion signal,
+  retires and recreates identical queues between settings, and compares PTE/DMA,
+  full saved HQ_STATUS0, GFXHUB and mapping policy. It runs the exact staggered
+  CPU 10M/GPU 1M algorithm OFF then ON. Restoration is checked against the
+  independently saved OFF register, not just two fields of the restore reply.
+- Shader source/binary hashes and CPU trial code match the measured driver 190
+  baseline. No PTE, cache, shader ordering or allocation changes are included.
+- Validation: 36 driver/ABI scripts and 12 HSA ASan/UBSan suites pass. The metrics
+  regression harness needed the new selector enum to compile its extracted
+  admission code. Xcode build and strict app/dext signature checks pass.
+- Build 0.1.91 (191) awaits installation; the Requester Enable ON experiment has
+  not run. Build 190 completed all prior tests and returned to stage 0.

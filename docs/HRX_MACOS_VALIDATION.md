@@ -3,9 +3,9 @@
 Driver 190 and the companion HSA runtime target an explicit macOS adapter for
 the pinned HRX host AQL path. Installed driver 189 passed public coarse/kernarg
 pools, topology/clock queries, shared HSA signals and multi-process queues.
-Scratch/LDS output validation failed; driver 190 corrects the GFX12 scratch
-wave-size unit and awaits hardware validation. Actual HRX compute and model
-inference remain unverified.
+Driver 190 corrected the GFX12 scratch wave-size unit and passed scratch/LDS
+output and guard checks on two queues through allocation, growth and reuse. Actual HRX copy/fill, FP32 vector and matrix compute also pass guarded
+readbacks. Model inference remains unverified.
 
 ## Implemented candidate
 
@@ -156,3 +156,23 @@ broader test reports 118/124: six remaining assertions assume device-first alias
 program replay or GPU launch counts while this test uses the CPU interpreter.
 The scheduler/interpreter paths involved are unchanged from the pinned upstream.
 These results do not establish HRX execution or model inference on the GPU.
+
+
+## Driver 190 hardware validation
+
+The two-queue resource test passed all three passes with intact 16 KiB data
+and kernarg guards. Initial 272-byte private allocation encoded TMPRING
+`0x44200`; growth to 4096 bytes encoded `0x400200`, and the larger allocation
+was reused on the final pass.
+
+Actual HRX initialization initially rejected a CPU access grant to GPU-only
+VRAM. The adapter now filters CPU agents only for confirmed HSA GPU-owned
+allocations with no host mapping; CPU-accessible GTT and all GPU peer requests
+retain their original access checks. Regression tests compile the actual helper
+and exercise allocation types, query failures and denied access.
+
+After that correction, the actual HRX smoke test passed initialization, streams,
+64 KiB copy/fill, 4,093 exact FP32 affine outputs and 256 exact FP32 matrix outputs.
+Inputs, output guards/tails and shutdown passed. These small compute results
+are not an LSE model inference result. Logs are in
+`build/tests/driver190-hardware/real-hrx-access-retry.log`.

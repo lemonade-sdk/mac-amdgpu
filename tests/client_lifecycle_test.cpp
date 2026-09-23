@@ -14,7 +14,7 @@ enum { kMacAMDGPUMethodRuntimeBuild, kMacAMDGPUMethodPing,
        kMacAMDGPUMethodCollectMetrics, kMacAMDGPUMethodMetricsSnapshot,
        kMacAMDGPUMethodLoadFirmware, kMacAMDGPUMethodSetIPBase,
        kMacAMDGPUMethodLoadDiscoveryBin, kMacAMDGPUMethodResetDevice,
-       kMacAMDGPUMethodSetupInterrupts };
+       kMacAMDGPUMethodSetupInterrupts, kMacAMDGPUMethodAtomicRequesterExperiment };
 struct IOService {};
 static unsigned openCalls;
 #define OSDynamicCast(type, pointer) static_cast<type *>(pointer)

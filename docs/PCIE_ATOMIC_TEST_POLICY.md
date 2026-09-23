@@ -33,9 +33,9 @@ and local `amdgpu_device.c`.
 
 `scripts/check-pcie-atomics.py` reports cached registry capabilities and controls,
 preserving unavailable values as unknown. Cached results are not live readback
-or proof of Thunderbolt/DART handling and CPU coherence. Neither diagnostic
-changes PCI configuration, MQD atomic policy or memory cache policy. There is no
-blind "enable atomics" override.
+or proof of Thunderbolt/DART handling and CPU coherence. The default diagnostics do not change PCI configuration, MQD atomic policy or
+memory cache policy. The separate driver 191 requester experiment below is
+explicitly opt-in and does not qualify the upstream path.
 
 ## Mapping and result limits
 
@@ -124,3 +124,80 @@ on one steady clock. Observation latency remains; they are not correlated GPU
 hardware timestamps. Use a 400-second outer deadline per add-only invocation.
 A completed mismatch may be investigated after confirming queue cleanup;
 a timeout or incomplete dispatch requires recovery before more submissions.
+
+
+## Measured result on driver 190
+
+Live endpoint snapshot on 2026-09-23: PCIe capability offset `0x64`,
+`DEVCAP2=0x0073099f`, `DEVCTL2=0x0000`. Requester Enable was off. The owned
+buffer's actual GART PTE `0x8080000082058077` matched its expected encoding;
+DART address was `0x82058000`, saved MQD HQ_STATUS0 was `0x4000`, and GFXHUB
+PTBASE was `0x700001`. Actual CPU cache/MAIR attributes remain unknown.
+No configuration bits changed during these tests.
+
+All 32 serialized native CPU/GPU handoff rounds passed add, exchange and
+successful/failed CAS checks. Single-agent addition controls passed in every
+case below; mixed phases completed both requested workloads with intact guards
+and observed progress overlap, but failed exact result checks:
+
+| Mixed test | CPU operations | GPU operations | Expected | Observed |
+| --- | ---: | ---: | ---: | ---: |
+| A | 10,000,000 | 1,000,000 | 11,000,000 | 1,191,166 |
+| B | 1,000,000 | 10,000,000 | 11,000,000 | 10,025,715 |
+| Staggered A | 10,000,000 | 1,000,000 | 11,000,000 | 6,124,524 |
+| Returning-add | 1,000,000 | 1,000,000 | 2,000,000 | 1,045,879 |
+
+Staggered A recorded an exact 2,500,000 CPU prefix, 1,124,524 increments
+in the middle phase versus 6,000,000 expected, and an exact 2,500,000 CPU tail.
+The deficit of 4,875,476 was already present before the tail and remained
+unchanged afterward. CPU timestamps were 0.000188–2.646470 seconds; host-observed
+GPU markers were 0.013828–2.603420 seconds. These timestamps include observation
+lag and do not count individual physically overlapping RMW operations.
+
+The returning-add mixed sum of returned old values was 570,895,470,261 versus
+1,999,999,000,000 expected. Each single-agent returned-old sum was exactly
+499,999,500,000. Failure therefore also occurs with the returning GPU atomic
+instruction under the current configuration.
+
+These results support a boundary between tested serialized visibility and
+concurrent heterogeneous RMW serialization. They do not identify the physical
+cache/transaction mechanism or prove failure under every configuration.
+Cached bridge controls remain unknown; the endpoint register is a live read.
+Logs and baseline artifact hashes are under `build/tests/driver190-hardware/`.
+
+
+## Driver 191 endpoint requester A/B experiment
+
+The explicit `--requester-ab` mode keeps the existing non-returning shader,
+CPU ordering, allocation type, mapping attributes and stagger algorithm. It
+fixes CPU/GPU operation counts to 10,000,000 / 1,000,000 and one mixed trial
+per setting, with the same single-agent controls before each mixed trial.
+
+It requires live Requester Enable OFF for the baseline. After completed work
+and confirmed queue removal, a dedicated driver API claims exclusive session
+participation, saves Device Control 2, changes only endpoint bit 6 using a
+16-bit read-modify-write and verifies readback. It does not alter any bridge,
+MQD atomic-policy bit, PTE or advertised HSA capability. This is an explicitly
+unqualified experiment despite the missing cached path prerequisites.
+
+The ON phase reuses the same shared allocations, kernel and signal, recreating
+the queue with identical settings. It checks full saved HQ_STATUS0, PTE/DMA/VA,
+GFXHUB context, requested CPU mapping policy and endpoint registers against the
+baseline. The recreated MQD storage address is logged separately. Completed
+counter mismatches permit comparison; incomplete dispatch, failed controls or
+guard damage stop the experiment.
+
+After queue removal, explicit end restores only the original requester bit,
+preserving unrelated control bits. Driver shutdown/client exit also restores
+before reset after disabling bus mastering and draining transactions, then
+verifies the bit after reset. Failed restoration blocks submissions and retains
+recovery state. Software cannot guarantee restoration after physical unplug or
+a driver-process crash.
+
+```sh
+build/hsa/mac-hsa-atomic-contention-test --run build/tests/hsa-atomic-contention.hsaco --requester-ab --timeout-seconds 120
+```
+
+Use a 700-second outer deadline. Completion of the A/B procedure is reported
+separately from exact-count success. No Requester Enable ON hardware result has
+yet been recorded; installation of driver 191 is required.

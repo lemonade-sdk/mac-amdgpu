@@ -128,6 +128,25 @@ void stopQueueServices(RetiredQueueSet &retired) {
 using namespace mac_hsa::detail;
 
 extern "C" {
+hsa_status_t mac_hsa_atomic_requester_experiment(hsa_agent_t agent,uint32_t enable,
+    mac_hsa_atomic_requester_experiment_t *out,size_t outSize) {
+    std::shared_ptr<mac_hsa::Connection> connection;
+    {
+        std::lock_guard lock(runtimeMutex);
+        if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+        if (enable>1 || !out || outSize!=sizeof(*out)) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        const auto found=findAgent(agent);
+        if (!found || !found->connection) return HSA_STATUS_ERROR_INVALID_AGENT;
+        connection=found->connection;
+    }
+    amdgpu::atomic_requester::Snapshot snapshot{};
+    const auto status=connection->atomicRequesterExperiment(enable!=0,snapshot);
+    if (amdgpu::atomic_requester::valid(snapshot)) {
+        static_assert(sizeof(snapshot)==sizeof(*out));
+        std::memcpy(out,&snapshot,sizeof(*out));
+    } else if (status==HSA_STATUS_SUCCESS) return HSA_STATUS_ERROR;
+    return status;
+}
 hsa_status_t mac_hsa_shared_atomic_diagnostics(const void *pointer,const hsa_queue_t *q,
     mac_hsa_shared_atomic_diagnostics_t *out,size_t outSize) {
     std::shared_ptr<Allocation> allocation;

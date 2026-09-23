@@ -7,6 +7,7 @@
 #include "../../dext/amdgpu/amdgpu_dispatch_abi.h"
 #include "../../dext/amdgpu/amdgpu_aql_abi.h"
 #include "../../dext/amdgpu/amdgpu_atomic_diagnostics.h"
+#include "../../dext/amdgpu/amdgpu_atomic_requester.h"
 
 namespace mac_hsa {
 
@@ -58,6 +59,9 @@ public:
     virtual hsa_status_t freeSharedBuffer(const SharedBuffer &) { return HSA_STATUS_ERROR; }
     // Diagnostic only: raw SDMA submission claims an exclusive client lease.
     virtual hsa_status_t testSharedAtomicAdd(const SharedBuffer &, uint64_t, int64_t, uint32_t) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
+    virtual hsa_status_t atomicRequesterExperiment(bool,amdgpu::atomic_requester::Snapshot &) {
+        return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    }
     virtual hsa_status_t sharedAtomicDiagnostics(const SharedBuffer &, uint64_t, uint64_t,
         amdgpu::atomic_diag::Snapshot &) { return HSA_STATUS_ERROR_INVALID_ARGUMENT; }
     virtual hsa_status_t createQueue(const SharedBuffer &, const SharedBuffer &, uint32_t, uint64_t &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }

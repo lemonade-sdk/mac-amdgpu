@@ -10,6 +10,7 @@ static bool failKick=false,failAtomic=false;
 static uint64_t driverBuild=187;
 static uint32_t gfxRevision=1;
 static unsigned diagnosticMode=0,diagnosticCalls=0;
+static unsigned requesterMode=0,requesterCalls=0;
 namespace mac_hsa {
 struct TestConnection:Connection {
     uint64_t next=0;bool fault=false;
@@ -43,6 +44,20 @@ struct TestConnection:Connection {
     }
     hsa_status_t writeBuffer(const DeviceBuffer &buffer,uint64_t offset,const void *data,size_t bytes) override {
         assert(offset+bytes<=buffer.size);std::memcpy(device.at(buffer.handle).data()+offset,data,bytes);return HSA_STATUS_SUCCESS;
+    }
+    hsa_status_t atomicRequesterExperiment(bool enable,amdgpu::atomic_requester::Snapshot &out) override {
+        using namespace amdgpu::atomic_requester;
+        ++requesterCalls;uint64_t now;assert(hsa_system_get_info(HSA_SYSTEM_INFO_TIMESTAMP,&now)==0);
+        assert(queues.empty());out={};out.values[Version]=1;
+        out.values[Before]=enable ? 0 : 64;out.values[Requested]=out.values[Observed]=enable ? 64 : 0;
+        out.values[Active]=out.values[RestorePending]=enable;
+        if(requesterMode==1) {out.values[Status]=2;return HSA_STATUS_ERROR;}
+        if(requesterMode==2) out.values[Version]=2;
+        if(requesterMode==3) out.values[Active]=2;
+        if(requesterMode==4) out.values[Status]=1ull<<32;
+        if(requesterMode==5) out.values[Observed]=1ull<<16;
+        if(requesterMode==6) {out.values[Active]=0;out.values[RestorePending]=1;}
+        return HSA_STATUS_SUCCESS;
     }
     hsa_status_t sharedAtomicDiagnostics(const SharedBuffer &buffer,uint64_t offset,uint64_t queue,
         amdgpu::atomic_diag::Snapshot &out) override {
@@ -107,6 +122,22 @@ int main() {
     assert(hsa_init()==0);hsa_agent_t gpu{};
     assert(hsa_iterate_agents([](hsa_agent_t a,void *p) {hsa_device_type_t type;hsa_agent_get_info(a,HSA_AGENT_INFO_DEVICE,&type);
         if(type==HSA_DEVICE_TYPE_GPU)*static_cast<hsa_agent_t *>(p)=a;return HSA_STATUS_SUCCESS;},&gpu)==0);
+    mac_hsa_atomic_requester_experiment_t requester{};
+    std::memset(&requester,0xa5,sizeof(requester));const auto requesterUnchanged=requester;
+    assert(mac_hsa_atomic_requester_experiment(gpu,2,&requester,sizeof(requester))==HSA_STATUS_ERROR_INVALID_ARGUMENT);
+    assert(mac_hsa_atomic_requester_experiment(gpu,1,&requester,sizeof(requester)-1)==HSA_STATUS_ERROR_INVALID_ARGUMENT);
+    assert(mac_hsa_atomic_requester_experiment({UINT64_MAX},1,&requester,sizeof(requester))==HSA_STATUS_ERROR_INVALID_AGENT);
+    assert(!requesterCalls && std::memcmp(&requester,&requesterUnchanged,sizeof(requester))==0);
+    assert(mac_hsa_atomic_requester_experiment(gpu,1,&requester,sizeof(requester))==0 && requester.active && requester.restore_pending && requester.observed_control2==64);
+    assert(mac_hsa_atomic_requester_experiment(gpu,0,&requester,sizeof(requester))==0 && !requester.active && !requester.restore_pending);
+    requesterMode=1;assert(mac_hsa_atomic_requester_experiment(gpu,1,&requester,sizeof(requester))==HSA_STATUS_ERROR);
+    assert(requester.version==1 && requester.driver_status==2 && requester.active && requester.restore_pending);
+    requester=requesterUnchanged;
+    for(requesterMode=2;requesterMode<=6;++requesterMode) {
+        assert(mac_hsa_atomic_requester_experiment(gpu,1,&requester,sizeof(requester))==HSA_STATUS_ERROR);
+        assert(std::memcmp(&requester,&requesterUnchanged,sizeof(requester))==0);
+    }
+    requesterMode=0;
     hsa_queue_t *queue=nullptr;
     driverBuild=186;
     uint32_t capability=UINT32_MAX;

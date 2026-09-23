@@ -47,6 +47,7 @@
 #include "amdgpu/amdgpu_vram_io.h"
 #include "amdgpu/amdgpu_clock.h"
 #include "amdgpu/amdgpu_atomic_diagnostics.h"
+#include "amdgpu/amdgpu_atomic_requester.h"
 
 #define MACAMDGPU_LOG(fmt, ...) \
     os_log(OS_LOG_DEFAULT, "mac.amdgpu: " fmt, ##__VA_ARGS__)
@@ -123,6 +124,7 @@ enum {
     kMacAMDGPUMethodAQLQueueKick      = 57,
     kMacAMDGPUMethodAQLQueueDestroy   = 58,
     kMacAMDGPUMethodAQLQueueService   = 59,
+    kMacAMDGPUMethodAtomicRequesterExperiment = 60, // explicit unqualified endpoint-only A/B
     kMacAMDGPUMethodAQLDispatch       = 55, // bounded owned AQL queue, dispatch and verified unmap
     kMacAMDGPUMethodHostWindow        = 54, // establish/query common CPU/GPU GART address range
 };
@@ -337,6 +339,7 @@ struct MacAMDGPU_IVars {
     bool       shutdownInProgress; // atomic admission barrier for new clients
     uint32_t   connectedClients; // atomic, decremented only after Stop drains
     amdgpu::ClientSessions sessions; // PCI opener is always this driver
+    amdgpu::atomic_requester::Experiment atomicRequester;
     amdgpu::SharedBuffers sharedBuffers;
     IOPCIDevice *retainedPCI;     // outlives superclass Stop until final free
     MacAMDGPUUserClient_IVars *quarantinedClient; // backing retained after failed reset
@@ -736,6 +739,7 @@ mac_amdgpu_admit_external(IOService *client, MacAMDGPU *driver,
                           IOPCIDevice *pci, uint64_t selector)
 {
     if (selector == kMacAMDGPUMethodMESAddQueue) return kIOReturnUnsupported;
+    if (selector == kMacAMDGPUMethodAtomicRequesterExperiment) return kIOReturnSuccess; // transition owns admission
     if (selector == kMacAMDGPUMethodCollectMetrics) {
         // Sampling does not turn an observer into an active participant.
         auto *user = OSDynamicCast(MacAMDGPUUserClient, client);
@@ -1207,6 +1211,9 @@ IMPL(MacAMDGPU, Start)
     return kIOReturnSuccess;
 }
 
+static kern_return_t mac_amdgpu_quiesce_for_shutdown(IOPCIDevice *, uint64_t &,
+    amdgpu::atomic_requester::Experiment *);
+
 //============================================================
 // MacAMDGPU::Stop — gate new work and stop bus mastering. Shared
 // storage remains alive until retained user clients have drained.
@@ -1218,6 +1225,12 @@ IMPL(MacAMDGPU, Stop)
         __atomic_store_n(&ivars->stopping, true, __ATOMIC_RELEASE);
         amdgpu::smu_metrics_invalidate(ivars->bringup.metrics, kIOReturnNotAttached);
         if (ivars->pciOpen) {
+            if (ivars->atomicRequester.owner) {
+                uint64_t phase=0;
+                if (mac_amdgpu_quiesce_for_shutdown(ivars->retainedPCI,phase,&ivars->atomicRequester)!=kIOReturnSuccess)
+                    ivars->shutdownBlocked=true; // unplug may make restoration impossible
+                else ivars->atomicRequester={};
+            }
             // PCIDriverKit Close disables Bus Lead Enable and Memory Space
             // Enable. Do this before any DMA descriptors can be completed.
             ivars->retainedPCI->Close(this, 0);
@@ -1421,7 +1434,8 @@ mac_amdgpu_release_quarantine(MacAMDGPU *driver)
 // verified off. Unlike the cold-start helper, this must never fall back to a
 // bridge hot reset, which could disrupt other functions/devices on that link.
 static kern_return_t
-mac_amdgpu_quiesce_for_shutdown(IOPCIDevice *pci, uint64_t &phase)
+mac_amdgpu_quiesce_for_shutdown(IOPCIDevice *pci, uint64_t &phase,
+    amdgpu::atomic_requester::Experiment *experiment)
 {
     phase = 1; // validate a live endpoint and FLR support before changing it
     uint16_t vendor = 0xFFFF;
@@ -1457,6 +1471,11 @@ mac_amdgpu_quiesce_for_shutdown(IOPCIDevice *pci, uint64_t &phase)
         IOSleep(1);
     }
 
+    if (experiment && experiment->owner) {
+        amdgpu::atomic_requester::Snapshot restored{};
+        if (!experiment->restore(*pci,restored)) return kIOReturnNotReady;
+    }
+
     phase = 4; // reset purges engine queues before their storage is unpinned
     ret = pci->Reset(kIOPCIDeviceResetTypeFunctionReset, kIOPCIDeviceResetOptionNone);
     if (ret != kIOReturnSuccess) return ret;
@@ -1470,6 +1489,7 @@ mac_amdgpu_quiesce_for_shutdown(IOPCIDevice *pci, uint64_t &phase)
     pci->ConfigurationRead16(4, &command);
     if (vendor != 0x1002 || command == 0xFFFF || (command & 4))
         return kIOReturnNotReady;
+    if (experiment && !experiment->verifyAfterReset(*pci)) return kIOReturnNotReady;
     return kIOReturnSuccess;
 }
 
@@ -1509,7 +1529,7 @@ mac_amdgpu_shutdown_gpu(MacAMDGPUUserClient *client, uint64_t &phase)
         state->pciOpen = true;
 
     }
-    kern_return_t ret = mac_amdgpu_quiesce_for_shutdown(pci, phase);
+    kern_return_t ret = mac_amdgpu_quiesce_for_shutdown(pci, phase, &state->atomicRequester);
     if (ret != kIOReturnSuccess) {
         MACAMDGPU_LOG("Shutdown GPU failed at phase %llu: %#x; backing retained, retry permitted",
                       phase, ret);
@@ -1520,6 +1540,7 @@ mac_amdgpu_shutdown_gpu(MacAMDGPUUserClient *client, uint64_t &phase)
     pci->Close(driver, 0);
     state->pciOpen = false;
     state->sessions.detach(client, client->ivars->claimed);
+    state->atomicRequester = {};
     state->submission = {};
     mac_amdgpu_release_quarantine(driver);
     mac_amdgpu_bo_release_all(client->ivars, driver);
@@ -1603,7 +1624,7 @@ MacAMDGPUUserClient::FinishStop(IOService *provider)
     if (participant && state->pciOpen && state->sessions.participants == 0) {
         uint64_t phase = 0;
         amdgpu::smu_metrics_invalidate(state->bringup.metrics, kIOReturnNotReady);
-        const auto stopped = mac_amdgpu_quiesce_for_shutdown(state->retainedPCI, phase);
+        const auto stopped = mac_amdgpu_quiesce_for_shutdown(state->retainedPCI, phase, &state->atomicRequester);
         resetComplete = stopped == kIOReturnSuccess;
         state->retainedPCI->Close(driver, 0);
         state->pciOpen = false;
@@ -1628,6 +1649,7 @@ MacAMDGPUUserClient::FinishStop(IOService *provider)
     }
     if (!quarantine && !storageReleased) mac_amdgpu_release_client_storage(ivars, driver);
     if (resetComplete) {
+        state->atomicRequester = {};
         amdgpu::bringup_release_resources(state->bringup);
         state->shutdownBlocked = false;
     }
@@ -1688,6 +1710,7 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         selector != kMacAMDGPUMethodRuntimeBuild &&
         selector != kMacAMDGPUMethodMetricsSnapshot &&
         selector != kMacAMDGPUMethodShutdownGPU &&
+        selector != kMacAMDGPUMethodAtomicRequesterExperiment &&
         selector != kMacAMDGPUMethodPing && selector != kMacAMDGPUMethodQueryInfo)
         return kIOReturnNotReady;
 
@@ -1709,6 +1732,60 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
     if (admission != kIOReturnSuccess) return admission;
 
     switch (selector) {
+
+    case kMacAMDGPUMethodAtomicRequesterExperiment: {
+        using namespace amdgpu::atomic_requester;
+        if (!arguments->scalarInput || arguments->scalarInputCount!=1 || arguments->scalarInput[0]>1 ||
+            !arguments->scalarOutput || arguments->scalarOutputCount<Count || arguments->structureInput ||
+            arguments->structureInputDescriptor || arguments->structureOutputDescriptor ||
+            arguments->structureOutputMaximumSize) return kIOReturnBadArgument;
+        auto &state=*driver->ivars;auto &experiment=state.atomicRequester;
+        const bool enable=arguments->scalarInput[0]!=0;
+        if (!ivars->claimed || !state.pciOpen || state.shutdownInProgress ||
+            state.retainedPCI!=pci || state.bringup.device.pci!=pci ||
+            state.bringup.reached!=amdgpu::BringupStage::SDMAInit ||
+            state.deviceID!=0x7551 || !state.bringup.device.ip.isVersion(amdgpu::IPBlock::GC,12,0,1))
+            return kIOReturnNotReady;
+        if (enable && state.shutdownBlocked) return kIOReturnNotReady;
+        if (!state.sessions.canReset(this,ivars->claimed) || ivars->mappedBAR || ivars->irqQueue ||
+            ivars->pendingInterruptNotify || !state.submission.poll()) return kIOReturnBusy;
+        for (auto *source:ivars->interruptSources) if (source) return kIOReturnBusy;
+        for (const auto &q:state.bringup.aqlQueues)
+            if (q.owner || q.handle || q.mapped || q.retained) return kIOReturnBusy;
+        if ((enable && experiment.owner) || (!enable && experiment.owner!=this)) return kIOReturnBadArgument;
+        uint64_t capability=0;
+        if (!Experiment::locate(*pci,capability)) return kIOReturnNotReady;
+        uint16_t transactionStatus=UINT16_MAX;
+        pci->ConfigurationRead16(capability+0x0a,&transactionStatus);
+        if (transactionStatus==UINT16_MAX) return kIOReturnNotAttached;
+        if (transactionStatus&(1u<<5)) return kIOReturnBusy; // no policy change until nonposted requests drain
+        Snapshot snapshot{};bool succeeded=false;
+        if (enable) {
+            const bool wasExclusive=state.sessions.exclusiveClient==this;
+            if (!state.sessions.claimExclusive(this,ivars->claimed)) return kIOReturnBusy;
+            succeeded=experiment.begin(*pci,this,snapshot);
+            experiment.acquiredExclusive=!wasExclusive;
+            if (!experiment.owner) {
+                if (!wasExclusive) __atomic_store_n(&state.sessions.exclusiveClient,(void *)nullptr,__ATOMIC_RELEASE);
+                experiment={};
+            }
+        } else {
+            succeeded=experiment.restore(*pci,snapshot);
+            if (succeeded) {
+                if (experiment.acquiredExclusive)
+                    __atomic_store_n(&state.sessions.exclusiveClient,(void *)nullptr,__ATOMIC_RELEASE);
+                experiment={};snapshot.values[Active]=0;
+            }
+        }
+        if (!succeeded && experiment.owner) state.shutdownBlocked=true;
+        snapshot.values[Status]=succeeded ? kIOReturnSuccess : uint32_t(kIOReturnNotReady);
+        for (unsigned i=0;i<Count;++i) arguments->scalarOutput[i]=snapshot.values[i];
+        arguments->scalarOutputCount=Count;
+        MACAMDGPU_LOG("EXPERIMENT unqualified AtomicOp requester: enable=%u before=%#llx requested=%#llx observed=%#llx original=%#llx active=%llu pending=%llu status=%#llx",
+            unsigned(enable),snapshot.values[Before],snapshot.values[Requested],snapshot.values[Observed],
+            snapshot.values[Original],snapshot.values[Active],snapshot.values[RestorePending],snapshot.values[Status]);
+        return kIOReturnSuccess;
+    }
 
     case kMacAMDGPUMethodCollectMetrics: {
         if (arguments->scalarInputCount != 0 || !arguments->scalarOutput ||

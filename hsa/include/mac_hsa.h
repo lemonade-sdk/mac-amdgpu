@@ -73,6 +73,21 @@ __attribute__((visibility("default")))
 hsa_status_t mac_hsa_shared_atomic_diagnostics(const void *shared_pointer,
     const hsa_queue_t *queue, mac_hsa_shared_atomic_diagnostics_t *out, size_t out_size);
 
+// Driver191 explicit experiment on an unqualified PCIe path. enable=1 sets
+// only endpoint DeviceControl2 bit6; enable=0 restores its original value.
+// No queue/submission may remain at either transition. Requires exclusive
+// ownership; does not change HSA capabilities, PTE/cache/MQD policy or memory.
+// A valid driver reply is copied even when its operation failed: inspect
+// driver_status/restore_pending. Transport/argument failures leave out unchanged.
+// Hot unplug or driver-process failure cannot guarantee software restoration.
+typedef struct mac_hsa_atomic_requester_experiment_s {
+    uint64_t version, before_control2, requested_control2, observed_control2;
+    uint64_t original_control2, active, restore_pending, driver_status;
+} mac_hsa_atomic_requester_experiment_t;
+__attribute__((visibility("default")))
+hsa_status_t mac_hsa_atomic_requester_experiment(hsa_agent_t agent,uint32_t enable,
+    mac_hsa_atomic_requester_experiment_t *out,size_t out_size);
+
 #ifdef __cplusplus
 }
 #endif

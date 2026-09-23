@@ -299,12 +299,14 @@ bool handoff(uint64_t rounds,unsigned timeoutSeconds,uint64_t *data,void *argume
 
 int main(int argc,char **argv) {
     if (argc<3 || std::strcmp(argv[1],"--run")) {
-        std::fprintf(stderr,"Usage: %s --run shader.hsaco [--return-add] [--handoff] [--add-only] [--stagger] [--trials N] [--iterations N | --cpu-iterations N --gpu-iterations N] [--lock-iterations N] [--timeout-seconds N]\n",argv[0]);return 2;
+        std::fprintf(stderr,"Usage: %s --run shader.hsaco [--requester-ab] [--return-add] [--handoff] [--add-only] [--stagger] [--trials N] [--iterations N | --cpu-iterations N --gpu-iterations N] [--lock-iterations N] [--timeout-seconds N]\n",argv[0]);return 2;
     }
     uint64_t cpuIncrements=10000000,gpuIncrements=10000000,lockIterations=1000000;unsigned trials=3,timeout=60;
-    bool returnAdd=false,handoffOnly=false,addOnly=false,stagger=false;
+    bool returnAdd=false,handoffOnly=false,addOnly=false,stagger=false,requesterAB=false;
+    bool countOption=false,trialOption=false;
     try {
         for (int i=3;i<argc;) {
+            if (!std::strcmp(argv[i],"--requester-ab")) {requesterAB=true;++i;continue;}
             if (!std::strcmp(argv[i],"--return-add")) {returnAdd=true;++i;continue;}
             if (!std::strcmp(argv[i],"--handoff")) {handoffOnly=true;++i;continue;}
             if (!std::strcmp(argv[i],"--add-only")) {addOnly=true;++i;continue;}
@@ -312,6 +314,8 @@ int main(int argc,char **argv) {
             if (i+1==argc) throw std::runtime_error("missing option value");
             size_t used=0;const auto value=std::stoull(argv[i+1],&used);
             if (used!=std::strlen(argv[i+1]) || !value || value>100000000) throw std::runtime_error("invalid option value");
+            if (!std::strcmp(argv[i],"--iterations") || !std::strcmp(argv[i],"--cpu-iterations") || !std::strcmp(argv[i],"--gpu-iterations")) countOption=true;
+            if (!std::strcmp(argv[i],"--trials")) trialOption=true;
             if (!std::strcmp(argv[i],"--iterations")) cpuIncrements=gpuIncrements=value;
             else if (!std::strcmp(argv[i],"--cpu-iterations")) cpuIncrements=value;
             else if (!std::strcmp(argv[i],"--gpu-iterations")) gpuIncrements=value;
@@ -321,6 +325,13 @@ int main(int argc,char **argv) {
             else throw std::runtime_error("invalid option");
             i+=2;
         }
+        if (requesterAB) {
+            if (handoffOnly || returnAdd) throw std::runtime_error("--requester-ab requires the unchanged non-returning add shader path");
+            if (countOption && (cpuIncrements!=10000000 || gpuIncrements!=1000000))
+                throw std::runtime_error("--requester-ab fixes CPU=10000000 and GPU=1000000");
+            if (trialOption && trials!=1) throw std::runtime_error("--requester-ab requires exactly one stagger A trial per policy");
+            cpuIncrements=10000000;gpuIncrements=1000000;trials=1;addOnly=stagger=true;
+        }
         if (handoffOnly && (returnAdd || addOnly || stagger)) throw std::runtime_error("--handoff selects a separate experiment");
         if (stagger && (!addOnly || cpuIncrements<4)) throw std::runtime_error("--stagger requires --add-only and at least four CPU increments");
     } catch (const std::exception &e) {std::fprintf(stderr,"%s\n",e.what());return 2;}
@@ -329,7 +340,9 @@ int main(int argc,char **argv) {
     if (image.empty()) return 2;
     hsa_agent_t gpu{};hsa_code_object_reader_t reader{};hsa_executable_t executable{};
     hsa_queue_t *queue=nullptr;hsa_signal_t done{};void *data=nullptr,*arguments=nullptr;
-    bool initialized=false,passed=true,safe=true;
+    bool initialized=false,passed=true,safe=true,requesterRestoreNeeded=false,experimentCompleted=false;
+    bool abExact[2]={false,false},abOverlap[2]={false,false};
+    uint64_t requesterBaselineControl2=UINT64_MAX;
     try {
         check(hsa_init(),"init");initialized=true;
         check(hsa_iterate_agents([](hsa_agent_t a,void *opaque) {
@@ -338,7 +351,7 @@ int main(int argc,char **argv) {
             return status;
         },&gpu),"enumeration");require(gpu.handle,"missing GPU");
         mac_hsa_device_info_t info{};check(mac_hsa_agent_get_driver_info(gpu,&info,sizeof(info)),"driver info");
-        require(info.driver_build>=190,"install driver 190 first for live read-only mapping diagnostics");
+        require(info.driver_build>=(requesterAB ? 191u : 190u),requesterAB ? "install driver 191 first for requester A/B" : "install driver 190 first for live read-only mapping diagnostics");
         check(hsa_code_object_reader_create_from_memory(image.data(),image.size(),&reader),"reader");
         check(hsa_executable_create_alt(HSA_PROFILE_BASE,HSA_DEFAULT_FLOAT_ROUNDING_MODE_DEFAULT,nullptr,&executable),"executable");
         check(hsa_executable_load_agent_code_object(executable,gpu,reader,nullptr,nullptr),"load");
@@ -356,9 +369,11 @@ int main(int argc,char **argv) {
         check(mac_hsa_memory_allocate_shared(gpu,bytes,&arguments),"kernarg allocation");
         require(!(reinterpret_cast<uintptr_t>(data)&16383),"DMA allocation not 16KiB aligned");
         check(hsa_signal_create(1,0,nullptr,&done),"completion");
-        check(hsa_queue_create(gpu,64,HSA_QUEUE_TYPE_MULTI,[](hsa_status_t status,hsa_queue_t *,void *) {
+        auto createQueue=[&] { check(hsa_queue_create(gpu,64,HSA_QUEUE_TYPE_MULTI,[](hsa_status_t status,hsa_queue_t *,void *) {
             std::fprintf(stderr,"queue error callback %#x\n",status);++queueErrors;
-        },nullptr,UINT32_MAX,UINT32_MAX,&queue),"persistent queue");
+        },nullptr,UINT32_MAX,UINT32_MAX,&queue),"persistent queue"); };
+        createQueue();
+        auto readPolicy=[&] {
         mac_hsa_shared_atomic_diagnostics_t policy{};
         check(mac_hsa_shared_atomic_diagnostics(data,queue,&policy,sizeof(policy)),"read atomic mapping/queue policy");
         require(policy.version==1 && (policy.valid_fields&3)==3,"missing PTE or MQD backing diagnostics");
@@ -381,17 +396,27 @@ int main(int argc,char **argv) {
         std::printf("CPU mapping options requested=%#llx; actual CPU cache/MAIR=%s\n",
             (unsigned long long)policy.cpu_mapping_options,policy.cpu_cache_attributes==UINT64_MAX ? "unknown" : "reported");
         require(policy.pte_actual==policy.pte_expected,"actual GART PTE differs from allocation policy");
+        return policy;
+        };
+        const auto baselinePolicy=readPolicy();
+        if (requesterAB) {
+            require((baselinePolicy.valid_fields&4) && !(baselinePolicy.pcie_device_control2&(1u<<6)),"requester A/B requires confirmed baseline RequesterEnable OFF");
+            requesterBaselineControl2=baselinePolicy.pcie_device_control2;
+        }
         std::printf("Native contention: driver=%llu gfx%u%u%u registry=%#llx CPU/GPU VA=%p bytes=%zu alignment=16384 trials=%u\n",
             (unsigned long long)info.driver_build,info.gfx_major,info.gfx_minor,info.gfx_revision,
             (unsigned long long)info.registry_id,data,bytes,trials);
         std::puts("Mapping: IOBufferMemoryDescriptor::Create(kIOMemoryDirectionOutIn), IODMACommand::PrepareForDMA, CPU IOConnectMapMemory64 options=0 (default cache policy), equal CPU/GPU VA. Actual CPU cacheability is not independently queried.");
         std::puts("GPU expected PTE policy is VALID|SYSTEM|SNOOPED|EXEC|R|W|IS_PTE with gfx12 MTYPE=2 (UC, bits54-55); actual mapping is recorded above.");
-        std::puts("MQD bit29 acknowledges PCIe-atomic support to CP firmware; it is not the shader instruction's system-scope bit. DeviceControl2 requester enable is a separate endpoint policy. No policy registers are changed by this tool.");
+        std::puts("MQD bit29 acknowledges PCIe-atomic support to CP firmware; it is not the shader instruction's system-scope bit. DeviceControl2 requester enable is a separate endpoint policy.");
+        std::puts(requesterAB ? "EXPERIMENT: only endpoint DeviceControl2 RequesterEnable bit6 changes between retired queues. Cached/root path is not qualified; no general capability is enabled." : "No policy registers are changed by this tool.");
         std::puts("Policy reference: docs/PCIE_ATOMIC_TEST_POLICY.md; AMD CPFW patch https://www.spinics.net/lists/amd-gfx/msg90787.html");
         std::puts("Experimental access exceeds the coarse allocation's promised semantics. Native CPU atomic_ref and GPU system-scope instructions touch the same words; HSA only controls queue completion.");
         std::puts("Record scripts/check-pcie-atomics.py output alongside this log; missing cached bits do not replace this measured result.");
         if (handoffOnly) passed=handoff(32,timeout,static_cast<uint64_t *>(data),arguments,queue,done,kernel);
         else {
+        auto runTrials=[&](unsigned abIndex) {
+        if (requesterAB) std::printf("REQUESTER-A/B phase=%s begin; identical allocation, shader, arguments, CPU ordering and trial algorithm\n",abIndex ? "ON" : "OFF");
         std::printf("Controls first: CPU-only and GPU-only %s use the same mapped words and operation counts. Mixed trials require progress overlap in both directions.\n",addOnly ? "add" : "add/CAS");
         std::printf("Requested increments CPU=%llu GPU=%llu add-only=%s stagger=%s; shared phase deadline=%us includes deliberate waiting\n",
             (unsigned long long)cpuIncrements,(unsigned long long)gpuIncrements,addOnly ? "yes" : "no",stagger ? "yes" : "no",timeout);
@@ -412,19 +437,79 @@ int main(int argc,char **argv) {
                     mode==1 ? lockIterations : gpuIncrements,stagger,timeout,
                     static_cast<uint64_t *>(data),arguments,queue,done,kernel,privateSize,groupSize);
                 passed&=result.completed && result.correct && result.overlapped;
+                if (requesterAB) {abExact[abIndex]=result.correct;abOverlap[abIndex]=result.overlapped;}
                 require(result.completed,"phase incomplete; stopping before reusing GPU storage");
             }
         }
+        if (requesterAB) {
+            for (size_t i=0;i<words;++i) if (!mutableWord(i))
+                require(static_cast<uint64_t *>(data)[i]==guard,"guard damage prevents requester A/B continuation");
+            std::printf("REQUESTER-A/B phase=%s completed exact-count-and-guards=%s overlap=%s\n",
+                abIndex ? "ON" : "OFF",abExact[abIndex] ? "yes" : "no",abOverlap[abIndex] ? "yes" : "no");
+        }
+        };
+        runTrials(0);
+        if (requesterAB) {
+            check(hsa_queue_destroy(queue),"retire OFF queue before requester change");queue=nullptr;
+            mac_hsa_atomic_requester_experiment_t changed{};
+            requesterRestoreNeeded=true;
+            const auto changeStatus=mac_hsa_atomic_requester_experiment(gpu,1,&changed,sizeof(changed));
+            std::printf("REQUESTER-A/B begin status=%#x before=%#llx requested=%#llx observed=%#llx original=%#llx active=%llu restore-pending=%llu driver-status=%#llx\n",changeStatus,
+                (unsigned long long)changed.before_control2,(unsigned long long)changed.requested_control2,
+                (unsigned long long)changed.observed_control2,(unsigned long long)changed.original_control2,
+                (unsigned long long)changed.active,(unsigned long long)changed.restore_pending,(unsigned long long)changed.driver_status);
+            check(changeStatus,"begin requester experiment");
+            require(changed.version==1 && changed.active==1 && changed.restore_pending==1 && !changed.driver_status && changed.before_control2==baselinePolicy.pcie_device_control2 &&
+                changed.original_control2==changed.before_control2 && changed.requested_control2==(changed.before_control2|(1u<<6)) &&
+                changed.observed_control2==changed.requested_control2,"requester begin changed an unexpected policy bit");
+            createQueue();
+            const auto onPolicy=readPolicy();
+            std::printf("REQUESTER-A/B queue recreated: MQD address OFF=%#llx ON=%#llx (backing address may change; queue policy must match)\n",
+                (unsigned long long)baselinePolicy.mqd_gpu_address,(unsigned long long)onPolicy.mqd_gpu_address);
+            require(onPolicy.valid_fields==baselinePolicy.valid_fields && (onPolicy.valid_fields&4) && onPolicy.pcie_device_control2==(baselinePolicy.pcie_device_control2|(1u<<6)) &&
+                onPolicy.pcie_capability_offset==baselinePolicy.pcie_capability_offset &&
+                onPolicy.pcie_device_capabilities2==baselinePolicy.pcie_device_capabilities2 &&
+                onPolicy.gpu_address==baselinePolicy.gpu_address && onPolicy.dma_address==baselinePolicy.dma_address &&
+                onPolicy.pte_vram_offset==baselinePolicy.pte_vram_offset && onPolicy.pte_actual==baselinePolicy.pte_actual &&
+                onPolicy.pte_expected==baselinePolicy.pte_expected &&
+                onPolicy.mqd_backing_hq_status0==baselinePolicy.mqd_backing_hq_status0 &&
+                onPolicy.gfxhub_page_table_base==baselinePolicy.gfxhub_page_table_base &&
+                onPolicy.gfxhub_context0_control==baselinePolicy.gfxhub_context0_control &&
+                onPolicy.cpu_mapping_options==baselinePolicy.cpu_mapping_options &&
+                onPolicy.cpu_cache_attributes==baselinePolicy.cpu_cache_attributes,
+                "ON policy differs beyond requester bit or mapped storage changed");
+            runTrials(1);experimentCompleted=true;
+        }
         }
     } catch (const std::exception &e) {std::fprintf(stderr,"FAIL/INCOMPLETE: %s\n",e.what());passed=false;}
-    if (queue && hsa_queue_destroy(queue)) {safe=false;passed=false;}
+    if (queue && hsa_queue_destroy(queue)) {safe=false;passed=false;experimentCompleted=false;}
+    if (requesterRestoreNeeded && safe) {
+        mac_hsa_atomic_requester_experiment_t restored{};
+        const auto status=mac_hsa_atomic_requester_experiment(gpu,0,&restored,sizeof(restored));
+        const bool restoredOK=!status && restored.version==1 && !restored.active && !restored.restore_pending && !restored.driver_status &&
+            restored.original_control2==requesterBaselineControl2 &&
+            restored.requested_control2==requesterBaselineControl2 &&
+            restored.observed_control2==requesterBaselineControl2;
+        std::printf("REQUESTER-A/B restore status=%#x observed=%#llx original=%#llx baseline=%#llx requested=%#llx active=%llu restore-pending=%llu driver-status=%#llx result=%s\n",
+            status,(unsigned long long)restored.observed_control2,(unsigned long long)restored.original_control2,
+            (unsigned long long)requesterBaselineControl2,(unsigned long long)restored.requested_control2,
+            (unsigned long long)restored.active,(unsigned long long)restored.restore_pending,
+            (unsigned long long)restored.driver_status,restoredOK ? "restored" : "unconfirmed");
+        if (!restoredOK) {passed=false;experimentCompleted=false;}
+    } else if (requesterRestoreNeeded) {
+        experimentCompleted=false;
+        std::fputs("Requester restoration deferred to driver: queue removal is unconfirmed.\n",stderr);
+    }
     if (safe) {
-        if (done.handle && hsa_signal_destroy(done)) passed=false;
-        for (auto *pointer:{data,arguments}) if (pointer && hsa_memory_free(pointer)) passed=false;
-        if (executable.handle && hsa_executable_destroy(executable)) passed=false;
+        if (done.handle && hsa_signal_destroy(done)) {passed=false;experimentCompleted=false;}
+        for (auto *pointer:{data,arguments}) if (pointer && hsa_memory_free(pointer)) {passed=false;experimentCompleted=false;}
+        if (executable.handle && hsa_executable_destroy(executable)) {passed=false;experimentCompleted=false;}
     } else std::fputs("Queue removal unconfirmed; retaining DMA buffers, code and completion storage until reset.\n",stderr);
-    if (reader.handle && hsa_code_object_reader_destroy(reader)) passed=false;
-    if (initialized && hsa_shut_down()) passed=false;
+    if (reader.handle && hsa_code_object_reader_destroy(reader)) {passed=false;experimentCompleted=false;}
+    if (initialized && hsa_shut_down()) {passed=false;experimentCompleted=false;}
+    if (requesterAB) std::printf("REQUESTER-A/B experiment=%s OFF-exact=%s OFF-overlap=%s ON-exact=%s ON-overlap=%s; completed experiment does not imply atomic interoperability passed\n",
+        experimentCompleted && safe ? "completed" : "incomplete",abExact[0] ? "yes" : "no",abOverlap[0] ? "yes" : "no",
+        abExact[1] ? "yes" : "no",abOverlap[1] ? "yes" : "no");
     std::puts(passed ? (handoffOnly ? "PASS: serialized native atomic usage only; contended interoperability remains untested." : "PASS: selected CPU-only/GPU-only controls and mixed-agent trials completed with exact results and intact guards; mixed trials had overlap. This tests this mapping and path only.") :
         "FAIL/INCONCLUSIVE under current queue/mapping policy: inspect completion, overlap, counters and guards. This does not prove hardware impossibility; no general atomic capability enabled.");
     return passed ? 0 : 1;

@@ -8,7 +8,8 @@ constexpr int kIOReturnSuccess = 0, kIOReturnBadArgument = 1, kIOReturnNoMemory 
     kIOReturnNotReady = 3, kIOReturnUnsupported = 4, kIOReturnTimeout = 5;
 enum { kMacAMDGPUMethodRuntimeBuild, kMacAMDGPUMethodPing, kMacAMDGPUMethodQueryInfo,
     kMacAMDGPUMethodShutdownGPU, kMacAMDGPUMethodGetBARInfo,
-    kMacAMDGPUMethodCollectMetrics = 46, kMacAMDGPUMethodMetricsSnapshot = 47 };
+    kMacAMDGPUMethodCollectMetrics = 46, kMacAMDGPUMethodMetricsSnapshot = 47,
+    kMacAMDGPUMethodAtomicRequesterExperiment = 60 };
 namespace amdgpu {
 enum class BringupStage { None, SDMAInit };
 static unsigned collections, snapshots;
