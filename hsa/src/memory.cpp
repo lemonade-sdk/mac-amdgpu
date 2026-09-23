@@ -5,6 +5,18 @@
 #include <system_error>
 
 namespace mac_hsa::detail {
+void reapCopyJobs() {
+    std::vector<std::unique_ptr<CopyJob>> retired;
+    {
+        std::lock_guard lock(runtimeMutex);
+        // Allocate retirement slots before changing the job list.
+        retired.reserve(copyJobs.size());
+        for (auto &job : copyJobs)
+            if (job->done.load(std::memory_order_acquire)) retired.push_back(std::move(job));
+        std::erase(copyJobs, nullptr);
+    }
+    // Completed job captures may release GPU buffers and reenter HSA.
+}
 Pool *findPool(uint64_t handle) {
     for (auto &pool : pools) if (pool.handle == handle) return &pool;
     return nullptr;
@@ -17,12 +29,13 @@ std::shared_ptr<Allocation> findAllocation(const void *pointer) {
     return address - it->first < it->second->size ? it->second : nullptr;
 }
 namespace {
-constexpr size_t granule = 4096;
-bool validRange(const void *pointer, size_t size, const std::shared_ptr<Allocation> &allocation) {
+const size_t granule = hostPageSize();
+bool validRange(const void *pointer, size_t size, const std::shared_ptr<Allocation> &allocation, bool write = false) {
     const auto address = reinterpret_cast<uintptr_t>(pointer);
     if (!pointer || size > UINTPTR_MAX - address) return false;
     if (allocation)
-        return size <= allocation->size - (address - reinterpret_cast<uintptr_t>(allocation->base));
+        return (allocation->access & (write ? HSA_ACCESS_PERMISSION_WO : HSA_ACCESS_PERMISSION_RO)) &&
+            size <= allocation->size - (address - reinterpret_cast<uintptr_t>(allocation->base));
     // Host pointers from the OS allocator are accepted. Reject a range that
     // crosses into a known allocation instead of bypassing its bounds check.
     const auto next = allocations.lower_bound(address);
@@ -222,6 +235,7 @@ hsa_status_t hsa_memory_free(void *pointer) {
         if (!pointer) return HSA_STATUS_SUCCESS;
         const auto found = allocations.find(reinterpret_cast<uintptr_t>(pointer));
         if (found == allocations.end()) return HSA_STATUS_ERROR_INVALID_ALLOCATION;
+        if (found->second->type != HSA_EXT_POINTER_TYPE_HSA) return HSA_STATUS_ERROR_INVALID_ALLOCATION;
         retired = std::move(found->second);
         allocations.erase(found);
     }
@@ -251,7 +265,7 @@ hsa_status_t hsa_memory_copy(void *dst, const void *src, size_t size) {
         if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
         if (!size) return HSA_STATUS_SUCCESS;
         destination = findAllocation(dst); source = findAllocation(src);
-        if (!validRange(dst, size, destination) || !validRange(src, size, source))
+        if (!validRange(dst, size, destination, true) || !validRange(src, size, source))
             return HSA_STATUS_ERROR_INVALID_ARGUMENT;
     }
     return copyBytes(dst, src, size, destination, source);
@@ -265,7 +279,7 @@ HSA_API_EXPORT hsa_status_t hsa_amd_memory_fill(void *pointer, uint32_t value, s
         allocation = findAllocation(pointer);
         if (!allocation) return HSA_STATUS_ERROR_INVALID_ALLOCATION;
         if (count > SIZE_MAX / sizeof(value) || reinterpret_cast<uintptr_t>(pointer) % alignof(uint32_t) ||
-            !validRange(pointer, count * sizeof(value), allocation))
+            !validRange(pointer, count * sizeof(value), allocation, true))
             return HSA_STATUS_ERROR_INVALID_ARGUMENT;
     }
     if (allocation->connection) {
@@ -293,7 +307,7 @@ HSA_API_EXPORT hsa_status_t hsa_amd_pointer_info(const void *pointer, hsa_amd_po
         result.type = HSA_EXT_POINTER_TYPE_UNKNOWN;
         if (auto allocation = findAllocation(pointer)) {
             known = true;
-            result.type = HSA_EXT_POINTER_TYPE_HSA;
+            result.type = allocation->type;
             result.agentBaseAddress = allocation->base;
             result.hostBaseAddress = allocation->connection ? nullptr : allocation->base;
             result.sizeInBytes = allocation->size;
@@ -301,7 +315,7 @@ HSA_API_EXPORT hsa_status_t hsa_amd_pointer_info(const void *pointer, hsa_amd_po
             result.userData = allocation->userData;
             result.global_flags = allocation->connection ? HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED : HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED;
             result.registered = bool(allocation->connection);
-        }
+        } else known = describeHostLock(pointer, result);
     }
     // The caller's allocator may reenter HSA. Do not call it under runtimeMutex.
     if (accessible) *accessible = nullptr;
@@ -326,6 +340,8 @@ HSA_API_EXPORT hsa_status_t hsa_amd_pointer_info_set_userdata(const void *pointe
 HSA_API_EXPORT hsa_status_t hsa_amd_memory_async_copy(void *dst, hsa_agent_t dstAgent,
     const void *src, hsa_agent_t srcAgent, size_t size, uint32_t count,
     const hsa_signal_t *dependencies, hsa_signal_t completion) {
+    try { reapCopyJobs(); }
+    catch (const std::bad_alloc &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
     std::lock_guard lock(runtimeMutex);
     if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
     if (!size) return HSA_STATUS_SUCCESS;
@@ -336,7 +352,7 @@ HSA_API_EXPORT hsa_status_t hsa_amd_memory_async_copy(void *dst, hsa_agent_t dst
     const auto destination = findAllocation(dst), source = findAllocation(src);
     if (!accessibleAgent(dstAgent, destination) || !accessibleAgent(srcAgent, source))
         return HSA_STATUS_ERROR_INVALID_AGENT;
-    if (!validRange(dst, size, destination) || !validRange(src, size, source))
+    if (!validRange(dst, size, destination, true) || !validRange(src, size, source))
         return HSA_STATUS_ERROR_INVALID_ARGUMENT;
     try {
         std::vector<std::shared_ptr<mac_hsa::Signal>> waiting;
@@ -346,7 +362,6 @@ HSA_API_EXPORT hsa_status_t hsa_amd_memory_async_copy(void *dst, hsa_agent_t dst
             if (found == signals.end()) return HSA_STATUS_ERROR_INVALID_SIGNAL;
             waiting.push_back(found->second);
         }
-        std::erase_if(copyJobs, [](const auto &job) { return job->done.load(std::memory_order_acquire); });
         if (copyJobs.size() >= 64) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
         copyJobs.reserve(copyJobs.size() + 1);
         auto job = std::make_unique<CopyJob>();

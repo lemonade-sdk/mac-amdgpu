@@ -12,6 +12,7 @@ struct Buffer { std::vector<uint8_t> bytes; uint64_t domain; };
 unsigned opens = 0, closes = 0, resets = 0, uploads = 0, maps = 0, unmaps = 0;
 bool busy = true, copyFailure = false, malformedRead = false;
 uint64_t stage = 15, nextHandle = 0;
+uint64_t driverBuild = 179, exportedBuffer = 0, exportToken[2]{};
 std::map<uint64_t, Buffer> buffers;
 std::vector<uint8_t> dma(32 << 20);
 kern_return_t mockOpen(io_service_t, task_port_t, uint32_t, io_connect_t *port) { *port = ++opens; return KERN_SUCCESS; }
@@ -20,7 +21,7 @@ kern_return_t mockRelease(io_object_t) { return KERN_SUCCESS; }
 kern_return_t mockScalar(mach_port_t, uint32_t selector, const uint64_t *in, uint32_t count,
                          uint64_t *out, uint32_t *outCount) {
     switch (selector) {
-    case 43: assert(*outCount == 3); out[0] = 0x414d444750554142ull; out[1] = 1; out[2] = 179; break;
+    case 43: assert(*outCount == 3); out[0] = 0x414d444750554142ull; out[1] = 1; out[2] = driverBuild; break;
     case 1:
         if (busy) return kIOReturnBusy;
         assert(*outCount == 7); out[3] = 0x1002; out[4] = 0x7551; out[6] = 0xc0; break;
@@ -44,6 +45,16 @@ kern_return_t mockScalar(mach_port_t, uint32_t selector, const uint64_t *in, uin
         break;
     }
     case 17: assert(buffers.erase(in[0]) == 1); break;
+    case 52:
+        assert(count == 3 && *outCount == 3 && buffers.at(in[0]).domain == 3 && (in[1] || in[2]));
+        exportedBuffer = in[0]; exportToken[0] = out[0] = in[1]; exportToken[1] = out[1] = in[2];
+        out[2] = buffers.at(in[0]).bytes.size(); break;
+    case 53:
+        assert(count == 3 && *outCount == 3);
+        if (in[0] != exportToken[0] || in[1] != exportToken[1] || !buffers.contains(exportedBuffer) ||
+            in[2] != buffers.at(exportedBuffer).bytes.size()) return kIOReturnBadArgument;
+        out[0] = ++nextHandle; out[1] = 0x8001000000ull + exportedBuffer * 0x100000; out[2] = in[2];
+        buffers.emplace(out[0], buffers.at(exportedBuffer)); break;
     case 48: {
         assert(count == 5 && *outCount == 1);
         if (copyFailure) { out[0] = kIOReturnTimeout; break; }
@@ -96,7 +107,7 @@ kern_return_t mockMethod(mach_port_t, uint32_t selector, const uint64_t *in, uin
 
 int main() {
     {
-        mac_hsa::IOKitConnection connection; connection.service = 123;
+        mac_hsa::IOKitConnection connection; connection.service = 123; connection.registryID = 456;
         mac_hsa::DeviceSnapshot snapshot;
         assert(connection.read(snapshot) == 0 && snapshot.stage == 15);
         assert(opens == closes && resets == 0 && uploads == 0);
@@ -116,6 +127,26 @@ int main() {
         assert(connection.read(snapshot) == 0 && snapshot.stage == 15 && opens == priorOpens);
         mac_hsa::DeviceBuffer device;
         assert(connection.allocateBuffer(16385, device) == 0 && device.size == 32768);
+        mac_hsa::BufferToken token{};
+        assert(connection.exportBuffer(device, token) == HSA_STATUS_ERROR_OUT_OF_RESOURCES && !exportedBuffer);
+        driverBuild = 181;
+        assert(connection.exportBuffer(device, token) == 0 && token.registryID == 456 && token.size == device.size);
+        {
+            mac_hsa::IOKitConnection importer; importer.service = 123; importer.registryID = 456;
+            mac_hsa::DeviceBuffer imported;
+            const auto beforeResets = resets, beforeUploads = uploads;
+            assert(importer.importBuffer(token, imported) == 0 && imported.address == device.address && imported.size == device.size);
+            assert(resets == beforeResets && uploads == beforeUploads);
+            assert(importer.freeBuffer(imported) == 0);
+        }
+        {
+            mac_hsa::IOKitConnection stopped; stopped.service = 123; stopped.registryID = 456;
+            stage = 0; const auto beforeResets = resets;
+            mac_hsa::DeviceBuffer imported;
+            assert(stopped.importBuffer(token, imported) == HSA_STATUS_ERROR_INVALID_ARGUMENT && resets == beforeResets);
+            stage = 15;
+        }
+        driverBuild = 179;
         std::vector<uint8_t> source(12003), destination(source.size());
         for (size_t i = 0; i < source.size(); ++i) source[i] = uint8_t(i * 113);
         assert(connection.writeBuffer(device, 3, source.data(), source.size()) == 0);

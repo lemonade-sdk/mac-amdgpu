@@ -88,16 +88,17 @@ int main() {
         ++*static_cast<unsigned *>(p); return HSA_STATUS_SUCCESS;
     }, &gpuPools) == 0 && !gpuPools);
 
-    auto src = static_cast<uint32_t *>(allocate(4095));
-    auto dst = static_cast<uint32_t *>(allocate(4096));
+    const size_t hostGranule = mac_hsa::detail::hostPageSize();
+    auto src = static_cast<uint32_t *>(allocate(hostGranule - 1));
+    auto dst = static_cast<uint32_t *>(allocate(hostGranule));
     assert(reinterpret_cast<uintptr_t>(src) % 4096 == 0);
     assert(hsa_amd_agents_allow_access(1, &agents[0], nullptr, src) == 0);
     assert(hsa_amd_agents_allow_access(1, &agents[1], nullptr, src) == HSA_STATUS_ERROR_INVALID_ARGUMENT);
     assert(hsa_amd_memory_fill(src, 0x12345678, 1024) == 0);
-    assert(hsa_amd_memory_fill(src + 1, 0, 1024) == HSA_STATUS_ERROR_INVALID_ARGUMENT);
+    assert(hsa_amd_memory_fill(src + 1, 0, hostGranule / 4) == HSA_STATUS_ERROR_INVALID_ARGUMENT);
     assert(hsa_amd_memory_fill(reinterpret_cast<char *>(src) + 1, 0, 1) == HSA_STATUS_ERROR_INVALID_ARGUMENT);
     assert(hsa_memory_copy(dst, src, 4096) == 0 && dst[1023] == 0x12345678);
-    assert(hsa_memory_copy(dst + 1, src, 4096) == HSA_STATUS_ERROR_INVALID_ARGUMENT);
+    assert(hsa_memory_copy(dst + 1, src, hostGranule) == HSA_STATUS_ERROR_INVALID_ARGUMENT);
     assert(hsa_memory_copy(dst, src, SIZE_MAX) == HSA_STATUS_ERROR_INVALID_ARGUMENT);
     assert(hsa_amd_memory_pool_free(src + 1) == HSA_STATUS_ERROR_INVALID_ALLOCATION);
     void *invalid = reinterpret_cast<void *>(1);
@@ -112,7 +113,7 @@ int main() {
         uint64_t now; assert(hsa_system_get_info(HSA_SYSTEM_INFO_TIMESTAMP, &now) == 0);
         return std::malloc(n);
     }, &count, &accessible) == 0);
-    assert(info.type == HSA_EXT_POINTER_TYPE_HSA && info.hostBaseAddress == src && info.sizeInBytes == 4096);
+    assert(info.type == HSA_EXT_POINTER_TYPE_HSA && info.hostBaseAddress == src && info.sizeInBytes == hostGranule);
     assert(info.userData == dst && !info.registered && count == 1 && accessible[0].handle == agents[0].handle);
     std::free(accessible);
     std::memset(&info, 0xa5, sizeof(info)); info.size = 8;

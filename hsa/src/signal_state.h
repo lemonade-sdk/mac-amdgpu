@@ -30,10 +30,14 @@ static_assert(offsetof(SignalABI, queue) == offsetof(amd_signal_t, queue_ptr));
 static_assert(std::atomic_ref<int64_t>::is_always_lock_free);
 struct Signal {
     SignalABI abi;
+    SignalABI *sharedABI = nullptr;
+    std::shared_ptr<void> sharedStorage;
+    uint64_t ipcToken[4]{};
     std::atomic<bool> alive{true};
     std::mutex waitMutex;
     std::condition_variable changed;
-    std::atomic_ref<int64_t> value() { return std::atomic_ref<int64_t>(abi.value); }
+    SignalABI *address() { return sharedABI ? sharedABI : &abi; }
+    std::atomic_ref<int64_t> value() { return std::atomic_ref<int64_t>(address()->value); }
 };
 inline bool signalCondition(int64_t value, hsa_signal_condition_t condition, int64_t compare) {
     switch (condition) {

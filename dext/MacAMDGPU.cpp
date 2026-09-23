@@ -41,6 +41,7 @@
 #include "amdgpu/amdgpu_ucode_extract.h"
 #include "amdgpu/amdgpu_pci_rebar.h"
 #include "amdgpu/amdgpu_client_lifecycle.h"
+#include "amdgpu/amdgpu_shared_buffers.h"
 #include "amdgpu/amdgpu_buffer_io.h"
 #include "amdgpu/amdgpu_vram_accounting.h"
 #include "amdgpu/amdgpu_vram_io.h"
@@ -114,6 +115,8 @@ enum {
     kMacAMDGPUMethodBOWrite            = 49, // verified BAR0 staging upload
     kMacAMDGPUMethodBORead             = 50, // BAR0 staging readback
     kMacAMDGPUMethodComputeDispatch    = 51, // owned code BO + launch parameters
+    kMacAMDGPUMethodBOExport          = 52, // owned device VRAM -> random sharing token
+    kMacAMDGPUMethodBOImport          = 53, // token -> reference in this client's BO table
 };
 
 // v0.1.28 — IP types accepted by CSCreate. Match the upstream
@@ -250,6 +253,7 @@ enum {
 };
 
 struct BOEntry {
+    uint32_t sharedIndex;      // root SharedBuffers reference; zero until exported
     bool      in_use;
     uint32_t  domain;          // kBODomain*
     uint64_t  size;            // user-visible size in bytes
@@ -325,6 +329,7 @@ struct MacAMDGPU_IVars {
     bool       shutdownInProgress; // atomic admission barrier for new clients
     uint32_t   connectedClients; // atomic, decremented only after Stop drains
     amdgpu::ClientSessions sessions; // PCI opener is always this driver
+    amdgpu::SharedBuffers sharedBuffers;
     IOPCIDevice *retainedPCI;     // outlives superclass Stop until final free
     MacAMDGPUUserClient_IVars *quarantinedClient; // backing retained after failed reset
     amdgpu::ClientSubmission submission;
@@ -1333,7 +1338,8 @@ mac_amdgpu_bo_release_all(MacAMDGPUUserClient_IVars *ivars,
             va.cpu_ptr   = nullptr;
             auto &gmc = driver->ivars->bringup.gmc;
             auto &allocator = e.domain == kBODomainVRAM ? gmc.vram_alloc : gmc.device_vram_alloc;
-            allocator.free(va);
+            if (!e.sharedIndex || driver->ivars->sharedBuffers.release(e.sharedIndex)) allocator.free(va);
+            e.sharedIndex = 0;
         }
         else if (e.domain == kBODomainGTT) {
             // This bulk path runs only after reset/PCI isolation.
@@ -3396,12 +3402,13 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         for (uint32_t i = 0; i < MACAMDGPU_MAX_BO; i++) {
             if (!ivars->bos[i].in_use) { idx = i; break; }
         }
-        if (idx == MACAMDGPU_MAX_BO) return kIOReturnNoResources;
+        if (idx == MACAMDGPU_MAX_BO || ivars->boGenCounter == UINT32_MAX) return kIOReturnNoResources;
 
         BOEntry &e = ivars->bos[idx];
         // Zero everything except the generation counter (preserved across
         // the freed slot to detect stale handles).
         e.in_use       = true;
+        e.sharedIndex  = 0;
         e.domain       = domain;
         e.size         = rounded_size;
         e.alignment    = alignment;
@@ -3529,6 +3536,44 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         return allocRet;
     }
 
+    case kMacAMDGPUMethodBOExport: {
+        if (!arguments->scalarInput || arguments->scalarInputCount != 3 ||
+            !arguments->scalarOutput || arguments->scalarOutputCount != 3) return kIOReturnBadArgument;
+        auto *entry = mac_amdgpu_bo_lookup(ivars, arguments->scalarInput[0]);
+        if (!entry || entry->domain != kBODomainDeviceVRAM) return kIOReturnBadArgument;
+        auto &shared = driver->ivars->sharedBuffers;
+        if (!entry->sharedIndex) {
+            entry->sharedIndex = shared.publish(arguments->scalarInput[1], arguments->scalarInput[2],
+                entry->gpu_va, entry->size, entry->alignment);
+            if (!entry->sharedIndex) return kIOReturnNoResources;
+        }
+        const auto &record = shared.entries[entry->sharedIndex - 1];
+        arguments->scalarOutput[0] = record.token[0];
+        arguments->scalarOutput[1] = record.token[1];
+        arguments->scalarOutput[2] = record.size;
+        return kIOReturnSuccess;
+    }
+    case kMacAMDGPUMethodBOImport: {
+        if (!arguments->scalarInput || arguments->scalarInputCount != 3 ||
+            !arguments->scalarOutput || arguments->scalarOutputCount != 3) return kIOReturnBadArgument;
+        auto &shared = driver->ivars->sharedBuffers;
+        const auto id = shared.find(arguments->scalarInput[0], arguments->scalarInput[1]);
+        if (!id || shared.entries[id - 1].size != arguments->scalarInput[2]) return kIOReturnBadArgument;
+        uint32_t slot = MACAMDGPU_MAX_BO;
+        for (uint32_t i = 0; i < MACAMDGPU_MAX_BO; ++i) if (!ivars->bos[i].in_use) { slot = i; break; }
+        if (slot == MACAMDGPU_MAX_BO || ivars->boGenCounter == UINT32_MAX || !shared.retain(id)) return kIOReturnNoResources;
+        const auto &record = shared.entries[id - 1];
+        auto &entry = ivars->bos[slot];
+        entry = {};
+        entry.in_use = true; entry.domain = kBODomainDeviceVRAM; entry.sharedIndex = id;
+        entry.size = record.size; entry.alignment = record.alignment; entry.gpu_va = record.gpu;
+        entry.vram_offset = record.gpu - driver->ivars->bringup.gmc.vram_start;
+        entry.generation = ++ivars->boGenCounter;
+        arguments->scalarOutput[0] = mac_amdgpu_bo_make_handle(entry.generation, slot);
+        arguments->scalarOutput[1] = entry.gpu_va;
+        arguments->scalarOutput[2] = entry.size;
+        return kIOReturnSuccess;
+    }
     case kMacAMDGPUMethodBOFree: {
         // scalarInput[0] = handle
         if (arguments->scalarInput == nullptr ||
@@ -3548,7 +3593,8 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             va.alignment = e->alignment;
             va.cpu_ptr   = nullptr;
             auto &allocator = e->domain == kBODomainVRAM ? gmc.vram_alloc : gmc.device_vram_alloc;
-            allocator.free(va);
+            if (!e->sharedIndex || driver->ivars->sharedBuffers.release(e->sharedIndex)) allocator.free(va);
+            e->sharedIndex = 0;
         }
         else if (e->domain == kBODomainGTT) {
             const auto r = amdgpu::gart_unbind(driver->ivars->bringup.device,

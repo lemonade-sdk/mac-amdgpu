@@ -25,6 +25,41 @@ void clearQueues() { queues.clear(); }
 using namespace mac_hsa::detail;
 
 extern "C" {
+HSA_API_EXPORT hsa_status_t hsa_amd_profiling_set_profiler_enabled(hsa_queue_t *pointer, int enable) {
+    std::lock_guard lock(runtimeMutex);
+    if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+    if (!pointer || (enable != 0 && enable != 1)) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    const auto queue = queues.find(pointer);
+    if (queue == queues.end()) return HSA_STATUS_ERROR_INVALID_QUEUE;
+    auto properties = std::atomic_ref<uint32_t>(queue->second->abi.queue_properties);
+    constexpr uint32_t mask = AMD_QUEUE_PROPERTIES_ENABLE_PROFILING;
+    if (enable) properties.fetch_or(mask, std::memory_order_release);
+    else properties.fetch_and(~mask, std::memory_order_release);
+    return HSA_STATUS_SUCCESS;
+}
+HSA_API_EXPORT hsa_status_t hsa_amd_queue_cu_set_mask(const hsa_queue_t *pointer, uint32_t bits, const uint32_t *mask) {
+    std::lock_guard lock(runtimeMutex);
+    if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+    if (!queues.contains(pointer)) return HSA_STATUS_ERROR_INVALID_QUEUE;
+    if (bits % 32 || (bits && !mask)) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    // ROCr HostQueue also rejects CU affinity and scheduling priority: a
+    // software queue has no hardware scheduler or compute-unit mask to set.
+    return HSA_STATUS_ERROR_INVALID_QUEUE;
+}
+HSA_API_EXPORT hsa_status_t hsa_amd_queue_set_priority(hsa_queue_t *pointer, hsa_amd_queue_priority_t priority) {
+    std::lock_guard lock(runtimeMutex);
+    if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+    if (!queues.contains(pointer)) return HSA_STATUS_ERROR_INVALID_QUEUE;
+    if (priority < HSA_AMD_QUEUE_PRIORITY_LOW || priority > HSA_AMD_QUEUE_PRIORITY_HIGH) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    return HSA_STATUS_ERROR_INVALID_QUEUE;
+}
+HSA_API_EXPORT hsa_status_t hsa_amd_queue_get_info(hsa_queue_t *pointer, hsa_queue_info_attribute_t attribute, void *value) {
+    std::lock_guard lock(runtimeMutex);
+    if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+    if (!queues.contains(pointer)) return HSA_STATUS_ERROR_INVALID_QUEUE;
+    if (!value || (attribute != HSA_AMD_QUEUE_INFO_AGENT && attribute != HSA_AMD_QUEUE_INFO_DOORBELL_ID)) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    return HSA_STATUS_ERROR_INVALID_QUEUE; // no underlying hardware queue/doorbell
+}
 hsa_status_t hsa_soft_queue_create(hsa_region_t region, uint32_t size, hsa_queue_type32_t type,
     uint32_t features, hsa_signal_t doorbell, hsa_queue_t **out) {
     std::lock_guard lock(runtimeMutex);

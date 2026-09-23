@@ -132,6 +132,10 @@ hsa_status_t hsa_shut_down() {
             executableSymbols.clear();
             codeReaders.clear();
             clearQueues();
+            clearVirtualMemory();
+            clearHostLocks();
+            clearCaches();
+            clearSystemEvents();
             signals.clear();
             pools.clear();
             retiredAllocations.swap(allocations);
@@ -237,6 +241,10 @@ hsa_status_t hsa_system_get_info(hsa_system_info_t attribute, void *value) {
     case HSA_SYSTEM_INFO_TIMESTAMP_FREQUENCY: return writeValue(value, uint64_t(1000000000));
     case HSA_SYSTEM_INFO_ENDIANNESS: return writeValue(value, HSA_ENDIANNESS_LITTLE);
     case HSA_SYSTEM_INFO_MACHINE_MODEL: return writeValue(value, HSA_MACHINE_MODEL_LARGE);
+    case HSA_AMD_SYSTEM_INFO_SVM_SUPPORTED:
+    case HSA_AMD_SYSTEM_INFO_SVM_ACCESSIBLE_BY_DEFAULT:
+    case HSA_AMD_SYSTEM_INFO_VIRTUAL_MEM_API_SUPPORTED:
+        return writeValue(value, false); // GPU SVM/VA aliases are not supported
     case HSA_SYSTEM_INFO_EXTENSIONS:
         std::memset(value, 0, 128);
         return HSA_STATUS_SUCCESS;
@@ -308,11 +316,11 @@ HSA_API_EXPORT hsa_status_t hsa_amd_signal_create(hsa_signal_value_t initial, ui
         if (!out || (attributes & ~(uint64_t(HSA_AMD_SIGNAL_AMD_GPU_ONLY) | HSA_AMD_SIGNAL_IPC)))
             return HSA_STATUS_ERROR_INVALID_ARGUMENT;
         *out = {};
-        if ((attributes & HSA_AMD_SIGNAL_IPC) || (!count && (attributes & HSA_AMD_SIGNAL_AMD_GPU_ONLY)))
+        if (!count && (attributes & HSA_AMD_SIGNAL_AMD_GPU_ONLY))
             return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
     }
-    // GPU_ONLY is ignored when an explicit consumer list is supplied, as
-    // specified by the AMD ABI. IPC needs separate shared lifetime/backing.
+    if (attributes & HSA_AMD_SIGNAL_IPC) return createIPCSignal(initial, count, consumers, out);
+    // GPU_ONLY is ignored when an explicit consumer list is supplied.
     return hsa_signal_create(initial, count, consumers, out);
 }
 

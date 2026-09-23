@@ -15,5 +15,5 @@ public:
 };
 // Caller serializes the session. Acquiring identity must succeed before reset;
 // a stage cached by another owner is never treated as this session's readiness.
-hsa_status_t initializeDevice(InitializationRPC &rpc, bool &claimed, uint64_t &capacity);
+hsa_status_t initializeDevice(InitializationRPC &rpc, bool &claimed, uint64_t &capacity, bool allowInitialize = true);
 }

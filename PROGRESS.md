@@ -1706,3 +1706,38 @@ Installing the ELF linker also upgraded Homebrew's default LLVM. Regression
 shader generation now selects the retained LLVM 21.1.8 keg and its compatible
 versioned Z3 library through a local environment helper, preserving the tested
 instruction bytes without changing global library symlinks.
+
+
+## Build 181: remaining HRX symbols and GPU IPC hardware acceptance — 2026-09-23
+
+Added all 29 previously unresolved dynamic symbols. The pinned HRX audit now
+reports 119/119 exported. Seven Linux DMA-BUF/SVM paths deliberately return
+errors; this is not full runtime readiness. The audit now prints platform and
+runtime limitations, and --require-runtime-ready fails while tracked GPU/HRX
+requirements remain incomplete. hsa/API_STATUS.md records each added family.
+
+Implemented native-page host allocations, virtual-memory reservations and
+aliases, pinned backing, host access protections, reference-counted overlapping
+locks, CPU cache queries, CPU IPC signals, GPU memory IPC, queue profiling flags,
+software-queue control rejection and system-event registration/dispatch. GPU
+hardware event notification wiring remains pending. Completion-job captures
+are now retired outside the runtime mutex to avoid reentrant BO-release deadlock.
+
+Driver selectors 52/53 export/import device VRAM using random capabilities and
+a driver-owned reference table. Bulk client cleanup and BOFree free the physical
+allocation only on the last reference, including references held in quarantine.
+Imports require an initialized device and cannot reset/reinitialize a stopped
+GPU using a stale sharing token. Driver 181 and the app built, were signed with
+unchanged entitlements, and passed strict signature verification. Installer code
+was unchanged. The user installed the build; RuntimeBuild verified 181.
+
+Hardware HSA IPC passed: exporter uploaded 16,384 patterned bytes, importer
+attached twice and verified the entire allocation, exporter exited without HSA
+cleanup, and importer verified every byte again. Imported writes and readback
+also passed. Balanced detach and final shutdown returned the GPU to stage 0.
+
+Eight HSA ASan/UBSan suites pass, including separate-process shared signal
+updates and cleanup after a SIGKILLed peer. All 28 non-runtime regression scripts
+pass, including extracted production driver export/import/free/close paths.
+GPU-visible signals, hardware AQL queues, shared host/GPU mappings, AMD loader
+extension support and actual HRX inference remain incomplete.

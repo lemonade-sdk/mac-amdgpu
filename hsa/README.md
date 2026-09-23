@@ -52,9 +52,10 @@ after final shutdown rebuilds the device list.
 - Core signal creation/destruction, loads/stores (including silent stores),
   arithmetic/bitwise atomics, exchange/CAS and condition waits in all required
   ordering variants. AMD signal creation and wait-any/wait-all are also present.
-  Signals currently support explicit CPU consumers; GPU consumers, IPC signals
-  and unrestricted consumers while a GPU is present return an allocation error
-  until coherent GPU-visible backing is implemented. No GPU completion is faked.
+  Signals support explicit CPU consumers, including CPU IPC signals. GPU
+  consumers and unrestricted consumers while a GPU is present return an
+  allocation error until coherent GPU-visible backing is implemented. No GPU
+  completion is faked.
 - mac_hsa_agent_get_driver_info, a separate diagnostic ABI exposing the live
   DriverKit snapshot. Bringup stage is historical and is not a readiness claim.
 
@@ -73,16 +74,17 @@ completion signals or successful no-op dispatches.
 
 LSE commit `b5637a7109d409c21f75586edb75e7631277bce8` pins HRX System to
 `5927b0e0fafdefb5c8b41aa71bca8fd28791ad7c`. This revision requires 119 dynamic
-HSA symbols; the current library supplies 90 of them, leaving 29 missing. Symbol presence
-is not equivalent to full behavior: queue creation still rejects requests, and
-signals currently require CPU-only consumers. It
+HSA symbols; the current library exports all 119 of them, leaving no unresolved symbols. Symbol presence
+is not equivalent to full behavior: hardware queue creation still rejects requests, signals require CPU-only
+consumers, and seven platform-specific APIs explicitly fail. See
+[API_STATUS.md](API_STATUS.md) for the behavior of each newly added family. It
 creates hardware queues through `hsa_queue_create`, then casts those queues to
 AMD's queue layout. Signals also have an AMD device-visible layout. The loader
 requires the AMD loader extension, memory pools, signals and code objects.
 The existing driver command/fence tests do not satisfy those contracts.
 
 The separately reviewed HRX main revision
-`437e789eaea207a036c197cf3398a6ca473d6534` requires 121 symbols (90 exported, 31 missing) and uses
+`437e789eaea207a036c197cf3398a6ca473d6534` requires 121 symbols (119 exported, 2 missing) and uses
 `hsa_amd_queue_create`. Keep these baselines distinct; LSE's pinned revision
 and its patches are the initial integration target.
 
@@ -295,3 +297,36 @@ This hardware test passed loading/freeze and resolved `vector_add.kd` at
 `0x8010000580`, with 12-byte kernargs. It did not execute the kernel. Native
 compute dispatch has a separate hardware result; HSA queue dispatch is not yet
 connected to it.
+
+
+## Build 181: host services and GPU buffer IPC
+
+All 29 previously unresolved HRX entry points now link. This is an ABI milestone;
+[API_STATUS.md](API_STATUS.md) distinguishes actual implementations, host-only
+paths, software-queue restrictions and seven platform-unsupported operations.
+
+Host pools now use the native macOS page size. Virtual-memory handles retain
+shared backing independently of public handles, support multiple CPU aliases
+and enforce host page protections. Async operations pin mappings and block
+unmap/protection changes while in use. Completed copy-job captures are released
+outside the runtime mutex, including when releasing a GPU BO calls back into
+runtime services. Host locks count overlapping pages and balance repeated locks.
+
+GPU buffer sharing uses new driver selectors 52/53. Export generates an opaque
+token containing registry identity, a random 128-bit capability and allocation
+size. Import attaches only to a ready session and adds an independently owned
+BO reference; it never initializes/reset a stopped device for a stale token.
+Each device has a bounded 256-entry sharing table. Only device-VRAM buffers can
+be exported. Client close and BOFree release physical VRAM only after the final
+import/export BO reference is gone; quarantined references remain retained.
+
+```sh
+build/hsa/mac-hsa-ipc-test --run
+```
+
+On driver 181 this test verified 16,384 bytes from another process's GPU
+allocation, repeated attachment, then verified the bytes after the exporter
+called `_exit` without HSA cleanup. Imported writes/readback also matched and
+final detach/shutdown returned the device to stage 0. Eight ASan/UBSan runtime
+suites and all 28 non-runtime regression scripts passed. This result establishes
+shared GPU buffer lifetime and transfer correctness, not HSA GPU dispatch.

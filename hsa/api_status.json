@@ -1,0 +1,19 @@
+{
+  "runtime_requirements": {
+    "gpu_visible_signals": false,
+    "hardware_aql_queues": false,
+    "gpu_host_shared_mapping": false,
+    "amd_loader_extension": false,
+    "hrx_inference_verified": false
+  },
+  "platform_unsupported": [
+    "hsa_amd_interop_map_buffer",
+    "hsa_amd_interop_unmap_buffer",
+    "hsa_amd_portable_export_dmabuf",
+    "hsa_amd_portable_close_dmabuf",
+    "hsa_amd_svm_attributes_get",
+    "hsa_amd_svm_attributes_set",
+    "hsa_amd_svm_prefetch_async"
+  ],
+  "notes": "Symbol presence is not behavioral completion. See API_STATUS.md for host-only paths, queue restrictions, event delivery and verified hardware behavior."
+}

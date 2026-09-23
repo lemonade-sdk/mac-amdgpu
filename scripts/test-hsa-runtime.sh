@@ -19,6 +19,18 @@ for suffix in ['relaxed', 'scacquire', 'screlease', 'scacq_screl']:
     required.update('hsa_signal_' + op + '_' + suffix
                     for op in ['add', 'subtract', 'and', 'or', 'xor', 'exchange', 'cas'])
 required.update({
+    'hsa_agent_iterate_caches', 'hsa_cache_get_info',
+    'hsa_amd_memory_lock', 'hsa_amd_memory_lock_to_pool', 'hsa_amd_memory_unlock',
+    'hsa_amd_ipc_memory_create', 'hsa_amd_ipc_memory_attach', 'hsa_amd_ipc_memory_detach',
+    'hsa_amd_ipc_signal_create', 'hsa_amd_ipc_signal_attach',
+    'hsa_amd_vmem_address_reserve_align', 'hsa_amd_vmem_address_free',
+    'hsa_amd_vmem_handle_create', 'hsa_amd_vmem_handle_release',
+    'hsa_amd_vmem_map', 'hsa_amd_vmem_unmap', 'hsa_amd_vmem_set_access',
+    'hsa_amd_register_system_event_handler', 'hsa_amd_profiling_set_profiler_enabled',
+    'hsa_amd_queue_get_info', 'hsa_amd_queue_cu_set_mask', 'hsa_amd_queue_set_priority',
+    'hsa_amd_interop_map_buffer', 'hsa_amd_interop_unmap_buffer',
+    'hsa_amd_portable_export_dmabuf', 'hsa_amd_portable_close_dmabuf',
+    'hsa_amd_svm_attributes_get', 'hsa_amd_svm_attributes_set', 'hsa_amd_svm_prefetch_async',
     'hsa_code_object_reader_create_from_memory', 'hsa_code_object_reader_destroy',
     'hsa_executable_create_alt', 'hsa_executable_destroy',
     'hsa_executable_load_agent_code_object', 'hsa_executable_freeze',
@@ -40,5 +52,6 @@ for suffix in ['relaxed', 'screlease']:
 for suffix in ['relaxed', 'scacquire', 'screlease', 'scacq_screl']:
     required.update('hsa_queue_' + op + '_write_index_' + suffix for op in ['add', 'cas'])
 assert not required - exported, f'Missing implemented exports: {required - exported}'
-print(f'{len(required)} signal, memory, queue, ISA and executable entry points exported from the built dylib')
+print(f'{len(required)} checked entry points exported; API_STATUS.md records behavioral limits')
 PY
+python3 hsa/tools/audit_hrx.py --hrx upstream/hrx-lse-pin --library build/hsa/libhsa-runtime64.dylib

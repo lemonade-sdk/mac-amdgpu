@@ -2,7 +2,7 @@
 #include <array>
 
 namespace mac_hsa {
-hsa_status_t initializeDevice(InitializationRPC &rpc, bool &claimed, uint64_t &capacity) {
+hsa_status_t initializeDevice(InitializationRPC &rpc, bool &claimed, uint64_t &capacity, bool allowInitialize) {
     claimed = false; capacity = 0;
     std::array<uint64_t, 3> build{};
     auto status = rpc.scalar(43, {}, build);
@@ -42,7 +42,7 @@ hsa_status_t initializeDevice(InitializationRPC &rpc, bool &claimed, uint64_t &c
         capacity = accounting[10];
         return HSA_STATUS_SUCCESS;
     }
-    if (stage != 0) return HSA_STATUS_ERROR_INCOMPATIBLE_ARGUMENTS;
+    if (!allowInitialize || stage != 0) return HSA_STATUS_ERROR_INCOMPATIBLE_ARGUMENTS;
 
     const std::string suffix = identity[6] == 0xc8 ? "_kicker.bin" : ".bin";
     const std::vector<FirmwareFile> firmware{

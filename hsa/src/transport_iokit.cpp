@@ -43,8 +43,9 @@ public:
                                                       output, &count);
         if (result == kIOReturnNoDevice || result == kIOReturnNotAttached ||
             result == MACH_SEND_INVALID_DEST) return HSA_STATUS_ERROR_INVALID_AGENT;
-        if (result == kIOReturnBusy || result == kIOReturnNoMemory || result == kIOReturnNoSpace)
+        if (result == kIOReturnBusy || result == kIOReturnNoMemory || result == kIOReturnNoSpace || result == kIOReturnNoResources)
             return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+        if (result == kIOReturnBadArgument) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
         if (result != KERN_SUCCESS || count != outputs) return HSA_STATUS_ERROR;
         return HSA_STATUS_SUCCESS;
     }
@@ -77,6 +78,43 @@ public:
     hsa_status_t writeBuffer(const DeviceBuffer &buffer, uint64_t offset, const void *in, size_t bytes) override {
         std::lock_guard lock(sessionMutex);
         return transfer(buffer, offset, const_cast<void *>(in), bytes, true);
+    }
+    hsa_status_t exportBuffer(const DeviceBuffer &buffer, BufferToken &token) override {
+        std::lock_guard lock(sessionMutex);
+        if (state != State::Ready) return HSA_STATUS_ERROR;
+        std::array<uint64_t, 3> build{};
+        auto status = scalar(43, {}, build);
+        if (status != HSA_STATUS_SUCCESS) return status;
+        if (build[2] < 181) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+        std::array<uint64_t, 3> input{buffer.handle, 0, 0}, output{};
+        arc4random_buf(input.data() + 1, 16);
+        status = scalar(52, input, output);
+        if (status != HSA_STATUS_SUCCESS) return status;
+        if ((!output[0] && !output[1]) || output[2] != buffer.size) return HSA_STATUS_ERROR;
+        token = {registryID, {output[0], output[1]}, output[2]}; return HSA_STATUS_SUCCESS;
+    }
+    hsa_status_t importBuffer(const BufferToken &token, DeviceBuffer &buffer) override {
+        std::lock_guard lock(sessionMutex);
+        if (token.registryID != registryID || !token.size || token.size % 16384 || (!token.token[0] && !token.token[1]))
+            return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        // Probe before claiming: a stale token must not initialize/reset a GPU.
+        io_connect_t probe = IO_OBJECT_NULL;
+        if (IOServiceOpen(service, mach_task_self(), 0, &probe) != KERN_SUCCESS) return HSA_STATUS_ERROR_INVALID_AGENT;
+        std::array<uint64_t, 3> build{}; uint64_t tag = 4, stage = 0;
+        auto status = call(probe, 43, nullptr, 0, build.data(), 3);
+        if (status == HSA_STATUS_SUCCESS) status = call(probe, 21, &tag, 1, &stage, 1);
+        IOServiceClose(probe);
+        if (status != HSA_STATUS_SUCCESS) return status;
+        if (build[2] < 181 || stage != 15) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        status = ensureReady(false);
+        if (status != HSA_STATUS_SUCCESS) return status;
+        std::array<uint64_t, 3> input{token.token[0], token.token[1], token.size}, output{};
+        status = scalar(53, input, output);
+        if (status != HSA_STATUS_SUCCESS) return status;
+        if (!output[0] || !output[1] || output[2] != token.size || output[1] > UINT64_MAX - output[2]) {
+            state = State::Faulted; return HSA_STATUS_ERROR;
+        }
+        buffer = {output[0], output[1], output[2]}; return HSA_STATUS_SUCCESS;
     }
 
 private:
@@ -128,7 +166,7 @@ private:
         return status;
     }
     void waitAfterReset() override { std::this_thread::sleep_for(std::chrono::milliseconds(150)); }
-    hsa_status_t ensureReady() {
+    hsa_status_t ensureReady(bool allowInitialize = true) {
         if (state == State::Ready) return HSA_STATUS_SUCCESS;
         if (state != State::Unclaimed) return HSA_STATUS_ERROR;
         if (IOServiceOpen(service, mach_task_self(), 0, &ownerPort) != KERN_SUCCESS)
@@ -136,7 +174,7 @@ private:
         state = State::Initializing;
         bool claimed = false;
         hsa_status_t status;
-        try { status = initializeDevice(*this, claimed, capacity); }
+        try { status = initializeDevice(*this, claimed, capacity, allowInitialize); }
         catch (const std::bad_alloc &) { status = HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
         firmware.clear();
         if (!claimed) {

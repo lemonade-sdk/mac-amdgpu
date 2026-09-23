@@ -85,7 +85,8 @@ int main() {
     assert(std::chrono::steady_clock::now()-before < std::chrono::seconds(2));
     hsa_signal_t other{};
     assert(hsa_amd_signal_create(0,1,&agents[0],4,&other)==HSA_STATUS_ERROR_INVALID_ARGUMENT);
-    assert(hsa_amd_signal_create(0,1,&agents[0],HSA_AMD_SIGNAL_IPC,&other)==HSA_STATUS_ERROR_OUT_OF_RESOURCES);
+    assert(hsa_amd_signal_create(0,1,&agents[0],HSA_AMD_SIGNAL_IPC,&other)==HSA_STATUS_SUCCESS);
+    assert(hsa_signal_destroy(other)==HSA_STATUS_SUCCESS);
     assert(hsa_amd_signal_create(0,0,nullptr,HSA_AMD_SIGNAL_AMD_GPU_ONLY,&other)==HSA_STATUS_ERROR_OUT_OF_RESOURCES);
     assert(hsa_amd_signal_create(2,1,&agents[0],HSA_AMD_SIGNAL_AMD_GPU_ONLY,&other)==HSA_STATUS_SUCCESS);
     hsa_signal_t group[]={ {}, signal, other, {UINT64_MAX} };

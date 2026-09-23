@@ -63,6 +63,8 @@ int main() {
     assert(mac_hsa::initializeDevice(busy, claimed, capacity) == HSA_STATUS_ERROR_OUT_OF_RESOURCES && !claimed);
     assert((busy.events == std::vector<std::string>{"43", "1"}));
     RPC stale; stale.stale = true;
+    RPC importOnly; importOnly.build = 181;
+    assert(mac_hsa::initializeDevice(importOnly, claimed, capacity, false) != 0 && importOnly.events.size() == 3);
     assert(mac_hsa::initializeDevice(stale, claimed, capacity) != 0 && claimed && stale.events.size() == 3);
     RPC shared; shared.build = 180; shared.stale = true;
     assert(mac_hsa::initializeDevice(shared, claimed, capacity) == 0 && claimed && capacity == 31ull << 30);

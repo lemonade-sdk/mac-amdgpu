@@ -19,6 +19,8 @@ struct DeviceSnapshot {
 struct DeviceBuffer {
     uint64_t handle = 0, address = 0, size = 0;
 };
+struct BufferToken { uint64_t registryID = 0, token[2]{}, size = 0; };
+static_assert(sizeof(BufferToken) == 32);
 
 class Connection {
 public:
@@ -30,6 +32,8 @@ public:
     virtual hsa_status_t freeBuffer(const DeviceBuffer &) { return HSA_STATUS_ERROR; }
     virtual hsa_status_t readBuffer(const DeviceBuffer &, uint64_t, void *, size_t) { return HSA_STATUS_ERROR; }
     virtual hsa_status_t writeBuffer(const DeviceBuffer &, uint64_t, const void *, size_t) { return HSA_STATUS_ERROR; }
+    virtual hsa_status_t exportBuffer(const DeviceBuffer &, BufferToken &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
+    virtual hsa_status_t importBuffer(const BufferToken &, DeviceBuffer &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
 };
 
 // Only opens observer clients and calls RuntimeBuild/QueryInfo. No ownership,
