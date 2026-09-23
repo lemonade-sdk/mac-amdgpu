@@ -1,5 +1,15 @@
 # Status
 
+**v0.1.83 — HSA-loaded native kernel launches (hardware passed).**
+The runtime now connects frozen gfx1201 executable symbols to the working
+compute queue, preserves compiler resource registers and retains code,
+arguments and referenced allocations through a real GPU fence. An explicit
+coarse shared allocator allows shader data at identical CPU/GPU addresses.
+The new kernel test checks 128 and 256 results plus all allocation guards in
+both VRAM and shared-memory modes. Both hardware modes passed with increasing
+GPU fences and successful cleanup. HSA AQL queues and HRX inference
+remain incomplete.
+
 **v0.1.82 — AMD loader extension and shared-memory transfers (hardware passed).**
 AMD loader extension 1.03 now returns real descriptor translations, loaded-code
 metadata and object/executable enumeration. The loader passed on the actual GPU,
@@ -22,21 +32,14 @@ Seven platform-specific APIs explicitly return unsupported-operation errors;
 GPU HSA queues, shared host/GPU mappings and inference remain incomplete.
 See the [behavior status](hsa/API_STATUS.md) for the exact limits.
 
-**v0.1.80 — shared GPU sessions (hardware passed).**
-The driver owns the PCI connection; each client owns its buffers and command
-resources. An initialized GPU accepts additional clients without reset or
-firmware reload. A departing client releases only its own resources; the last
-client quiesces and resets the GPU. Two simultaneous HSA clients passed full
-data/guard checks, including continued operation after a peer exited abruptly.
-Global Stop/Reset remains blocked while another participating client is active.
-
 The native [amdgpu_mtop monitor](amdgpu_mtop/README.md) enumerates attached
 MacAMDGPU devices with GPU switching and JSON output. Live discovery and VRAM
 capacity queries work; dynamic firmware metrics require a verified interface-0x33 layout.
 
 The current target is AI compute and model inference. The initial [HSA runtime](hsa/README.md)
 now initializes the GPU and provides data-verified device allocations, copies,
-asynchronous completion, host pools, CPU signals and software queues.
+asynchronous completion, host pools, CPU signals and software queues. Its
+native synchronous executable-launch extension passed in VRAM and shared memory.
 All 119 functions resolved by LSE’s pinned HRX are exported; seven platform
 paths explicitly fail, and several other families are currently host-only.
 A bounded gfx1201 ELF loader now uploads linked kernels and exposes their

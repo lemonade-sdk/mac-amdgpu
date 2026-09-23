@@ -24,6 +24,9 @@ target_compile_options(mac-hsa-memory-test PRIVATE -Wall -Wextra -Werror)
 add_executable(mac-hsa-executable-test tools/mac_hsa_executable_test.c)
 target_link_libraries(mac-hsa-executable-test PRIVATE hsa-runtime64)
 target_compile_options(mac-hsa-executable-test PRIVATE -Wall -Wextra -Werror)
+add_executable(mac-hsa-kernel-test tools/mac_hsa_kernel_test.c)
+target_link_libraries(mac-hsa-kernel-test PRIVATE hsa-runtime64)
+target_compile_options(mac-hsa-kernel-test PRIVATE -Wall -Wextra -Werror)
 add_executable(mac-hsa-ipc-test tools/mac_hsa_ipc_test.c)
 target_link_libraries(mac-hsa-ipc-test PRIVATE hsa-runtime64)
 target_compile_options(mac-hsa-ipc-test PRIVATE -Wall -Wextra -Werror)
@@ -40,6 +43,14 @@ target_link_libraries(mac-hsa-atomic-test PRIVATE "-framework IOKit" "-framework
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(hsa-dispatch-test ../tests/hsa_dispatch_test.cpp ${HSA_RUNTIME_SOURCES})
+  target_include_directories(hsa-dispatch-test PRIVATE include src third_party/hsa/include)
+  target_compile_options(hsa-dispatch-test PRIVATE -Wall -Wextra -Werror -UNDEBUG
+    -fsanitize=address,undefined -fno-sanitize-recover=all)
+  target_link_options(hsa-dispatch-test PRIVATE -fsanitize=address,undefined)
+  add_test(NAME hsa-native-dispatch COMMAND hsa-dispatch-test
+    ${CMAKE_CURRENT_SOURCE_DIR}/../build/tests/hsa-code-object.hsaco)
+  set_tests_properties(hsa-native-dispatch PROPERTIES TIMEOUT 15)
   add_executable(hsa-extensions-test ../tests/hsa_extensions_test.cpp ${HSA_RUNTIME_SOURCES})
   target_include_directories(hsa-extensions-test PRIVATE include src third_party/hsa/include)
   target_compile_options(hsa-extensions-test PRIVATE -Wall -Wextra -Werror -UNDEBUG

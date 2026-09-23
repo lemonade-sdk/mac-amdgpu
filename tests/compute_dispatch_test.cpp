@@ -91,7 +91,7 @@ int main() {
     for(unsigned failure=0;failure<12;++failure) {
         auto invalid=request;
         switch(failure) {
-        case 0: invalid.version=2; break;
+        case 0: invalid.version=3; break;
         case 1: invalid.flags=1; break;
         case 2: invalid.codeOffset=4; break;
         case 3: invalid.codeBytes=3; break;
@@ -108,6 +108,30 @@ int main() {
     }
     assert(compute_dispatch_packets(packets,(1ull<<48)-256,request,masks));
     assert(!compute_dispatch_packets(packets,1ull<<48,request,masks));
+    auto v2=request;
+    v2.version=2; v2.rsrc1=0xe00f0000; v2.rsrc3=0x10;
+    assert(compute_dispatch_shape(v2));
+    const auto v2Count=compute_dispatch_packets(packets,0x8001000000,v2,masks);
+    bool resources=false, prefetch=false;
+    for (unsigned i=0;i<v2Count;) {
+        const auto size=((packets[i]>>16)&0x3fff)+2;
+        if (((packets[i]>>8)&255)==0x76) {
+            const auto reg=(packets[i+1]+0x2c00)*4;
+            if (reg==0xb848) { assert(packets[i+2]==v2.rsrc1); resources=true; }
+            if (reg==0xb8a0) { assert(packets[i+2]==v2.rsrc3); prefetch=true; }
+        }
+        i+=size;
+    }
+    assert(resources && prefetch);
+    for (unsigned bad=0;bad<5;++bad) {
+        auto invalid=v2;
+        if (bad==0) invalid.version=1;
+        if (bad==1) invalid.rsrc3|=COMPUTE_PGM_RSRC3__SHARED_VGPR_CNT_MASK;
+        if (bad==2) invalid.rsrc3|=COMPUTE_PGM_RSRC3__GLG_EN_MASK;
+        if (bad==3) invalid.rsrc1|=COMPUTE_PGM_RSRC1__PRIV_MASK;
+        if (bad==4) invalid.reserved=1;
+        assert(!compute_dispatch_shape(invalid));
+    }
     for(mode=0;mode<=4;++mode) {
         PCI pci; DeviceContext dev{&pci}; dev.ip.version[0]={12,0,1};
         GMCContext gmc; gmc.vram_alloc.init(gmc.vram_start,16384); CPContext cp; GFXConfig gfx;

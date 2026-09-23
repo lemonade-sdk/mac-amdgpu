@@ -3277,11 +3277,14 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
     case kMacAMDGPUMethodComputeDispatch: {
         if (arguments->scalarInputCount || !arguments->scalarOutput ||
             arguments->scalarOutputCount < 3 || !arguments->structureInput ||
-            arguments->structureInput->getLength() != sizeof(amdgpu::ComputeDispatchRequest) ||
+            (arguments->structureInput->getLength() != sizeof(amdgpu::ComputeDispatchRequest) &&
+             arguments->structureInput->getLength() != amdgpu::kComputeDispatchV1Bytes) ||
             arguments->structureInputDescriptor || arguments->structureOutputDescriptor ||
             arguments->structureOutputMaximumSize) return kIOReturnBadArgument;
         amdgpu::ComputeDispatchRequest request{};
-        memcpy(&request, arguments->structureInput->getBytesNoCopy(), sizeof(request));
+        memcpy(&request, arguments->structureInput->getBytesNoCopy(), arguments->structureInput->getLength());
+        if (arguments->structureInput->getLength() == amdgpu::kComputeDispatchV1Bytes && request.version != 1)
+            return kIOReturnBadArgument;
         if (!amdgpu::compute_dispatch_shape(request)) return kIOReturnBadArgument;
         auto *code = mac_amdgpu_bo_lookup(ivars, request.codeHandle);
         uint64_t codeVA = 0;
@@ -3292,7 +3295,9 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         for (const auto handle : request.buffers) {
             if (!handle) continue;
             auto *buffer = mac_amdgpu_bo_lookup(ivars, handle);
-            if (!buffer || !amdgpu::buffer_vram_domain(buffer->domain)) return kIOReturnBadArgument;
+            if (!buffer || (!amdgpu::buffer_vram_domain(buffer->domain) &&
+                !(request.version == 2 && buffer->domain == kBODomainGTT && buffer->gttBinding.ready)))
+                return kIOReturnBadArgument;
         }
         auto &b = driver->ivars->bringup;
         if (b.reached != amdgpu::BringupStage::SDMAInit) return kIOReturnNotReady;

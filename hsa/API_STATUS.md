@@ -25,13 +25,19 @@ address translation, segment/executable/object enumeration, object metadata,
 and embedded-file readers. Original storage and relocated descriptor copies
 remain alive until executable destruction, even after reader destruction.
 General global linking, GPU-visible signals and hardware AQL queues remain
-incomplete. Build 182 implements equal-address CPU/GPU host-buffer mappings
-in the transport, but the new hardware path is awaiting installation and
-validation; it is not yet advertised as an HSA pool or signal capability.
+incomplete. Build 182 passed equal-address CPU/GPU host-buffer transfers, but
+concurrent CPU/GPU atomic updates failed. Build 183 adds explicit coarse shared
+allocations and native synchronous dispatch of frozen HSA-loaded kernels.
+Both VRAM and direct shared-memory shader tests passed on build 183. These are
+separate native APIs, not HSA fine-grained pools, signals or AQL queues.
 No HRX/LSE inference has run.
 
 ## Validation
 
+- Driver 183 executed HSA-loaded `vector_add.kd` in VRAM and shared host memory.
+  Each mode verified 128 and 256 results, all 16 KiB of input/output/guard bytes,
+  increasing GPU fences and successful cleanup. This is native synchronous
+  dispatch, not hardware HSA AQL or HRX inference.
 - The loader extension passed on the actual GPU with driver 181: a linked
   kernel uploaded/froze successfully and its translated descriptor matched
   kernarg metadata after reader destruction.
@@ -41,10 +47,13 @@ No HRX/LSE inference has run.
   an immutable session GART window, fixed CPU mappings that fail on address
   collisions, and GTT/VRAM SDMA copies. `mac-hsa-shared-test --run` verifies
   64,003 unaligned bytes each way plus the complete 128 KiB shared allocation
-  and VRAM guards. Its hardware result is pending; concurrent CPU/GPU atomics
-  and hardware AQL queues require separate tests.
+  and VRAM guards. This passed on hardware. GPU-only decrement and carry also
+  passed, but concurrent CPU/GPU additions lost updates and timed out. Cached
+  PCIe capabilities lack host AtomicOp completion and Thunderbolt routing.
+  No coherent GPU-signal capability was enabled.
 
-- Eight ASan/UBSan runtime suites, including native host virtual memory and
+- Nine ASan/UBSan runtime suites, including native executable dispatch,
+  shared allocation lifetime, host virtual memory and
   separate-process IPC signal updates. A SIGKILL test verifies cleanup by a
   surviving attachment.
 - Production driver export/import/free and client-close code is extracted into

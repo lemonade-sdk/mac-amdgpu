@@ -142,6 +142,33 @@ public:
         if (status != HSA_STATUS_SUCCESS) state = State::Faulted;
         return status;
     }
+    hsa_status_t dispatch(const amdgpu::ComputeDispatchRequest &request, uint64_t &fence) override {
+        std::lock_guard lock(sessionMutex);
+        fence = 0;
+        if (state != State::Ready) return HSA_STATUS_ERROR;
+        if (!amdgpu::compute_dispatch_shape(request)) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        if (request.version == 2) {
+            std::array<uint64_t, 3> build{};
+            const auto status = scalar(43, {}, build);
+            if (status != HSA_STATUS_SUCCESS) return status;
+            if (build[2] < 183) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+        }
+        std::array<uint64_t, 3> output{};
+        uint32_t count = output.size();
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        const auto status = IOConnectCallMethod(ownerPort, 51, nullptr, 0, &request,
+            request.version == 1 ? amdgpu::kComputeDispatchV1Bytes : sizeof(request),
+            output.data(), &count, nullptr, nullptr);
+        if (status != KERN_SUCCESS || count != output.size() || output[0] ||
+            output[2] != 3 || !output[1] || output[1] <= lastComputeFence) {
+            // A failed or malformed response cannot prove completion. The
+            // driver keeps code, arguments and referenced BOs until recovery.
+            state = State::Faulted; return HSA_STATUS_ERROR;
+        }
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        fence = lastComputeFence = output[1];
+        return HSA_STATUS_SUCCESS;
+    }
     hsa_status_t testSharedAtomicAdd(const SharedBuffer &buffer, uint64_t offset,
                                     int64_t increment, uint32_t repetitions) override {
         std::lock_guard lock(sessionMutex);
@@ -249,6 +276,7 @@ private:
     enum class State { Unclaimed, Initializing, Ready, Faulted } state = State::Unclaimed;
     std::mutex sessionMutex;
     io_connect_t ownerPort = IO_OBJECT_NULL;
+    uint64_t lastComputeFence = 0;
     uint64_t capacity = 0;
     DeviceBuffer staging;
     uint64_t hostWindowBase = 0, hostWindowSize = 0;

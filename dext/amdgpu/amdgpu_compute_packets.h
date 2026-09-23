@@ -54,11 +54,12 @@ inline uint32_t compute_dispatch_packets(uint32_t (&out)[kComputeSmokePacketCapa
     sh(0xb840, 0); sh(0xb844, 0); // no scratch
     sh(0xb848, r.rsrc1);
     sh(0xb84c, r.rsrc2);
-    sh(0xb8a0, 0);
+    sh(0xb8a0, r.rsrc3);
     sh(0xb860, 0); // no scratch ring
     const uint32_t waves = (r.threads[0] * r.threads[1] * r.threads[2] + 31) / 32;
     // Mesa uses paired one-wave groups in CU mode. Larger groups stand alone.
-    sh(0xb854, (waves == 1 ? 1u << 24 : 0) | (waves % 4 == 0 ? 1u << 22 : 0));
+    const bool wgpMode = (r.rsrc1 & (1u << 29)) != 0;
+    sh(0xb854, (waves == 1 && !wgpMode ? 1u << 24 : 0) | (waves % 4 == 0 ? 1u << 22 : 0));
     const uint32_t seRegs[] = {0xb858, 0xb85c, 0xb864, 0xb868};
     for (uint32_t i = 0; i < 4; ++i) sh(seRegs[i], cuMask[i]);
     sh(0xb88c, 0); // SE8

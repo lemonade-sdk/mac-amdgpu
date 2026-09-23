@@ -9,6 +9,7 @@ constexpr int kIOReturnSuccess=0, kIOReturnBadArgument=1, kIOReturnNotReady=2,
     kIOReturnNoMemory=3, kIOReturnTimeout=4, kIOReturnIOError=5, kIOReturnNotAttached=6;
 constexpr int kMacAMDGPUMethodBOCopy=48, kMacAMDGPUMethodBOWrite=49, kMacAMDGPUMethodBORead=50, kMacAMDGPUMethodComputeDispatch=51;
 constexpr int kBODomainVRAM=1;
+constexpr int kBODomainGTT=2;
 struct OSData {
     std::vector<uint8_t> data;
     static OSData *withBytes(const void *p, size_t n) {
@@ -62,7 +63,7 @@ static int sdma_copy_linear_test(DeviceContext &,SDMA &sdma,uint64_t src,uint64_
 }
 static void amdgpu_hdp_flush(DeviceContext &) { ++flushes; }
 }
-struct BO { bool used=true; uint32_t domain=1; uint64_t gpu_va=0,size=16384; };
+struct BO { bool used=true; uint32_t domain=1; uint64_t gpu_va=0,size=16384; struct { bool ready=false; } gttBinding{}; };
 static BO entries[3]{{true,1,0,16384},{true,1,16384,16384},{true,3,0x10000000,22ull<<30}};
 static BO *mac_amdgpu_bo_lookup(int *,uint64_t handle) {
     return handle>=1 && handle<=3 && entries[handle-1].used ? &entries[handle-1] : nullptr;
@@ -140,8 +141,9 @@ int main() {
     request.threads[0]=32; request.threads[1]=request.threads[2]=1;
     request.rsrc1=0xc0000; request.buffers[0]=3;
     uint64_t dispatchOut[3]{};
+    size_t wireBytes = sizeof(request);
     auto dispatch=[&]() {
-        auto *data=OSData::withBytes(&request,sizeof(request));
+        auto *data=OSData::withBytes(&request,wireBytes);
         Args dispatchArgs;dispatchArgs.structureInput=data;dispatchArgs.scalarOutput=dispatchOut;
         dispatchArgs.scalarOutputCount=3;
         const auto status=call(&driver,&pci,&client,51,&dispatchArgs);
@@ -162,4 +164,22 @@ int main() {
     assert(dispatch()==0 && amdgpu::launchCode==entries[2].gpu_va+request.codeOffset);
     amdgpu::launchStatus=kIOReturnTimeout;amdgpu::retainLaunch=true;
     assert(dispatch()==0 && dispatchOut[0]==kIOReturnTimeout && state.shutdownBlocked);
+    amdgpu::launchStatus=0; amdgpu::retainLaunch=false; state.shutdownBlocked=false;
+    request.buffers[0]=2; entries[1].domain=2;
+    assert(dispatch()==kIOReturnBadArgument); // v1 cannot reference shared host data
+    request.version=2; request.rsrc1=0xe00f0000; request.rsrc3=0x10;
+    assert(dispatch()==kIOReturnBadArgument); // incomplete GART binding
+    entries[1].gttBinding.ready=true;
+    assert(dispatch()==0 && dispatchOut[2]==3);
+    request.codeHandle=2;
+    assert(dispatch()==kIOReturnBadArgument); // executable code remains VRAM-only
+    request.codeHandle=3; entries[1].domain=0;
+    assert(dispatch()==kIOReturnBadArgument); // legacy DMA buffer is not a BO binding
+    request.buffers[0]=3; request.version=1; request.rsrc1=0xc0000; request.rsrc3=0;
+    wireBytes=amdgpu::kComputeDispatchV1Bytes;
+    assert(dispatch()==0); // installed host's 264-byte ABI still works
+    request.version=2;
+    assert(dispatch()==kIOReturnBadArgument); // cannot truncate v2 registers
+    wireBytes=sizeof(request); request.reserved=1;
+    assert(dispatch()==kIOReturnBadArgument);
 }

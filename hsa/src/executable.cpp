@@ -1,5 +1,7 @@
 #include "runtime_state.h"
 #include "code_object.h"
+#include "mac_hsa.h"
+#include <array>
 #include <cerrno>
 #include <cstdio>
 #include <fcntl.h>
@@ -68,6 +70,73 @@ static hsa_status_t findExecutable(hsa_executable_t handle, std::shared_ptr<Exec
 }
 using namespace mac_hsa::detail;
 extern "C" {
+hsa_status_t mac_hsa_executable_dispatch(hsa_executable_symbol_t handle,
+    const void *kernarg, size_t kernargSize, const uint32_t groups[3],
+    const uint32_t threads[3], const void *const *buffers, size_t bufferCount,
+    uint64_t *fence) {
+    std::lock_guard lifecycle(executableLifecycleMutex);
+    if (!fence) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    *fence = 0;
+    std::shared_ptr<ExecutableSymbol> symbol;
+    std::shared_ptr<Executable> executable;
+    std::array<std::shared_ptr<Allocation>, 15> retained;
+    amdgpu::ComputeDispatchRequest request{};
+    {
+        std::lock_guard lock(runtimeMutex);
+        if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+        if (!groups || !threads || (kernargSize && !kernarg) || bufferCount > retained.size() ||
+            (bufferCount && !buffers)) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        const auto found = executableSymbols.find(handle.handle);
+        if (found == executableSymbols.end()) return HSA_STATUS_ERROR_INVALID_EXECUTABLE_SYMBOL;
+        symbol = found->second; executable = symbol->executable.lock();
+        if (!executable || !executable->frozen) return HSA_STATUS_ERROR_INVALID_EXECUTABLE;
+        for (size_t i = 0; i < bufferCount; ++i) {
+            retained[i] = findAllocation(buffers[i]);
+            if (!retained[i] || retained[i]->connection != symbol->image->connection || !retained[i]->buffer.handle)
+                return HSA_STATUS_ERROR_INVALID_ALLOCATION;
+            request.buffers[i] = retained[i]->buffer.handle;
+        }
+    }
+    const auto &image = *symbol->image;
+    const auto &kernel = image.object.kernels[symbol->kernelIndex];
+    if (kernel.kernargSize != kernargSize || kernargSize > 4 * 1024 * 1024)
+        return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    // AMDHSA descriptor: ENABLE_SGPR_KERNARG_SEGMENT_PTR (bit 3), wave32
+    // (bit 10). Other implicit SGPR layouts need explicit runtime support.
+    if (kernel.properties != 0x408 || kernel.preload ||
+        kernel.privateSize || kernel.groupSize || kernel.dynamicStack)
+        return HSA_STATUS_ERROR_INCOMPATIBLE_ARGUMENTS;
+    request.version = 2; request.codeHandle = image.buffer.handle;
+    request.codeOffset = kernel.entry;
+    for (const auto &segment : image.object.segments) {
+        if ((segment.flags & 1) && kernel.entry >= segment.offset && kernel.entry - segment.offset < segment.size)
+            request.codeBytes = (segment.size - (kernel.entry - segment.offset)) & ~uint64_t(3);
+    }
+    for (unsigned i = 0; i < 3; ++i) { request.groups[i] = groups[i]; request.threads[i] = threads[i]; }
+    request.rsrc1 = kernel.rsrc1; request.rsrc2 = kernel.rsrc2;
+    request.rsrc3 = kernel.rsrc3;
+    request.userSGPRCount = 2; request.timeoutUS = 100000;
+    if (!amdgpu::compute_dispatch_shape(request)) return HSA_STATUS_ERROR_INCOMPATIBLE_ARGUMENTS;
+    struct Arguments {
+        std::shared_ptr<mac_hsa::Connection> connection;
+        mac_hsa::DeviceBuffer buffer;
+        ~Arguments() { if (buffer.handle) connection->freeBuffer(buffer); }
+    } arguments{image.connection, {}};
+    auto status = image.connection->allocateBuffer(kernargSize ? kernargSize : 16, arguments.buffer);
+    if (status != HSA_STATUS_SUCCESS) return status;
+    if (!arguments.buffer.handle || arguments.buffer.size < kernargSize ||
+        !arguments.buffer.address || arguments.buffer.address % 16 ||
+        (kernel.kernargAlignment && arguments.buffer.address % kernel.kernargAlignment) ||
+        arguments.buffer.address >= (1ull << 48)) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+    if (kernargSize) {
+        status = image.connection->writeBuffer(arguments.buffer, 0, kernarg, kernargSize);
+        if (status != HSA_STATUS_SUCCESS) return status;
+    }
+    request.userSGPR[0] = uint32_t(arguments.buffer.address);
+    request.userSGPR[1] = uint32_t(arguments.buffer.address >> 32);
+    request.buffers[bufferCount] = arguments.buffer.handle;
+    return image.connection->dispatch(request, *fence);
+}
 hsa_status_t hsa_code_object_reader_create_from_memory(const void *data, size_t size,
                                                        hsa_code_object_reader_t *out) {
     std::lock_guard lifecycle(executableLifecycleMutex);

@@ -31,10 +31,11 @@ struct Allocation {
     void *userData = nullptr;
     std::shared_ptr<Connection> connection;
     DeviceBuffer buffer;
+    SharedBuffer shared;
     hsa_status_t release() {
         if (!connection || !buffer.handle) return HSA_STATUS_SUCCESS;
-        const auto status = connection->freeBuffer(buffer);
-        if (status == HSA_STATUS_SUCCESS) { buffer = {}; base = nullptr; }
+        const auto status = shared.host ? connection->freeSharedBuffer(shared) : connection->freeBuffer(buffer);
+        if (status == HSA_STATUS_SUCCESS) { buffer = {}; shared = {}; base = nullptr; }
         return status;
     }
     ~Allocation() {

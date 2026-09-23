@@ -42,7 +42,7 @@ int main(void) {
         fprintf(stderr, "HSA discovery failed: 0x%x (shutdown 0x%x)\n", status, shutdown);
         return 1;
     }
-    printf("Discovered %u MacAMDGPU device(s). Discovery only; kernel dispatch is unavailable.\n",
+    printf("Discovered %u MacAMDGPU device(s). Discovery only; hardware HSA queue dispatch is unavailable.\n",
            gpu_count);
     return 0;
 }

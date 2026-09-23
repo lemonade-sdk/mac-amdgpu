@@ -1809,3 +1809,40 @@ AtomicOp path checks. They do not prove the precise timeout mechanism, nor
 rule out other communication protocols. Shared DMA transfer success must not
 be advertised as concurrent HSA signal atomicity. The diagnostic tests cover
 missing capabilities, endpoint/root distinctions and multiple GPU paths.
+## Build 183: HSA executable launches and shared shader data — 2026-09-23
+
+Connected frozen HSA executable symbols to native selector-51 compute dispatch.
+The runtime preserves the kernel's entry, resource registers and kernarg layout,
+retains all referenced allocations/code through a real GPU fence, and rejects
+unsupported scratch/LDS/preload/dynamic-stack or implicit-SGPR layouts. It does
+not advertise hardware AQL queues or synthesize GPU signal completion.
+
+LLVM's gfx1201 descriptor uses WGP_MODE, MEM_ORDERED, FWD_PROGRESS and instruction
+prefetch. Added a 272-byte version-2 request to preserve these fields; the
+original 264-byte version-1 format remains supported. Version 2 accepts ready
+GART-bound data BOs while code stays in VRAM. Reserved/privileged and unsupported
+resource fields are rejected. Prefetch is emitted to COMPUTE_PGM_RSRC3, and
+CU-mode paired workgroup policy is not applied to WGP mode.
+
+Added an explicit coarse shared allocator with identical CPU/GPU addresses,
+correct unmap/free lifetime, CPU/GPU pointer-info access and allocation pins.
+CPU access is allowed between completed GPU operations; concurrent system
+atomics remain unsupported. The new kernel probe tests HSA loading followed by
+two actual native launches, in VRAM or direct shared-memory mode, with 128/256
+outputs and all 16 KiB inputs/guards verified. Installer code and entitlements
+are unchanged.
+
+Nine HSA sanitizer suites pass, including public executable/buffer destruction
+during an in-flight mocked dispatch, old/new wire formats, malformed completion
+retention and shared mapping lifetime. All 29 driver regression scripts passed,
+the driver/app build succeeded, and both strict driver and deep app signature
+verification passed. Both bundles identify build 183. Stop GPU completed its
+reset/PCI close/resource release before opening the new app for installation.
+
+After installation, the live observer verified build 183 at stage 0. The new
+native test initialized automatically, loaded/froze `vector_add.kd`, destroyed
+its reader and launched twice. VRAM mode at `0x8010004000` passed 128/256
+computed results and all 16,384 input/output/guard bytes, with fences 1 and 2.
+Shared mode at CPU/GPU `0x110000000` passed the same checks through direct CPU
+stores and shader writes/readback, also with fences 1 and 2. Both tools exited
+successfully after cleanup. No hardware AQL queue or HRX inference is claimed.

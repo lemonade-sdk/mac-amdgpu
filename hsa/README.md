@@ -7,7 +7,9 @@ PCI access, firmware, DMA mappings and hardware queues.
 
 This is an incomplete runtime, not an HSA-conformant implementation or a
 working HRX backend. It provides live discovery, runtime lifecycle, CPU signals, software queues,
-and CPU/GPU memory allocation and copies. It does not execute HSA kernels. ABI version queries describe
+and CPU/GPU memory allocation and copies. Build 183 adds native synchronous
+launches of HSA-loaded kernels; both VRAM and shared-memory hardware tests pass, while HSA AQL
+queues remain unavailable. ABI version queries describe
 the targeted HSA 1.2 interface, not conformance certification.
 
 ## Build and verify
@@ -152,7 +154,7 @@ followed by successful buffer release and the fixed compute test. This does
 not verify every byte, arbitrary copy lengths, throughput or HSA semantics.
 
 
-## Native compute dispatch (build 178)
+## Native compute dispatch
 
 Selector 51 accepts the 264-byte version-1 `ComputeDispatchRequest` in
 `dext/amdgpu/amdgpu_dispatch_abi.h`, no input scalars, and three output scalars:
@@ -176,13 +178,54 @@ Calls execute on the serial lifecycle queue and return only after completion
 or bounded failure. All owner BOs remain alive during the call. A failed
 staged/published submission retains the command IB and blocks mutation until
 Stop/reset, including failures that precede the doorbell. Successful calls free
-the IB. The HSA runtime does not yet call this selector or advertise dispatch.
+the IB. The native HSA extension calls this selector in build 183; standard
+HSA queue dispatch remains unadvertised.
 The host Dispatch Test uploads a separate kernarg-loading shader and checks
 four/eight workgroups, changing arguments and all data/guard words. Build 178 completed the first
 fence but failed its 128-word output check. Build 179 corrects the test kernel
 to compiler-generated gfx1201 workgroup IDs and dependency instructions;
 hardware passed both launches on 2026-09-23 at 15:23 UTC: 128 and 256
 outputs plus all input/guard words, fences 1 and 2, followed by buffer release.
+
+### Build 183: frozen executable to native compute
+
+The version-2 selector-51 request is 272 bytes, extending the original prefix
+with `rsrc3` and a zero reserved word. It preserves descriptor WGP mode,
+memory ordering, forward progress and instruction-prefetch fields. Unsupported
+shared VGPR/GLG/image fields still fail validation. The 264-byte version-1
+format remains accepted with its original constraints. Referenced version-2
+data BOs may be GTT with completed GART bindings; executable code remains VRAM.
+
+`mac_hsa_executable_dispatch` in `include/mac_hsa.h` resolves a frozen executable
+symbol, uses its relocated entry and resource registers, uploads an independent
+kernarg BO, pins all declared allocations and waits for the native GPU fence.
+It requires gfx1201 wave32, only a kernarg pointer in user SGPRs, no scratch,
+LDS, preload, or dynamic stack. Calls have a 100 ms GPU timeout. Bad/missing
+completion results fault the transport and prevent storage recycling.
+Executable destruction/shutdown serialize against launches; allocation pins
+also prevent a concurrent `hsa_memory_free` from reclaiming referenced BOs.
+
+`mac_hsa_memory_allocate_shared` provides an explicit coarse shared allocation
+with identical CPU/GPU addresses and `hsa_memory_free` cleanup. Pointer queries
+report both views and CPU/GPU access. CPU access is restricted to intervals
+between completed GPU operations. Normal HSA pool flags remain unchanged;
+this is not fine-grained atomic memory or GPU signal support.
+
+After installing build 183:
+
+```sh
+build/hsa/mac-hsa-kernel-test --run build/tests/hsa-code-object.hsaco
+build/hsa/mac-hsa-kernel-test --shared build/tests/hsa-code-object.hsaco
+```
+
+Both modes load/freeze `vector_add.kd`, destroy the reader before dispatch,
+execute 128 and 256 workitems with distinct arguments, require increasing GPU
+fences, and verify every byte of each 16 KiB allocation. Shared mode writes
+inputs and reads shader output directly through the CPU mapping. On installed
+build 183, both modes passed 128/256 outputs and every allocation byte, with
+fences 1 and 2. VRAM data was at `0x8010004000`; shared data was at `0x110000000`.
+Native synchronous dispatch is not
+hardware HSA AQL queue support, and HRX inference has not run.
 
 ## Signal implementation and verification
 

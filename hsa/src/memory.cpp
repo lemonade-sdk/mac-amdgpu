@@ -1,4 +1,5 @@
 #include "runtime_state.h"
+#include "mac_hsa.h"
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -106,7 +107,8 @@ bool accessibleAgent(hsa_agent_t agent, const std::shared_ptr<Allocation> &alloc
     if (!agent.handle) return true;
     const auto found = findAgent(agent);
     if (!found) return false;
-    return allocation && allocation->connection ? agent.handle == allocation->owner.handle : !found->connection;
+    return allocation && allocation->connection ? agent.handle == allocation->owner.handle ||
+        (allocation->shared.host && !found->connection) : !found->connection;
 }
 hsa_status_t copyBytes(void *dst, const void *src, size_t size,
     const std::shared_ptr<Allocation> &destination, const std::shared_ptr<Allocation> &source) {
@@ -133,6 +135,43 @@ hsa_status_t copyBytes(void *dst, const void *src, size_t size,
 
 using namespace mac_hsa::detail;
 extern "C" {
+hsa_status_t mac_hsa_memory_allocate_shared(hsa_agent_t agent, size_t size, void **out) {
+    if (!out) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    *out = nullptr;
+    std::shared_ptr<mac_hsa::Connection> connection;
+    {
+        std::lock_guard lock(runtimeMutex);
+        if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+        const auto found = findAgent(agent);
+        if (!found || !found->connection) return HSA_STATUS_ERROR_INVALID_AGENT;
+        connection = found->connection;
+    }
+    if (!size || size > SIZE_MAX - 16383) return HSA_STATUS_ERROR_INVALID_ALLOCATION;
+    try {
+        auto allocation = std::make_shared<Allocation>();
+        allocation->connection = connection; allocation->owner = agent;
+        const auto status = connection->allocateSharedBuffer(size, allocation->shared);
+        if (status != HSA_STATUS_SUCCESS) return status;
+        allocation->buffer = allocation->shared.device;
+        allocation->base = allocation->shared.host;
+        allocation->size = allocation->buffer.size;
+        const auto address = reinterpret_cast<uintptr_t>(allocation->base);
+        if (!address || address != allocation->buffer.address || !allocation->buffer.handle ||
+            allocation->size < size || allocation->size > UINTPTR_MAX - address)
+            return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+        {
+            std::lock_guard lock(runtimeMutex);
+            if (!references || !findAgent(agent)) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+            if (findAllocation(allocation->base)) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+            const auto next = allocations.lower_bound(address);
+            if (next != allocations.end() && next->first - address < allocation->size)
+                return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+            allocations.emplace(address, allocation);
+        }
+        *out = allocation->base;
+        return HSA_STATUS_SUCCESS;
+    } catch (const std::bad_alloc &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
+}
 hsa_status_t hsa_agent_iterate_regions(hsa_agent_t agent,
     hsa_status_t (*callback)(hsa_region_t, void *), void *data) {
     hsa_region_t region{};
@@ -254,7 +293,8 @@ HSA_API_EXPORT hsa_status_t hsa_amd_agents_allow_access(uint32_t count, const hs
     for (uint32_t i = 0; i < count; ++i) {
         const auto agent = findAgent(handles[i]);
         if (!agent) return HSA_STATUS_ERROR_INVALID_AGENT;
-        if (handles[i].handle != allocation->owner.handle) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        if (handles[i].handle != allocation->owner.handle && !(allocation->shared.host && !agent->connection))
+            return HSA_STATUS_ERROR_INVALID_ARGUMENT;
     }
     return HSA_STATUS_SUCCESS;
 }
@@ -298,6 +338,7 @@ HSA_API_EXPORT hsa_status_t hsa_amd_pointer_info(const void *pointer, hsa_amd_po
     void *(*alloc)(size_t), uint32_t *count, hsa_agent_t **accessible) {
     hsa_amd_pointer_info_t result{};
     bool known = false;
+    hsa_agent_t hostAccess{};
     {
         std::lock_guard lock(runtimeMutex);
         if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
@@ -309,21 +350,26 @@ HSA_API_EXPORT hsa_status_t hsa_amd_pointer_info(const void *pointer, hsa_amd_po
             known = true;
             result.type = allocation->type;
             result.agentBaseAddress = allocation->base;
-            result.hostBaseAddress = allocation->connection ? nullptr : allocation->base;
+            result.hostBaseAddress = allocation->shared.host ? allocation->shared.host :
+                (allocation->connection ? nullptr : allocation->base);
             result.sizeInBytes = allocation->size;
             result.agentOwner = allocation->owner;
             result.userData = allocation->userData;
             result.global_flags = allocation->connection ? HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED : HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED;
             result.registered = bool(allocation->connection);
+            if (allocation->shared.host)
+                for (const auto &agent : agents) if (!agent.connection) { hostAccess = agent.handle; break; }
         } else known = describeHostLock(pointer, result);
     }
     // The caller's allocator may reenter HSA. Do not call it under runtimeMutex.
     if (accessible) *accessible = nullptr;
-    if (count) *count = known ? 1 : 0;
+    const uint32_t agentCount = known ? 1 + bool(hostAccess.handle) : 0;
+    if (count) *count = agentCount;
     if (known && alloc && count && accessible) {
-        auto array = static_cast<hsa_agent_t *>(alloc(sizeof(hsa_agent_t)));
+        auto array = static_cast<hsa_agent_t *>(alloc(sizeof(hsa_agent_t) * agentCount));
         if (!array) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
         *array = result.agentOwner;
+        if (hostAccess.handle) array[1] = hostAccess;
         *accessible = array;
     }
     std::memcpy(info, &result, result.size);
