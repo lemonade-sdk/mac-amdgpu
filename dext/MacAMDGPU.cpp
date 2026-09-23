@@ -103,6 +103,7 @@ enum {
     kMacAMDGPUMethodShutdownGPU        = 42, // reset, close PCI, discard session
     kMacAMDGPUMethodRuntimeBuild       = 43, // actual responding binary, no hardware access
     kMacAMDGPUMethodHostMemoryTest     = 44, // data-verified SDMA transfers through GART
+    kMacAMDGPUMethodComputeTest        = 45, // fixed wave32 shader with full readback
 };
 
 // v0.1.28 — IP types accepted by CSCreate. Match the upstream
@@ -2842,6 +2843,28 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             r, result.stage, result.mismatches, result.firstMismatch,
             result.hostGPUAddress, result.vramGPUAddress);
         return kIOReturnSuccess; // preserve diagnostics even when operation failed
+    }
+
+    case kMacAMDGPUMethodComputeTest: {
+        if (!arguments->scalarInput || arguments->scalarInputCount != 1 ||
+            !arguments->scalarOutput || arguments->scalarOutputCount < 6)
+            return kIOReturnBadArgument;
+        if (!driver->ivars->pciOpen) return kIOReturnNotOpen;
+        auto &b = driver->ivars->bringup;
+        amdgpu::ComputeTestResult result{};
+        const auto r = amdgpu::compute_test(b.device, b.gmc, b.cp, b.gfx,
+            b.computeTest, static_cast<uint32_t>(arguments->scalarInput[0]), result);
+        if (r != kIOReturnSuccess && b.computeTest.active)
+            driver->ivars->shutdownBlocked = true;
+        arguments->scalarOutput[0] = static_cast<uint32_t>(r);
+        arguments->scalarOutput[1] = result.stage;
+        arguments->scalarOutput[2] = result.mismatches;
+        arguments->scalarOutput[3] = result.firstMismatch;
+        arguments->scalarOutput[4] = result.fence;
+        arguments->scalarOutput[5] = result.gpuAddress;
+        MACAMDGPU_LOG("compute test: status=%#x stage=%u mismatches=%u first=%#x fence=%u gpu=%#llx",
+            r, result.stage, result.mismatches, result.firstMismatch, result.fence, result.gpuAddress);
+        return kIOReturnSuccess;
     }
 
     case kMacAMDGPUMethodSDMACopyTest: {

@@ -52,6 +52,7 @@ private let kSelGetIdentity:     UInt32 = 1
 private let kSelGetBARInfo:      UInt32 = 2
 private let kSelRuntimeBuild:    UInt32 = 43
 private let kSelHostMemoryTest:  UInt32 = 44
+private let kSelComputeTest:     UInt32 = 45
 private let kSelShutdownGPU:     UInt32 = 42
 private let kSelGetReBARInfo:    UInt32 = 41
 private let kSelAllocateDMA:     UInt32 = 6
@@ -363,6 +364,8 @@ struct ContentView: View {
                     GroupLabel("Memory")
                     Button("Host Memory Copy") { controller.testHostMemoryTransfer() }
                         .help("Verify 16 KB in each direction between host memory and VRAM through GART, then unbind the DMA mapping.")
+                    Button("Compute Smoke") { controller.testCompute() }
+                        .help("Run a 32-thread shader that reads, adds and writes values; verify every result and surrounding guard words.")
                     Spacer()
                 }
 
@@ -1682,6 +1685,30 @@ final class DriverController: NSObject, ObservableObject,
             expected, observed, gpuVa))
         if kr != KERN_SUCCESS && status == 0 {
             append(String(format: "  (kr=%#x)", kr))
+        }
+    }
+
+    func testCompute() {
+        guard openUserClient() else { return }
+        let seed = UInt32(truncatingIfNeeded: DispatchTime.now().uptimeNanoseconds)
+        append("Compute Smoke: starting one wave32 workgroup (input + seed → output)")
+        let (kr, out) = callScalar(kSelComputeTest, input: [UInt64(seed)], outCount: 6)
+        guard kr == KERN_SUCCESS, out.count == 6 else {
+            append(String(format: "Compute Smoke: RPC failed kr=%#x", kr))
+            return
+        }
+        let stages = ["preflight", "allocate", "upload", "dispatch/fence", "verify", "complete"]
+        let stage = out[1] < UInt64(stages.count) ? stages[Int(out[1])] : "unknown"
+        append(String(format: "Compute Smoke: status=%#llx stage=%@ mismatches=%llu fence=%llu",
+                      out[0], stage, out[2], out[4]))
+        append(String(format: "  data GPU VA=%#llx seed=%#x", out[5], seed))
+        if out[2] != 0 {
+            append(String(format: "  first mismatch at data byte offset=%#llx", out[3]))
+        }
+        if out[0] == 0 && out[1] == 5 {
+            append("Compute Smoke: all 32 results, input and guard words verified; storage released")
+        } else if out[1] != 0 {
+            append("Compute Smoke: session retained for recovery — Stop GPU before retry")
         }
     }
 

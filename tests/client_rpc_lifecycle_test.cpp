@@ -10,6 +10,7 @@ constexpr int kIOReturnSuccess = 0, kIOReturnBusy = 1, kIOReturnBadArgument = 2,
               kIOReturnNotOpen = 6, kIOReturnNoSpace = 7, kIOReturnNoResources = 8;
 constexpr int kMacAMDGPUMethodSubmitIB = 19;
 constexpr int kMacAMDGPUMethodHostMemoryTest = 44;
+constexpr int kMacAMDGPUMethodComputeTest = 45;
 constexpr int kMacAMDGPUMethodWaitInterrupt = 4, kMacAMDGPUMethodWaitFence = 20;
 constexpr int kMacAMDGPUMethodSubmitTestPM4 = 14, kMacAMDGPUMethodCPKIQSmoke = 35,
               kMacAMDGPUMethodSDMACopyTest = 15;
@@ -42,8 +43,9 @@ struct DriverState {
     bool pciOpen = true, shutdownBlocked = false;
     struct {
         int device = 0, mes = 0, gmc = 0;
-        int gart = 0;
+        int gart = 0, gfx = 0;
         struct { bool active = false; } memoryTest;
+        struct { bool active = false; } computeTest;
         struct { struct {
             bool inited = true, enabled = true;
             uint32_t wptr = 0, cs_fence_shadow = 0;
@@ -66,6 +68,17 @@ static bool appendOK = true, emitOK = true, cpReadOK = true;
 static int kickResult;
 static uint64_t gpuCPFence;
 namespace amdgpu {
+struct ComputeTestResult {
+    uint32_t stage = 0, mismatches = 0, firstMismatch = UINT32_MAX, fence = 0;
+    uint64_t gpuAddress = 0;
+};
+template<class CP, class Test>
+int compute_test(int &, int &, CP &, int &, Test &test, uint32_t, ComputeTestResult &result) {
+    test.active = advanceDiagnosticWptr;
+    result.stage = test.active ? 3 : 0;
+    result.mismatches = 5;
+    return diagnosticResult;
+}
 struct MemoryTransferResult {
     uint32_t stage = 0, mismatches = 0, firstMismatch = UINT32_MAX;
     uint64_t hostGPUAddress = 0, vramGPUAddress = 0;
@@ -261,6 +274,12 @@ int main() {
     assert(memoryOutputs[0] == kIOReturnTimeout && !state.shutdownBlocked);
     advanceDiagnosticWptr = true;
     assert(client.call(kMacAMDGPUMethodHostMemoryTest, &args) == 0);
+    assert(memoryOutputs[1] == 3 && memoryOutputs[2] == 5 && state.shutdownBlocked);
+    state.shutdownBlocked = false; advanceDiagnosticWptr = false;
+    assert(client.call(kMacAMDGPUMethodComputeTest, &args) == 0);
+    assert(memoryOutputs[0] == kIOReturnTimeout && !state.shutdownBlocked);
+    advanceDiagnosticWptr = true;
+    assert(client.call(kMacAMDGPUMethodComputeTest, &args) == 0);
     assert(memoryOutputs[1] == 3 && memoryOutputs[2] == 5 && state.shutdownBlocked);
     // Failed diagnostics that queued packets require reset. Preflight failures
     // do not poison the session, and caller timeouts remain capped.

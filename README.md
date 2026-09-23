@@ -1,5 +1,14 @@
 # Status
 
+**v0.1.74 — bounded compute shader diagnostic (hardware acceptance pending).**
+The new Compute Smoke test dispatches one 32-thread gfx1201 workgroup through
+the existing GFX queue. It reads input values, adds a changing seed and writes
+32 results. Readback checks every result, the unchanged inputs and surrounding
+guard words after compute completion and cache flush. Failures retain storage
+and require Stop GPU before retry. All 21 regression suites, the Debug build
+and strict signature verification pass. Shader execution has not yet been
+verified on hardware; HSA dispatch and HRX/LSE inference remain unavailable.
+
 **v0.1.73 — reusable, aligned GART reservations.**
 GMC and GTT now share a bounded range allocator. Successful unbind reclaims
 non-trailing holes, GPU addresses honor the requested alignment, and ownership
@@ -27,17 +36,6 @@ reload. CP register/fence, GFX CS and VRAM SDMA copy also pass; all 23 captured
 GFXHUB fault snapshots are zero. General GTT remains disabled and arbitrary
 freed aperture holes are not yet reclaimed. These bounded tests do not yet
 establish long-running stability or shader execution.
-
-**v0.1.71 — one allocation cursor for the GART aperture.**
-Firmware bindings and GTT bindings now reserve disjoint page-table entries
-through the same GMC-owned cursor. Reinitializing the GART facade preserves
-existing reservations. A production-path regression reproduces the prior
-overlap and checks interleaved bindings, owned buffers and exhaustion. GART
-binding/CP startup tests, the signed Debug build and signature verification
-pass. GTT stays disabled pending mapping teardown and data-verified host-memory
-transfers; this correction alone does not establish GPU access to system RAM.
-Verified runtime 171 initializes, passes GFX CS and a correct 4 KB SDMA copy,
-and stops successfully.
 
 Older release history and detailed hardware results are in [PROGRESS.md](PROGRESS.md).
 

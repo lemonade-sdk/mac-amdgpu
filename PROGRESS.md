@@ -1374,3 +1374,40 @@ are advertised. This is not HSA conformance, an HRX-loadable backend or shader
 execution. General memory allocation/copy, compute dispatch, signals, AQL,
 executable/code-object handling and AMD loader tables remain required for the
 requested HRX/LSE inference target. The user intends compute-only operation.
+
+
+## v0.1.74 fixed compute shader diagnostic
+
+Added Compute Smoke (selector 45), a fixed gfx1201 wave32 load/add/store shader
+submitted through the existing kernel GFX queue. This is a compute instruction
+execution test, not an AQL queue, executable loader or general dispatch API.
+The host supplies a changing seed; 32 output words must equal input plus seed.
+Input words and the rest of the 4 KiB data area must remain unchanged. Output
+starts as the bitwise complement of the expected result, so an EOP fence alone
+cannot pass the test. The function waits up to 100 ms for a unique CP fence.
+
+The packet setup follows Mesa's GFX12 compute preamble and direct dispatch
+sequence, including CU harvest masks, three user SGPRs, wave32 and no LDS or
+scratch. Legacy MEM_ORDERED/high flags remain clear as in radeonsi's GFX12
+setup. Linux's full ACQUIRE_MEM cache sequence precedes the shader; a compute
+partial flush and another cache flush precede the final EOP fence. The shader
+uses explicit GFX12 load/store waits. An offline LLVM assembler check verifies
+the embedded instruction bytes against the assembly source.
+
+A retained 16 KiB VRAM allocation owns both code and data. Any started-test
+failure blocks normal operations and retains storage until the existing reset
+path destroys the session arena. Success releases storage only after fence
+completion and complete data/guard verification. Tests cover packet fields
+against Linux definitions, ordering, shader bytes, bad address/architecture
+preflight, poisoned output, input/guard corruption, upload/submission failures,
+timeout, replay rejection and RPC diagnostic preservation.
+
+All 21 scripts/test-*.sh suites pass. The signed Debug host and extension are
+174 / 0.1.74; the build is in build/compute-smoke and strict signature validation
+passes. Hardware acceptance remains pending. Installer behavior is unchanged.
+
+Local LM Studio contains a Qwen3.8-27B-MLX-6bit checkpoint (group size 64,
+affine, about 21.21 GiB of weights), suitable as a later LSE acceptance target
+based on LSE's dense Qwen family and 6-bit group-affine source support. This is
+format compatibility only: device allocation for the full model, runtime and
+context memory, kernel execution and inference correctness remain unverified.
