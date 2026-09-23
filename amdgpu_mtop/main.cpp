@@ -9,6 +9,7 @@
 #include <string_view>
 #include <sys/select.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 namespace {
@@ -49,6 +50,24 @@ std::string quote(const std::string &value) {
     out << '"';
     return out.str();
 }
+std::string metric(const mtop::Device &d, amdgpu::metrics::Field field,
+                   uint32_t scale = 1, const char *unit = "", bool jsonMode = false) {
+    if (!mtop::fresh(d, clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) ||
+        !(d.metrics.validFields & (uint64_t(1) << field)))
+        return jsonMode ? "null" : "unavailable";
+    std::ostringstream out;
+    if (scale == 1) out << d.metrics.values[field];
+    else out << std::fixed << std::setprecision(1) << double(d.metrics.values[field]) / scale;
+    if (!jsonMode) out << unit;
+    return out.str();
+}
+std::string telemetryStatus(const mtop::Device &d) {
+    if (!d.telemetrySupported) return d.telemetryError.empty() ? "not_implemented" : "unavailable";
+    if (d.metrics.flags & amdgpu::kSMUMetricsFaulted) return "faulted";
+    if (mtop::fresh(d, clock_gettime_nsec_np(CLOCK_UPTIME_RAW))) return "fresh";
+    if ((d.metrics.flags & amdgpu::kSMUMetricsStale) || d.metrics.validFields) return "stale";
+    return "unavailable";
+}
 void json(const std::vector<mtop::Device> &devices, const mtop::Selection &selection,
           const std::string &error) {
     auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -67,12 +86,29 @@ void json(const std::vector<mtop::Device> &devices, const mtop::Selection &selec
                       << ",\"vram_total_bytes\":" << (d.total ? std::to_string(d.total) : "null")
                       << ",\"vram_cpu_visible_bytes\":" << (d.visible ? std::to_string(d.visible) : "null");
         }
-        std::cout << ",\"telemetry_status\":\"not_implemented\",\"gfx_activity_percent\":null,"
-                     "\"umc_activity_percent\":null,\"vram_used_bytes\":null,\"gtt_used_bytes\":null,"
-                     "\"gfx_clock_mhz\":null,\"memory_clock_mhz\":null,\"socket_power_watts\":null,"
-                     "\"board_power_watts\":null,\"edge_temperature_celsius\":null,"
-                     "\"hotspot_temperature_celsius\":null,\"memory_temperature_celsius\":null,"
-                     "\"fan_rpm\":null}";
+        using namespace amdgpu::metrics;
+        std::cout << ",\"telemetry_status\":" << quote(telemetryStatus(d))
+                  << ",\"telemetry_error\":" << (d.telemetryError.empty() ? "null" : quote(d.telemetryError));
+        if (d.telemetrySupported)
+            std::cout << ",\"telemetry_driver_status\":" << d.metrics.status
+                      << ",\"sample_generation\":" << d.metrics.generation
+                      << ",\"sample_sequence\":" << d.metrics.sequence
+                      << ",\"sample_uptime_ns\":" << d.metrics.collectedAtNs
+                      << ",\"firmware_metrics_counter\":" << d.metrics.firmwareCounter;
+        std::cout << ",\"gfx_activity_percent\":" << metric(d, GfxActivityPercent, 1, "", true)
+                  << ",\"umc_activity_percent\":" << metric(d, UmcActivityPercent, 1, "", true)
+                  << ",\"media_activity_percent\":" << metric(d, MediaActivityPercent, 1, "", true)
+                  << ",\"vram_used_bytes\":null,\"gtt_used_bytes\":null"
+                  << ",\"gfx_clock_mhz\":" << metric(d, GfxClockMHz, 1, "", true)
+                  << ",\"memory_clock_mhz\":" << metric(d, MemoryClockMHz, 1, "", true)
+                  << ",\"soc_clock_mhz\":" << metric(d, SocClockMHz, 1, "", true)
+                  << ",\"fabric_clock_mhz\":" << metric(d, FabricClockMHz, 1, "", true)
+                  << ",\"socket_power_watts\":" << metric(d, SocketPowerMilliwatts, 1000, "", true)
+                  << ",\"board_power_watts\":" << metric(d, BoardPowerMilliwatts, 1000, "", true)
+                  << ",\"edge_temperature_celsius\":" << metric(d, EdgeTemperatureMillicelsius, 1000, "", true)
+                  << ",\"hotspot_temperature_celsius\":" << metric(d, HotspotTemperatureMillicelsius, 1000, "", true)
+                  << ",\"memory_temperature_celsius\":" << metric(d, MemoryTemperatureMillicelsius, 1000, "", true)
+                  << ",\"fan_rpm\":" << metric(d, FanRPM, 1, "", true) << '}';
     }
     std::cout << "]}\n";
 }
@@ -94,19 +130,33 @@ void dashboard(const std::vector<mtop::Device> &devices, const mtop::Selection &
     if (!d) {
         if (selection.registry) std::cout << "Selected device " << id(*selection.registry) << " is disconnected.\n";
     } else if (d->error.empty()) {
-        std::cout << "\n GPU ACTIVITY                MEMORY\n"
-                     " GFX     unavailable         VRAM total        " << gib(d->total) << '\n'
-                  << " UMC     unavailable         CPU-visible VRAM  " << gib(d->visible) << '\n'
-                  << " Media   unavailable         VRAM used         unavailable\n"
-                     "                             GTT used          unavailable\n"
-                     "\n CLOCKS                      SENSORS\n"
-                     " GFX     unavailable         Socket power      unavailable\n"
-                     " Memory  unavailable         Board power       unavailable\n"
-                     " SOC     unavailable         Edge / hotspot    unavailable\n"
-                     " Fabric  unavailable         Memory temp       unavailable\n"
-                     "                             Fan RPM           unavailable\n"
-                     "\n Dynamic telemetry awaits the driver metrics endpoint.\n"
-                     " UMC activity measures memory-controller work; VRAM used measures allocations.\n";
+        using namespace amdgpu::metrics;
+        auto row = [](const std::string &left, const std::string &right) {
+            std::cout << ' ' << std::left << std::setw(29) << left << right << '\n';
+        };
+        std::cout << '\n';
+        row("GPU ACTIVITY", "MEMORY");
+        row("GFX     " + metric(*d, GfxActivityPercent, 1, "%"), "VRAM total        " + gib(d->total));
+        row("UMC     " + metric(*d, UmcActivityPercent, 1, "%"), "CPU-visible VRAM  " + gib(d->visible));
+        row("Media   " + metric(*d, MediaActivityPercent, 1, "%"), "VRAM used         unavailable");
+        row("", "GTT used          unavailable");
+        std::cout << '\n';
+        row("CLOCKS", "SENSORS");
+        row("GFX     " + metric(*d, GfxClockMHz, 1, " MHz"),
+            "Socket power      " + metric(*d, SocketPowerMilliwatts, 1000, " W"));
+        row("Memory  " + metric(*d, MemoryClockMHz, 1, " MHz"),
+            "Board power       " + metric(*d, BoardPowerMilliwatts, 1000, " W"));
+        row("SOC     " + metric(*d, SocClockMHz, 1, " MHz"),
+            "Edge / hotspot    " + metric(*d, EdgeTemperatureMillicelsius, 1000, " C") +
+            " / " + metric(*d, HotspotTemperatureMillicelsius, 1000, " C"));
+        row("Fabric  " + metric(*d, FabricClockMHz, 1, " MHz"),
+            "Memory temp       " + metric(*d, MemoryTemperatureMillicelsius, 1000, " C"));
+        row("", "Fan RPM           " + metric(*d, FanRPM));
+        std::cout << "\n Telemetry: " << telemetryStatus(*d);
+        if (d->telemetrySupported) std::cout << "  sample " << d->metrics.sequence
+                                           << "  driver status " << id(d->metrics.status);
+        if (!d->telemetryError.empty()) std::cout << "  " << d->telemetryError;
+        std::cout << "\n UMC activity measures memory-controller work; VRAM used measures allocations.\n";
     }
     if (interactive) std::cout << "\n [n] next GPU  [p] previous GPU  [q] quit  | refresh 1 s\n";
 }
@@ -130,7 +180,7 @@ int main(int argc, char **argv) {
                          "Terminal mode refreshes each second; n/p switch devices, q quits.\n"
                          "Non-terminal output is one snapshot unless --watch is specified.\n"
                          "Observer only: never initializes, resets or changes the GPU.\n"
-                         "Dynamic telemetry is unavailable until its driver endpoint is implemented.\n";
+                         "Reads cached dynamic telemetry from driver 176+ when collected by its owner.\n";
             return 0;
         } else if (arg == "--json" || arg == "-J") jsonMode = true;
         else if (arg == "--list") listOnly = true;

@@ -50,6 +50,19 @@ void read(io_service_t service, Device &d) {
     for (unsigned i = 0; i < 3; ++i) d.gfx[i] = uint32_t(gfx[i]);
     d.visible = vram[0];
     d.total = vram[1];
+    if (d.build >= 176) {
+        size_t bytes = sizeof(d.metrics);
+        kr = IOConnectCallStructMethod(connection.value, 47, nullptr, 0, &d.metrics, &bytes);
+        if (kr == kIOReturnUnsupported) {
+            d.telemetryError = "Driver does not provide the metrics endpoint";
+        } else if (kr != KERN_SUCCESS) {
+            d.telemetryError = failure("Metrics snapshot", kr);
+        } else if (bytes != sizeof(d.metrics) || !validSnapshot(d.metrics)) {
+            d.telemetryError = "Invalid metrics snapshot ABI";
+        } else {
+            d.telemetrySupported = true;
+        }
+    }
 }
 } // namespace
 

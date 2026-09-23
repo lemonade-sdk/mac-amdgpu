@@ -89,6 +89,7 @@ enum class BringupStage : uint32_t {
 struct BringupContext {
     DeviceContext device;
     PSPContext    psp;
+    SMUMetricsContext metrics; // Cached telemetry and retained shared SMU staging.
     GMCContext    gmc;
     IHContext     ih;
     RLCContext    rlc;

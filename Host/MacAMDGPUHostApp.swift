@@ -66,6 +66,8 @@ private let kSelDumpPSP:         UInt32 = 25
 private let kSelDumpCmdBuf:      UInt32 = 26
 // v0.1.24 — runtime engine health + DPM toggle.
 private let kSelLiveStatus:          UInt32 = 30
+private let kSelSampleMetrics:       UInt32 = 46
+private let kSelMetricsSnapshot:     UInt32 = 47
 private let kSelDisableSmuFeatures:  UInt32 = 33
 // v0.1.25 — VRAM->VRAM SDMA copy smoke test.
 private let kSelSDMACopyVRAM:        UInt32 = 34
@@ -366,6 +368,8 @@ struct ContentView: View {
                         .help("Verify 16 KB in each direction between host memory and VRAM through GART, then unbind the DMA mapping.")
                     Button("Compute Smoke") { controller.testCompute() }
                         .help("Run a 32-thread shader that reads, adds and writes values; verify every result and surrounding guard words.")
+                    Button("Sample Metrics") { controller.sampleMetrics() }
+                        .help("Request one firmware telemetry snapshot for amdgpu_mtop. Requires an initialized GPU; stale samples are marked unavailable.")
                     Spacer()
                 }
 
@@ -1685,6 +1689,59 @@ final class DriverController: NSObject, ObservableObject,
             expected, observed, gpuVa))
         if kr != KERN_SUCCESS && status == 0 {
             append(String(format: "  (kr=%#x)", kr))
+        }
+    }
+
+    func sampleMetrics() {
+        guard openUserClient() else { return }
+        let (kr, out) = callScalar(kSelSampleMetrics, outCount: 3)
+        guard kr == KERN_SUCCESS, out.count == 3 else {
+            append(String(format: "Sample Metrics: RPC failed kr=%#x", kr))
+            return
+        }
+        append(String(format: "Sample Metrics: status=%#llx sequence=%llu valid fields=%#llx",
+                      out[0], out[1], out[2]))
+        if out[0] == 0 {
+            var bytes = [UInt8](repeating: 0, count: 192)
+            var length = bytes.count
+            let snapshotKR = bytes.withUnsafeMutableBytes { buffer in
+                IOConnectCallStructMethod(ucConn, kSelMetricsSnapshot, nil, 0,
+                                          buffer.baseAddress, &length)
+            }
+            guard snapshotKR == KERN_SUCCESS, length == 192 else {
+                append(String(format: "Sample Metrics: snapshot read failed kr=%#x size=%llu",
+                              snapshotKR, UInt64(length)))
+                return
+            }
+            func integer(_ offset: Int, _ count: Int) -> UInt64 {
+                (0..<count).reduce(UInt64(0)) { $0 | UInt64(bytes[offset + $1]) << ($1 * 8) }
+            }
+            let flags = integer(12, 4), valid = integer(56, 8)
+            guard integer(0, 4) == 1, integer(4, 4) == 192,
+                  integer(8, 4) == 0, flags == 1, valid & ~UInt64(0xffff) == 0 else {
+                append("Sample Metrics: snapshot unavailable or incompatible")
+                return
+            }
+            let fields: [(String, String, Double)] = [
+                ("GPU", "%", 1), ("UMC", "%", 1), ("Media", "%", 1),
+                ("GFX clock", "MHz", 1), ("Memory clock", "MHz", 1),
+                ("SOC clock", "MHz", 1), ("Fabric clock", "MHz", 1),
+                ("Socket power", "W", 1000), ("Board power", "W", 1000),
+                ("Edge", "°C", 1000), ("Hotspot", "°C", 1000), ("Memory", "°C", 1000),
+                ("Fan", "RPM", 1), ("Fan PWM", "%", 1),
+                ("GFX voltage", "mV", 1), ("SOC voltage", "mV", 1)
+            ]
+            for (index, field) in fields.enumerated() {
+                if valid & (UInt64(1) << index) != 0 {
+                    append(String(format: "  %@: %.1f %@", field.0,
+                                  Double(integer(64 + index * 8, 8)) / field.2, field.1))
+                } else {
+                    append("  \(field.0): unavailable")
+                }
+            }
+            append("Sample Metrics: snapshot recorded above; monitor samples expire after 2.5 seconds")
+        } else {
+            append("Sample Metrics: unavailable; a failed firmware transfer requires Stop GPU before collection can resume")
         }
     }
 

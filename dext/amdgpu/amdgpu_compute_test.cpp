@@ -62,8 +62,24 @@ kern_return_t compute_test(DeviceContext &dev, GMCContext &gmc, CPContext &cp,
     // Verify cache preparation and register programming independently before
     // launching the shader. A timeout now identifies the first uncompleted
     // phase instead of attributing every stalled packet to shader execution.
+    uint32_t ibSlot = 0;
     auto submit = [&](uint32_t start, uint32_t length) -> kern_return_t {
-        if (cp_ring_write(cp, packets + start, length) != length) return kIOReturnNoSpace;
+        // Dispatch must enter through an IB with an explicit application VMID,
+        // as in Linux's GFX ring submission. HQD VMID alone only establishes
+        // the queue's memory context; direct shader packets inherited VMID3
+        // during the first hardware test and faulted on instruction fetch.
+        uint32_t ib[kComputeSmokePacketCapacity + 8]{};
+        for (uint32_t i = 0; i < length; ++i) ib[i] = packets[start + i];
+        uint32_t padded = (length + 7) & ~7u;
+        if (padded - length == 1) padded += 8; // NOP needs header + payload.
+        if (padded != length) ib[length] = pm4_header(kPM4OpNop, padded - length - 2);
+        const uint64_t ibOffset = 8192 + uint64_t(ibSlot++) * 1024;
+        auto status = vram_write_verified(dev, offset + ibOffset, ib, padded * 4);
+        if (status != kIOReturnSuccess) return status;
+        amdgpu_hdp_flush(dev);
+        uint32_t launch[4]{};
+        if (!pm4_gfx_ib(launch, codeVA + ibOffset, padded, 0)) return kIOReturnBadArgument;
+        if (cp_ring_write(cp, launch, 4) != 4) return kIOReturnNoSpace;
         return cp_submit_eop_test(dev, cp, 100000, &result.fence);
     };
     result.stage = 3;

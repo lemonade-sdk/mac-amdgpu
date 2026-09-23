@@ -4,13 +4,34 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include "../dext/amdgpu/amdgpu_metrics_state.h"
 
 namespace mtop {
 struct Device {
     uint64_t registry = 0, build = 0, stage = 0, visible = 0, total = 0;
     uint32_t gfx[3]{};
     std::string error;
+    bool telemetrySupported = false;
+    std::string telemetryError;
+    amdgpu::SMUMetricsSnapshot metrics{};
 };
+
+inline bool validSnapshot(const amdgpu::SMUMetricsSnapshot &s) {
+    constexpr uint32_t flags = amdgpu::kSMUMetricsValid | amdgpu::kSMUMetricsFaulted |
+                               amdgpu::kSMUMetricsStale;
+    constexpr uint64_t fields = (uint64_t(1) << amdgpu::metrics::Count) - 1;
+    return s.version == amdgpu::kSMUMetricsSnapshotVersion && s.size == sizeof(s) &&
+           !(s.flags & ~flags) && !(s.validFields & ~fields) &&
+           (!(s.flags & amdgpu::kSMUMetricsValid) ||
+            (s.status == 0 && s.validFields != 0 &&
+             !(s.flags & (amdgpu::kSMUMetricsFaulted | amdgpu::kSMUMetricsStale))));
+}
+
+inline bool fresh(const Device &d, uint64_t now) {
+    return d.telemetrySupported && d.telemetryError.empty() && validSnapshot(d.metrics) &&
+        (d.metrics.flags & amdgpu::kSMUMetricsValid) && now >= d.metrics.collectedAtNs &&
+        now - d.metrics.collectedAtNs <= amdgpu::kSMUMetricsStaleAfterNs;
+}
 
 // Selection survives enumeration reordering and removal. Never silently
 // replace a removed card with the next array index; replug gets a new ID.

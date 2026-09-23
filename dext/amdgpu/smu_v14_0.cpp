@@ -219,10 +219,15 @@ smu_get_version(const DeviceContext &dev, uint32_t *outVer)
 //============================================================
 
 kern_return_t
-smu_smc_hw_setup(DeviceContext &dev, PSPContext &psp)
+smu_smc_hw_setup(DeviceContext &dev, PSPContext &psp,
+                 SMUMetricsContext *metrics)
 {
     constexpr uint64_t kDriverTableSize  = 0x10000;   // 64 KB
     constexpr uint64_t kFwBufAlign       = 0x1000;    // PAGE_SIZE
+
+    // Retrying partially programmed storage is unsafe until the enclosing
+    // firmware arena has been reset. Normal bringup already runs this once.
+    if (metrics && metrics->reserved) return kIOReturnBusy;
 
     // 1. Sanity-check the SMU driver IF version. Upstream logs but does
     //    NOT abort on version mismatch on most chips — we mirror that.
@@ -235,6 +240,7 @@ smu_smc_hw_setup(DeviceContext &dev, PSPContext &psp)
             return r;
         }
         SMU_LOG("smc_hw_setup: SMC IF version = %#x", if_ver);
+        if (metrics) metrics->driverInterface = if_ver;
     }
 
     // 2. Allocate driver_table from psp.fwBuf (VRAM slot allocator).
@@ -247,12 +253,20 @@ smu_smc_hw_setup(DeviceContext &dev, PSPContext &psp)
     }
     uint64_t slot_off = psp.fwBufBumpOffset;
     uint64_t slot_sz  = (kDriverTableSize + kFwBufAlign - 1) & ~(kFwBufAlign - 1);
-    if (slot_off + slot_sz > psp.fwBufSize) {
+    if (slot_off > psp.fwBufSize || slot_sz > psp.fwBufSize - slot_off ||
+        slot_off > UINT64_MAX - psp.fwBufBaseMC ||
+        slot_sz > UINT64_MAX - (psp.fwBufBaseMC + slot_off)) {
         SMU_LOG("smc_hw_setup: fwBuf exhausted (want %llu @ %llu, cap %llu)",
                 slot_sz, slot_off, psp.fwBufSize);
         return kIOReturnNoSpace;
     }
     uint64_t driver_table_mc = psp.fwBufBaseMC + slot_off;
+    // Capture the reservation before either half of the firmware destination
+    // is programmed. Later PSP uploads advance the bump pointer independently.
+    if (metrics && !smu_metrics_reserve(*metrics, psp.fwBufBaseMC,
+        psp.fwBufVRAMOffset, psp.fwBufSize, slot_off, slot_sz,
+        psp.fwBufSysmemBuffer == nullptr, clock_gettime_nsec_np(CLOCK_UPTIME_RAW)))
+        return kIOReturnNoSpace;
     psp.fwBufBumpOffset = slot_off + slot_sz;
 
     SMU_LOG("smc_hw_setup: driver_table @ mc=%#llx size=%llu",
@@ -276,6 +290,7 @@ smu_smc_hw_setup(DeviceContext &dev, PSPContext &psp)
             return r;
         }
         SMU_LOG("smc_hw_setup: SetDriverDramAddr ok (hi=%#x lo=%#x)", hi, lo);
+        if (metrics) metrics->addressProgrammed = true;
     }
 
     // 3.5 v0.1.29 — UseDefaultPPTable. The full pptable-from-VBIOS
@@ -401,6 +416,7 @@ smu_smc_hw_setup(DeviceContext &dev, PSPContext &psp)
     }
 
     SMU_LOG("smc_hw_setup: ok");
+    if (metrics) metrics->setupComplete = !dev.smuMessagePending;
     return kIOReturnSuccess;
 }
 

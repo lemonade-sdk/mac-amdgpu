@@ -5,11 +5,12 @@
 
 using kern_return_t = int;
 constexpr int kIOReturnSuccess = 0, kIOReturnBusy = 1,
-              kIOReturnBadArgument = 2, kIOReturnUnsupported = 3;
+              kIOReturnBadArgument = 2, kIOReturnUnsupported = 3, kIOReturnNotOpen = 4;
 enum { kMacAMDGPUMethodRuntimeBuild, kMacAMDGPUMethodPing,
        kMacAMDGPUMethodQueryInfo, kMacAMDGPUMethodShutdownGPU,
        kMacAMDGPUMethodWaitFence, kMacAMDGPUMethodBOGetInfo,
-       kMacAMDGPUMethodBOFree, kMacAMDGPUMethodSubmitIB, kMacAMDGPUMethodMESAddQueue };
+       kMacAMDGPUMethodBOFree, kMacAMDGPUMethodSubmitIB, kMacAMDGPUMethodMESAddQueue,
+       kMacAMDGPUMethodCollectMetrics, kMacAMDGPUMethodMetricsSnapshot };
 struct IOService {};
 struct IOPCIDevice {
     uint8_t head = 0;
@@ -21,13 +22,19 @@ struct IOPCIDevice {
     }
 };
 #include "client_pm_cap_under_test.inc"
-struct State { IOService *owner = nullptr; amdgpu::ClientSubmission submission; };
+struct State {
+    IOService *owner = nullptr, *openerUserClient = nullptr;
+    bool pciOpen = false;
+    amdgpu::ClientSubmission submission;
+};
 struct MacAMDGPU { State *ivars; };
 static unsigned openCalls;
 static int mac_amdgpu_ensure_open(IOService *client, MacAMDGPU *driver, IOPCIDevice *) {
     ++openCalls;
     if (driver->ivars->owner && driver->ivars->owner != client) return kIOReturnBusy;
     driver->ivars->owner = client;
+    driver->ivars->openerUserClient = client;
+    driver->ivars->pciOpen = true;
     return 0;
 }
 #include "client_admission_under_test.inc"
@@ -99,14 +106,22 @@ int main() {
     };
     assert(call(observer, kMacAMDGPUMethodMESAddQueue) == kIOReturnUnsupported && openCalls == 0);
     assert(call(observer, kMacAMDGPUMethodRuntimeBuild) == 0 && openCalls == 0);
+    assert(call(observer, kMacAMDGPUMethodMetricsSnapshot) == 0 && openCalls == 0);
+    assert(call(owner, kMacAMDGPUMethodCollectMetrics) == kIOReturnNotOpen && openCalls == 0);
     assert(call(owner, kMacAMDGPUMethodBOFree) == 0 && state.owner == &owner);
     assert(call(observer, kMacAMDGPUMethodSubmitIB) == kIOReturnBusy);
     unsigned before = openCalls;
+    assert(call(owner, kMacAMDGPUMethodCollectMetrics) == 0 && openCalls == before);
+    assert(call(observer, kMacAMDGPUMethodCollectMetrics) == kIOReturnNotOpen && openCalls == before);
+    assert(call(observer, kMacAMDGPUMethodMetricsSnapshot) == 0 && openCalls == before);
     assert(call(observer, kMacAMDGPUMethodQueryInfo) == 0 && openCalls == before);
 
     volatile uint32_t fence = 0;
     const auto first = state.submission.beginSDMA(&fence);
     assert(first == 1 && !state.submission.poll());
+    before = openCalls;
+    assert(call(owner, kMacAMDGPUMethodCollectMetrics) == kIOReturnBusy && openCalls == before);
+    assert(call(observer, kMacAMDGPUMethodMetricsSnapshot) == 0 && state.submission.pending);
     assert(state.submission.beginSDMA(&fence) == 0); // no overlapping submission
     assert(call(owner, kMacAMDGPUMethodBOFree) == kIOReturnBusy);
     assert(call(owner, kMacAMDGPUMethodSubmitIB) == kIOReturnBusy);

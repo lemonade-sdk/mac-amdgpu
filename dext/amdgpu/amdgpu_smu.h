@@ -22,6 +22,7 @@
 
 #include <stdint.h>
 #include "amdgpu_regs.h"
+#include "amdgpu_metrics_state.h"
 
 namespace amdgpu {
 
@@ -157,6 +158,19 @@ kern_return_t smu_transfer_table_smu_to_dram(const DeviceContext &dev,
 // Returns kIOReturnSuccess on full success; any PMFW message returning
 // a non-OK response status is logged and propagated as kIOReturnError.
 //
-kern_return_t smu_smc_hw_setup(DeviceContext &dev, struct PSPContext &psp);
+kern_return_t smu_smc_hw_setup(DeviceContext &dev, struct PSPContext &psp,
+                               SMUMetricsContext *metrics = nullptr);
+
+// All functions below must run on the owning driver's serialized queue, shared
+// with SMU commands and teardown. No timer or user-client admission is implied.
+// Collection is an owner operation; observer reads only copy the cached payload.
+// runtimeReady must include initialized lifecycle and PCI ownership checks.
+kern_return_t smu_collect_metrics(const DeviceContext &dev,
+    SMUMetricsContext &metrics, bool runtimeReady);
+void smu_metrics_snapshot(const SMUMetricsContext &metrics,
+    bool runtimeReady, SMUMetricsSnapshot &snapshot);
+// Call before Stop/reset/detach; this never releases firmware-owned staging.
+// Clear the enclosing context only after a verified reset (PSP arena lifetime).
+void smu_metrics_invalidate(SMUMetricsContext &metrics, kern_return_t status);
 
 } // namespace amdgpu

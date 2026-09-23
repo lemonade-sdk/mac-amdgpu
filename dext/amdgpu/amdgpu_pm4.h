@@ -30,6 +30,7 @@ constexpr uint32_t kPM4Type3 = 3u;   // PACKET3
 constexpr uint32_t kPM4OpNop        = 0x10;
 constexpr uint32_t kPM4OpWriteData  = 0x37;
 constexpr uint32_t kPM4OpReleaseMem = 0x49;
+constexpr uint32_t kPM4OpIndirectBuffer = 0x3f;
 constexpr uint32_t kPM4OpSetUconfigReg = 0x79;
 constexpr uint32_t kPM4UconfigStart = 0xc000;
 constexpr uint32_t kPM4UconfigEnd = 0xc400;
@@ -47,6 +48,22 @@ pm4_header(uint32_t op, uint32_t count_minus_1)
 
 // ---- NOP header (count=0). Must be followed by one payload DWORD. ----
 static inline uint32_t pm4_nop(void) { return pm4_header(kPM4OpNop, 0); }
+
+// Linux gfx_v12_0_ring_emit_ib_gfx: the IB control selects the application's
+// VMID independently of the queue's own ring-fetch VMID. GFX does not use the
+// compute-ring INDIRECT_BUFFER_VALID bit. Enforce its 32-byte IB alignment.
+static inline uint32_t pm4_gfx_ib(uint32_t (&packet)[4], uint64_t address,
+                                 uint32_t dwords, uint32_t vmid)
+{
+    if ((address & 31) || (address >> 48) || !dwords || (dwords & 7) ||
+        dwords > 0xfffff || vmid > 15 ||
+        address > (1ull << 48) - uint64_t(dwords) * 4) return 0;
+    packet[0] = pm4_header(kPM4OpIndirectBuffer, 2);
+    packet[1] = static_cast<uint32_t>(address);
+    packet[2] = static_cast<uint32_t>(address >> 32);
+    packet[3] = dwords | (vmid << 24);
+    return 4;
+}
 
 // ---- WRITE_DATA: write N DWORDs to memory. Minimum form (1 DW data):
 //   DW0: header

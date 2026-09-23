@@ -28,4 +28,25 @@ int main() {
     selection.registry = 999;
     selection.initialize(devices);
     assert(!selection.find(devices));
+
+    a.telemetrySupported = true;
+    a.metrics.version = amdgpu::kSMUMetricsSnapshotVersion;
+    a.metrics.size = sizeof(a.metrics);
+    a.metrics.flags = amdgpu::kSMUMetricsValid;
+    a.metrics.validFields = 1;
+    a.metrics.collectedAtNs = 100;
+    assert(mtop::validSnapshot(a.metrics) && mtop::fresh(a, 101));
+    assert(!mtop::fresh(a, 99));
+    assert(!mtop::fresh(a, 101 + amdgpu::kSMUMetricsStaleAfterNs));
+    a.metrics.validFields = uint64_t(1) << 63;
+    assert(!mtop::validSnapshot(a.metrics));
+    a.metrics.validFields = 1;
+    a.metrics.status = 1;
+    assert(!mtop::validSnapshot(a.metrics));
+    a.metrics.status = 0;
+    a.metrics.flags |= amdgpu::kSMUMetricsFaulted;
+    assert(!mtop::validSnapshot(a.metrics));
+    a.metrics.flags = amdgpu::kSMUMetricsFaulted;
+    a.metrics.validFields = 0;
+    assert(mtop::validSnapshot(a.metrics) && !mtop::fresh(a, 101));
 }

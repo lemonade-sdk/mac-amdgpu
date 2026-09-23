@@ -19,6 +19,7 @@ constexpr int kIOReturnSuccess = 0, kIOReturnBusy = 1, kIOReturnNotReady = 2,
 static int mode;
 static unsigned reads, writes, submits, failWrite, phase;
 static std::vector<uint32_t> stream;
+static uint32_t launchIB[4];
 struct PCI {
     uint32_t memory[16384 / 4]{};
     void MemoryWrite32(unsigned, uint64_t off, uint32_t val) {
@@ -44,7 +45,8 @@ struct GFXConfig {
 static void amdgpu_hdp_flush(DeviceContext &) {}
 static uint32_t cp_ring_write(CPContext &cp, const uint32_t *p, uint32_t n) {
     if (mode == 1) return 0;
-    stream.insert(stream.end(), p, p+n); cp.wptr += n; return n;
+    assert(n == 4);
+    std::memcpy(launchIB, p, sizeof(launchIB)); cp.wptr += n; return n;
 }
 static std::map<uint32_t, uint32_t> decode(const std::vector<uint32_t> &p) {
     std::map<uint32_t, uint32_t> sh;
@@ -54,6 +56,7 @@ static std::map<uint32_t, uint32_t> decode(const std::vector<uint32_t> &p) {
         const unsigned n = CP_PACKET_GET_COUNT(p[i]) + 2;
         assert(i + n <= p.size());
         switch (CP_PACKET3_GET_OPCODE(p[i])) {
+        case PACKET3_NOP: break;
         case PACKET3_SET_SH_REG:
             assert(n == 3 && (p[i] & 2) && !dispatches);
             assert(sh.emplace((p[i+1] + 0x2c00) * 4, p[i+2]).second); break;
@@ -87,6 +90,13 @@ static std::map<uint32_t, uint32_t> decode(const std::vector<uint32_t> &p) {
 }
 static int cp_submit_eop_test(DeviceContext &dev, CPContext &, uint64_t timeout, uint32_t *fence) {
     assert(timeout == 100000); ++submits;
+    assert(launchIB[0] == uint32_t(PACKET3(PACKET3_INDIRECT_BUFFER, 2)));
+    assert(launchIB[2] == 0x80 && !(launchIB[3] & 0xfff00000)); // Explicit VMID0.
+    assert((launchIB[1] & 31) == 0 && (launchIB[3] & 7) == 0);
+    assert(launchIB[1] == 8192 + phase * 1024);
+    auto first = dev.pci->memory + launchIB[1] / 4;
+    assert(launchIB[1] + launchIB[3] * 4 <= sizeof(dev.pci->memory));
+    stream.insert(stream.end(), first, first + launchIB[3]);
     ++phase;
     if (mode == 2 || (mode == 7 && phase == 2) || (mode == 8 && phase == 3))
         return kIOReturnTimeout;
@@ -157,7 +167,7 @@ int main() {
         }
     }
     mode = 0;
-    for (auto failure : {1u, 4097u, 4108u}) {
+    for (auto failure : {1u, 4097u, 4108u, 5132u}) {
         PCI pci{}; DeviceContext dev{&pci}; GMCContext gmc; CPContext cp; GFXConfig gfx;
         std::memset(pci.memory, 0xff, sizeof(pci.memory));
         dev.ip.version[0] = {12, 0, 1}; gmc.vram_alloc.init(gmc.vram_start, 16384);
@@ -165,7 +175,7 @@ int main() {
         writes = 0; failWrite = failure;
         const auto before = submits;
         assert(compute_test(dev, gmc, cp, gfx, test, 5, result) == kIOReturnIOError);
-        assert(test.active && result.stage == 2 && before == submits);
+        assert(test.active && result.stage == (failure == 5132 ? 3 : 2) && before == submits);
     }
     failWrite = 0;
     PCI pci{}; DeviceContext dev{&pci}; GMCContext gmc; CPContext cp; GFXConfig gfx;

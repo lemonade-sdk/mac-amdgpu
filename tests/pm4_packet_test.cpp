@@ -10,6 +10,17 @@ int main()
 {
     using namespace amdgpu;
     static_assert(kPM4OpSetUconfigReg == PACKET3_SET_UCONFIG_REG);
+    static_assert(kPM4OpIndirectBuffer == PACKET3_INDIRECT_BUFFER);
+    uint32_t ib[4]{};
+    assert(pm4_gfx_ib(ib, 0x8001880000, 128, 0) == 4);
+    assert(ib[0] == uint32_t(PACKET3(PACKET3_INDIRECT_BUFFER, 2)));
+    assert(ib[1] == 0x01880000 && ib[2] == 0x80 && ib[3] == 128);
+    assert(pm4_gfx_ib(ib, 0, 8, 15) == 4 && ib[3] == 0x0f000008);
+    assert(!pm4_gfx_ib(ib, 4, 8, 0));
+    assert(!pm4_gfx_ib(ib, 0, 7, 0));
+    assert(!pm4_gfx_ib(ib, 0, 0x100000, 0));
+    assert(!pm4_gfx_ib(ib, 0, 8, 16));
+    assert(!pm4_gfx_ib(ib, (1ull << 48) - 32, 16, 0));
     static_assert(kPM4UconfigStart == PACKET3_SET_UCONFIG_REG_START);
     static_assert(kPM4UconfigEnd == PACKET3_SET_UCONFIG_REG_END);
     assert(pm4_header(kPM4OpSetUconfigReg, 1) == uint32_t(PACKET3(PACKET3_SET_UCONFIG_REG, 1)));

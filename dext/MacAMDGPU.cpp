@@ -17,6 +17,7 @@
 #include <time.h>
 
 #include <DriverKit/OSMetaClass.h>
+#include <DriverKit/OSData.h>
 #include <DriverKit/IOLib.h>
 #include <DriverKit/IOMemoryDescriptor.h>
 #include <DriverKit/IOBufferMemoryDescriptor.h>
@@ -104,6 +105,8 @@ enum {
     kMacAMDGPUMethodRuntimeBuild       = 43, // actual responding binary, no hardware access
     kMacAMDGPUMethodHostMemoryTest     = 44, // data-verified SDMA transfers through GART
     kMacAMDGPUMethodComputeTest        = 45, // fixed wave32 shader with full readback
+    kMacAMDGPUMethodCollectMetrics     = 46, // owner-only one-shot SMU telemetry
+    kMacAMDGPUMethodMetricsSnapshot    = 47, // cached CPU snapshot, observer only
 };
 
 // v0.1.28 — IP types accepted by CSCreate. Match the upstream
@@ -703,7 +706,15 @@ mac_amdgpu_admit_external(IOService *client, MacAMDGPU *driver,
                           IOPCIDevice *pci, uint64_t selector)
 {
     if (selector == kMacAMDGPUMethodMESAddQueue) return kIOReturnUnsupported;
+    if (selector == kMacAMDGPUMethodCollectMetrics) {
+        // Sampling cannot acquire a new hardware session. It belongs to the
+        // client that already initialized the GPU, not a monitoring observer.
+        if (!driver->ivars->pciOpen || driver->ivars->openerUserClient != client)
+            return kIOReturnNotOpen;
+        return driver->ivars->submission.poll() ? kIOReturnSuccess : kIOReturnBusy;
+    }
     const bool observer = selector == kMacAMDGPUMethodRuntimeBuild ||
+                          selector == kMacAMDGPUMethodMetricsSnapshot ||
                           selector == kMacAMDGPUMethodPing ||
                           selector == kMacAMDGPUMethodQueryInfo;
     if (!observer && selector != kMacAMDGPUMethodShutdownGPU) {
@@ -1163,6 +1174,7 @@ IMPL(MacAMDGPU, Stop)
 {
     if (ivars != nullptr) {
         __atomic_store_n(&ivars->stopping, true, __ATOMIC_RELEASE);
+        amdgpu::smu_metrics_invalidate(ivars->bringup.metrics, kIOReturnNotAttached);
         if (ivars->pciOpen && ivars->openerUserClient != nullptr) {
             // PCIDriverKit Close disables Bus Lead Enable and Memory Space
             // Enable. Do this before any DMA descriptors can be completed.
@@ -1411,6 +1423,7 @@ mac_amdgpu_shutdown_gpu(MacAMDGPUUserClient *client, uint64_t &phase)
     // A previous owner may have closed with shared rings retained. Reopen
     // exclusively for reset, without ensure_open (which enables bus mastering).
     state->shutdownBlocked = true;
+    amdgpu::smu_metrics_invalidate(state->bringup.metrics, kIOReturnNotReady);
     if (!state->pciOpen) {
         kern_return_t ret = pci->Open(client, 0);
         if (ret != kIOReturnSuccess) return ret;
@@ -1458,6 +1471,10 @@ IMPL(MacAMDGPUUserClient, Stop)
         return ret != kIOReturnSuccess ? ret : kIOReturnNoResources;
     }
     __atomic_store_n(&ivars->stopping, true, __ATOMIC_RELEASE);
+    if (ivars->ownerDriver && ivars->ownerDriver->ivars &&
+        ivars->ownerDriver->ivars->openerUserClient == this)
+        amdgpu::smu_metrics_invalidate(ivars->ownerDriver->ivars->bringup.metrics,
+                                     kIOReturnNotReady);
     retain();
     provider->retain();
     ivars->stopProvider = provider;
@@ -1508,6 +1525,7 @@ MacAMDGPUUserClient::FinishStop(IOService *provider)
         driver->ivars->pciOpen && driver->ivars->openerUserClient == this) {
         auto *state = driver->ivars;
         uint64_t phase = 0;
+        amdgpu::smu_metrics_invalidate(state->bringup.metrics, kIOReturnNotReady);
         // Root Stop already isolates an unplugged/terminated provider. For a
         // live client close, flush engine work before recycling VRAM or DMA.
         kern_return_t stopped = mac_amdgpu_quiesce_for_shutdown(state->retainedPCI, phase);
@@ -1585,6 +1603,7 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
 
     if (driver->ivars->shutdownBlocked &&
         selector != kMacAMDGPUMethodRuntimeBuild &&
+        selector != kMacAMDGPUMethodMetricsSnapshot &&
         selector != kMacAMDGPUMethodShutdownGPU &&
         selector != kMacAMDGPUMethodPing && selector != kMacAMDGPUMethodQueryInfo)
         return kIOReturnNotReady;
@@ -1595,6 +1614,7 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
     if (!driver->ivars->pciOpen &&
         driver->ivars->bringup.reached != amdgpu::BringupStage::None &&
         selector != kMacAMDGPUMethodRuntimeBuild &&
+        selector != kMacAMDGPUMethodMetricsSnapshot &&
         selector != kMacAMDGPUMethodShutdownGPU &&
         selector != kMacAMDGPUMethodPing &&
         selector != kMacAMDGPUMethodQueryInfo &&
@@ -1606,6 +1626,42 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
     if (admission != kIOReturnSuccess) return admission;
 
     switch (selector) {
+
+    case kMacAMDGPUMethodCollectMetrics: {
+        if (arguments->scalarInputCount != 0 || !arguments->scalarOutput ||
+            arguments->scalarOutputCount < 3 || arguments->structureInput ||
+            arguments->structureInputDescriptor || arguments->structureOutputDescriptor ||
+            arguments->structureOutputMaximumSize != 0)
+            return kIOReturnBadArgument;
+        auto &state = *driver->ivars;
+        const bool ready = state.pciOpen && !state.stopping &&
+            !state.shutdownBlocked && !state.shutdownInProgress &&
+            state.bringup.reached == amdgpu::BringupStage::SDMAInit;
+        const auto status = amdgpu::smu_collect_metrics(state.bringup.device,
+                                                       state.bringup.metrics, ready);
+        arguments->scalarOutput[0] = static_cast<uint32_t>(status);
+        arguments->scalarOutput[1] = state.bringup.metrics.snapshot.sequence;
+        arguments->scalarOutput[2] = state.bringup.metrics.snapshot.validFields;
+        arguments->scalarOutputCount = 3;
+        return kIOReturnSuccess;
+    }
+
+    case kMacAMDGPUMethodMetricsSnapshot: {
+        if (arguments->scalarInputCount != 0 || arguments->scalarOutputCount != 0 ||
+            arguments->structureInput || arguments->structureInputDescriptor ||
+            arguments->structureOutputDescriptor ||
+            arguments->structureOutputMaximumSize < sizeof(amdgpu::SMUMetricsSnapshot))
+            return kIOReturnBadArgument;
+        auto &state = *driver->ivars;
+        const bool ready = state.pciOpen && !state.stopping &&
+            !state.shutdownBlocked && !state.shutdownInProgress &&
+            state.bringup.reached == amdgpu::BringupStage::SDMAInit;
+        amdgpu::SMUMetricsSnapshot snapshot{};
+        amdgpu::smu_metrics_snapshot(state.bringup.metrics, ready, snapshot);
+        // IOUserClient owns and releases the created OSData output object.
+        arguments->structureOutput = OSData::withBytes(&snapshot, sizeof(snapshot));
+        return arguments->structureOutput ? kIOReturnSuccess : kIOReturnNoMemory;
+    }
 
     case kMacAMDGPUMethodRuntimeBuild: {
         if (arguments->scalarInputCount != 0 || arguments->scalarOutput == nullptr ||

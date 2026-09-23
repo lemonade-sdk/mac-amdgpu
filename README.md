@@ -1,11 +1,19 @@
 # Status
 
-**v0.1.75 — separate compute completion checkpoints.**
-Cache preparation, compute register programming and shader dispatch each have
-a bounded completion fence. Failures capture CP/GFXHUB state before recovery;
-the app explicitly reports when results were not checked. Compute/lifecycle
-regressions, the Debug build and strict signatures pass. Hardware validation of
-these checkpoints is pending; this does not claim a fix for shader execution.
+**v0.1.76 — explicit compute VMID and firmware telemetry.**
+Compute checkpoints now enter through Linux's GFX indirect-buffer submission,
+selecting VMID 0 explicitly. Build 175 reached the shader but faulted fetching
+its code under VMID 3; this change addresses that context selection and still
+requires hardware validation. Sample Metrics requests one bounded SMU snapshot;
+`amdgpu_mtop` reads the cached, versioned response without hardware ownership.
+Periodic collection is not enabled, and stale samples are marked unavailable.
+All 24 regression suites, the Debug build and strict signature checks pass.
+
+**v0.1.75 — compute fault isolated to shader instruction fetch.**
+Cache preparation and register-programming fences passed. Shader completion
+timed out with a GFXHUB VMID-3 fault at the shader code address, while the queue
+itself used VMID 0. Output was not checked. Stop GPU recovered through function
+reset and session release without an enclosure power cycle.
 
 **v0.1.74 — bounded compute shader diagnostic (dispatch timed out).**
 The new Compute Smoke test dispatches one 32-thread gfx1201 workgroup through
@@ -17,19 +25,9 @@ and strict signature verification pass. The first hardware dispatch timed out be
 Stop GPU recovered without a power cycle, and reinitialization plus GFX CS
 passed. HSA dispatch and HRX/LSE inference remain unavailable.
 
-**v0.1.73 — reusable, aligned GART reservations.**
-GMC and GTT now share a bounded range allocator. Successful unbind reclaims
-non-trailing holes, GPU addresses honor the requested alignment, and ownership
-IDs reject stale unbinds after address reuse. Publication/invalidation failures
-retain their reservations. All 19 regression suites, the signed Debug build
-and strict signature verification pass. Verified runtime 173 initializes,
-passes the two-way host-memory test with zero mismatches, and completes GFX
-command submission. Non-trailing reuse is covered offline; general GTT
-allocation is still gated.
-
 The native [amdgpu_mtop monitor](amdgpu_mtop/README.md) enumerates attached
 MacAMDGPU devices with GPU switching and JSON output. Live discovery and VRAM
-capacity queries work; dynamic GPU/UMC/clocks/power metrics remain pending.
+capacity queries work; dynamic firmware metrics await hardware validation.
 
 The current target is AI compute and model inference. The initial [HSA runtime](hsa/README.md)
 discovers the live GPU through IOKit and passes lifecycle tests. HRX integration,

@@ -5,10 +5,12 @@ the familiar device list, GPU activity, memory, clock and sensor groups from
 [amdgpu_top](https://github.com/Umio-Yasuno/amdgpu_top), with a new IOKit backend.
 It does not depend on Linux DRM, sysfs, Rust, HSA, or a graphics runtime.
 
-This first implementation reads the responding driver build, initialization
-stage and VRAM capacities. Dynamic statistics are explicitly **unavailable**;
-the firmware decoder is tested separately but is not connected to hardware yet.
-It does not show fabricated zero load, temperature, power or memory use.
+The monitor reads the responding driver build, initialization stage and VRAM
+capacities. It also supports the build-176 cached metrics endpoint for
+GPU/UMC activity, clocks, power, temperatures and fan speed. The host app’s Sample Metrics button requests one firmware snapshot; live
+firmware validation is still pending. Automatic collection is not enabled. Older drivers, absent samples,
+failed requests and stale samples are explicitly **unavailable**; it does not
+show fabricated zero load, temperature, power or memory use.
 
 ```sh
 cmake -S amdgpu_mtop -B build/amdgpu_mtop -DCMAKE_BUILD_TYPE=Release
@@ -34,15 +36,16 @@ replugged device receives a new registry ID. All matching devices appear in JSON
 
 Non-terminal output and `--json` default to a single snapshot. `--watch` emits
 one snapshot per second. JSON uses `null` for unsupported statistics, byte units
-for capacities, and explicit unit suffixes for planned dynamic statistics.
+for capacities, and explicit unit suffixes for dynamic statistics.
 Zero-sized capacities before initialization are also shown as unavailable.
 
 The tool requires driver build 172 or newer and permission to open its user
-client. It only invokes observer selectors 43 (runtime build) and 21 (cached
-information). It never initializes the GPU, claims the hardware session, sends
-SMU messages, changes power policy, submits work, or resets the device. Closing
+client. It only invokes observer selectors 43 (runtime build), 21 (cached
+information), and 47 (cached metrics, build 176+). It never initializes the GPU,
+claims the hardware session, sends SMU messages, changes power policy, submits
+work, or resets the device. Closing
 its observer connection does not stop another client's session. Cards bound to
-Apple's driver, or not bound to any driver, are outside this backend's coverage.
+Apple’s driver, or not bound to any driver, are outside this backend's coverage.
 
 Offline checks:
 

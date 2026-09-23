@@ -17,6 +17,7 @@ namespace amdgpu {
 
 void bringup_release_resources(BringupContext &ctx)
 {
+    smu_metrics_invalidate(ctx.metrics, kIOReturnNotReady);
     // PCI Close disables bus mastering before any DMA mapping is released.
     // Do not try to halt engines here: the device may already be unplugged.
     auto release_dma = [](IOBufferMemoryDescriptor *&buffer,
@@ -842,7 +843,7 @@ run_stage(BringupContext &ctx, BringupStage s)
 
         // A successful ping proves communication, not completed setup.
         // Required SMU setup failures must stop initialization here.
-        kern_return_t hwr = smu_smc_hw_setup(ctx.device, ctx.psp);
+        kern_return_t hwr = smu_smc_hw_setup(ctx.device, ctx.psp, &ctx.metrics);
         if (hwr != kIOReturnSuccess)
             INIT_LOG("SMUInit: required hardware setup failed: %#x", hwr);
         return hwr;

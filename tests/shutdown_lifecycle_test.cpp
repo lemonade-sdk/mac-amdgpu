@@ -24,6 +24,7 @@ struct IODispatchQueue { void release() {} };
 #define IOSafeDeleteNULL(value, type, count) do { delete value; value = nullptr; } while (0)
 #include "../dext/amdgpu/amdgpu_client_lifecycle.h"
 static std::vector<std::string> events;
+static bool metricsInvalidated;
 struct IOPCIDevice {
     uint16_t command = 6;
     bool absent = false, supportsFLR = true, refusesBM = false;
@@ -49,6 +50,7 @@ struct IOPCIDevice {
         assert(cap == 0x10); *offset = 0x40; return 0;
     }
     int Reset(int type, int options) {
+        assert(metricsInvalidated);
         assert(type == kIOPCIDeviceResetTypeFunctionReset && options == 0);
         assert(!(command & 4)); assert(timeNS >= pendingUntil);
         assert(std::find(events.begin(), events.end(), "free DMA") == events.end());
@@ -60,11 +62,19 @@ struct IOPCIDevice {
     }
     int Open(IOService *, int) { events.push_back("open"); return 0; }
     void Close(IOService *, int) {
+        assert(metricsInvalidated);
         command &= ~6; closed = true; events.push_back("close");
     }
 };
 struct CS { bool in_use = true; };
-namespace amdgpu { struct Bringup { bool initialized = true; }; }
+namespace amdgpu {
+struct Bringup { bool initialized = true, metrics = true; };
+static void smu_metrics_invalidate(bool &valid, int status) {
+    assert(status == kIOReturnNotReady);
+    valid = false;
+    metricsInvalidated = true;
+}
+}
 struct ClientState;
 struct DriverState {
     bool shutdownInProgress = false, shutdownBlocked = false, pciOpen = true;
@@ -128,6 +138,7 @@ struct Fixture {
     uint64_t phase = 99;
     Fixture() {
         events.clear(); timeNS = 0;
+        metricsInvalidated = false;
         driver.ivars = &state; client.ivars = &clientState;
         clientState.ownerDriver = &driver;
         state.retainedPCI = &pci; state.openerUserClient = &client;
@@ -179,6 +190,7 @@ int main() {
         if (reason == 3) f.clientState.pendingInterruptNotify = &f;
         if (reason == 4) f.state.openerUserClient = &f.driver;
         assert(f.stop() == kIOReturnBusy && f.phase == 0);
+        assert(f.state.bringup.metrics && !metricsInvalidated);
         assert(events.empty() && !f.state.shutdownBlocked); f.retained();
     }
     {

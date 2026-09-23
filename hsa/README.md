@@ -19,7 +19,9 @@ build/hsa/mac-hsa-info
 
 The build uses Apple Clang, CMake, IOKit/CoreFoundation, and vendored core HSA
 headers with their upstream license. No ROCm installation is needed for this
-discovery library. The C probe links the actual dylib and prints CPU/GPU names,
+discovery library. The selected design is a focused, native HSA-compatible
+interface for LSE’s pinned HRX backend, backed by DriverKit. ROCr is a source
+reference; porting or shipping the full ROCr runtime is outside this approach. The C probe links the actual dylib and prints CPU/GPU names,
 the responding driver build, cached bringup stage and VRAM sizes. Run it outside
 a sandbox that denies IOKit user-client access. The installed DriverKit
 extension must permit the client to connect.
@@ -55,17 +57,32 @@ completion signals or successful no-op dispatches.
 
 ## HRX integration work
 
-The reviewed HRX System source is commit
-`437e789eaea207a036c197cf3398a6ca473d6534`. Its dynamic loader resolves a broad
-HSA symbol table and requests the AMD loader extension. It currently creates
-compute queues through hsa_amd_queue_create, allocates HSA memory pools and
-uses HSA signals and code objects. The existing driver command/fence tests do
-not satisfy those contracts.
+LSE commit `b5637a7109d409c21f75586edb75e7631277bce8` pins HRX System to
+`5927b0e0fafdefb5c8b41aa71bca8fd28791ad7c`. This revision requires 119 dynamic
+HSA symbols; the current library supplies 8 of them, leaving 111 missing. It
+creates hardware queues through `hsa_queue_create`, then casts those queues to
+AMD's queue layout. Signals also have an AMD device-visible layout. The loader
+requires the AMD loader extension, memory pools, signals and code objects.
+The existing driver command/fence tests do not satisfy those contracts.
+
+The separately reviewed HRX main revision
+`437e789eaea207a036c197cf3398a6ca473d6534` requires 121 symbols and uses
+`hsa_amd_queue_create`. Keep these baselines distinct; LSE's pinned revision
+and its patches are the initial integration target.
+
+The ROCr runtime reference is `ROCm/rocm-systems`, commit
+`820ea79c1848e1291204e7f7e56ec68bd049704e`, under `projects/rocr-runtime`.
+Its `amd_aql_queue.cpp`, signal implementations, executable loader and driver
+interface complement Linux AMDGPU/KFD's hardware queue, memory and teardown
+contracts. Linux KFD's GFX12 MQD setup uses AQL packet slots and queue-specific
+pointer units; the existing PM4 GFX queue cannot be advertised as an AQL queue.
+Host/GPU pointer identity, coherent atomic visibility, shared queue metadata,
+completion signals and teardown must be implemented and tested together.
 
 Track the missing symbol surface with:
 
 ```sh
-python3 hsa/tools/audit_hrx.py --hrx upstream/hrx-system \
+python3 hsa/tools/audit_hrx.py --hrx upstream/hrx-lse-pin \
   --library build/hsa/libhsa-runtime64.dylib
 ```
 

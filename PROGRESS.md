@@ -1446,3 +1446,49 @@ until firmware collection is integrated. Offline selection and SMU decoder
 checks pass; multiple physical GPUs have not been tested. The decoder is
 version-gated to SMU 14.0.3 interface 0x2e and checked against local Linux table
 layout definitions; passing these tests does not verify firmware telemetry.
+
+
+## v0.1.75 hardware checkpoints and recovery
+
+Verified responding build 175 at 06:12:36 UTC on September 23; initialization
+completed at 06:13:44. Compute Smoke at 06:13:59 completed the cache and register
+phases (fences 1 and 2), then timed out waiting for shader fence 3. GFXHUB fault
+0x00301281 reported CID 9, VMID 3, read access at page 0x08001878, corresponding
+to shader code address 0x8001878000. The GFX HQD itself reported VMID 0. Data at
+0x8001879000 was not checked. Log: /tmp/mac-amdgpu-175-compute.log.
+
+Stop GPU completed at 06:14:44 with FLR, PCI close and session release. No
+enclosure power cycle was needed. The fault suggests application VMID selection
+was missing from direct ring submission; it does not establish that all other
+shader setup is correct.
+
+## v0.1.76 explicit IB context and bounded telemetry
+
+The fixed compute test now submits each phase through a GFX INDIRECT_BUFFER
+packet carrying VMID 0, matching Linux gfx_v12_0_ring_emit_ib_gfx. Queue-fetch
+VMID alone did not select the observed shader memory context. Each IB has a
+separate retained VRAM slot, 32-byte alignment, eight-dword length padding and
+verified upload before publication. GFX packets omit the compute-ring-only
+VALID bit. Offline packet and compute tests check the actual IB contents,
+VMID, padding, data guards, upload failure and retained storage. Hardware
+acceptance of the change remains pending.
+
+SMU setup retains the existing 64 KiB firmware-table staging reservation before
+programming its address. Owner selector 46 performs one bounded table-5
+transfer and readback after firmware acknowledgement. Observer selector 47
+returns a 192-byte cached snapshot with per-field validity, monotonic timestamps,
+generation and error state. Collection failure disables retries until reset;
+failed or older-than-2.5-second samples remain unavailable. The monitor never
+issues table transfers. No telemetry timer is enabled in this build.
+
+
+Build 176 passed all 24 scripts/test-*.sh regression suites, the signed Debug
+build and independent strict signature verification for host and extension.
+The candidate app opened at 06:28:39 UTC on September 23 and reports bundled
+176, installed 175, awaiting installation. No installer implementation changed.
+
+The HSA integration target is LSE's pinned HRX revision
+5927b0e0fafdefb5c8b41aa71bca8fd28791ad7c (119 required symbols, 8 currently
+exported), rather than the separately reviewed newer main revision. The chosen
+approach is our own focused HSA-compatible interface backed by DriverKit,
+using Linux KFD and ROCr as references. No full ROCr port is being integrated.
