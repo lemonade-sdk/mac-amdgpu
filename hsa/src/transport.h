@@ -10,6 +10,7 @@
 namespace mac_hsa {
 
 constexpr uint64_t kPersistentQueueDriverBuild=187;
+constexpr uint64_t kQueueResourceDriverBuild=189;
 
 struct DeviceSnapshot {
     uint64_t registryID = 0;
@@ -28,6 +29,12 @@ inline bool supportsPersistentQueues(const DeviceSnapshot &snapshot) {
 struct DeviceBuffer {
     uint64_t handle = 0, address = 0, size = 0;
 };
+struct DeviceProperties {
+    uint32_t chipID=0, revision=0, bdf=0, domain=0;
+    uint32_t computeUnits=0, shaderEngines=0, arraysPerEngine=0;
+    uint64_t timestampFrequency=0;
+    uint32_t maxWavesPerCU=0, wavefrontSize=0;
+};
 struct SharedBuffer { DeviceBuffer device; void *host = nullptr; uint32_t memoryType = 0; };
 struct BufferToken { uint64_t registryID = 0, token[2]{}, size = 0; };
 static_assert(sizeof(BufferToken) == 32);
@@ -37,6 +44,10 @@ public:
     virtual ~Connection() = default;
     virtual hsa_status_t read(DeviceSnapshot &snapshot) = 0;
     virtual bool supportsBuffers() const { return false; }
+    virtual hsa_status_t properties(DeviceProperties &) { return HSA_STATUS_ERROR_INVALID_ARGUMENT; }
+    virtual hsa_status_t serviceQueue(uint64_t, uint64_t &inactive) { inactive=0;return HSA_STATUS_SUCCESS; }
+    virtual bool supportsSharedBuffers() const { return false; }
+    virtual hsa_status_t sharedMemoryCapacity(uint64_t &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
     virtual hsa_status_t memoryCapacity(uint64_t &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
     virtual hsa_status_t allocateBuffer(uint64_t, DeviceBuffer &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
     virtual hsa_status_t freeBuffer(const DeviceBuffer &) { return HSA_STATUS_ERROR; }

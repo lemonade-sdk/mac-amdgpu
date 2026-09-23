@@ -291,7 +291,7 @@ gfx_get_cu_info(const DeviceContext &dev, GFXConfig &cfg)
 
             // Mirror upstream's "GFX12 can have > 4 SEs but ioctl
             // table is 4x4" layout (gfx_v12_0.c:5778). Our config
-            // limits the array to 4x2 (R9700 has 4 SEs × 1 SH), so
+            // limits the array to 4x2 (R9700 has 4 SEs × 2 SHs), so
             // for i ∈ [0..3] and j ∈ [0..1] this is straightforward.
             if (i < 4 && j < 2) {
                 cfg.active_cu_bitmap[i % 4][j + (i / 4) * 2] = bitmap;
@@ -386,15 +386,30 @@ gfx_constants_init(const DeviceContext &dev, GFXConfig &cfg)
         return kIOReturnNotReady;
     }
 
-    // R9700 (gfx1201) early-init caps — upstream sets these in
-    // gfx_v12_0_gpu_early_init's IP_VERSION(12, 0, 1) branch.
-    // The values are from the public RDNA4 datasheet: 4 SEs × 1 SA ×
-    // 4 RBs/SE × 8 CUs/SA. 8 hw contexts.
-    cfg.max_shader_engines  = 4;
-    cfg.max_sh_per_se       = 1;
-    cfg.max_backends_per_se = 4;
-    cfg.max_cu_per_sh       = 8;
-    cfg.max_hw_contexts     = 8;
+    // Linux obtains geometry/resource limits from the GC_INFO discovery table
+    // before reading harvest masks. Fixed CU counts mask off usable WGPs.
+    const auto &physical = dev.ip.gfx;
+    if (!physical.valid || physical.max_shader_engines > 4 ||
+        physical.max_sh_per_se > 2 || physical.max_cu_per_sh > 32 ||
+        physical.max_cu_per_sh % 2 ||
+        physical.max_shader_engines * physical.max_backends_per_se > 32) {
+        GFX_LOG("constants_init: missing or unsupported GC_INFO geometry");
+        return kIOReturnUnsupported;
+    }
+    cfg.max_shader_engines = physical.max_shader_engines;
+    cfg.max_sh_per_se = physical.max_sh_per_se;
+    cfg.max_backends_per_se = physical.max_backends_per_se;
+    cfg.max_cu_per_sh = physical.max_cu_per_sh;
+    cfg.max_hw_contexts = 8; // gfx_v12_0_gpu_early_init
+    cfg.wave_front_size = physical.wave_front_size;
+    cfg.max_waves_per_simd = physical.max_waves_per_simd;
+    cfg.max_scratch_slots_per_cu = physical.max_scratch_slots_per_cu;
+    // soc24_enum.h NUM_SIMD_PER_CU=2; reserve no more waves than the
+    // discovery table's independent scratch-slot limit permits.
+    const auto waveLimit = physical.max_waves_per_simd * 2;
+    cfg.max_scratch_waves_per_cu = physical.max_scratch_slots_per_cu < waveLimit ?
+        physical.max_scratch_slots_per_cu : waveLimit;
+    cfg.lds_size_bytes = physical.lds_size_kib * 1024;
 
     auto reg = [&](GFXRegs::Register r) {
         return SOC15_REG_OFFSET_BIDX(dev, IPBlock::GC, r.baseIndex, r.offset);
@@ -411,7 +426,7 @@ gfx_constants_init(const DeviceContext &dev, GFXConfig &cfg)
     // get_tcc_info is empty upstream on gfx12 (gfx_v12_0.c:1802).
     //
     // Both setup_rb and get_cu_info NEED gb_addr_config populated for
-    // some fields, but on RDNA4 the caps we use are hardcoded — the
+    // some fields; physical capacity comes from GC_INFO. The
     // gb_addr_config read is best-effort and non-fatal.
     (void)gfx_get_gb_addr_config(dev, cfg);
     kern_return_t r;
@@ -441,7 +456,9 @@ gfx_constants_init(const DeviceContext &dev, GFXConfig &cfg)
             // gfx_v12_0.c:1825 — SH_MEM_CONFIG = DEFAULT for every VMID.
             WREG32(dev, reg_mem_config, kDefaultSHMemConfig);
 
-            if (i != 0) {
+            {
+                // VMID0 also carries our trusted HSA queues. Give it the same
+                // flat LDS/private apertures as compute VMIDs.
                 // gfx_v12_0.c:1827-1831 — VMID i ≥ 1 gets the gmc
                 // private/shared aperture bases. Both apertures are
                 // 48-bit GPU-VA tops; we don't yet track the

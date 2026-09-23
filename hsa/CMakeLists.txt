@@ -90,8 +90,15 @@ if(BUILD_TESTING)
     -fsanitize=address,undefined -fno-sanitize-recover=all)
   target_link_options(hsa-executable-test PRIVATE -fsanitize=address,undefined)
   add_test(NAME hsa-executable-loader COMMAND hsa-executable-test
-    ${CMAKE_CURRENT_SOURCE_DIR}/../build/tests/hsa-code-object.hsaco)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../build/tests/hsa-code-object.hsaco
+    ${CMAKE_CURRENT_SOURCE_DIR}/../upstream/hrx-lse-pin/runtime/src/iree/hal/drivers/amdgpu/device/binaries/prebuilt/amdgcn-amd-amdhsa--gfx12-generic.so)
   set_tests_properties(hsa-executable-loader PROPERTIES TIMEOUT 15)
+  # Offline prerequisite: scripts/build-hrx-compute-fixture.sh.
+  add_test(NAME hsa-hrx-compute-loader COMMAND hsa-executable-test
+    ${CMAKE_CURRENT_SOURCE_DIR}/../build/tests/hsa-code-object.hsaco
+    ${CMAKE_CURRENT_SOURCE_DIR}/../upstream/hrx-lse-pin/runtime/src/iree/hal/drivers/amdgpu/device/binaries/prebuilt/amdgcn-amd-amdhsa--gfx12-generic.so
+    ${CMAKE_CURRENT_SOURCE_DIR}/../build/tests/hrx-compute.hsaco)
+  set_tests_properties(hsa-hrx-compute-loader PROPERTIES TIMEOUT 15)
   add_executable(hsa-runtime-test ../tests/hsa_runtime_test.cpp ${HSA_RUNTIME_SOURCES})
   target_include_directories(hsa-runtime-test PRIVATE include src third_party/hsa/include)
   target_compile_options(hsa-runtime-test PRIVATE -Wall -Wextra -Werror -UNDEBUG
@@ -126,3 +133,20 @@ if(BUILD_TESTING)
   set_tests_properties(hsa-transport-test PROPERTIES
     ENVIRONMENT "MAC_AMDGPU_FIRMWARE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/../firmware")
 endif()
+
+add_executable(mac-hsa-resource-test tools/mac_hsa_resource_test.cpp)
+target_link_libraries(mac-hsa-resource-test PRIVATE hsa-runtime64)
+target_compile_options(mac-hsa-resource-test PRIVATE -Wall -Wextra -Werror)
+if(BUILD_TESTING)
+  add_executable(hsa-queue-service-test ../tests/hsa_queue_service_test.cpp ${HSA_RUNTIME_SOURCES})
+  target_include_directories(hsa-queue-service-test PRIVATE include src third_party/hsa/include)
+  target_compile_options(hsa-queue-service-test PRIVATE -Wall -Wextra -Werror -UNDEBUG
+    -fsanitize=address,undefined -fno-sanitize-recover=all)
+  target_link_options(hsa-queue-service-test PRIVATE -fsanitize=address,undefined)
+  add_test(NAME hsa-queue-service-lifecycle COMMAND hsa-queue-service-test)
+  set_tests_properties(hsa-queue-service-lifecycle PROPERTIES TIMEOUT 15)
+endif()
+
+add_executable(mac-hsa-atomic-contention-test tools/mac_hsa_atomic_contention_test.cpp)
+target_link_libraries(mac-hsa-atomic-contention-test PRIVATE hsa-runtime64)
+target_compile_options(mac-hsa-atomic-contention-test PRIVATE -Wall -Wextra -Werror)

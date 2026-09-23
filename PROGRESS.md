@@ -1944,3 +1944,50 @@ successfully after cleanup. No hardware AQL queue or HRX inference is claimed.
   installation. No manual GPU power cycle was needed during the passing tests.
   General GPU-accessible HSA host pools, scratch/LDS resources and HRX inference
   remain incomplete; symbol resolution alone is not runtime readiness.
+
+
+## Builds 188–189 — HRX host adapter and resource candidate
+
+- Added public CPU-owned coarse/kernarg pools backed by prepared DriverKit DMA
+  buffers, truthful access/pointer metadata, and bounded native SDMA copies for
+  same-GPU VRAM allocations. No fine-grained CPU/GPU atomic contract is advertised.
+- Persistent queues now allocate/grow/reuse scratch, service the CP inactive
+  signal, and expose LDS/private apertures. Queue workers stop before normal
+  destruction returns; fault handling wakes waiters without fabricating completion.
+- Replaced the hardcoded CU geometry with validated GC_INFO discovery, and added
+  PCI/topology properties plus a bounded ATOM ROM timestamp-frequency reader.
+- The executable loader accepts compatible gfx12-generic-v1 images, including
+  all 17 real HRX helper kernels, with checked relocations and descriptor lifetime.
+- Built the pinned HRX library and Loom compiler using a tracked macOS adapter
+  applied to a disposable source copy. The explicit adapter supports one GPU and
+  host-published AQL queues; it rejects unsupported device enqueue, instrumentation,
+  hostcalls and PM4 replay. Hardware profiling enablement returns an error.
+- Added actual HRX memory operations and executable dispatch checks: 4,093 FP32
+  affine outputs and a 16×16 FP32 matrix product, with full readback and guards.
+- Added CPU-only/GPU-only add and CAS controls, followed by native CPU/GPU
+  contention experiments: three trials of 10 million
+  64-bit additions per agent, then shared 64-bit CAS-lock contention. They require
+  overlap, exact counts, intact guards and completed GPU work, with deadlines.
+  Shader disassembly verifies system-scope 64-bit atomic instructions. Cached
+  PCIe capability checks distinguish known-missing bits from unavailable registers;
+  they do not substitute for measured interoperability. CPU mapping uses Apple's
+  default cache policy, not a verified cache-inhibited mapping.
+- Validation: 33 driver/ABI regression scripts, 12 HSA ASan/UBSan suites and nine
+  PCIe diagnostic tests passed. Xcode build and strict app/driver signature checks
+  passed. Stop GPU completed before opening the new host for installation.
+  New resource, HRX and native contention hardware results remain pending;
+  driver 187's earlier results do not validate these additions.
+- Built the pinned LSE CLI against native HRX/Loom through a reproducible patch,
+  including kqueue, Darwin sockets and portable argument reflection. Eight CPU
+  suites and a readiness/TCP regression passed. Explicit kernel-archive linking
+  fixed numerical CPU graph failures; the broad graph suite is 118/124, with six
+  remaining device-first/GPU-launch-count assertions in unchanged upstream paths.
+  No model inference has run.
+- Installed driver 188 initialized successfully and reported the actual R9700
+  topology: four shader engines, two arrays each, eight CUs per array (64 total).
+  The first hardware property test exposed a stale one-array validation gate.
+  Review then found the same assumption in queue admission and CU masks; these
+  are corrected for build 189 using Linux's per-array compact-mask packing.
+  The ATOM clock query also rejected actual NBIO 6.3.1; its ROM-offset handling
+  now matches Linux NBIF bank selection, with bounded diagnostic logging. No new HRX or atomic dispatch
+  result was produced by the stopped run.

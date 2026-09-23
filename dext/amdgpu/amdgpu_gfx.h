@@ -146,21 +146,24 @@ struct GFXConfig {
     uint32_t  pipe_interleave_size;  // = 1 << (8 + PIPE_INTERLEAVE_SIZE)
     uint32_t  max_compressed_frags;  // = 1 << MAX_COMPRESSED_FRAGS
 
-    // R9700 (gfx1201) caps. Upstream hardcodes these in
-    // gfx_v12_0_gpu_early_init (gfx_v12_0.c:1660-1690 for the
-    // IP_VERSION(12, 0, 1) branch).
-    uint32_t  max_shader_engines;     // 4
-    uint32_t  max_sh_per_se;          // 1
-    uint32_t  max_backends_per_se;    // 4
-    uint32_t  max_cu_per_sh;          // 8 (R9700)
-    uint32_t  max_hw_contexts;        // 8
+    // Physical limits from GC_INFO; harvest registers select the active subset.
+    uint32_t  max_shader_engines;
+    uint32_t  max_sh_per_se;
+    uint32_t  max_backends_per_se;
+    uint32_t  max_cu_per_sh;
+    uint32_t  max_hw_contexts;
+    uint32_t  wave_front_size;
+    uint32_t  max_waves_per_simd;
+    uint32_t  max_scratch_slots_per_cu;
+    uint32_t  max_scratch_waves_per_cu;
+    uint32_t  lds_size_bytes;
 
     // Render-backend harvest map (set by setup_rb).
     uint32_t  active_rb_bitmap;
     uint32_t  num_rbs;
 
     // CU harvest map (set by get_cu_info). active_cu_bitmap[se][sh].
-    // For R9700 (gfx1201): max_shader_engines = 4, max_sh_per_se = 1.
+    // For R9700 (gfx1201): max_shader_engines = 4, max_sh_per_se = 2.
     uint32_t  active_cu_bitmap[4][2];
     uint32_t  num_active_cus;
 };

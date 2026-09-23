@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Build the pinned LSE host/HRX adapter and run CPU-only portability tests.
+set -euo pipefail
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$repo_root"
+source scripts/amdgpu-llvm-env.sh
+lse_revision=b5637a7109d409c21f75586edb75e7631277bce8
+lse_source="$repo_root/upstream/lse"
+lse_copy="$repo_root/build/lse-macos-source"
+lse_build="$repo_root/build/lse-macos-adapter"
+lse_tests="$repo_root/build/lse-macos-host-tests"
+lse_patch="$repo_root/patches/lse/macos-host-adapter.patch"
+hrx_build="$repo_root/build/hrx-macos-adapter"
+hrx_copy="$repo_root/build/hrx-macos-source"
+[[ "$(uname -s)" == Darwin ]] || { echo 'This adapter targets macOS.' >&2; exit 1; }
+[[ "$(git -C "$lse_source" rev-parse HEAD)" == "$lse_revision" ]] || {
+  echo 'LSE pin changed: re-audit the adapter before building.' >&2; exit 1;
+}
+[[ -f "$hrx_build/loom/binding/c/libloomc.dylib" &&
+   -f "$hrx_build/libhrx/src/libhrx/libhrx.dylib" ]] || {
+  echo 'Build native HRX and Loom first: bash scripts/build-hrx-macos.sh' >&2; exit 1;
+}
+if [[ ! -d "$lse_copy" ]]; then
+  git clone --shared --no-hardlinks "$lse_source" "$lse_copy"
+fi
+[[ "$(git -C "$lse_copy" rev-parse HEAD)" == "$lse_revision" ]] || {
+  echo 'Existing LSE build source is at an unexpected revision.' >&2; exit 1;
+}
+if git -C "$lse_copy" apply --reverse --check "$lse_patch" 2>/dev/null; then
+  : # Exact adapter is already applied.
+else
+  git -C "$lse_copy" apply --check "$lse_patch"
+  git -C "$lse_copy" apply "$lse_patch"
+fi
+# New libc++ headers need the matching library, not the older SDK library.
+lse_link_flags="-L$llvm_bin/../lib/c++ -Wl,-rpath,$llvm_bin/../lib/c++"
+lse_common_args=(-G Ninja "-DCMAKE_CXX_COMPILER=$llvm_bin/clang++"
+  "-DCMAKE_EXE_LINKER_FLAGS=$lse_link_flags" -DLSE_ENABLE_CPU=ON)
+cmake -S "$lse_copy" -B "$lse_build" "${lse_common_args[@]}" \
+  -DLSE_ENABLE_HRX=ON -DLSE_BUILD_TESTS=OFF -DLSE_GPU_TARGETS=gfx1201 \
+  "-DLSE_HRX_INCLUDE_DIR=$hrx_copy/libhrx/include" \
+  "-DLSE_HRX_LIBRARY=$hrx_build/libhrx/src/libhrx/libhrx.dylib" \
+  "-DLSE_LOOMC_INCLUDE_DIR=$hrx_copy/loom/binding/c/include" \
+  "-DLSE_LOOMC_LIBRARY=$hrx_build/loom/binding/c/libloomc.dylib"
+cmake --build "$lse_build" --target lse --parallel "${LSE_BUILD_JOBS:-4}"
+# --help exits before backend initialization: this does not access the GPU.
+"$lse_build/lse" --help > "$lse_build/help.txt"
+cmake -S "$lse_copy" -B "$lse_tests" "${lse_common_args[@]}" \
+  -DLSE_ENABLE_HRX=OFF -DLSE_BUILD_TESTS=ON
+lse_test_targets=(test_kernel_env test_ir test_dtype test_shape test_quant test_backend_cpu test_primitive test_trace)
+cmake --build "$lse_tests" --target "${lse_test_targets[@]}" lse_communication --parallel "${LSE_BUILD_JOBS:-4}"
+ctest --test-dir "$lse_tests" --output-on-failure \
+  -R '^test_(kernel_env|ir|dtype|shape|quant|backend_cpu|primitive|trace)$'
+"$llvm_bin/clang++" -std=c++26 -Wall -Wextra -Werror \
+  -I"$lse_copy/include" tests/lse_macos_poller_test.cpp \
+  "$lse_tests/liblse_core.a" \
+  -Wl,-force_load,"$lse_tests/liblse_communication.a" \
+  -L"$llvm_bin/../lib/c++" -Wl,-rpath,"$llvm_bin/../lib/c++" \
+  -o "$lse_tests/lse-macos-poller-test"
+"$lse_tests/lse-macos-poller-test"
+printf 'Built LSE %s with native HRX/Loom; CPU-only tests passed. No GPU work run.\n' "$lse_revision"

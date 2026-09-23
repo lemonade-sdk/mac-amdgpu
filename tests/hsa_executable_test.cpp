@@ -44,7 +44,7 @@ static hsa_executable_t executable() {
     return result;
 }
 int main(int argc, char **argv) {
-    assert(argc == 2);
+    assert(argc>=2 && argc<=4);
     std::ifstream stream(argv[1], std::ios::binary);
     std::vector<uint8_t> file{std::istreambuf_iterator<char>(stream), {}};
     mac_hsa::CodeObject expected;
@@ -214,5 +214,77 @@ int main(int argc, char **argv) {
     assert(hsa_executable_freeze(exec, nullptr) == HSA_STATUS_ERROR_INVALID_EXECUTABLE);
     assert(hsa_code_object_reader_destroy(reader) == HSA_STATUS_ERROR_INVALID_CODE_OBJECT_READER);
     assert(hsa_shut_down() == 0);
+    if (argc>=3) {
+        // The pinned HRX helper library is a generic-v1 image with many kernels,
+        // not the single-target/single-symbol shader used above.
+        assert(hsa_init()==0);
+        std::ifstream helperStream(argv[2],std::ios::binary);
+        const std::vector<uint8_t> helperBytes{std::istreambuf_iterator<char>(helperStream),{}};
+        mac_hsa::CodeObject helperObject;
+        assert(mac_hsa::parseCodeObject(helperBytes,helperObject) && helperObject.kernels.size()>=17);
+        assert(hsa_iterate_agents([](hsa_agent_t a,void *) {
+            hsa_device_type_t type;assert(hsa_agent_get_info(a,HSA_AGENT_INFO_DEVICE,&type)==0);
+            if (type==HSA_DEVICE_TYPE_GPU) gpu=a;
+            return HSA_STATUS_SUCCESS;
+        },nullptr)==0);
+        assert(hsa_code_object_reader_create_from_memory(helperBytes.data(),helperBytes.size(),&reader)==0);
+        exec=executable();
+        assert(hsa_executable_load_agent_code_object(exec,gpu,reader,nullptr,&loaded)==0);
+        assert(hsa_executable_freeze(exec,nullptr)==0);
+        assert(hsa_code_object_reader_destroy(reader)==0);
+        for (const auto &helper:helperObject.kernels) {
+            assert(hsa_executable_get_symbol_by_name(exec,helper.symbol.c_str(),&gpu,&symbol)==0);
+            assert(hsa_executable_symbol_get_info(symbol,HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT,&address)==0);
+            assert(address==0x8010000000ull+helper.descriptor);
+            assert(loader.hsa_ven_amd_loader_query_host_address(reinterpret_cast<void *>(address),&descriptor)==0);
+            assert(!std::memcmp(descriptor,helperObject.image.data()+helper.descriptor,64));
+            assert(hsa_executable_symbol_get_info(symbol,HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_KERNARG_SEGMENT_SIZE,&value)==0 && value==helper.kernargSize);
+            assert(hsa_executable_symbol_get_info(symbol,HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_PRIVATE_SEGMENT_SIZE,&value)==0 && value==helper.privateSize);
+            assert(hsa_executable_symbol_get_info(symbol,HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_GROUP_SEGMENT_SIZE,&value)==0 && value==helper.groupSize);
+        }
+        assert(hsa_executable_destroy(exec)==0 && hsa_shut_down()==0 && allocated==freed);
+    }
+    if (argc==4) {
+        // Exercise the exact native image passed through HRX's public loader.
+        // Its bindings occupy 0/8/16 and affine constants occupy 24/28.
+        assert(hsa_init()==0);
+        std::ifstream computeStream(argv[3],std::ios::binary);
+        const std::vector<uint8_t> computeBytes{std::istreambuf_iterator<char>(computeStream),{}};
+        mac_hsa::CodeObject computeObject;
+        assert(mac_hsa::parseCodeObject(computeBytes,computeObject) && computeObject.kernels.size()==2);
+        assert(hsa_iterate_agents([](hsa_agent_t a,void *) {
+            hsa_device_type_t type;assert(hsa_agent_get_info(a,HSA_AGENT_INFO_DEVICE,&type)==0);
+            if (type==HSA_DEVICE_TYPE_GPU) gpu=a;
+            return HSA_STATUS_SUCCESS;
+        },nullptr)==0);
+        assert(hsa_code_object_reader_create_from_memory(computeBytes.data(),computeBytes.size(),&reader)==0);
+        exec=executable();
+        assert(hsa_executable_load_agent_code_object(exec,gpu,reader,nullptr,&loaded)==0);
+        assert(hsa_executable_freeze(exec,nullptr)==0);
+        assert(hsa_code_object_reader_destroy(reader)==0);
+        unsigned seen=0;
+        for (const auto &kernel:computeObject.kernels) {
+            const bool affine=kernel.symbol=="hrx_vector_affine.kd";
+            assert(affine || kernel.symbol=="hrx_matmul_16.kd");
+            const unsigned bit=affine ? 1 : 2;
+            assert(!(seen&bit));seen|=bit;
+            assert(kernel.name==(affine ? "hrx_vector_affine" : "hrx_matmul_16"));
+            assert(kernel.kernargSize==(affine ? 32u : 24u) && kernel.kernargAlignment==8);
+            assert(kernel.privateSize==0 && kernel.groupSize==0 && !kernel.dynamicStack);
+            assert(kernel.properties&(1u<<10)); // AMD_KERNEL_CODE_PROPERTIES_ENABLE_WAVEFRONT_SIZE32
+            assert(hsa_executable_get_symbol_by_name(exec,kernel.symbol.c_str(),&gpu,&symbol)==0);
+            assert(hsa_executable_symbol_get_info(symbol,HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT,&address)==0);
+            assert(address==0x8010000000ull+kernel.descriptor);
+            assert(loader.hsa_ven_amd_loader_query_host_address(reinterpret_cast<void *>(address),&descriptor)==0);
+            assert(!std::memcmp(descriptor,computeObject.image.data()+kernel.descriptor,64));
+            assert(hsa_executable_symbol_get_info(symbol,HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_KERNARG_SEGMENT_SIZE,&value)==0 && value==kernel.kernargSize);
+            assert(hsa_executable_symbol_get_info(symbol,HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_KERNARG_SEGMENT_ALIGNMENT,&value)==0 && value==8);
+            assert(hsa_executable_symbol_get_info(symbol,HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_PRIVATE_SEGMENT_SIZE,&value)==0 && value==0);
+            assert(hsa_executable_symbol_get_info(symbol,HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_GROUP_SEGMENT_SIZE,&value)==0 && value==0);
+        }
+        assert(seen==3);
+        assert(hsa_executable_destroy(exec)==0 && hsa_shut_down()==0 && allocated==freed);
+        puts("HRX native compute: both gfx1201 exports load/freeze with exact kernarg ABI and wave32 descriptors");
+    }
     puts("HSA executable: copied readers, real ELF upload, symbols, freeze, rejection, failure cleanup and shutdown pass");
 }

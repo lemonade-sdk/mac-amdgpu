@@ -7,6 +7,7 @@
 #include "amdgpu_ip.h"
 #include "../upstream/linux/drivers/gpu/drm/amd/include/v12_structs.h"
 #include "../upstream/linux/drivers/gpu/drm/amd/include/asic_reg/gc/gc_12_0_0_sh_mask.h"
+#include "../upstream/rocm-systems/projects/rocr-runtime/runtime/hsa-runtime/core/inc/registers.h"
 using namespace amdgpu;
 #include "aql_mqd_offsets.inc"
 #include "aql_topology.inc"
@@ -47,13 +48,16 @@ struct PCI {
 };
 namespace amdgpu {
 struct DeviceContext { PCI *pci; uint64_t bar0Size=16384,bar2Size=0x200000; unsigned bar0MemIndex=0,bar2MemIndex=1; IPBaseTable ip{}; };
-struct GMCContext { uint64_t vram_start=0x8000000000; VRAMBumpAllocator vram_alloc; };
+struct GMCContext { uint64_t vram_start=0x8000000000; VRAMBumpAllocator vram_alloc,device_vram_alloc; };
 struct MESInstance { bool enabled=true,inited=true,submission_pending=false; };
 struct MESContext { bool uni_mes_active=true; MESInstance pipe[2]; };
-struct GFXConfig { unsigned max_shader_engines=4,max_sh_per_se=1,num_active_cus=32; uint32_t active_cu_bitmap[4][2]={{255,0},{255,0},{255,0},{255,0}}; };
+struct GFXConfig { unsigned max_shader_engines=4,max_sh_per_se=2,num_active_cus=64,max_scratch_waves_per_cu=32; uint32_t active_cu_bitmap[4][2]={{255,255},{255,255},{255,255},{255,255}}; };
 #include "aql_context.inc"
 static int mes_map_legacy_queue(DeviceContext &dev,MESContext &,unsigned type,unsigned pipe,unsigned queue,
     unsigned doorbell,uint64_t base,uint64_t wptr) {
+    const auto &mqd=*reinterpret_cast<const v12_compute_mqd *>(dev.pci->memory);
+    assert(mqd.compute_static_thread_mgmt_se0==0x00ff00ff && mqd.compute_static_thread_mgmt_se1==0x00ff00ff);
+    assert(mqd.compute_static_thread_mgmt_se2==0x00ff00ff && mqd.compute_static_thread_mgmt_se3==0x00ff00ff);
     if (persistent) {
         assert(type==1 && pipe==persistentSlot/4 && queue==persistentSlot%4 && doorbell==0x80+persistentSlot*2);
         assert(wptr==0x110000000ull+offsetof(amd_queue_t,write_dispatch_id));
@@ -81,11 +85,26 @@ namespace amdgpu {
 }
 #undef clock_gettime_nsec_np
 int main() {
+    {
+        uint32_t topology[4][2]={{255,255},{255,255},{255,255},{255,255}},masks[4]{};
+        assert(gfx12_compute_masks(4,2,64,topology,masks));
+        for (const auto mask:masks) assert(mask==0x00ff00ff);
+        // Physical harvest holes are compacted independently in each array.
+        topology[0][0]=0xcc;topology[0][1]=0xf3;
+        assert(gfx12_compute_masks(4,2,58,topology,masks) && masks[0]==0x003f000f);
+        assert(!gfx12_compute_masks(4,2,64,topology,masks));
+        assert(!gfx12_compute_masks(4,3,58,topology,masks));
+        topology[0][0]=1;
+        assert(!gfx12_compute_masks(4,2,55,topology,masks));
+        for (auto &se:topology) {se[0]=255;se[1]=0;}
+        assert(gfx12_compute_masks(4,1,32,topology,masks));
+        for (const auto mask:masks) assert(mask==255);
+    }
     AQLDispatchRequest r{}; r.version=1;r.codeHandle=1;r.kernargHandle=2;r.kernargBytes=12;r.timeoutUS=100000;
     r.groups[0]=4;r.groups[1]=r.groups[2]=1;r.threads[0]=32;r.threads[1]=r.threads[2]=1;
     alignas(64) uint8_t staging[16384]; const uint32_t masks[]={255,63,15,3};
     const uint64_t base=0x8000000000,descriptor=base+0x10000000,kernarg=base+0x10004000;
-    assert(aql_build_storage(staging,base,descriptor,kernarg,r,masks,22));
+    assert(aql_build_storage(staging,base,descriptor,kernarg,r,masks,22,32));
     const auto &m=*reinterpret_cast<const v12_compute_mqd *>(staging);
     assert(m.header==0xc0310800 && m.compute_static_thread_mgmt_se2==15);
     assert(m.cp_hqd_persistent_state==(CP_HQD_PERSISTENT_STATE__PRELOAD_REQ_MASK | (0x55<<CP_HQD_PERSISTENT_STATE__PRELOAD_SIZE__SHIFT)));
@@ -121,9 +140,9 @@ int main() {
         }
         assert(!aql_dispatch_shape(invalid));
     }
-    assert(!aql_build_storage(staging,base+4,descriptor,kernarg,r,masks,22));
-    assert(!aql_build_storage(staging,base,descriptor+4,kernarg,r,masks,22));
-    assert(!aql_build_storage(staging,base,descriptor,kernarg+4,r,masks,22));
+    assert(!aql_build_storage(staging,base+4,descriptor,kernarg,r,masks,22,32));
+    assert(!aql_build_storage(staging,base,descriptor+4,kernarg,r,masks,22,32));
+    assert(!aql_build_storage(staging,base,descriptor,kernarg+4,r,masks,22,32));
     for (mode=0;mode<=9;++mode) {
         PCI pci; DeviceContext dev{&pci}; dev.ip.version[0]={12,0,1};
         GMCContext gmc; gmc.vram_alloc.init(base,16384); MESContext mes; GFXConfig gfx;
@@ -145,14 +164,15 @@ int main() {
         for (mode=0;mode<=6;++mode) {
             if (mode==3 || mode==4 || mode==5) continue;
             PCI pci;DeviceContext dev{&pci};dev.ip.version[0]={12,0,1};
-            GMCContext gmc;gmc.vram_alloc.init(base,16384);MESContext mes;GFXConfig gfx;
+            GMCContext gmc;gmc.vram_alloc.init(base,16384);gmc.device_vram_alloc.init(base+0x10000000,256ull<<20);MESContext mes;GFXConfig gfx;
             alignas(64) amd_queue_t metadata{};
             metadata.hsa_queue.base_address=reinterpret_cast<void *>(0x110004000ull);metadata.hsa_queue.size=64;
             metadata.queue_properties=2;metadata.read_dispatch_id_field_base_byte_offset=offsetof(amd_queue_t,read_dispatch_id);
+            metadata.scratch_wave64_lane_byte_size=64;
             PersistentAQLQueue q{};maps=unmaps=bells=writes=0;
             auto status=aql_queue_open(dev,gmc,mes,gfx,q,0x110004000,0x110000000,&metadata,64,persistentSlot);
-            if (mode==1) {assert(status!=0 && !q.retained && !gmc.vram_alloc.bytes_used() && !maps);continue;}
-            if (mode==2) {assert(status!=0 && q.retained && gmc.vram_alloc.bytes_used()==16384);continue;}
+            if (mode==1) {assert(status!=0 && !q.retained && !gmc.vram_alloc.bytes_used() && !gmc.device_vram_alloc.bytes_used() && !maps);continue;}
+            if (mode==2) {assert(status!=0 && q.retained && gmc.vram_alloc.bytes_used()==16384 && gmc.device_vram_alloc.bytes_used());continue;}
             assert(status==0 && q.mapped && !q.retained && maps==1);
             assert(aql_queue_kick(dev,q,0)==kIOReturnBadArgument && !bells);
             metadata.write_dispatch_id=70;metadata.read_dispatch_id=64;
@@ -164,8 +184,74 @@ int main() {
             if (mode==6) {
                 assert(status==kIOReturnTimeout && q.retained && q.mapped && gmc.vram_alloc.bytes_used()==16384);
                 assert(aql_queue_kick(dev,q,69)==kIOReturnNotReady);
-            } else assert(status==0 && !q.mapped && !gmc.vram_alloc.bytes_used() && unmaps==1);
+            } else assert(status==0 && !q.mapped && !gmc.vram_alloc.bytes_used() && !gmc.device_vram_alloc.bytes_used() && unmaps==1);
         }
+    }
+    // CP's non-async scratch request allocates device VRAM, publishes the gfx12
+    // SRD/TMPRING ABI, and clears only recoverable inactive-signal bits.
+    mode=0;persistentSlot=1;
+    {
+        PCI pci;DeviceContext dev{&pci};dev.ip.version[0]={12,0,1};
+        GMCContext gmc;gmc.vram_alloc.init(base,16384);
+        gmc.device_vram_alloc.init(base+0x10000000,256ull<<20);
+        MESContext mes;GFXConfig gfx;
+        alignas(64) amd_queue_t metadata{};
+        alignas(64) hsa_kernel_dispatch_packet_t packets[64]{};
+        metadata.hsa_queue.base_address=reinterpret_cast<void *>(0x110004000ull);metadata.hsa_queue.size=64;
+        metadata.queue_properties=2;metadata.read_dispatch_id_field_base_byte_offset=offsetof(amd_queue_t,read_dispatch_id);
+        PersistentAQLQueue queue{};
+        assert(aql_queue_open(dev,gmc,mes,gfx,queue,0x110004000,0x110000000,&metadata,64,1)==0);
+        assert(metadata.group_segment_aperture_base_hi==0x10000 && metadata.private_segment_aperture_base_hi==0x20000);
+        auto &signal=*reinterpret_cast<amd_signal_t *>(pci.memory+kAQLInactiveOffset);
+        metadata.write_dispatch_id=1;
+        packets[0].header=HSA_PACKET_TYPE_KERNEL_DISPATCH;packets[0].private_segment_size=257;
+        signal.value=0x400;uint64_t inactive=UINT64_MAX;
+        assert(aql_queue_service(dev,gmc,gfx,queue,packets,inactive)==0 && !inactive && !signal.value);
+        assert(queue.scratch.size==uint64_t(272)*64*64*32);
+        assert(metadata.max_cu_id==63 && metadata.max_wave_id==31);
+        assert(metadata.scratch_wave64_lane_byte_size==272 && metadata.scratch_backing_memory_location==queue.scratch.gpu_va);
+        assert(metadata.scratch_resource_descriptor[1]==((uint32_t(queue.scratch.gpu_va>>32))|(1u<<30)));
+        SQ_BUF_RSRC_WORD3_GFX12 rsrc{};
+        rsrc.bits.DST_SEL_X=SQ_SEL_X;rsrc.bits.DST_SEL_Y=SQ_SEL_Y;
+        rsrc.bits.DST_SEL_Z=SQ_SEL_Z;rsrc.bits.DST_SEL_W=SQ_SEL_W;
+        rsrc.bits.FORMAT=BUF_FORMAT_32_UINT;rsrc.bits.ADD_TID_ENABLE=1;rsrc.bits.OOB_SELECT=2;
+        assert(metadata.scratch_resource_descriptor[3]==rsrc.u32All);
+        COMPUTE_TMPRING_SIZE_GFX12 tmpring{};tmpring.bits.WAVES=512;tmpring.bits.WAVESIZE=17;
+        assert(metadata.compute_tmpring_size==tmpring.u32All);
+        assert(metadata.compute_tmpring_size==(512u|(17u<<12)));
+        const auto original=queue.scratch;
+        signal.value=4;
+        assert(aql_queue_service(dev,gmc,gfx,queue,packets,inactive)==kIOReturnIOError && inactive==4 && signal.value==4);
+        assert(queue.scratch.gpu_va==original.gpu_va);
+        signal.value=0x405;
+        assert(aql_queue_service(dev,gmc,gfx,queue,packets,inactive)==kIOReturnIOError);
+        signal.value=1;packets[0].private_segment_size=1024;
+        assert(aql_queue_service(dev,gmc,gfx,queue,packets,inactive)==0);
+        assert(metadata.scratch_wave64_lane_byte_size==1024 && gmc.device_vram_alloc.alloc_count()==1);
+        const auto validBacking=queue.scratch.gpu_va;
+        const auto validBytes=metadata.scratch_wave64_lane_byte_size;
+        signal.value=1;packets[0].private_segment_size=262128;
+        assert(aql_queue_service(dev,gmc,gfx,queue,packets,inactive)==kIOReturnNoMemory);
+        assert(inactive==1 && signal.value==1 && queue.scratch.gpu_va==validBacking);
+        assert(metadata.scratch_wave64_lane_byte_size==validBytes && gmc.device_vram_alloc.alloc_count()==1);
+        signal.value=1;packets[0].private_segment_size=262129;
+        assert(aql_queue_service(dev,gmc,gfx,queue,packets,inactive)==kIOReturnBadArgument && signal.value==1);
+        // A later producer may reserve beyond ring capacity; inspect only the
+        // current resident window, without treating that legal MPSC state as fatal.
+        metadata.write_dispatch_id=128;packets[0].private_segment_size=272;signal.value=0x401;
+        assert(aql_queue_service(dev,gmc,gfx,queue,packets,inactive)==0 && !inactive);
+        // Queue teardown must retire scratch only after MES removal.
+        mode=6;
+        assert(aql_queue_close(dev,gmc,mes,queue)==kIOReturnTimeout && gmc.device_vram_alloc.alloc_count()==1);
+        queue.retained=false;mode=0;
+        assert(aql_queue_close(dev,gmc,mes,queue)==0 && !gmc.device_vram_alloc.bytes_used());
+    }
+    {
+        amd_queue_t metadata{};uint32_t aligned,waves;uint64_t bytes;
+        assert(!aql_scratch_geometry(262129,32,4,32,aligned,waves,bytes));
+        assert(aql_scratch_geometry(1,33,4,32,aligned,waves,bytes) && aligned==16 && waves==288);
+        assert(!aql_scratch_metadata(metadata,base,UINT64_MAX,16,4,32));
+        assert(!aql_scratch_metadata(metadata,base,16384,16,4,32));
     }
     puts("AQL: Linux MQD/register layout, ROCr packet/metadata, publication, completion, unmap and failure retention passed");
 }

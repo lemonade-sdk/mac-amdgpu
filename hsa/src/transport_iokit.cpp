@@ -40,6 +40,35 @@ public:
         if (service) IOObjectRelease(service);
     }
     bool supportsBuffers() const override { return true; }
+    hsa_status_t properties(DeviceProperties &out) override {
+        std::lock_guard lock(sessionMutex);
+        auto status=ensureReady();
+        if (status!=HSA_STATUS_SUCCESS) return status;
+        std::array<uint64_t,3> build{};
+        status=scalar(43,{},build);
+        if (status!=HSA_STATUS_SUCCESS) return status;
+        if (build[2]<kQueueResourceDriverBuild) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        const uint64_t tag=6;std::array<uint64_t,10> values{};
+        status=scalar(21,{&tag,1},values);
+        if (status!=HSA_STATUS_SUCCESS) return status;
+        if (values[0]>UINT16_MAX || values[1]>UINT8_MAX || values[2]>UINT16_MAX ||
+            values[3]>UINT32_MAX || !values[4] || values[4]>128 ||
+            !values[5] || values[5]>8 || !values[6] || values[6]>2 || values[7]>400000000 ||
+            !values[8] || values[8]>64 || (values[9]!=32 && values[9]!=64))
+            return HSA_STATUS_ERROR;
+        out={uint32_t(values[0]),uint32_t(values[1]),uint32_t(values[2]),uint32_t(values[3]),
+             uint32_t(values[4]),uint32_t(values[5]),uint32_t(values[6]),values[7],
+             uint32_t(values[8]),uint32_t(values[9])};
+        return HSA_STATUS_SUCCESS;
+    }
+    bool supportsSharedBuffers() const override { return true; }
+    hsa_status_t sharedMemoryCapacity(uint64_t &bytes) override {
+        std::lock_guard lock(sessionMutex);
+        auto status = ensureReady();
+        if (status == HSA_STATUS_SUCCESS) status = ensureHostWindow();
+        if (status == HSA_STATUS_SUCCESS) bytes = hostWindowSize;
+        return status;
+    }
 
 
     static hsa_status_t call(io_connect_t port, uint32_t selector, const uint64_t *input, uint32_t inputs,
@@ -200,6 +229,20 @@ public:
         if (status!=HSA_STATUS_SUCCESS || output[0]) {state=State::Faulted;return HSA_STATUS_ERROR;}
         std::atomic_thread_fence(std::memory_order_seq_cst);
         hardwareQueues.erase(handle);return HSA_STATUS_SUCCESS;
+    }
+    hsa_status_t serviceQueue(uint64_t handle,uint64_t &inactive) override {
+        std::lock_guard lock(sessionMutex);inactive=0;
+        if (state!=State::Ready) return HSA_STATUS_ERROR;
+        if (!handle || !hardwareQueues.contains(handle)) return HSA_STATUS_ERROR_INVALID_QUEUE;
+        std::array<uint64_t,2> output{};
+        const auto status=scalar(59,{&handle,1},output);
+        if (status!=HSA_STATUS_SUCCESS) {state=State::Faulted;return status;}
+        inactive=output[1];
+        // A suspended queue can still be removed safely after a resource error.
+        if (output[0]==uint32_t(kIOReturnNoMemory) || output[0]==uint32_t(kIOReturnNoResources))
+            return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+        if (output[0]) return HSA_STATUS_ERROR_EXCEPTION;
+        return HSA_STATUS_SUCCESS;
     }
     hsa_status_t dispatchAQL(const amdgpu::AQLDispatchRequest &request, uint64_t &completion) override {
         std::lock_guard lock(sessionMutex);

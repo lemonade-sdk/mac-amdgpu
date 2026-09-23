@@ -31,6 +31,16 @@ std::shared_ptr<Allocation> findAllocation(const void *pointer) {
 }
 namespace {
 const size_t granule = hostPageSize();
+uint32_t poolFlags(const Pool &pool) {
+    if (pool.sharedHost) return HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED |
+                               HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT;
+    return pool.connection ? HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED :
+                             HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED;
+}
+bool poolAccessible(const Pool &pool, const Agent &agent) {
+    return pool.owner.handle == agent.handle.handle ||
+        (pool.sharedHost && agent.connection == pool.connection);
+}
 bool validRange(const void *pointer, size_t size, const std::shared_ptr<Allocation> &allocation, bool write = false) {
     const auto address = reinterpret_cast<uintptr_t>(pointer);
     if (!pointer || size > UINTPTR_MAX - address) return false;
@@ -53,7 +63,8 @@ hsa_status_t poolSnapshot(uint64_t handle, Pool &out, hsa_status_t invalidPool) 
 hsa_status_t poolCapacity(const Pool &pool, void *value) {
     uint64_t capacity = pool.capacity;
     if (pool.connection) {
-        const auto status = pool.connection->memoryCapacity(capacity);
+        const auto status = pool.sharedHost ? pool.connection->sharedMemoryCapacity(capacity) :
+                                             pool.connection->memoryCapacity(capacity);
         if (status != HSA_STATUS_SUCCESS) return status;
     }
     return writeValue(value, size_t(capacity));
@@ -71,7 +82,23 @@ hsa_status_t allocate(uint64_t poolHandle, size_t size, uint32_t flags, void **o
     const auto rounded = (size + alignment - 1) & ~(alignment - 1);
     try {
         auto allocation = std::make_shared<Allocation>();
-        if (pool.connection) {
+        allocation->globalFlags = poolFlags(pool);
+        if (pool.sharedHost) {
+            uint64_t capacity = 0;
+            auto result = pool.connection->sharedMemoryCapacity(capacity);
+            if (result != HSA_STATUS_SUCCESS) return result;
+            if (rounded > capacity) return HSA_STATUS_ERROR_INVALID_ALLOCATION;
+            allocation->connection = pool.connection;
+            result = pool.connection->allocateSharedBuffer(rounded, allocation->shared);
+            allocation->buffer = allocation->shared.device;
+            if (result != HSA_STATUS_SUCCESS) return result;
+            allocation->base = allocation->shared.host;
+            allocation->size = allocation->buffer.size;
+            const auto address = reinterpret_cast<uintptr_t>(allocation->base);
+            if (!address || address != allocation->buffer.address || !allocation->buffer.handle ||
+                allocation->size < rounded || allocation->size > UINTPTR_MAX - address)
+                return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+        } else if (pool.connection) {
             const auto result = pool.connection->allocateBuffer(rounded, allocation->buffer);
             if (result != HSA_STATUS_SUCCESS) return result;
             allocation->connection = pool.connection;
@@ -107,26 +134,56 @@ bool accessibleAgent(hsa_agent_t agent, const std::shared_ptr<Allocation> &alloc
     if (!agent.handle) return true;
     const auto found = findAgent(agent);
     if (!found) return false;
-    return allocation && allocation->connection ? agent.handle == allocation->owner.handle ||
+    return allocation && allocation->connection ? found->connection == allocation->connection ||
         (allocation->shared.host && !found->connection) : !found->connection;
 }
 hsa_status_t copyBytes(void *dst, const void *src, size_t size,
     const std::shared_ptr<Allocation> &destination, const std::shared_ptr<Allocation> &source) {
-    const auto srcGPU = source ? source->connection : nullptr;
-    const auto dstGPU = destination ? destination->connection : nullptr;
-    if (!srcGPU && !dstGPU) { std::memmove(dst, src, size); return HSA_STATUS_SUCCESS; }
+    // Shared GTT pointers are real host mappings. Use their CPU mapping when
+    // either endpoint is host-visible; ownership transitions remain the caller's
+    // responsibility for coarse-grained storage.
+    const auto srcGPU = source && !source->shared.host ? source->connection : nullptr;
+    const auto dstGPU = destination && !destination->shared.host ? destination->connection : nullptr;
+    if (!srcGPU && !dstGPU) {
+        std::atomic_thread_fence(std::memory_order_acquire);
+        std::memmove(dst, src, size);
+        std::atomic_thread_fence(std::memory_order_release);
+        return HSA_STATUS_SUCCESS;
+    }
     const auto srcOffset = source ? reinterpret_cast<uintptr_t>(src) - reinterpret_cast<uintptr_t>(source->base) : 0;
     const auto dstOffset = destination ? reinterpret_cast<uintptr_t>(dst) - reinterpret_cast<uintptr_t>(destination->base) : 0;
     if (srcGPU && !dstGPU) return srcGPU->readBuffer(source->buffer, srcOffset, dst, size);
     if (!srcGPU) return dstGPU->writeBuffer(destination->buffer, dstOffset, src, size);
+    if (srcGPU == dstGPU) {
+        if (src == dst) return HSA_STATUS_SUCCESS;
+        const bool overlap = source->buffer.handle == destination->buffer.handle &&
+            srcOffset < dstOffset + size && dstOffset < srcOffset + size;
+        if (!overlap) {
+            // The bounded driver copy RPC accepts at most 4 MiB. Keep both BOs
+            // retained throughout all chunks and propagate the first failure;
+            // retrying through another engine cannot prove the first completed.
+            constexpr size_t maxCopy = 4 * 1024 * 1024;
+            for (size_t offset = 0; offset < size;) {
+                const auto bytes = std::min(maxCopy, size - offset);
+                const auto status = srcGPU->copyBuffers(source->buffer, srcOffset + offset,
+                    destination->buffer, dstOffset + offset, bytes);
+                if (status != HSA_STATUS_SUCCESS) return status;
+                offset += bytes;
+            }
+            return HSA_STATUS_SUCCESS;
+        }
+    }
     std::array<uint8_t, 4096> staging;
-    for (size_t offset = 0; offset < size;) {
-        const auto bytes = std::min(staging.size(), size - offset);
+    const bool backwards = srcGPU == dstGPU && source->buffer.handle == destination->buffer.handle &&
+        dstOffset > srcOffset && dstOffset < srcOffset + size;
+    for (size_t completed = 0; completed < size;) {
+        const auto bytes = std::min(staging.size(), size - completed);
+        const auto offset = backwards ? size - completed - bytes : completed;
         auto status = srcGPU->readBuffer(source->buffer, srcOffset + offset, staging.data(), bytes);
         if (status != HSA_STATUS_SUCCESS) return status;
         status = dstGPU->writeBuffer(destination->buffer, dstOffset + offset, staging.data(), bytes);
         if (status != HSA_STATUS_SUCCESS) return status;
-        offset += bytes;
+        completed += bytes;
     }
     return HSA_STATUS_SUCCESS;
 }
@@ -174,29 +231,41 @@ hsa_status_t mac_hsa_memory_allocate_shared(hsa_agent_t agent, size_t size, void
 }
 hsa_status_t hsa_agent_iterate_regions(hsa_agent_t agent,
     hsa_status_t (*callback)(hsa_region_t, void *), void *data) {
-    hsa_region_t region{};
-    {
-        std::lock_guard lock(runtimeMutex);
-        if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
-        if (!findAgent(agent)) return HSA_STATUS_ERROR_INVALID_AGENT;
-        if (!callback) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
-        for (const auto &pool : pools)
-            if (pool.owner.handle == agent.handle) region.handle = pool.handle;
-    }
-    return region.handle ? callback(region, data) : HSA_STATUS_SUCCESS;
+    std::vector<hsa_region_t> snapshot;
+    try {
+        {
+            std::lock_guard lock(runtimeMutex);
+            if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+            if (!findAgent(agent)) return HSA_STATUS_ERROR_INVALID_AGENT;
+            if (!callback) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+            for (const auto &pool : pools)
+                if (pool.owner.handle == agent.handle) snapshot.push_back({pool.handle});
+        }
+        for (const auto region : snapshot) {
+            const auto status = callback(region, data);
+            if (status != HSA_STATUS_SUCCESS) return status;
+        }
+        return HSA_STATUS_SUCCESS;
+    } catch (const std::bad_alloc &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
 }
 HSA_API_EXPORT hsa_status_t hsa_amd_agent_iterate_memory_pools(hsa_agent_t agent,
     hsa_status_t (*callback)(hsa_amd_memory_pool_t, void *), void *data) {
-    hsa_amd_memory_pool_t result{};
-    {
-        std::lock_guard lock(runtimeMutex);
-        if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
-        if (!findAgent(agent)) return HSA_STATUS_ERROR_INVALID_AGENT;
-        if (!callback) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
-        for (const auto &pool : pools)
-            if (pool.owner.handle == agent.handle) result.handle = pool.handle;
-    }
-    return result.handle ? callback(result, data) : HSA_STATUS_SUCCESS;
+    std::vector<hsa_amd_memory_pool_t> snapshot;
+    try {
+        {
+            std::lock_guard lock(runtimeMutex);
+            if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+            if (!findAgent(agent)) return HSA_STATUS_ERROR_INVALID_AGENT;
+            if (!callback) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+            for (const auto &pool : pools)
+                if (pool.owner.handle == agent.handle) snapshot.push_back({pool.handle});
+        }
+        for (const auto pool : snapshot) {
+            const auto status = callback(pool, data);
+            if (status != HSA_STATUS_SUCCESS) return status;
+        }
+        return HSA_STATUS_SUCCESS;
+    } catch (const std::bad_alloc &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
 }
 hsa_status_t hsa_region_get_info(hsa_region_t region, hsa_region_info_t attribute, void *value) {
     Pool storage{};
@@ -206,7 +275,7 @@ hsa_status_t hsa_region_get_info(hsa_region_t region, hsa_region_info_t attribut
     if (!value) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
     switch (attribute) {
     case HSA_REGION_INFO_SEGMENT: return writeValue(value, HSA_REGION_SEGMENT_GLOBAL);
-    case HSA_REGION_INFO_GLOBAL_FLAGS: return writeValue(value, uint32_t(pool->connection ? HSA_REGION_GLOBAL_FLAG_COARSE_GRAINED : HSA_REGION_GLOBAL_FLAG_FINE_GRAINED));
+    case HSA_REGION_INFO_GLOBAL_FLAGS: return writeValue(value, poolFlags(*pool));
     case HSA_REGION_INFO_SIZE:
     case HSA_REGION_INFO_ALLOC_MAX_SIZE: return poolCapacity(*pool, value);
     case HSA_REGION_INFO_RUNTIME_ALLOC_ALLOWED: return writeValue(value, true);
@@ -225,17 +294,18 @@ HSA_API_EXPORT hsa_status_t hsa_amd_memory_pool_get_info(hsa_amd_memory_pool_t h
     switch (attribute) {
     case HSA_AMD_MEMORY_POOL_INFO_SEGMENT: return writeValue(value, HSA_AMD_SEGMENT_GLOBAL);
     case HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS:
-        return writeValue(value, uint32_t(pool->connection ? HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED : HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED));
+        return writeValue(value, poolFlags(*pool));
     case HSA_AMD_MEMORY_POOL_INFO_SIZE:
     case HSA_AMD_MEMORY_POOL_INFO_ALLOC_MAX_SIZE: return poolCapacity(*pool, value);
     case HSA_AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_ALLOWED: return writeValue(value, true);
     case HSA_AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_GRANULE:
     case HSA_AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_REC_GRANULE:
     case HSA_AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_ALIGNMENT: return writeValue(value, pool->connection ? size_t(16384) : granule);
-    case HSA_AMD_MEMORY_POOL_INFO_LOCATION: return writeValue(value, pool->connection ? HSA_AMD_MEMORY_POOL_LOCATION_GPU : HSA_AMD_MEMORY_POOL_LOCATION_CPU);
+    case HSA_AMD_MEMORY_POOL_INFO_LOCATION: return writeValue(value, pool->connection && !pool->sharedHost ? HSA_AMD_MEMORY_POOL_LOCATION_GPU : HSA_AMD_MEMORY_POOL_LOCATION_CPU);
     case HSA_AMD_MEMORY_POOL_INFO_ACCESSIBLE_BY_ALL: {
         std::lock_guard lock(runtimeMutex);
-        return writeValue(value, agents.size() == 1);
+        return writeValue(value, std::all_of(agents.begin(), agents.end(),
+            [&](const Agent &agent) { return poolAccessible(*pool, agent); }));
     }
     default: return HSA_STATUS_ERROR_INVALID_ARGUMENT;
     }
@@ -251,11 +321,19 @@ HSA_API_EXPORT hsa_status_t hsa_amd_agent_memory_pool_get_info(hsa_agent_t agent
     if (!value) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
     switch (attribute) {
     case HSA_AMD_AGENT_MEMORY_POOL_INFO_ACCESS:
-        return writeValue(value, agent.handle != pool->owner.handle ? HSA_AMD_MEMORY_POOL_ACCESS_NEVER_ALLOWED :
+        return writeValue(value, !poolAccessible(*pool, *found) ? HSA_AMD_MEMORY_POOL_ACCESS_NEVER_ALLOWED :
                                                     HSA_AMD_MEMORY_POOL_ACCESS_ALLOWED_BY_DEFAULT);
     case HSA_AMD_AGENT_MEMORY_POOL_INFO_NUM_LINK_HOPS:
-        if (agent.handle != pool->owner.handle) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
-        return writeValue(value, uint32_t(0));
+        return writeValue(value, uint32_t(poolAccessible(*pool, *found) && agent.handle != pool->owner.handle));
+    case HSA_AMD_AGENT_MEMORY_POOL_INFO_LINK_INFO: {
+        if (!poolAccessible(*pool, *found) || agent.handle == pool->owner.handle)
+            return HSA_STATUS_SUCCESS; // zero-hop array: do not write caller storage
+        hsa_amd_memory_pool_link_info_t link{};
+        link.link_type = HSA_AMD_LINK_INFO_TYPE_PCIE;
+        // PCIe/Thunderbolt host AtomicOp completion is not supported. Unknown
+        // bandwidth/latency stay zero instead of inventing a direct PCIe rate.
+        return writeValue(value, link);
+    }
     default: return HSA_STATUS_ERROR_INVALID_ARGUMENT;
     }
 }
@@ -293,8 +371,7 @@ HSA_API_EXPORT hsa_status_t hsa_amd_agents_allow_access(uint32_t count, const hs
     for (uint32_t i = 0; i < count; ++i) {
         const auto agent = findAgent(handles[i]);
         if (!agent) return HSA_STATUS_ERROR_INVALID_AGENT;
-        if (handles[i].handle != allocation->owner.handle && !(allocation->shared.host && !agent->connection))
-            return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        if (!accessibleAgent(handles[i], allocation)) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
     }
     return HSA_STATUS_SUCCESS;
 }
@@ -322,7 +399,7 @@ HSA_API_EXPORT hsa_status_t hsa_amd_memory_fill(void *pointer, uint32_t value, s
             !validRange(pointer, count * sizeof(value), allocation, true))
             return HSA_STATUS_ERROR_INVALID_ARGUMENT;
     }
-    if (allocation->connection) {
+    if (allocation->connection && !allocation->shared.host) {
         std::array<uint32_t, 1024> values; values.fill(value);
         uint64_t offset = reinterpret_cast<uintptr_t>(pointer) - reinterpret_cast<uintptr_t>(allocation->base);
         while (count) {
@@ -331,14 +408,17 @@ HSA_API_EXPORT hsa_status_t hsa_amd_memory_fill(void *pointer, uint32_t value, s
             if (status != HSA_STATUS_SUCCESS) return status;
             count -= words; offset += words * 4;
         }
-    } else std::fill_n(static_cast<uint32_t *>(pointer), count, value);
+    } else {
+        std::fill_n(static_cast<uint32_t *>(pointer), count, value);
+        std::atomic_thread_fence(std::memory_order_release);
+    }
     return HSA_STATUS_SUCCESS;
 }
 HSA_API_EXPORT hsa_status_t hsa_amd_pointer_info(const void *pointer, hsa_amd_pointer_info_t *info,
     void *(*alloc)(size_t), uint32_t *count, hsa_agent_t **accessible) {
     hsa_amd_pointer_info_t result{};
     bool known = false;
-    hsa_agent_t hostAccess{};
+    hsa_agent_t otherAccess{};
     {
         std::lock_guard lock(runtimeMutex);
         if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
@@ -355,21 +435,25 @@ HSA_API_EXPORT hsa_status_t hsa_amd_pointer_info(const void *pointer, hsa_amd_po
             result.sizeInBytes = allocation->size;
             result.agentOwner = allocation->owner;
             result.userData = allocation->userData;
-            result.global_flags = allocation->connection ? HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED : HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED;
+            result.global_flags = allocation->globalFlags ? allocation->globalFlags :
+                (allocation->connection ? HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED : HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED);
             result.registered = bool(allocation->connection);
             if (allocation->shared.host)
-                for (const auto &agent : agents) if (!agent.connection) { hostAccess = agent.handle; break; }
+                for (const auto &agent : agents)
+                    if (agent.handle.handle != allocation->owner.handle && accessibleAgent(agent.handle, allocation)) {
+                        otherAccess = agent.handle; break;
+                    }
         } else known = describeHostLock(pointer, result);
     }
     // The caller's allocator may reenter HSA. Do not call it under runtimeMutex.
     if (accessible) *accessible = nullptr;
-    const uint32_t agentCount = known ? 1 + bool(hostAccess.handle) : 0;
+    const uint32_t agentCount = known ? 1 + bool(otherAccess.handle) : 0;
     if (count) *count = agentCount;
     if (known && alloc && count && accessible) {
         auto array = static_cast<hsa_agent_t *>(alloc(sizeof(hsa_agent_t) * agentCount));
         if (!array) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
         *array = result.agentOwner;
-        if (hostAccess.handle) array[1] = hostAccess;
+        if (otherAccess.handle) array[1] = otherAccess;
         *accessible = array;
     }
     std::memcpy(info, &result, result.size);

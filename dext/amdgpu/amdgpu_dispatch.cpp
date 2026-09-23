@@ -16,10 +16,9 @@ kern_return_t compute_launch(DeviceContext &dev, GMCContext &gmc, CPContext &cp,
         return kIOReturnNotReady;
     const auto v = dev.ip.version[static_cast<int>(IPBlock::GC)];
     if (v.major != 12 || v.minor != 0 || v.rev != 1) return kIOReturnUnsupported;
-    if (!gfx.num_active_cus || gfx.max_shader_engines != 4 || gfx.max_sh_per_se != 1)
-        return kIOReturnNotReady;
     uint32_t masks[4]{};
-    for (unsigned i = 0; i < 4; ++i) masks[i] = gfx.active_cu_bitmap[i][0];
+    if (!gfx12_compute_masks(gfx.max_shader_engines,gfx.max_sh_per_se,gfx.num_active_cus,
+        gfx.active_cu_bitmap,masks)) return kIOReturnNotReady;
     uint32_t packets[kComputeSmokePacketCapacity]{};
     const uint32_t count = compute_dispatch_packets(packets, codeVA, request, masks);
     if (!count) return kIOReturnBadArgument;

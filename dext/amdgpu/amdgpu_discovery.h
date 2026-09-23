@@ -112,6 +112,7 @@ constexpr uint32_t kDiscoveryIPDSSignature   = 0x53445049u;  // 'IPDS'
 namespace HWID {
     constexpr uint16_t MP1     = 1;
     constexpr uint16_t GC      = 11;
+    constexpr uint16_t SMUIO   = 4;
     constexpr uint16_t MMHUB   = 34;   // GMC's hub
     constexpr uint16_t OSSSYS  = 40;
     constexpr uint16_t HDP     = 41;

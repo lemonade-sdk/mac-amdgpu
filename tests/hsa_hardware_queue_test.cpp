@@ -110,6 +110,11 @@ int main() {
     assert(hsa_queue_create(gpu,64,HSA_QUEUE_TYPE_MULTI,[](hsa_status_t status,hsa_queue_t *,void *) {
         assert(status==HSA_STATUS_ERROR);uint64_t now;assert(hsa_system_get_info(HSA_SYSTEM_INFO_TIMESTAMP,&now)==0);++callbacks;
     },nullptr,UINT32_MAX,UINT32_MAX,&queue)==0 && queue);
+    const auto propertiesBefore=reinterpret_cast<amd_queue_t *>(queue)->queue_properties;
+    assert(hsa_amd_profiling_set_profiler_enabled(queue,1)==HSA_STATUS_ERROR);
+    assert(reinterpret_cast<amd_queue_t *>(queue)->queue_properties==propertiesBefore);
+    assert(hsa_amd_profiling_set_profiler_enabled(queue,0)==HSA_STATUS_SUCCESS);
+    assert(reinterpret_cast<amd_queue_t *>(queue)->queue_properties==propertiesBefore);
     hsa_agent_t queueAgent{};
     assert(hsa_amd_queue_get_info(queue,HSA_AMD_QUEUE_INFO_AGENT,&queueAgent)==0 && queueAgent.handle==gpu.handle);
     uint64_t doorbellID=0xabcdef;

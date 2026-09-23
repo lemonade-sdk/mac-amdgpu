@@ -1,5 +1,8 @@
 #include "runtime_state.h"
 #include <hsa/amd_hsa_queue.h>
+#include <chrono>
+#include <condition_variable>
+#include <system_error>
 
 namespace mac_hsa::detail {
 struct RuntimeQueue {
@@ -13,6 +16,59 @@ struct RuntimeQueue {
     void (*errorCallback)(hsa_status_t,hsa_queue_t *,void *)=nullptr;
     void *errorData=nullptr;
     bool errorDelivered=false;
+    struct ServiceState {
+        std::atomic<bool> stop{false};
+        std::mutex waitMutex;
+        std::condition_variable changed;
+    };
+    std::shared_ptr<ServiceState> serviceState;
+    std::mutex serviceThreadMutex;
+    std::thread serviceThread;
+    void stopService() {
+        if (serviceState) {serviceState->stop=true;serviceState->changed.notify_all();}
+        std::thread retired;
+        {
+            std::lock_guard lock(serviceThreadMutex);
+            retired=std::move(serviceThread);
+        }
+        if (retired.joinable()) {
+            if (retired.get_id()==std::this_thread::get_id()) retired.detach();
+            else retired.join();
+        }
+    }
+    void service() {
+        hsa_status_t status=HSA_STATUS_SUCCESS;
+        bool notify=false;
+        {
+            std::lock_guard lock(mutex);
+            if (!active || !hardwareHandle || errorDelivered) return;
+            uint64_t inactive=0;
+            status=connection->serviceQueue(hardwareHandle,inactive);
+            if (status!=HSA_STATUS_SUCCESS) {errorDelivered=true;notify=true;}
+        }
+        // Callbacks may query or destroy this queue; never hold its mutex here.
+        if (notify) {
+            if (serviceState) serviceState->stop=true;
+            invalidateGPUSignals(connection);
+            if (errorCallback) errorCallback(status,&abi->hsa_queue,errorData);
+        }
+    }
+    void startService(const std::shared_ptr<RuntimeQueue> &self) {
+        serviceState=std::make_shared<ServiceState>();
+        const std::weak_ptr<RuntimeQueue> weak=self;
+        std::lock_guard publication(serviceThreadMutex);
+        serviceThread=std::thread([weak,state=serviceState] {
+            while (!state->stop.load()) {
+                {
+                    auto queue=weak.lock();
+                    if (!queue) break;
+                    queue->service();
+                }
+                std::unique_lock lock(state->waitMutex);
+                state->changed.wait_for(lock,std::chrono::milliseconds(1),[&] {return state->stop.load();});
+            }
+        });
+    }
     hsa_status_t inactivate() {
         std::lock_guard lock(mutex);
         if (!active) return HSA_STATUS_SUCCESS;
@@ -21,7 +77,9 @@ struct RuntimeQueue {
             if (status!=HSA_STATUS_SUCCESS) return status;
             hardwareHandle=0;
         }
-        active=false;return HSA_STATUS_SUCCESS;
+        active=false;
+        if (serviceState) {serviceState->stop=true;serviceState->changed.notify_all();}
+        return HSA_STATUS_SUCCESS;
     }
     void ringDoorbell(int64_t value) {
         bool notify=false;
@@ -37,6 +95,7 @@ struct RuntimeQueue {
     std::shared_ptr<Signal> doorbell;
     bool active = true;
     ~RuntimeQueue() {
+        stopService();
         if (connection) {
             if (inactivate()!=HSA_STATUS_SUCCESS) return; // driver retains backing until reset
             if (ring.host) connection->freeSharedBuffer(ring);
@@ -60,6 +119,9 @@ RetiredQueueSet clearQueues() {
     RetiredQueueSet retired;
     retired.swap(queues);return retired;
 }
+void stopQueueServices(RetiredQueueSet &retired) {
+    for (auto &[pointer,queue]:retired) {(void)pointer;queue->stopService();}
+}
 
 } // namespace mac_hsa::detail
 using namespace mac_hsa::detail;
@@ -81,7 +143,7 @@ hsa_status_t hsa_queue_create(hsa_agent_t agent,uint32_t size,hsa_queue_type32_t
         if (!size || (size&(size-1)) || (type!=HSA_QUEUE_TYPE_SINGLE && type!=HSA_QUEUE_TYPE_MULTI))
             return HSA_STATUS_ERROR_INVALID_ARGUMENT;
         if (!found->connection || size<64 || size>4096 ||
-            (privateBytes && privateBytes!=UINT32_MAX) || (groupBytes && groupBytes!=UINT32_MAX))
+            (privateBytes>262128 && privateBytes!=UINT32_MAX) || (groupBytes>65536 && groupBytes!=UINT32_MAX))
             return HSA_STATUS_ERROR_INVALID_QUEUE_CREATION;
         if (lastHandle==UINT64_MAX) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
         connection=found->connection;id=++lastHandle;
@@ -90,6 +152,9 @@ hsa_status_t hsa_queue_create(hsa_agent_t agent,uint32_t size,hsa_queue_type32_t
     auto status=connection->read(info);
     if (status!=HSA_STATUS_SUCCESS) return status;
     if (!mac_hsa::supportsPersistentQueues(info)) return HSA_STATUS_ERROR_INVALID_QUEUE_CREATION;
+    if (info.build<mac_hsa::kQueueResourceDriverBuild &&
+        ((privateBytes && privateBytes!=UINT32_MAX) || (groupBytes && groupBytes!=UINT32_MAX)))
+        return HSA_STATUS_ERROR_INVALID_QUEUE_CREATION;
     try {
         auto queue=std::make_shared<RuntimeQueue>();
         queue->connection=connection;queue->agent=agent;queue->errorCallback=callback;queue->errorData=data;
@@ -108,6 +173,7 @@ hsa_status_t hsa_queue_create(hsa_agent_t agent,uint32_t size,hsa_queue_type32_t
         q.hsa_queue.type=type;q.hsa_queue.features=HSA_QUEUE_FEATURE_KERNEL_DISPATCH;
         q.hsa_queue.base_address=queue->ring.host;q.hsa_queue.size=size;q.hsa_queue.id=id;
         q.queue_properties=AMD_QUEUE_PROPERTIES_IS_PTR64;
+        q.scratch_wave64_lane_byte_size=privateBytes==UINT32_MAX ? 0 : privateBytes;
         q.read_dispatch_id_field_base_byte_offset=offsetof(amd_queue_t,read_dispatch_id);
         auto *packets=static_cast<uint16_t *>(queue->ring.host);
         for (uint32_t i=0;i<size;++i) packets[size_t(i)*32]=HSA_PACKET_TYPE_INVALID;
@@ -125,8 +191,16 @@ hsa_status_t hsa_queue_create(hsa_agent_t agent,uint32_t size,hsa_queue_type32_t
             try {queues.emplace(pointer,queue);}
             catch (...) {signals.erase(q.hsa_queue.doorbell_signal.handle);throw;}
         }
+        if (info.build>=mac_hsa::kQueueResourceDriverBuild) {
+            try {queue->startService(queue);}
+            catch (...) {
+                std::lock_guard lock(runtimeMutex);
+                queues.erase(pointer);signals.erase(q.hsa_queue.doorbell_signal.handle);throw;
+            }
+        }
         *out=pointer;return HSA_STATUS_SUCCESS;
     } catch (const std::bad_alloc &) {return HSA_STATUS_ERROR_OUT_OF_RESOURCES;}
+      catch (const std::system_error &) {return HSA_STATUS_ERROR_OUT_OF_RESOURCES;}
 }
 HSA_API_EXPORT hsa_status_t hsa_amd_profiling_set_profiler_enabled(hsa_queue_t *pointer, int enable) {
     std::lock_guard lock(runtimeMutex);
@@ -134,6 +208,10 @@ HSA_API_EXPORT hsa_status_t hsa_amd_profiling_set_profiler_enabled(hsa_queue_t *
     if (!pointer || (enable != 0 && enable != 1)) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
     const auto queue = queues.find(pointer);
     if (queue == queues.end()) return HSA_STATUS_ERROR_INVALID_QUEUE;
+    // CP caches these properties when mapping a hardware queue. Enabling
+    // profiling requires a synchronized suspend/resume, as in ROCr SetProfiling.
+    // Until that refresh exists, do not promise timestamps from a host-only bit.
+    if (enable && queue->second->connection) return HSA_STATUS_ERROR;
     auto properties = std::atomic_ref<uint32_t>(queue->second->abi->queue_properties);
     constexpr uint32_t mask = AMD_QUEUE_PROPERTIES_ENABLE_PROFILING;
     if (enable) properties.fetch_or(mask, std::memory_order_release);
@@ -220,6 +298,7 @@ hsa_status_t hsa_queue_destroy(hsa_queue_t *pointer) {
             signals.erase(queue->abi->hsa_queue.doorbell_signal.handle);
         }
     }
+    queue->stopService();
     return HSA_STATUS_SUCCESS;
 }
 hsa_status_t hsa_queue_inactivate(hsa_queue_t *pointer) {

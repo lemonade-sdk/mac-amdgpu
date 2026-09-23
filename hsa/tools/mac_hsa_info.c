@@ -1,8 +1,11 @@
 #include "mac_hsa.h"
+#include <hsa/hsa_ext_amd.h>
 #include <inttypes.h>
 #include <stdio.h>
+#include <string.h>
 
 static unsigned gpu_count;
+static int hardware_properties;
 static hsa_status_t inspect(hsa_agent_t agent, void *unused) {
     (void)unused;
     char name[64];
@@ -34,11 +37,36 @@ static hsa_status_t inspect(hsa_agent_t agent, void *unused) {
         status = hsa_agent_get_info(agent, HSA_AGENT_INFO_QUEUE_MAX_SIZE, &max_size);
         if (status != HSA_STATUS_SUCCESS) return status;
         printf("  HSA queues=%u device-wide; ring=%u..%u packets\n", queues, min_size, max_size);
+        if (hardware_properties) {
+            uint32_t cus, waves, wavefront, bdf;
+            uint64_t frequency;
+            status=hsa_agent_get_info(agent,(hsa_agent_info_t)HSA_AMD_AGENT_INFO_COMPUTE_UNIT_COUNT,&cus);
+            if (status!=HSA_STATUS_SUCCESS) return status;
+            status=hsa_agent_get_info(agent,(hsa_agent_info_t)HSA_AMD_AGENT_INFO_MAX_WAVES_PER_CU,&waves);
+            if (status!=HSA_STATUS_SUCCESS) return status;
+            status=hsa_agent_get_info(agent,HSA_AGENT_INFO_WAVEFRONT_SIZE,&wavefront);
+            if (status!=HSA_STATUS_SUCCESS) return status;
+            status=hsa_agent_get_info(agent,(hsa_agent_info_t)HSA_AMD_AGENT_INFO_BDFID,&bdf);
+            if (status!=HSA_STATUS_SUCCESS) return status;
+            printf("  initialized hardware: CUs=%u waves/CU=%u wavefront=%u PCI=%02x:%02x.%u\n",
+                   cus,waves,wavefront,(bdf>>8)&255,(bdf>>3)&31,bdf&7);
+            status=hsa_agent_get_info(agent,(hsa_agent_info_t)HSA_AMD_AGENT_INFO_TIMESTAMP_FREQUENCY,&frequency);
+            if (status!=HSA_STATUS_SUCCESS) {
+                fprintf(stderr,"GPU timestamp frequency unavailable; ATOM ROM clock query failed\n");
+                return status;
+            }
+            printf("  GPU timestamp=%" PRIu64 " Hz\n",frequency);
+        }
     }
     return HSA_STATUS_SUCCESS;
 }
 
-int main(void) {
+int main(int argc,char **argv) {
+    if (argc==2 && !strcmp(argv[1],"--hardware-properties")) hardware_properties=1;
+    else if (argc!=1) {
+        fprintf(stderr,"Usage: %s [--hardware-properties]\nThe optional flag initializes a GPU session.\n",argv[0]);
+        return 2;
+    }
     const hsa_status_t init = hsa_init();
     if (init != HSA_STATUS_SUCCESS) {
         fprintf(stderr, "HSA observer initialization failed: 0x%x\n", init);
@@ -50,7 +78,7 @@ int main(void) {
         fprintf(stderr, "HSA discovery failed: 0x%x (shutdown 0x%x)\n", status, shutdown);
         return 1;
     }
-    printf("Discovered %u MacAMDGPU device(s). Discovery only; no GPU work submitted.\n",
-           gpu_count);
+    printf("Discovered %u MacAMDGPU device(s). %s\n",gpu_count,hardware_properties ?
+           "Hardware properties checked; session released." : "Discovery only; no GPU work submitted.");
     return 0;
 }

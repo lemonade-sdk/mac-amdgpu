@@ -42,6 +42,52 @@ uint16_t compute_checksum(const uint8_t *p, uint32_t size) {
     return sum;
 }
 
+// Linux amdgpu_discovery_get_gfx_info(), GC v1.0-1.3 / v2.0-2.1.
+// Both versions share their wave/resource word positions; v1 describes WGPs
+// and puts shader arrays at word16, whereas v2 gives CU/SH dimensions directly.
+bool parse_gc_info(const uint8_t *binary, uint32_t declaredSize,
+                   const DiscoveryTableInfo &info, GCDiscoveryInfo &out) {
+    out = {};
+    if (!info.offset) return true; // old discovery may omit GC_INFO
+    if (info.offset < sizeof(DiscoveryBinaryHeader) ||
+        info.offset > declaredSize || declaredSize - info.offset < 12) return false;
+    const auto *table = binary + info.offset;
+    const auto u16 = [&](uint32_t offset) {
+        return uint32_t(table[offset]) | (uint32_t(table[offset+1]) << 8);
+    };
+    const auto u32 = [&](uint32_t offset) {
+        return u16(offset) | (u16(offset+2) << 16);
+    };
+    if (u32(0) != 0x4347) return false;
+    const auto major = u16(4), minor = u16(6), size = u32(8);
+    constexpr uint32_t v1Size[] = {88,100,132,164};
+    constexpr uint32_t v2Size[] = {80,108};
+    const auto required = major == 1 && minor < 4 ? v1Size[minor] :
+                          major == 2 && minor < 2 ? v2Size[minor] : 0;
+    if (!required || size < required || size > declaredSize - info.offset ||
+        compute_checksum(table,size) != info.checksum) return false;
+    const auto word = [&](uint32_t index) {return u32(12 + index * 4);};
+    GCDiscoveryInfo result;
+    result.max_shader_engines = word(0);
+    const uint64_t cu = major == 1 ? 2ull * (uint64_t(word(1)) + word(2)) : word(1);
+    if (!cu || cu > 64) return false;
+    result.max_cu_per_sh = uint32_t(cu);
+    result.max_sh_per_se = word(major == 1 ? 16 : 2);
+    result.max_backends_per_se = word(3);
+    result.wave_front_size = word(11);
+    result.max_waves_per_simd = word(12);
+    result.max_scratch_slots_per_cu = word(13);
+    result.lds_size_kib = word(14);
+    if (!result.max_shader_engines || result.max_shader_engines > 32 ||
+        !result.max_sh_per_se || result.max_sh_per_se > 4 ||
+        !result.max_backends_per_se || result.max_backends_per_se > 32 ||
+        (result.wave_front_size != 32 && result.wave_front_size != 64) ||
+        !result.max_waves_per_simd || result.max_waves_per_simd > 64 ||
+        !result.max_scratch_slots_per_cu || result.max_scratch_slots_per_cu > 256 ||
+        !result.lds_size_kib || result.lds_size_kib > 1024) return false;
+    result.valid = true;out = result;return true;
+}
+
 // Map an HW_ID from the binary to our IPBlock enum. Returns IPBlock::Count
 // if we don't track this HW block.
 IPBlock hwid_to_block(uint16_t hwid) {
@@ -55,6 +101,7 @@ IPBlock hwid_to_block(uint16_t hwid) {
     case HWID::SDMA0:  return IPBlock::SDMA0;
     case HWID::SDMA1:  return IPBlock::SDMA1;
     case HWID::NBIF:   return IPBlock::NBIO;
+    case HWID::SMUIO:  return IPBlock::SMUIO;
     default:           return IPBlock::Count;
     }
 }
@@ -70,6 +117,7 @@ const char *block_name(IPBlock b) {
     case IPBlock::SDMA0:  return "SDMA0";
     case IPBlock::SDMA1:  return "SDMA1";
     case IPBlock::NBIO:   return "NBIO";
+    case IPBlock::SMUIO:  return "SMUIO";
     case IPBlock::MMHUB:  return "MMHUB";
     default:              return "?";
     }
@@ -236,6 +284,10 @@ discovery_parse(const uint8_t *binary, uint64_t binarySize,
         }
     }
 
+    if (!parse_gc_info(binary,declaredSize,hdr->table_list[1],parsed.gfx)) {
+        fail(outResult,"invalid GC_INFO header, bounds, checksum or geometry");
+        return kIOReturnInvalid;
+    }
     dev.ip = parsed;
     if (outResult) {
         outResult->ok            = true;

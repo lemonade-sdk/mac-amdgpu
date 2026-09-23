@@ -13,7 +13,7 @@ template<class T> static void set(std::vector<uint8_t> &bytes, size_t offset, T 
     assert(offset + sizeof(T) <= bytes.size()); std::memcpy(bytes.data() + offset, &value, sizeof(value));
 }
 int main(int argc, char **argv) {
-    assert(argc == 2);
+    assert(argc >= 2 && argc <= 4);
     std::ifstream stream(argv[1], std::ios::binary);
     const std::vector<uint8_t> file{std::istreambuf_iterator<char>(stream), {}};
     assert(file.size() > 64);
@@ -69,5 +69,45 @@ int main(int argc, char **argv) {
     assert(!mac_hsa::relocateCodeObject(reloc, 1));
     reloc.relocations = {{0, 0, -2, 13, false}};
     assert(!mac_hsa::relocateCodeObject(reloc, 1));
+    reloc.image.assign(24,0xa5);
+    reloc.relocations={{0,0x1234567801234567ull,0,1,true},{4,0x1234567801234567ull,0,2,true},
+        {8,0x100,1,6,true}};
+    assert(mac_hsa::relocateCodeObject(reloc,0x8000000000));
+    assert(get<uint32_t>(reloc.image,0)==0x01234567 && get<uint32_t>(reloc.image,4)==0x12345678);
+    assert(get<uint32_t>(reloc.image,8)==0x101 && get<uint32_t>(reloc.image,12)==0xa5a5a5a5);
+    const auto unchanged=reloc.image;
+    reloc.relocations={{0,0,0,13,false},{8,UINT32_MAX,1,6,true}};
+    assert(!mac_hsa::relocateCodeObject(reloc,0x8000000000) && reloc.image==unchanged);
+    reloc.relocations={{21,0,0,1,true}};
+    assert(!mac_hsa::relocateCodeObject(reloc,1));
+    if (argc>=3) {
+        std::ifstream resources(argv[2],std::ios::binary);
+        const std::vector<uint8_t> resourceFile{std::istreambuf_iterator<char>(resources),{}};
+        mac_hsa::CodeObject parsed;
+        assert(mac_hsa::parseCodeObject(resourceFile,parsed) && parsed.kernels.size()==1);
+        const auto &resource=parsed.kernels[0];
+        assert(resource.name=="scratch_lds" && resource.groupSize==128 && resource.privateSize>=256);
+        assert(resource.kernargSize==12 && !resource.dynamicStack);
+        assert(mac_hsa::relocateCodeObject(parsed,0x8100000000));
+    }
+    if (argc==4) {
+        std::ifstream helpers(argv[3],std::ios::binary);
+        const std::vector<uint8_t> helperFile{std::istreambuf_iterator<char>(helpers),{}};
+        mac_hsa::CodeObject parsed;
+        assert(mac_hsa::parseCodeObject(helperFile,parsed) && parsed.kernels.size()>=17);
+        bool copy=false,fill=false,timestamp=false;
+        for (const auto &helper:parsed.kernels) {
+            copy|=helper.name=="iree_hal_amdgpu_device_buffer_copy_x1";
+            fill|=helper.name=="iree_hal_amdgpu_device_buffer_fill_x1";
+            timestamp|=helper.name=="iree_hal_amdgpu_device_timestamp_capture_queue_tick";
+        }
+        assert(copy && fill && timestamp && mac_hsa::relocateCodeObject(parsed,0x8100000000));
+        for (uint32_t flags:{0x59u,0x2000059u,0x1000058u}) {
+            auto invalid=helperFile;set(invalid,48,flags);
+            assert(!mac_hsa::parseCodeObject(invalid,parsed));
+        }
+        auto invalid=helperFile;invalid[8]=3;
+        assert(!mac_hsa::parseCodeObject(invalid,parsed));
+    }
     puts("HSA: compiler-produced linked ELF metadata, descriptors, load ranges, relocations, truncations and mutation checks pass");
 }

@@ -9,23 +9,23 @@
 - Bounded hardware AQL dispatch: kernels passed in VRAM and shared host memory, with firmware-acknowledged queue removal and recreation between launches.
 - Persistent HSA compute queues: all seven slots, ring wraparound, four CPU producers, shared completion/barrier signals and two processes sharing the GPU passed hardware tests. One process can exit while the other continues on its existing queues.
 - Coarse shared allocations with identical CPU/GPU addresses. CPU access is allowed between completed GPU operations.
-- GPU-backed HSA signal operations: stores, arithmetic, bitwise operations, exchange, compare-and-swap and waits passed hardware checks. CPU HSA updates execute GPU atomics; direct CPU/GPU atomic RMW interoperability remains unsupported.
+- GPU-backed HSA signal operations: stores, arithmetic, bitwise operations, exchange, compare-and-swap and waits passed hardware checks. CPU HSA updates execute GPU atomics; earlier native CPU/GPU contention tests lost updates, so that interoperability is not advertised.
 - HSA host services, CPU signals and software queues. All 119 entry points required by LSE’s pinned HRX resolve; the [behavior status](hsa/API_STATUS.md) explains their limits.
 - [amdgpu_mtop](amdgpu_mtop/README.md) device enumeration, GPU selection, capacity queries and JSON output.
 - Stop/Restart GPU through transaction draining and verified reset; recovery still depends on a responsive device and link.
 
 ## Not working yet
 
-- General fine-grained shared memory and GPU-accessible HSA memory pools.
+- General fine-grained CPU/GPU atomic interoperability. GPU-accessible coarse/kernarg HSA pools are implemented and software-tested; their public hardware path awaits validation.
 - HRX/LSE model inference. No end-to-end AI workload has run.
-- General executable linking, scratch/LDS kernel support and the full HSA feature set. Some platform-specific APIs explicitly return unsupported errors.
+- Full HSA conformance and general executable linking. Scratch/LDS resource handling and gfx12-generic HRX helper loading are implemented and software-tested, pending the new hardware checks. Hardware profiling and some platform-specific APIs explicitly return errors.
 - Live firmware telemetry in amdgpu_mtop: usage, clocks, temperature and power need a verified firmware metrics layout.
 - Larger PCIe BAR allocation through a public Apple API, and Mesa/Vulkan integration.
 
 ## Upcoming
 
-- Integrate shared allocations with HSA pools, using the verified [queues and shared signals](docs/HSA_QUEUE_VALIDATION.md).
-- Complete HRX memory and kernel-resource integration and verify a real inference workload with LSE.
+- Run the [combined HRX validation suite](docs/HRX_MACOS_VALIDATION.md): public pools, discovered topology, scratch/LDS, real HRX operations and native CPU/GPU addition/CAS contention.
+- Validate the native LSE/HRX/Loom build on the GPU, then verify a real model inference workload.
 - Finish the firmware telemetry path for amdgpu_mtop.
 
 Detailed changes and hardware results are in [PROGRESS.md](PROGRESS.md).

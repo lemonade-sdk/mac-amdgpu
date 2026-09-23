@@ -94,6 +94,15 @@ struct SignalSlot {
     ~SignalSlot() {std::lock_guard lock(context->slotsMutex);context->signals[index].reset();context->used[index]=false;}
 };
 }
+void invalidateGPUSignals(const std::shared_ptr<Connection> &connection) {
+    std::shared_ptr<GPUSignalContext> context;
+    {
+        std::lock_guard lock(contextsMutex);
+        const auto found=contexts.find(connection.get());
+        if (found!=contexts.end()) context=found->second.lock();
+    }
+    if (context) context->fail();
+}
 hsa_status_t createGPUSignalBacking(const std::shared_ptr<Connection> &connection,int64_t initial,const std::shared_ptr<Signal> &signal) {
     std::shared_ptr<GPUSignalContext> context;
     {

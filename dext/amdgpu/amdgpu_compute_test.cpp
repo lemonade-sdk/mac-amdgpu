@@ -25,10 +25,9 @@ kern_return_t compute_test(DeviceContext &dev, GMCContext &gmc, CPContext &cp,
     const auto version = dev.ip.version[static_cast<int>(IPBlock::GC)];
     if (version.major != 12 || version.minor != 0 || version.rev != 1)
         return kIOReturnUnsupported;
-    if (!gfx.num_active_cus || gfx.max_shader_engines != 4 || gfx.max_sh_per_se != 1)
-        return kIOReturnNotReady;
     uint32_t masks[4]{};
-    for (uint32_t i = 0; i < 4; ++i) masks[i] = gfx.active_cu_bitmap[i][0];
+    if (!gfx12_compute_masks(gfx.max_shader_engines,gfx.max_sh_per_se,gfx.num_active_cus,
+        gfx.active_cu_bitmap,masks)) return kIOReturnNotReady;
     // One allocation keeps code, input, output and guards alive together.
     // On any started-test failure, only reset/session destruction releases it.
     result.stage = 1;

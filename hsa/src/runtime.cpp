@@ -3,6 +3,7 @@
 #include "signal_state.h"
 #include <hsa/hsa_ext_amd.h>
 #include <chrono>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -88,7 +89,7 @@ hsa_status_t hsa_init() {
         std::vector<std::shared_ptr<mac_hsa::Connection>> connections;
         const auto status = mac_hsa::discover(connections);
         if (status != HSA_STATUS_SUCCESS) return status;
-        if (lastHandle >= UINT64_MAX - 2 || connections.size() > (UINT64_MAX - lastHandle - 2) / 2)
+        if (lastHandle >= UINT64_MAX - 2 || connections.size() > (UINT64_MAX - lastHandle - 2) / 3)
             return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
         std::vector<Agent> fresh;
         fresh.reserve(connections.size() + 1);
@@ -101,8 +102,11 @@ hsa_status_t hsa_init() {
             return HSA_STATUS_ERROR;
         std::vector<Pool> freshPools{{++lastHandle, fresh.front().handle, size_t(capacity), nullptr}};
         for (const auto &agent : fresh)
-            if (agent.connection && agent.connection->supportsBuffers())
+            if (agent.connection && agent.connection->supportsBuffers()) {
                 freshPools.push_back({++lastHandle, agent.handle, 0, agent.connection});
+                if (agent.connection->supportsSharedBuffers())
+                    freshPools.push_back({++lastHandle, fresh.front().handle, 0, agent.connection, true});
+            }
         pools.swap(freshPools);
         agents.swap(fresh);
         references = 1;
@@ -113,7 +117,7 @@ hsa_status_t hsa_init() {
 }
 
 hsa_status_t hsa_shut_down() {
-    std::lock_guard lifecycle(executableLifecycleMutex);
+    std::unique_lock lifecycle(executableLifecycleMutex);
     std::vector<Agent> retiredAgents;
     RetiredQueueSet retiredQueues;
     std::unordered_map<uint64_t,std::shared_ptr<mac_hsa::Signal>> retiredSignals;
@@ -148,6 +152,8 @@ hsa_status_t hsa_shut_down() {
     }
     // Joining workers or closing a future owning connection must never run
     // under the global lock. Jobs retain every runtime-owned buffer they use.
+    lifecycle.unlock();
+    stopQueueServices(retiredQueues);
     retiredJobs.clear();
     retiredQueues.clear();
     retiredSignals.clear();
@@ -182,7 +188,15 @@ hsa_status_t hsa_agent_get_info(hsa_agent_t handle, hsa_agent_info_t attribute, 
         const auto status = agent->connection->read(snapshot);
         if (status != HSA_STATUS_SUCCESS) return status;
     }
-    switch (attribute) {
+    const uint32_t ordinal=uint32_t(agent-agents.data());
+    const auto property=[&](auto member)->hsa_status_t {
+        if (!agent->connection) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        mac_hsa::DeviceProperties properties{};
+        const auto status=agent->connection->properties(properties);
+        if (status!=HSA_STATUS_SUCCESS) return status;
+        return writeValue(value,properties.*member);
+    };
+    switch (uint32_t(attribute)) {
     case HSA_AGENT_INFO_NAME:
         std::memset(value, 0, 64);
         if (agent->connection)
@@ -196,6 +210,43 @@ hsa_status_t hsa_agent_get_info(hsa_agent_t handle, hsa_agent_info_t attribute, 
         return HSA_STATUS_SUCCESS;
     case HSA_AGENT_INFO_DEVICE:
         return writeValue(value, agent->connection ? HSA_DEVICE_TYPE_GPU : HSA_DEVICE_TYPE_CPU);
+    case HSA_AGENT_INFO_NODE:
+    case HSA_AMD_AGENT_INFO_DRIVER_UID:
+        return writeValue(value,ordinal);
+    case HSA_AMD_AGENT_INFO_NEAREST_CPU:
+        return writeValue(value,agents.front().handle);
+    case HSA_AMD_AGENT_INFO_UUID:
+        // Registry IDs are session identities, not persistent hardware UUIDs.
+        std::strcpy(static_cast<char *>(value),agent->connection ? "GPU-XX" : "CPU-XX");
+        return HSA_STATUS_SUCCESS;
+    case HSA_AMD_AGENT_INFO_CHIP_ID: return property(&mac_hsa::DeviceProperties::chipID);
+    case HSA_AMD_AGENT_INFO_ASIC_REVISION: return property(&mac_hsa::DeviceProperties::revision);
+    case HSA_AMD_AGENT_INFO_BDFID: return property(&mac_hsa::DeviceProperties::bdf);
+    case HSA_AMD_AGENT_INFO_DOMAIN: return property(&mac_hsa::DeviceProperties::domain);
+    case HSA_AMD_AGENT_INFO_COMPUTE_UNIT_COUNT: return property(&mac_hsa::DeviceProperties::computeUnits);
+    case HSA_AMD_AGENT_INFO_MAX_WAVES_PER_CU: return property(&mac_hsa::DeviceProperties::maxWavesPerCU);
+    case HSA_AGENT_INFO_WAVEFRONT_SIZE: return property(&mac_hsa::DeviceProperties::wavefrontSize);
+    case HSA_AMD_AGENT_INFO_NUM_SHADER_ENGINES: return property(&mac_hsa::DeviceProperties::shaderEngines);
+    case HSA_AMD_AGENT_INFO_NUM_SHADER_ARRAYS_PER_SE: return property(&mac_hsa::DeviceProperties::arraysPerEngine);
+    case HSA_AMD_AGENT_INFO_TIMESTAMP_FREQUENCY: {
+        if (!agent->connection) return writeValue(value,uint64_t(1000000000));
+        mac_hsa::DeviceProperties properties{};
+        const auto status=agent->connection->properties(properties);
+        if (status!=HSA_STATUS_SUCCESS) return status;
+        if (!properties.timestampFrequency) return HSA_STATUS_ERROR;
+        return writeValue(value,properties.timestampFrequency);
+    }
+    case HSA_AMD_AGENT_INFO_COOPERATIVE_QUEUES:
+    case HSA_AMD_AGENT_INFO_SVM_DIRECT_HOST_ACCESS:
+        return writeValue(value,false);
+    case HSA_AGENT_INFO_DEFAULT_FLOAT_ROUNDING_MODE:
+        return writeValue(value,HSA_DEFAULT_FLOAT_ROUNDING_MODE_NEAR);
+    case HSA_AGENT_INFO_WORKGROUP_MAX_DIM:
+        return writeValue(value,std::array<uint16_t,3>{1024,1024,1024});
+    case HSA_AGENT_INFO_WORKGROUP_MAX_SIZE: return writeValue(value,uint32_t(1024));
+    case HSA_AGENT_INFO_GRID_MAX_DIM: return writeValue(value,hsa_dim3_t{UINT32_MAX,UINT32_MAX,UINT32_MAX});
+    case HSA_AGENT_INFO_GRID_MAX_SIZE: return writeValue(value,uint64_t(UINT64_MAX));
+    case HSA_AGENT_INFO_FBARRIER_MAX_SIZE: return writeValue(value,uint32_t(32));
     case HSA_AGENT_INFO_FEATURE:
         return writeValue(value, uint32_t(mac_hsa::supportsPersistentQueues(snapshot) ?
             HSA_AGENT_FEATURE_KERNEL_DISPATCH : 0));

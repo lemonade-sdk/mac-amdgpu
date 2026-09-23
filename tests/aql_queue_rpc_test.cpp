@@ -6,6 +6,7 @@ using kern_return_t=int;
 constexpr int kIOReturnSuccess=0,kIOReturnBadArgument=1,kIOReturnNotReady=2,kIOReturnBusy=3,kIOReturnNoResources=4,kIOReturnTimeout=5;
 constexpr uint32_t kBODomainGTT=2;
 constexpr unsigned kMacAMDGPUMethodAQLQueueCreate=56,kMacAMDGPUMethodAQLQueueKick=57,kMacAMDGPUMethodAQLQueueDestroy=58;
+constexpr unsigned kMacAMDGPUMethodAQLQueueService=59;
 #define MACAMDGPU_LOG(...) ((void)0)
 namespace amdgpu {
 constexpr unsigned kPersistentAQLQueues=7;
@@ -13,7 +14,11 @@ enum class BringupStage {None,SDMAInit};
 struct PersistentAQLQueue {
     void *owner=nullptr;uint64_t handle=0,ringHandle=0,metadataHandle=0;bool retained=false;
 };
-unsigned opened=0,kicked=0,closed=0;int failure=0;bool retainFailure=false;
+unsigned opened=0,kicked=0,closed=0,serviced=0;int failure=0;bool retainFailure=false;
+uint64_t inactiveValue=0;
+int aql_queue_service(int,int,int,PersistentAQLQueue &,const void *ring,uint64_t &inactive) {
+    assert(ring);++serviced;inactive=inactiveValue;return failure;
+}
 int aql_queue_open(int,int,int,int,PersistentAQLQueue &q,uint64_t ring,uint64_t metadata,void *cpu,uint32_t packets,unsigned slot) {
     assert(ring && metadata && cpu && packets==64 && slot>=1 && slot<=7);++opened;
     q.retained=retainFailure;return failure;
@@ -64,6 +69,16 @@ int main() {
     assert(action(second,57,1)==kIOReturnBadArgument && !amdgpu::kicked);
     assert(action(second,58,1)==kIOReturnBadArgument && !amdgpu::closed);
     assert(action(first,57,1)==0 && !out[0] && amdgpu::kicked==1);
+    in[0]=1;args.scalarInputCount=1;args.scalarOutputCount=2;
+    assert(call(&driver,&second,59,&args)==kIOReturnBadArgument && !amdgpu::serviced);
+    assert(call(&driver,&first,59,&args)==0 && !out[0] && !out[1] && amdgpu::serviced==1);
+    amdgpu::inactiveValue=8;amdgpu::failure=kIOReturnNoResources;
+    assert(call(&driver,&first,59,&args)==0 && out[0]==kIOReturnNoResources && out[1]==8);
+    assert(!state.shutdownBlocked && state.bringup.aqlQueues[0].owner==&first);
+    amdgpu::inactiveValue=0;amdgpu::failure=0;
+    args.scalarOutputCount=1;assert(call(&driver,&first,59,&args)==kIOReturnBadArgument);
+    args.scalarOutputCount=2;first.buffers[0].cpu_addr=nullptr;
+    assert(call(&driver,&first,59,&args)==kIOReturnNotReady);first.buffers[0].cpu_addr=ring.data();
     assert(action(first,58,1)==0 && amdgpu::closed==1);
     assert(action(first,58,1)==kIOReturnBadArgument);
     in[0]=1;in[1]=2;

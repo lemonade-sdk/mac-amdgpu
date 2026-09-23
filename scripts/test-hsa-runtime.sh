@@ -2,6 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 bash scripts/test-hsa-code-objects.sh
+bash scripts/build-hrx-compute-fixture.sh
 cmake -S hsa -B build/hsa -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
 cmake --build build/hsa --parallel 4
 ctest --test-dir build/hsa --output-on-failure

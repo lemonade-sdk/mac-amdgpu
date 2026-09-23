@@ -17,5 +17,5 @@
     "hsa_amd_svm_attributes_set",
     "hsa_amd_svm_prefetch_async"
   ],
-  "notes": "Symbol presence is not behavioral completion. Driver 187 on gfx1201 passed persistent queues, wraparound, multi-producer submission, two-process sharing and concurrent shader/CP/CPU-HSA signals. CPU HSA updates execute GPU atomics. Shared mappings are explicit coarse allocations, not general CPU/GPU atomic interoperability. GPU-accessible HSA host pools, general scratch/LDS resources and HRX inference remain incomplete. See API_STATUS.md."
+  "notes": "Symbol presence is not behavioral completion. Driver 187 on gfx1201 passed persistent queues, wraparound, multi-producer submission, two-process sharing and concurrent shader/CP/CPU-HSA signals. Driver 189 adds software-tested public coarse/kernarg pools, dynamic scratch/LDS and device topology/clock queries. The actual pinned HRX dylib builds with an explicit macOS host-AQL adapter. New hardware paths and HRX inference remain unverified. Native CPU/GPU additions and CAS contention are separate bounded experiments; no general fine-grained atomic capability is advertised. See API_STATUS.md and docs/HRX_MACOS_VALIDATION.md."
 }

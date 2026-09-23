@@ -27,7 +27,7 @@ struct CodeObject {
     std::vector<KernelMetadata> kernels;
     std::vector<Relocation> relocations;
 };
-// Bounded ELF64 AMDHSA gfx1201 loader. Linked code objects only; unsupported
+// Bounded ELF64 AMDHSA gfx1201/gfx12-generic-v1 loader. Linked code objects only; unsupported
 // targets, imports, TLS and relocation forms are rejected before GPU upload.
 bool parseCodeObject(std::span<const uint8_t> file, CodeObject &output);
 bool relocateCodeObject(CodeObject &object, uint64_t gpuAddress);

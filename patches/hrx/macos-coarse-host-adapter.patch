@@ -1,0 +1,156 @@
+diff --git a/libhrx/cmake/hrx_exports_macos.txt b/libhrx/cmake/hrx_exports_macos.txt
+index 95e8bbf2..a5e6218f 100644
+--- a/libhrx/cmake/hrx_exports_macos.txt
++++ b/libhrx/cmake/hrx_exports_macos.txt
+@@ -39,6 +39,8 @@ _hrx_semaphore_query
+ _hrx_semaphore_wait
+ _hrx_semaphore_signal
+ _hrx_stream_create
++_hrx_stream_create_on_queue
++_hrx_stream_get_queue_affinity
+ _hrx_stream_retain
+ _hrx_stream_release
+ _hrx_stream_synchronize
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/logical_device.c b/runtime/src/iree/hal/drivers/amdgpu/logical_device.c
+index be7c4cfc..1728323a 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/logical_device.c
++++ b/runtime/src/iree/hal/drivers/amdgpu/logical_device.c
+@@ -2021,6 +2021,36 @@ iree_status_t iree_hal_amdgpu_logical_device_create(
+   iree_hal_amdgpu_logical_device_options_t resolved_options = *options;
+   iree_hal_amdgpu_logical_device_options_apply_create_params(&resolved_options,
+                                                              create_params);
++#if defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
++  // The macOS transport currently provides one GPU domain and CPU-published
++  // AQL queues. Reject features requiring GPU VA aliases or mixed CPU/GPU RMW.
++  if (topology->gpu_agent_count != 1 || hostcall_provider ||
++      resolved_options.feedback.enabled || resolved_options.asan.enabled ||
++      resolved_options.tsan.enabled ||
++      resolved_options.queue_placement == IREE_HAL_AMDGPU_QUEUE_PLACEMENT_DEVICE ||
++      resolved_options.command_buffer_mode == IREE_HAL_AMDGPU_COMMAND_BUFFER_MODE_PM4) {
++    IREE_RETURN_AND_END_ZONE_IF_ERROR(z0, iree_make_status(
++        IREE_STATUS_UNIMPLEMENTED,
++        "macOS coarse-host adapter supports one GPU, host AQL queues, and "
++        "uninstrumented dispatch; hostcalls, device scheduling, PM4 replay, "
++        "and ASAN/TSAN/feedback require additional transport contracts"));
++  }
++  uint32_t queue_size_max = 0;
++  IREE_RETURN_AND_END_ZONE_IF_ERROR(z0, iree_hsa_agent_get_info(
++      IREE_LIBHSA(libhsa), topology->gpu_agents[0],
++      HSA_AGENT_INFO_QUEUE_MAX_SIZE, &queue_size_max));
++  if (queue_size_max < 64 || !iree_host_size_is_power_of_two(queue_size_max)) {
++    IREE_RETURN_AND_END_ZONE_IF_ERROR(z0, iree_make_status(
++        IREE_STATUS_FAILED_PRECONDITION, "invalid macOS HSA queue capacity"));
++  }
++  if (resolved_options.host_queues.aql_capacity > queue_size_max) {
++    resolved_options.host_queues.aql_capacity = queue_size_max;
++  }
++  resolved_options.command_buffer_mode = IREE_HAL_AMDGPU_COMMAND_BUFFER_MODE_AQL;
++  // Timeline dependencies are resolved by the host until vendor PM4 packets
++  // are separately validated on this transport.
++  resolved_options.force_wait_barrier_defer = true;
++#endif
+   // PM4 and automatic modes promise reusable dispatch command buffers,
+   // including dynamic binding-table fixups. Provision their queue-control
+   // storage here so a valid recording cannot fail only when first submitted.
+@@ -3199,6 +3229,10 @@ iree_hal_amdgpu_logical_device_verify_queue_device_profiling_supported(
+ static iree_status_t iree_hal_amdgpu_logical_device_profiling_begin(
+     iree_hal_device_t* base_device,
+     const iree_hal_device_profiling_options_t* options) {
++#if defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
++  return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
++                          "macOS adapter queue profiling is not supported");
++#endif
+   iree_hal_amdgpu_logical_device_t* logical_device =
+       iree_hal_amdgpu_logical_device_cast(base_device);
+   iree_hal_device_profiling_options_t resolved_options =
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/physical_device.c b/runtime/src/iree/hal/drivers/amdgpu/physical_device.c
+index 40374788..60007355 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/physical_device.c
++++ b/runtime/src/iree/hal/drivers/amdgpu/physical_device.c
+@@ -903,6 +903,13 @@ iree_hal_amdgpu_physical_device_initialize_vendor_packet_strategy(
+     wait_barrier_strategy = iree_hal_amdgpu_select_wait_barrier_strategy(
+         vendor_packet_capabilities);
+   }
++#if defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
++  // No vendor packets have been validated by this adapter. This also prevents
++  // queue setup from requesting an executable PM4 IB pool allocation.
++  vendor_packet_capabilities = 0;
++  pm4_timestamp_strategy = IREE_HAL_AMDGPU_PM4_TIMESTAMP_STRATEGY_NONE;
++  wait_barrier_strategy = IREE_HAL_AMDGPU_WAIT_BARRIER_STRATEGY_DEFER;
++#endif
+   out_physical_device->agent_target = agent_target;
+   out_physical_device->vendor_packet_capabilities = vendor_packet_capabilities;
+   out_physical_device->wait_barrier_strategy = wait_barrier_strategy;
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/system.c b/runtime/src/iree/hal/drivers/amdgpu/system.c
+index 12d8462e..e776e6c9 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/system.c
++++ b/runtime/src/iree/hal/drivers/amdgpu/system.c
+@@ -115,6 +115,16 @@ static iree_status_t iree_hal_amdgpu_system_populate_host_memory_pools(
+                              "no accessible-by-all + coarse-grained shared "
+                              "memory pool is available in the system"));
+   }
++#if defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
++  // This adapter uses dispatch publication and completion for ownership
++  // transfer. It does not change the HSA pool flags or promise CPU/GPU RMW
++  // interoperability. Logical-device creation rejects protocols requiring it.
++  if (!host_memory_pools->fine_pool.handle &&
++      host_memory_pools->coarse_pool.handle ==
++          host_memory_pools->kernarg_pool.handle) {
++    host_memory_pools->fine_pool = host_memory_pools->coarse_pool;
++  }
++#endif
+   if (!host_memory_pools->fine_pool.handle) {
+     IREE_RETURN_AND_END_ZONE_IF_ERROR(
+         z0, iree_make_status(IREE_STATUS_NOT_FOUND,
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/util/info.c b/runtime/src/iree/hal/drivers/amdgpu/util/info.c
+index fae2b3ee..c9958e0b 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/util/info.c
++++ b/runtime/src/iree/hal/drivers/amdgpu/util/info.c
+@@ -68,13 +68,15 @@ iree_status_t iree_hal_amdgpu_system_info_query(
+                                HSA_AMD_SYSTEM_INFO_SVM_SUPPORTED,
+                                &svm_supported),
+       "querying HSA_AMD_SYSTEM_INFO_SVM_SUPPORTED");
++#if !defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
+   if (!svm_supported) {
+     IREE_RETURN_AND_END_ZONE_IF_ERROR(
+         z0, iree_make_status(IREE_STATUS_INCOMPATIBLE,
+                              "only systems with SVM are supported "
+                              "(HSA_AMD_SYSTEM_INFO_SVM_SUPPORTED == true)"));
+   }
+-  out_info->svm.supported = 1;
++#endif
++  out_info->svm.supported = svm_supported ? 1 : 0;
+ 
+   bool svm_accessible_by_default = false;
+   IREE_RETURN_AND_END_ZONE_IF_ERROR(
+@@ -110,6 +112,7 @@ iree_status_t iree_hal_amdgpu_system_info_query(
+                                HSA_AMD_SYSTEM_INFO_VIRTUAL_MEM_API_SUPPORTED,
+                                &virtual_mem_api_supported),
+       "querying HSA_AMD_SYSTEM_INFO_VIRTUAL_MEM_API_SUPPORTED");
++#if !defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
+   if (!virtual_mem_api_supported) {
+     IREE_RETURN_AND_END_ZONE_IF_ERROR(
+         z0, iree_make_status(
+@@ -118,6 +121,8 @@ iree_status_t iree_hal_amdgpu_system_info_query(
+                 "(HSA_AMD_SYSTEM_INFO_VIRTUAL_MEM_API_SUPPORTED == true)"));
+   }
+ 
++#endif
++
+   IREE_RETURN_AND_END_ZONE_IF_ERROR(
+       z0,
+       iree_hsa_system_get_info(IREE_LIBHSA(libhsa),
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/util/libhsa.c b/runtime/src/iree/hal/drivers/amdgpu/util/libhsa.c
+index 18ff2256..ab1d3837 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/util/libhsa.c
++++ b/runtime/src/iree/hal/drivers/amdgpu/util/libhsa.c
+@@ -282,6 +282,9 @@ static const char* iree_hal_amdgpu_libhsa_names[] = {
+     // appears on Windows again (🤞) we'll update this to point at it. For now
+     // users can still build the HAL driver but it won't run.
+     "hsa-runtime64.dll",
++#elif defined(IREE_PLATFORM_APPLE)
++    "libhsa-runtime64.1.dylib",
++    "libhsa-runtime64.dylib",
+ #else
+     // Versioned soname first — this is the real soname baked into the library
+     // and is always present. The unversioned .so is a development symlink that

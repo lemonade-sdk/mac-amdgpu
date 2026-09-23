@@ -1,6 +1,7 @@
 #pragma once
 #include "amdgpu_pm4.h"
 #include "amdgpu_dispatch_abi.h"
+#include "amdgpu_queue_topology.h"
 
 namespace amdgpu {
 // Assembled from tests/shaders/compute_smoke_gfx1201.s using LLVM 21.1.8.
@@ -28,7 +29,7 @@ inline uint32_t compute_dispatch_packets(uint32_t (&out)[kComputeSmokePacketCapa
     if (!compute_dispatch_shape(r) || (codeVA & 255) || (codeVA >> 48) ||
         r.codeBytes > (1ull << 48) - codeVA ||
         !(cuMask[0] | cuMask[1] | cuMask[2] | cuMask[3])) return 0;
-    for (auto mask : cuMask) if (mask & 0xffff0000u) return 0;
+    // Each SE register contains both shader-array masks (low/high 16 bits).
     uint32_t n = 0;
     auto sh = [&](uint32_t byteReg, uint32_t value) {
         out[n++] = pm4_header(0x76, 1) | 2; // SET_SH_REG, shader type compute

@@ -66,6 +66,7 @@ enum class IPBlock : uint8_t {
     OSSSYS,    // IH lives here
     GMC,
     MMHUB,     // owns regMMMC_VM_FB_LOCATION_BASE — needed to find vram_start
+    SMUIO,     // ROM and golden timestamp counter
     Count,
 };
 
@@ -83,7 +84,18 @@ enum class IPBlock : uint8_t {
 // Sentinel: 0xFFFFFFFFu means "not yet read from discovery". A real
 // IP base is never 0 on a PCIDriverKit-mapped BAR (SMN registers
 // start in the 0x40000+ range after the SMUIO front-end block).
+// Geometry and CU resources from the checksummed GC_INFO discovery table.
+// Zero/valid=false means absent; no ASIC capacity is guessed from a device ID.
+struct GCDiscoveryInfo {
+    bool valid = false;
+    uint32_t max_shader_engines = 0, max_sh_per_se = 0, max_cu_per_sh = 0;
+    uint32_t max_backends_per_se = 0, wave_front_size = 0;
+    uint32_t max_waves_per_simd = 0, max_scratch_slots_per_cu = 0;
+    uint32_t lds_size_kib = 0;
+};
+
 struct IPBaseTable {
+    GCDiscoveryInfo gfx;
     // Some IPs (esp. NBIO on RDNA4) declare BASE_IDX up to 5 — see
     // regBIF_BIF256_CI256_RC3X4_USB4_PCIE_MST_CTRL_3_BASE_IDX=5 in
     // nbio_7_11_0_offset.h. That means we need slot index 5, i.e. at
@@ -101,7 +113,7 @@ struct IPBaseTable {
     // at runtime is non-negotiable. Don't hardcode for one chip.
     IPVersion version[(int)IPBlock::Count];
 
-    constexpr IPBaseTable() : base{}, version{} {
+    constexpr IPBaseTable() : gfx{}, base{}, version{} {
         for (int i = 0; i < (int)IPBlock::Count; i++) {
             for (int j = 0; j < kMaxBaseSegments; j++) {
                 base[i][j] = 0xFFFFFFFFu;

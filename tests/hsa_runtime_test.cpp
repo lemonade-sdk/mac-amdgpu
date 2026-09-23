@@ -1,4 +1,5 @@
 #include <hsa/hsa_ven_amd_loader.h>
+#include <hsa/hsa_ext_amd.h>
 #include "transport.h"
 #include "mac_hsa.h"
 #include <atomic>
@@ -11,8 +12,14 @@ static unsigned discovered, closed;
 static hsa_status_t discoveryStatus = HSA_STATUS_SUCCESS;
 static hsa_status_t readStatus = HSA_STATUS_SUCCESS;
 static bool present = true;
+static hsa_status_t propertyStatus=HSA_STATUS_SUCCESS;
+static uint64_t gpuTimestampFrequency=100000000;
 namespace mac_hsa {
 struct TestConnection final : Connection {
+    hsa_status_t properties(DeviceProperties &properties) override {
+        properties={0x7551,0xc0,0x500,0,64,4,1,gpuTimestampFrequency,32,32};
+        return propertyStatus;
+    }
     ~TestConnection() override { ++closed; }
     hsa_status_t read(DeviceSnapshot &snapshot) override {
         if (readStatus != HSA_STATUS_SUCCESS) return readStatus;
@@ -51,6 +58,29 @@ int main() {
     assert(hsa_iterate_agents(nullptr, nullptr) == HSA_STATUS_ERROR_INVALID_ARGUMENT);
     assert(hsa_iterate_agents(collect, nullptr) == HSA_STATUS_SUCCESS && observed.size() == 2);
     const auto cpu = observed[0], gpu = observed[1];
+    uint32_t property=99;
+    assert(hsa_agent_get_info(cpu,HSA_AGENT_INFO_NODE,&property)==0 && property==0);
+    assert(hsa_agent_get_info(gpu,HSA_AGENT_INFO_NODE,&property)==0 && property==1);
+    hsa_agent_t nearest{};
+    assert(hsa_agent_get_info(gpu,hsa_agent_info_t(HSA_AMD_AGENT_INFO_NEAREST_CPU),&nearest)==0 && nearest.handle==cpu.handle);
+    char uuid[21];std::memset(uuid,'!',sizeof(uuid));
+    assert(hsa_agent_get_info(gpu,hsa_agent_info_t(HSA_AMD_AGENT_INFO_UUID),uuid)==0 && !std::strcmp(uuid,"GPU-XX") && uuid[20]=='!');
+    const std::pair<uint32_t,uint32_t> properties[]={
+        {HSA_AMD_AGENT_INFO_CHIP_ID,0x7551},{HSA_AMD_AGENT_INFO_ASIC_REVISION,0xc0},
+        {HSA_AMD_AGENT_INFO_BDFID,0x500},{HSA_AMD_AGENT_INFO_DOMAIN,0},
+        {HSA_AMD_AGENT_INFO_COMPUTE_UNIT_COUNT,64},{HSA_AMD_AGENT_INFO_NUM_SHADER_ENGINES,4},
+        {HSA_AMD_AGENT_INFO_NUM_SHADER_ARRAYS_PER_SE,1},{HSA_AMD_AGENT_INFO_MAX_WAVES_PER_CU,32},
+        {HSA_AGENT_INFO_WAVEFRONT_SIZE,32}};
+    for (const auto &[attribute,expected]:properties) {
+        assert(hsa_agent_get_info(gpu,hsa_agent_info_t(attribute),&property)==0 && property==expected);
+    }
+    uint64_t frequency=99;
+    assert(hsa_agent_get_info(gpu,hsa_agent_info_t(HSA_AMD_AGENT_INFO_TIMESTAMP_FREQUENCY),&frequency)==0 && frequency==100000000);
+    gpuTimestampFrequency=0;frequency=99;
+    assert(hsa_agent_get_info(gpu,hsa_agent_info_t(HSA_AMD_AGENT_INFO_TIMESTAMP_FREQUENCY),&frequency)==HSA_STATUS_ERROR && frequency==99);
+    gpuTimestampFrequency=100000000;propertyStatus=HSA_STATUS_ERROR;property=99;
+    assert(hsa_agent_get_info(gpu,hsa_agent_info_t(HSA_AMD_AGENT_INFO_COMPUTE_UNIT_COUNT),&property)==HSA_STATUS_ERROR && property==99);
+    propertyStatus=HSA_STATUS_SUCCESS;
     unsigned count = 0;
     assert(hsa_iterate_agents([](hsa_agent_t, void *p) {
         ++*static_cast<unsigned *>(p); return HSA_STATUS_INFO_BREAK;

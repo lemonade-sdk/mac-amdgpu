@@ -18,6 +18,7 @@ struct Pool {
     hsa_agent_t owner;
     size_t capacity;
     std::shared_ptr<Connection> connection;
+    bool sharedHost = false; // CPU-owned GTT, single-writer coarse memory and kernargs
 };
 struct Allocation {
     hsa_amd_pointer_type_t type = HSA_EXT_POINTER_TYPE_HSA;
@@ -29,6 +30,7 @@ struct Allocation {
     size_t size = 0;
     hsa_agent_t owner{};
     void *userData = nullptr;
+    uint32_t globalFlags = 0; // zero uses the legacy host/device default
     std::shared_ptr<Connection> connection;
     DeviceBuffer buffer;
     SharedBuffer shared;
@@ -74,6 +76,7 @@ std::shared_ptr<Signal> findSignal(hsa_signal_t handle);
 struct RuntimeQueue;
 using RetiredQueueSet=std::unordered_map<const hsa_queue_t *,std::shared_ptr<RuntimeQueue>>;
 RetiredQueueSet clearQueues(); // retire under runtimeMutex; destroy after unlocking
+void stopQueueServices(RetiredQueueSet &);
 size_t hostPageSize();
 void clearVirtualMemory(); // caller holds runtimeMutex; allocation pins retain mappings
 void clearHostLocks();
@@ -83,6 +86,7 @@ void reapCopyJobs();
 void clearSystemEvents();
 hsa_status_t deliverSystemEvent(const hsa_amd_event_t &event);
 hsa_status_t createGPUSignalBacking(const std::shared_ptr<Connection> &, int64_t, const std::shared_ptr<Signal> &);
+void invalidateGPUSignals(const std::shared_ptr<Connection> &);
 hsa_status_t createIPCSignal(hsa_signal_value_t initial, uint32_t count, const hsa_agent_t *consumers, hsa_signal_t *out);
 
 template<typename T> hsa_status_t writeValue(void *output, T value) {

@@ -27,6 +27,7 @@ std::vector<std::array<uint64_t, 10>> atomicPackets;
 bool atomicTimeout = false, streamLive = false;
 unsigned submittedStreams = 0;
 unsigned queueCreates=0,queueKicks=0,queueDestroys=0,queueFault=0;
+unsigned propertyFault=0,serviceFault=0;
 unsigned computeCalls = 0, computeFault = 0, aqlCalls = 0, aqlFault = 0;
 kern_return_t mockOpen(io_service_t, task_port_t, uint32_t, io_connect_t *port) { *port = ++opens; return KERN_SUCCESS; }
 kern_return_t mockClose(io_connect_t) { ++closes; return KERN_SUCCESS; }
@@ -34,6 +35,12 @@ kern_return_t mockRelease(io_object_t) { return KERN_SUCCESS; }
 kern_return_t mockScalar(mach_port_t, uint32_t selector, const uint64_t *in, uint32_t count,
                          uint64_t *out, uint32_t *outCount) {
     switch (selector) {
+    case 59:
+        assert(count==1 && *outCount==2 && in[0]==97);
+        out[0]=serviceFault==1 ? uint32_t(kIOReturnNoMemory) : serviceFault==2 ? uint32_t(kIOReturnIOError) : 0;
+        out[1]=serviceFault ? 8 : 0;
+        if (serviceFault==3) *outCount=1;
+        return KERN_SUCCESS;
     case 56:
         assert(count==3 && *outCount==2 && in[0]!=in[1] && in[2]==64);
         assert(buffers.at(in[0]).domain==2 && buffers.at(in[1]).domain==2);++queueCreates;
@@ -87,7 +94,18 @@ kern_return_t mockScalar(mach_port_t, uint32_t selector, const uint64_t *in, uin
         else if (in[0] == 1) { out[0] = 12; out[1] = 0; out[2] = 1; }
         else if (in[0] == 2) { out[0] = 256ull << 20; out[1] = 32ull << 30; }
         else if (in[0] == 3) { out[0] = 0; out[1] = 0x070001; out[2] = out[3] = 0x0e0003; }
-        else { assert(in[0] == 5); out[0] = out[1] = 1; out[10] = 31ull << 30; }
+        else if (in[0]==6) {
+            assert(*outCount==10);
+            const uint64_t properties[10]={0x7551,0xc0,0x500,0,64,4,2,100000000,32,32};
+            std::copy_n(properties,10,out);
+            if (propertyFault==1) out[4]=0;
+            if (propertyFault==2) out[8]=UINT64_MAX;
+            if (propertyFault==3) *outCount=9;
+            if (propertyFault==4) out[6]=0;
+            if (propertyFault==5) out[6]=3;
+            if (propertyFault==6) out[5]=0;
+            if (propertyFault==7) out[5]=9;
+        } else { assert(in[0] == 5); out[0] = out[1] = 1; out[10] = 31ull << 30; }
         break;
     case 6: out[0] = 1; out[1] = 0x80000000; break;
     case 8: ++resets; break;
@@ -414,5 +432,35 @@ int main() {
         }
     }
     assert(opens==closes);
+    {
+        driverBuild=189;queueFault=0;
+        mac_hsa::IOKitConnection connection;connection.service=123;connection.registryID=456;
+        mac_hsa::SharedBuffer ring,metadata;
+        assert(connection.allocateSharedBuffer(16384,ring)==0 && connection.allocateSharedBuffer(16384,metadata)==0);
+        mac_hsa::DeviceProperties properties;
+        assert(connection.properties(properties)==0 && properties.chipID==0x7551 && properties.computeUnits==64 && properties.arraysPerEngine==2 &&
+            properties.timestampFrequency==100000000 && properties.maxWavesPerCU==32 && properties.wavefrontSize==32);
+        for (propertyFault=1;propertyFault<=7;++propertyFault) assert(connection.properties(properties)==HSA_STATUS_ERROR);
+        propertyFault=0;uint64_t handle=0,inactive=99;
+        assert(connection.createQueue(ring,metadata,64,handle)==0);
+        assert(connection.serviceQueue(98,inactive)==HSA_STATUS_ERROR_INVALID_QUEUE);
+        assert(connection.serviceQueue(handle,inactive)==0 && !inactive);
+        serviceFault=1;assert(connection.serviceQueue(handle,inactive)==HSA_STATUS_ERROR_OUT_OF_RESOURCES && inactive==8);
+        serviceFault=2;assert(connection.serviceQueue(handle,inactive)==HSA_STATUS_ERROR_EXCEPTION && inactive==8);
+        serviceFault=0;assert(connection.destroyQueue(handle)==0);
+        assert(connection.freeSharedBuffer(ring)==0 && connection.freeSharedBuffer(metadata)==0);
+    }
+    {
+        driverBuild=189;queueFault=0;serviceFault=3;
+        mac_hsa::IOKitConnection connection;connection.service=123;connection.registryID=456;
+        mac_hsa::SharedBuffer ring,metadata;
+        assert(connection.allocateSharedBuffer(16384,ring)==0 && connection.allocateSharedBuffer(16384,metadata)==0);
+        uint64_t handle=0,inactive=99;
+        assert(connection.createQueue(ring,metadata,64,handle)==0);
+        assert(connection.serviceQueue(handle,inactive)==HSA_STATUS_ERROR && !inactive);
+        assert(connection.destroyQueue(handle)==HSA_STATUS_ERROR);
+        assert(connection.freeSharedBuffer(ring)==HSA_STATUS_ERROR && buffers.contains(ring.device.handle));
+        serviceFault=0;
+    }
     puts("HSA: transient observers, owner Busy without reset, single concurrent initialization, firmware mapping, unaligned SDMA staging/guards and fault retention pass");
 }

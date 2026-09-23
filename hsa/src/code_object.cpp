@@ -104,7 +104,7 @@ bool string(const Value &map, const char *key, std::string &out) {
         value->string.find('\0') != std::string::npos) return false;
     out = value->string; return true;
 }
-bool metadata(std::span<const uint8_t> data, std::vector<KernelMetadata> &kernels) {
+bool metadata(std::span<const uint8_t> data, std::vector<KernelMetadata> &kernels, const char *expectedTarget) {
     Value root;
     if (!MessagePack(data).decode(root)) return false;
     const auto version = root.get("amdhsa.version"), list = root.get("amdhsa.kernels");
@@ -113,7 +113,7 @@ bool metadata(std::span<const uint8_t> data, std::vector<KernelMetadata> &kernel
         version->array[1].kind != Value::Integer || version->array[1].integer > 2 ||
         !list || list->kind != Value::Array || list->array.empty()) return false;
     const auto target = root.get("amdhsa.target");
-    if (target && (target->kind != Value::String || target->string != "amdgcn-amd-amdhsa--gfx1201")) return false;
+    if (target && (target->kind != Value::String || target->string != expectedTarget)) return false;
     for (const auto &item : list->array) {
         KernelMetadata kernel; uint32_t wave = 0;
         if (!string(item, ".name", kernel.name) || !string(item, ".symbol", kernel.symbol) ||
@@ -133,6 +133,14 @@ bool metadata(std::span<const uint8_t> data, std::vector<KernelMetadata> &kernel
     }
     return true;
 }
+unsigned relocationWidth(uint32_t type) {
+    // AMDGPU dynamic relocations supported by ROCr ApplyDynamicRelocation.
+    switch (type) {
+    case 1: case 2: case 6: return 4; // ABS32_LO, ABS32_HI, ABS32
+    case 3: case 13: return 8; // ABS64, RELATIVE64
+    default: return 0;
+    }
+}
 bool symbolName(std::span<const uint8_t> file, const SectionHeader &strings, uint32_t offset, std::string &out) {
     if (offset >= strings.size) return false;
     const auto start = reinterpret_cast<const char *>(file.data() + strings.offset + offset);
@@ -149,9 +157,16 @@ bool parseCodeObject(std::span<const uint8_t> file, CodeObject &output) {
         std::memcmp(header.ident, "\177ELF\2\1\1\100", 8) ||
         header.ident[8] < 1 || header.ident[8] > 4 || header.type != 3 || header.machine != 224 ||
         header.version != 1 || header.ehsize != 64 || header.phentsize != 56 || header.shentsize != 64 ||
-        !header.phnum || !header.shnum || (header.flags & 0xff) != 0x4e ||
+        !header.phnum || !header.shnum ||
         !range(header.phoff, uint64_t(header.phnum) * 56, file.size()) ||
         !range(header.shoff, uint64_t(header.shnum) * 64, file.size())) return false;
+    // ROCr's IsaRegistry associates gfx1201 with gfx12-generic version 1.
+    // HRX's built-in helper kernels use that generic target, not gfx1201.
+    const auto machine=header.flags&0xff;
+    const auto genericVersion=header.flags>>24;
+    const bool generic=machine==0x59 && header.ident[8]>=4 && genericVersion==1;
+    if (!generic && (machine!=0x4e || genericVersion)) return false;
+    const char *target=generic ? "amdgcn-amd-amdhsa--gfx12-generic" : "amdgcn-amd-amdhsa--gfx1201";
     std::vector<ProgramHeader> segments;
     uint64_t begin = UINT64_MAX, end = 0;
     bool haveMetadata = false;
@@ -180,7 +195,7 @@ bool parseCodeObject(std::span<const uint8_t> file, CodeObject &output) {
                 const uint64_t paddedData = (uint64_t(dataSize) + 3) & ~uint64_t(3);
                 if (!range(cursor - ph.offset, paddedName + paddedData, ph.fileSize)) return false;
                 if (type == 32 && nameSize == 7 && !std::memcmp(file.data() + cursor, "AMDGPU", 7)) {
-                    if (haveMetadata || !metadata(file.subspan(cursor + paddedName, dataSize), object.kernels)) return false;
+                    if (haveMetadata || !metadata(file.subspan(cursor + paddedName, dataSize), object.kernels,target)) return false;
                     haveMetadata = true;
                 }
                 cursor += paddedName + paddedData;
@@ -247,8 +262,8 @@ bool parseCodeObject(std::span<const uint8_t> file, CodeObject &output) {
             if (!read(file, section.offset + offset, relocation)) return false;
             const uint32_t type = uint32_t(relocation.info);
             if (!type) continue;
-            if (type != 3 && type != 13) return false; // ABS64 and RELATIVE64
-            if (!loadedRange(relocation.offset, 8)) return false;
+            const auto width=relocationWidth(type);
+            if (!width || !loadedRange(relocation.offset,width)) return false;
             const auto symbolIndex = relocation.info >> 32;
             if (type == 13) { if (symbolIndex) return false; }
             else {
@@ -263,19 +278,33 @@ bool parseCodeObject(std::span<const uint8_t> file, CodeObject &output) {
 bool relocateCodeObject(CodeObject &object, uint64_t gpuAddress) {
     if (gpuAddress < object.virtualBase || object.image.size() > UINT64_MAX - gpuAddress) return false;
     const auto bias = gpuAddress - object.virtualBase;
-    for (const auto &relocation : object.relocations) {
-        if ((relocation.type != 3 && relocation.type != 13) ||
-            !range(relocation.offset, 8, object.image.size())) return false;
-        // Descriptors were validated against metadata before relocation. Do not
-        // allow a relocation to change those validated sizes or entry points.
+    // Validate every fixup before changing the image, so a rejected relocation
+    // cannot leave an executable half-rebased.
+    const auto evaluate = [&](const Relocation &relocation,uint64_t &encoded) {
+        const auto width=relocationWidth(relocation.type);
+        if (!width || !range(relocation.offset,width,object.image.size())) return false;
+        // Metadata was checked against these descriptor bytes before relocation.
         for (const auto &kernel : object.kernels)
-            if (relocation.offset < kernel.descriptor + 64 &&
-                kernel.descriptor < relocation.offset + 8) return false;
-        const __int128 value = (relocation.type == 13 ? __int128(bias) :
-            __int128(relocation.symbol) + (relocation.absolute ? 0 : bias)) + relocation.addend;
-        if (value < 0 || value > UINT64_MAX || !range(relocation.offset, 8, object.image.size())) return false;
-        const auto encoded = uint64_t(value);
-        std::memcpy(object.image.data() + relocation.offset, &encoded, 8);
+            if (relocation.offset<kernel.descriptor+64 && kernel.descriptor<relocation.offset+width)
+                return false;
+        const __int128 value=(relocation.type==13 ? __int128(bias) :
+            __int128(relocation.symbol)+(relocation.absolute ? 0 : bias))+relocation.addend;
+        if (value<0 || value>UINT64_MAX || (relocation.type==6 && value>UINT32_MAX)) return false;
+        encoded=uint64_t(value);
+        if (relocation.type==2) encoded>>=32;
+        return true;
+    };
+    for (const auto &relocation : object.relocations) {
+        uint64_t encoded;
+        if (!evaluate(relocation,encoded)) return false;
+    }
+    for (const auto &relocation : object.relocations) {
+        uint64_t encoded;
+        evaluate(relocation,encoded);
+        if (relocationWidth(relocation.type)==4) {
+            const auto word=uint32_t(encoded);
+            std::memcpy(object.image.data()+relocation.offset,&word,4);
+        } else std::memcpy(object.image.data()+relocation.offset,&encoded,8);
     }
     return true;
 }

@@ -1,6 +1,7 @@
 #pragma once
 #include "amdgpu_aql_abi.h"
 #include "amdgpu_queue_topology.h"
+#include "amdgpu_aql_resources.h"
 #include "../../hsa/third_party/hsa/include/hsa/amd_hsa_signal.h"
 #include <string.h>
 
@@ -54,7 +55,9 @@ inline bool aql_build_mqd(AQLComputeMQD &mqd, uint64_t base, uint64_t ring,
     w[cp_hqd_pq_doorbell_control]=0x40000002 | (doorbell<<2);
     w[cp_hqd_pq_control]=queueSize | (5<<8) | (1<<28) | (1<<27) | (2<<18) | (1<<14);
     w[cp_hqd_ib_control]=3<<20;
-    // Do not enable PCIe system atomics (bit 29) on this host path.
+    // Keep CP firmware's PCIe-atomics support acknowledgement (bit 29) clear
+    // until the full requester/routing/root path is verified. This selects
+    // firmware fallback; it is not the shader instruction's scope control.
     w[cp_hqd_hq_status0]=1<<14;
     pair(cp_hqd_eop_base_addr_lo,(base+kAQLEOPOffset)>>8);
     w[cp_hqd_eop_control]=9; w[cp_hqd_aql_control]=1;
@@ -62,11 +65,11 @@ inline bool aql_build_mqd(AQLComputeMQD &mqd, uint64_t base, uint64_t ring,
 }
 
 inline bool aql_build_storage(void *storage, uint64_t base, uint64_t descriptor,
-    uint64_t kernarg, const AQLDispatchRequest &r, const uint32_t masks[4], uint32_t cuCount) {
+    uint64_t kernarg, const AQLDispatchRequest &r, const uint32_t masks[4], uint32_t cuCount, uint32_t wavesPerCU) {
     if (!storage || !aql_dispatch_shape(r) || !base || (base & 16383) ||
         base > (1ull << 48) - kAQLStorageBytes || !descriptor || (descriptor & 63) ||
         descriptor >= (1ull << 48) || !kernarg || (kernarg & 15) ||
-        kernarg >= (1ull << 48) || !cuCount || !masks) return false;
+        kernarg >= (1ull << 48) || !cuCount || !wavesPerCU || wavesPerCU>64 || !masks) return false;
     memset(storage, 0, kAQLStorageBytes);
     auto *bytes = static_cast<uint8_t *>(storage);
     auto &mqd = *reinterpret_cast<AQLComputeMQD *>(bytes);
@@ -79,7 +82,9 @@ inline bool aql_build_storage(void *storage, uint64_t base, uint64_t descriptor,
     metadata.hsa_queue.size=kAQLRingBytes/64;
     metadata.read_dispatch_id_field_base_byte_offset=offsetof(amd_queue_t,read_dispatch_id);
     metadata.max_cu_id=cuCount-1;
-    metadata.max_wave_id=31; // gfx12: 2 SIMD/CU, 16 waves/SIMD.
+    metadata.group_segment_aperture_base_hi=kAQLGroupApertureHi;
+    metadata.private_segment_aperture_base_hi=kAQLPrivateApertureHi;
+    metadata.max_wave_id=wavesPerCU-1; // GC discovery scratch-slot limit.
     metadata.queue_properties=AMD_QUEUE_PROPERTIES_IS_PTR64;
     metadata.queue_inactive_signal.handle=base+kAQLInactiveOffset;
     auto &done=*reinterpret_cast<amd_signal_t *>(bytes+kAQLCompletionOffset);

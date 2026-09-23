@@ -16,7 +16,7 @@ kern_return_t aql_launch(DeviceContext &, GMCContext &, MESContext &, const GFXC
     AQLLaunch &, uint64_t descriptorVA, uint64_t kernargVA,
     const AQLDispatchRequest &, AQLLaunchResult &);
 struct PersistentAQLQueue {
-    VRAMAllocation storage;
+    VRAMAllocation storage, scratch;
     void *owner, *metadataCPU;
     uint64_t handle, ringHandle, metadataHandle, metadataVA;
     uint64_t lastDoorbell;
@@ -27,6 +27,8 @@ kern_return_t aql_queue_open(DeviceContext &, GMCContext &, MESContext &, const 
     PersistentAQLQueue &, uint64_t ringVA, uint64_t metadataVA, void *metadataCPU,
     uint32_t packets, uint32_t slot);
 kern_return_t aql_queue_kick(DeviceContext &, PersistentAQLQueue &, uint64_t lastPacket);
+kern_return_t aql_queue_service(DeviceContext &, GMCContext &, const GFXConfig &,
+    PersistentAQLQueue &, const void *ringCPU, uint64_t &inactive);
 kern_return_t aql_queue_close(DeviceContext &, GMCContext &, MESContext &, PersistentAQLQueue &);
 
 }

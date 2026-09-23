@@ -29,8 +29,8 @@ struct DeviceContext { PCI *pci; uint64_t bar0Size=16384; unsigned bar0MemIndex=
 struct GMCContext { uint64_t vram_start=0x8000000000; VRAMBumpAllocator vram_alloc; };
 struct CPContext { bool inited=true, ringReady=true; uint64_t wptr=0; };
 struct GFXConfig {
-    unsigned num_active_cus=64, max_shader_engines=4, max_sh_per_se=1;
-    uint32_t active_cu_bitmap[4][2]={{0xffff,0},{0xffff,0},{0xffff,0},{0xffff,0}};
+    unsigned num_active_cus=64, max_shader_engines=4, max_sh_per_se=2;
+    uint32_t active_cu_bitmap[4][2]={{255,255},{255,255},{255,255},{255,255}};
 };
 #include "dispatch_context.inc"
 static void amdgpu_hdp_flush(DeviceContext &) {}
@@ -42,8 +42,20 @@ static uint32_t cp_ring_write(CPContext &cp, const uint32_t *ib, uint32_t count)
     cp.wptr+=4;
     return mode==4 ? 2 : 4; // retain even a partial staged submission
 }
-static int cp_submit_eop_test(DeviceContext &, CPContext &, uint64_t timeout, uint32_t *fence) {
+static int cp_submit_eop_test(DeviceContext &dev, CPContext &, uint64_t timeout, uint32_t *fence) {
     assert(timeout==100000); ++submits;
+    unsigned masks=0;
+    for (unsigned i=0;i+2<4096 && (dev.pci->memory[i]>>30)==3;) {
+        const auto header=dev.pci->memory[i];
+        if (((header>>8)&255)==0x76) {
+            const auto reg=(dev.pci->memory[i+1]+0x2c00)*4;
+            if (reg==0xb858 || reg==0xb85c || reg==0xb864 || reg==0xb868) {
+                assert(dev.pci->memory[i+2]==0x00ff00ff);++masks;
+            }
+        }
+        i+=((header>>16)&0x3fff)+2;
+    }
+    assert(masks==4);
     if(mode==3) return kIOReturnTimeout;
     *fence=submits; return 0;
 }

@@ -4,18 +4,47 @@
 #include <cstdio>
 #include <array>
 
-static bool gpuBuffers = false, failCopy = false;
-static unsigned gpuFrees = 0;
+static bool gpuBuffers = false, failCopy = false, sharedBuffers = false, secondGPU = false;
+static unsigned sharedAllocations = 0, sharedFrees = 0;
+static unsigned gpuFrees = 0, nativeCopies = 0;
+static std::vector<size_t> nativeCopySizes;
 namespace mac_hsa {
 struct TestConnection final : Connection {
     uint64_t next = 0;
     std::map<uint64_t, std::vector<uint8_t>> buffers;
     bool supportsBuffers() const override { return gpuBuffers; }
-    hsa_status_t memoryCapacity(uint64_t &size) override { size = 1 << 20; return HSA_STATUS_SUCCESS; }
+    bool supportsSharedBuffers() const override { return sharedBuffers; }
+    hsa_status_t sharedMemoryCapacity(uint64_t &size) override { size = 65536; return HSA_STATUS_SUCCESS; }
+    hsa_status_t allocateSharedBuffer(uint64_t bytes, SharedBuffer &buffer) override {
+        void *pointer = nullptr;
+        assert(!posix_memalign(&pointer, 16384, bytes));
+        std::memset(pointer, 0, bytes);
+        buffer = {{++next, uint64_t(pointer), bytes}, pointer, 1};
+        ++sharedAllocations;
+        return HSA_STATUS_SUCCESS;
+    }
+    hsa_status_t freeSharedBuffer(const SharedBuffer &buffer) override {
+        uint64_t now;
+        assert(hsa_system_get_info(HSA_SYSTEM_INFO_TIMESTAMP, &now) == HSA_STATUS_SUCCESS ||
+               !mac_hsa::detail::references);
+        std::free(buffer.host); ++sharedFrees;
+        return HSA_STATUS_SUCCESS;
+    }
+    hsa_status_t memoryCapacity(uint64_t &size) override { size = 16 << 20; return HSA_STATUS_SUCCESS; }
     hsa_status_t allocateBuffer(uint64_t size, DeviceBuffer &buffer) override {
         const auto handle = ++next;
-        buffer = {handle, 0x8001000000ull + handle * 0x100000, size};
+        buffer = {handle, 0x8001000000ull + handle * 0x1000000, size};
         buffers.emplace(handle, std::vector<uint8_t>(size, 0x91));
+        return HSA_STATUS_SUCCESS;
+    }
+    hsa_status_t copyBuffers(const DeviceBuffer &src, uint64_t so,
+        const DeviceBuffer &dst, uint64_t dso, size_t size) override {
+        ++nativeCopies;nativeCopySizes.push_back(size);
+        assert(size && size <= 4 * 1024 * 1024);
+        assert(so <= src.size && size <= src.size-so && dso <= dst.size && size <= dst.size-dso);
+        assert(src.handle != dst.handle || so+size <= dso || dso+size <= so);
+        if (failCopy) return HSA_STATUS_ERROR;
+        std::memcpy(buffers.at(dst.handle).data()+dso,buffers.at(src.handle).data()+so,size);
         return HSA_STATUS_SUCCESS;
     }
     hsa_status_t freeBuffer(const DeviceBuffer &buffer) override {
@@ -43,6 +72,7 @@ struct TestConnection final : Connection {
 };
 hsa_status_t discover(std::vector<std::shared_ptr<Connection>> &connections) {
     connections.push_back(std::make_shared<TestConnection>());
+    if (secondGPU) connections.push_back(std::make_shared<TestConnection>());
     return HSA_STATUS_SUCCESS;
 }
 }
@@ -227,6 +257,16 @@ int main() {
     assert(std::memcmp(output.data() + 3, input.data(), input.size()) == 0);
     for (size_t i = 0; i < 3; ++i) assert(output[i] == 0x91);
     for (size_t i = input.size() + 3; i < output.size(); ++i) assert(output[i] == 0x91);
+    assert(nativeCopies == 1 && nativeCopySizes.back() == 16384);
+    assert(hsa_memory_copy(output.data(), deviceA, output.size()) == 0);
+    std::memmove(output.data()+4,output.data(),12003);
+    assert(hsa_memory_copy(reinterpret_cast<void *>(uintptr_t(deviceA)+4),deviceA,12003) == 0);
+    std::vector<uint8_t> overlap(output.size());
+    assert(hsa_memory_copy(overlap.data(),deviceA,overlap.size()) == 0 && overlap == output);
+    assert(nativeCopies == 1); // overlapping ranges never sent to SDMA
+    failCopy = true;
+    assert(hsa_memory_copy(deviceB,deviceA,16384) == HSA_STATUS_ERROR && nativeCopies == 2);
+    failCopy = false;
     assert(hsa_amd_memory_fill(deviceA, 0x76543210, 4096) == 0);
     info.size = sizeof(info);
     assert(hsa_amd_pointer_info(deviceA, &info, nullptr, nullptr, nullptr) == 0);
@@ -240,5 +280,102 @@ int main() {
     wait(completed, -1);
     assert(hsa_amd_memory_pool_free(deviceA) == 0);
     assert(hsa_shut_down() == 0 && gpuFrees == 2);
+    // CPU-owned GPU-backed pools carry coarse/kernarg semantics without claiming
+    // native CPU/GPU atomic interoperability. Exercise discovery and ownership
+    // exactly as HRX does before requesting host-visible allocations.
+    failCopy = false; sharedBuffers = true;
+    for (bool multiple : {false, true}) {
+        secondGPU = multiple; agents.clear();
+        assert(hsa_init() == 0);
+        assert(hsa_iterate_agents([](hsa_agent_t a, void *) { agents.push_back(a); return HSA_STATUS_SUCCESS; }, nullptr) == 0);
+        std::vector<hsa_amd_memory_pool_t> hostPools;
+        assert(hsa_amd_agent_iterate_memory_pools(agents[0], [](hsa_amd_memory_pool_t p, void *out) {
+            uint32_t flags = 0;
+            assert(hsa_amd_memory_pool_get_info(p, HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS, &flags) == 0);
+            static_cast<std::vector<hsa_amd_memory_pool_t> *>(out)->push_back(p);
+            return HSA_STATUS_SUCCESS;
+        }, &hostPools) == 0);
+        assert(hostPools.size() == (multiple ? 3 : 2));
+        unsigned visits = 0;
+        assert(hsa_agent_iterate_regions(agents[0], [](hsa_region_t r, void *out) {
+            uint32_t flags;
+            assert(hsa_region_get_info(r, HSA_REGION_INFO_GLOBAL_FLAGS, &flags) == 0);
+            ++*static_cast<unsigned *>(out); return HSA_STATUS_SUCCESS;
+        }, &visits) == 0 && visits == hostPools.size());
+        visits = 0;
+        assert(hsa_amd_agent_iterate_memory_pools(agents[0], [](hsa_amd_memory_pool_t, void *out) {
+            ++*static_cast<unsigned *>(out); return HSA_STATUS_INFO_BREAK;
+        }, &visits) == HSA_STATUS_INFO_BREAK && visits == 1);
+        uint32_t flags = 0;
+        bool all = true;
+        assert(hsa_amd_memory_pool_get_info(hostPools[0], HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS, &flags) == 0);
+        assert(flags == HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED);
+        assert(hsa_amd_memory_pool_get_info(hostPools[0], HSA_AMD_MEMORY_POOL_INFO_ACCESSIBLE_BY_ALL, &all) == 0 && !all);
+        if (!multiple) {
+            hsa_amd_memory_pool_t vram{};
+            assert(hsa_amd_agent_iterate_memory_pools(agents[1],[](hsa_amd_memory_pool_t p,void *out) {
+                *static_cast<hsa_amd_memory_pool_t *>(out)=p;return HSA_STATUS_SUCCESS;
+            },&vram)==0);
+            void *a=nullptr,*b=nullptr;
+            const size_t bytes=5*1024*1024+3;
+            assert(hsa_amd_memory_pool_allocate(vram,bytes,0,&a)==0);
+            assert(hsa_amd_memory_pool_allocate(vram,bytes,0,&b)==0);
+            std::vector<uint8_t> input(bytes),output(bytes);
+            for(size_t i=0;i<bytes;++i) input[i]=uint8_t(i*71+3);
+            assert(hsa_memory_copy(a,input.data(),bytes)==0);
+            nativeCopySizes.clear();
+            assert(hsa_memory_copy(b,a,bytes)==0);
+            assert((nativeCopySizes==std::vector<size_t>{4*1024*1024,1024*1024+3}));
+            assert(hsa_memory_copy(output.data(),b,bytes)==0 && input==output);
+            assert(hsa_memory_free(a)==0 && hsa_memory_free(b)==0);
+        }
+        const auto sharedPool = hostPools[1];
+        assert(hsa_amd_memory_pool_get_info(sharedPool, HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS, &flags) == 0);
+        assert(flags == (HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED | HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT));
+        assert(hsa_amd_memory_pool_get_info(sharedPool, HSA_AMD_MEMORY_POOL_INFO_ACCESSIBLE_BY_ALL, &all) == 0 && all == !multiple);
+        hsa_amd_memory_pool_location_t location;
+        assert(hsa_amd_memory_pool_get_info(sharedPool, HSA_AMD_MEMORY_POOL_INFO_LOCATION, &location) == 0 && location == HSA_AMD_MEMORY_POOL_LOCATION_CPU);
+        size_t capacity = 0;
+        assert(hsa_amd_memory_pool_get_info(sharedPool, HSA_AMD_MEMORY_POOL_INFO_ALLOC_MAX_SIZE, &capacity) == 0 && capacity == 65536);
+        assert(hsa_region_get_info({sharedPool.handle}, HSA_REGION_INFO_ALLOC_MAX_SIZE, &capacity) == 0 && capacity == 65536);
+        assert(hsa_amd_agent_memory_pool_get_info(agents[1], sharedPool, HSA_AMD_AGENT_MEMORY_POOL_INFO_ACCESS, &access) == 0 && access == HSA_AMD_MEMORY_POOL_ACCESS_ALLOWED_BY_DEFAULT);
+        uint32_t hops = 0;
+        assert(hsa_amd_agent_memory_pool_get_info(agents[1], sharedPool, HSA_AMD_AGENT_MEMORY_POOL_INFO_NUM_LINK_HOPS, &hops) == 0 && hops == 1);
+        hsa_amd_memory_pool_link_info_t link{};
+        assert(hsa_amd_agent_memory_pool_get_info(agents[1], sharedPool, HSA_AMD_AGENT_MEMORY_POOL_INFO_LINK_INFO, &link) == 0);
+        assert(link.link_type == HSA_AMD_LINK_INFO_TYPE_PCIE && !link.atomic_support_32bit && !link.atomic_support_64bit);
+        void *host = nullptr;
+        const auto before = sharedAllocations;
+        assert(hsa_amd_memory_pool_allocate(sharedPool, 65537, 0, &host) == HSA_STATUS_ERROR_INVALID_ALLOCATION && !host);
+        assert(sharedAllocations == before);
+        assert(hsa_amd_memory_pool_allocate(sharedPool, 16381, 0, &host) == 0);
+        assert(uintptr_t(host) % 16384 == 0);
+        assert(hsa_amd_agents_allow_access(2, agents.data(), nullptr, host) == 0);
+        info = {}; info.size = sizeof(info); accessible = nullptr;
+        assert(hsa_amd_pointer_info(static_cast<uint8_t *>(host) + 8, &info, std::malloc, &count, &accessible) == 0);
+        assert(info.agentOwner.handle == agents[0].handle && info.hostBaseAddress == host && info.agentBaseAddress == host);
+        assert(info.global_flags == flags && info.registered && info.sizeInBytes == 16384 && count == 2);
+        assert(accessible[0].handle == agents[0].handle && accessible[1].handle == agents[1].handle);
+        std::free(accessible);
+        if (multiple) {
+            assert(hsa_amd_agent_memory_pool_get_info(agents[2], sharedPool, HSA_AMD_AGENT_MEMORY_POOL_INFO_ACCESS, &access) == 0 && access == HSA_AMD_MEMORY_POOL_ACCESS_NEVER_ALLOWED);
+            assert(hsa_amd_agents_allow_access(1, &agents[2], nullptr, host) == HSA_STATUS_ERROR_INVALID_ARGUMENT);
+            hops = 99;
+            assert(hsa_amd_agent_memory_pool_get_info(agents[2], sharedPool, HSA_AMD_AGENT_MEMORY_POOL_INFO_NUM_LINK_HOPS, &hops) == 0 && hops == 0);
+            link.min_latency = 0xfeed;
+            assert(hsa_amd_agent_memory_pool_get_info(agents[2], sharedPool, HSA_AMD_AGENT_MEMORY_POOL_INFO_LINK_INFO, &link) == 0 && link.min_latency == 0xfeed);
+        }
+        assert(hsa_amd_memory_fill(host, 0xfedcba98, 4096) == 0);
+        assert(static_cast<uint32_t *>(host)[4095] == 0xfedcba98);
+        assert(hsa_memory_copy(static_cast<uint8_t *>(host) + 3, input.data(), input.size()) == 0);
+        assert(std::memcmp(static_cast<uint8_t *>(host) + 3, input.data(), input.size()) == 0);
+        assert(hsa_memory_copy(output.data(), host, 16384) == 0);
+        assert(std::memcmp(output.data(), host, 16384) == 0);
+        completed = signal(1);
+        assert(hsa_amd_memory_async_copy(output.data(), agents[0], host, agents[1], 16384, 0, nullptr, completed) == 0);
+        wait(completed);
+        assert(hsa_amd_memory_pool_free(host) == 0);
+        assert(hsa_shut_down() == 0 && sharedAllocations == sharedFrees);
+    }
     puts("HSA: host pools, bounds, pointer ABI, async copy ordering/lifetime, software queue atomics/publication and cancellation pass");
 }

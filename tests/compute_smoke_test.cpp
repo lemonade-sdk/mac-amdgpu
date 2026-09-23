@@ -38,8 +38,8 @@ struct DeviceContext { PCI *pci; uint64_t bar0Size = 16384; unsigned bar0MemInde
 struct GMCContext { uint64_t vram_start = 0x8000000000; VRAMBumpAllocator vram_alloc; };
 struct CPContext { bool inited = true, ringReady = true; uint64_t wptr = 0; };
 struct GFXConfig {
-    unsigned num_active_cus = 64, max_shader_engines = 4, max_sh_per_se = 1;
-    uint32_t active_cu_bitmap[4][2] = {{0xffff, 0}, {0xffff, 0}, {0xffff, 0}, {0xffff, 0}};
+    unsigned num_active_cus = 64, max_shader_engines = 4, max_sh_per_se = 2;
+    uint32_t active_cu_bitmap[4][2] = {{255, 255}, {255, 255}, {255, 255}, {255, 255}};
 };
 #include "compute_context.inc"
 static void amdgpu_hdp_flush(DeviceContext &) {}
@@ -103,6 +103,7 @@ static int cp_submit_eop_test(DeviceContext &dev, CPContext &, uint64_t timeout,
     if (phase < 3) { *fence = phase; return 0; }
     assert(phase == 3);
     auto sh = decode(stream);
+    for (const auto reg:{0xb858u,0xb85cu,0xb864u,0xb868u}) assert(sh.at(reg)==0x00ff00ff);
     assert(sh.at(0xb900) == 4096 && sh.at(0xb904) == 0x80);
     if (mode != 3) { // Model successful shader stores; mode 3 is fence-only completion.
         for (unsigned i = 0; i < 32; ++i)

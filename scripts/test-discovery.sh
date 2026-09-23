@@ -6,6 +6,8 @@ python3 - <<'PY'
 from pathlib import Path
 h = Path('dext/amdgpu/amdgpu_discovery.h').read_text()
 Path('build/tests/discovery_types_under_test.inc').write_text(h[h.index('#pragma pack(push'):h.index('//\n// discovery_parse')])
+linux = Path('upstream/linux/drivers/gpu/drm/amd/include/discovery.h').read_text()
+Path('build/tests/discovery_gc_linux.inc').write_text(linux[linux.index('struct gpu_info_header {'):linux.index('typedef struct harvest_info_header')])
 s = Path('dext/amdgpu/amdgpu_discovery.cpp').read_text()
 Path('build/tests/discovery_parser_under_test.inc').write_text(s[s.index('namespace {'):s.index('//\n// discover_ips_on_die')])
 PY

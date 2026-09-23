@@ -73,8 +73,38 @@ int main(int argc,char **argv) {
         hsa_executable_symbol_t symbol{};uint64_t kernel=0;
         check(hsa_executable_get_symbol_by_name(executable,"vector_add.kd",&gpu,&symbol),"symbol");
         check(hsa_executable_symbol_get_info(symbol,HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT,&kernel),"kernel descriptor");
-        check(mac_hsa_memory_allocate_shared(gpu,16384,&data),"data");
-        check(mac_hsa_memory_allocate_shared(gpu,16384,&arguments),"kernargs");
+        hsa_agent_t cpu{};
+        check(hsa_iterate_agents([](hsa_agent_t agent, void *out) {
+            hsa_device_type_t type;
+            const auto status=hsa_agent_get_info(agent,HSA_AGENT_INFO_DEVICE,&type);
+            if (!status && type==HSA_DEVICE_TYPE_CPU) *static_cast<hsa_agent_t *>(out)=agent;
+            return status;
+        },&cpu),"CPU agent");require(cpu.handle,"no CPU agent");
+        struct PoolSelection {hsa_agent_t gpu;hsa_amd_memory_pool_t pool{};} selection{gpu};
+        check(hsa_amd_agent_iterate_memory_pools(cpu,[](hsa_amd_memory_pool_t pool,void *opaque) {
+            auto &selection=*static_cast<PoolSelection *>(opaque);
+            uint32_t flags=0;
+            auto status=hsa_amd_memory_pool_get_info(pool,HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS,&flags);
+            if (status) return status;
+            if (flags!=(HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED|HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT))
+                return HSA_STATUS_SUCCESS;
+            hsa_amd_memory_pool_access_t access;
+            status=hsa_amd_agent_memory_pool_get_info(selection.gpu,pool,HSA_AMD_AGENT_MEMORY_POOL_INFO_ACCESS,&access);
+            if (!status && access!=HSA_AMD_MEMORY_POOL_ACCESS_NEVER_ALLOWED) selection.pool=pool;
+            return status;
+        },&selection),"shared coarse/kernarg pool");require(selection.pool.handle,"no GPU-accessible host kernarg pool");
+        check(hsa_amd_memory_pool_allocate(selection.pool,16384,0,&data),"public shared data allocation");
+        check(hsa_amd_memory_pool_allocate(selection.pool,16384,0,&arguments),"public kernarg allocation");
+        for (void *pointer:{data,arguments}) {
+            check(hsa_amd_agents_allow_access(1,&gpu,nullptr,pointer),"allow GPU pool access");
+            hsa_amd_pointer_info_t metadata{};metadata.size=sizeof(metadata);
+            check(hsa_amd_pointer_info(pointer,&metadata,nullptr,nullptr,nullptr),"shared pointer info");
+            require(metadata.hostBaseAddress==pointer && metadata.agentBaseAddress==pointer &&
+                metadata.agentOwner.handle==cpu.handle && metadata.sizeInBytes>=16384 &&
+                metadata.global_flags==(HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED|HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT),
+                "public shared allocation metadata");
+        }
+        std::puts("PASS: standard HSA CPU-owned coarse/kernarg pool, GPU access and identical host/device addresses");
         check(hsa_signal_create(1,0,nullptr,&done),"completion signal");
         check(hsa_signal_create(1,0,nullptr,&dependency),"dependency signal");
         for (auto &queue:queues) check(hsa_queue_create(gpu,64,HSA_QUEUE_TYPE_MULTI,

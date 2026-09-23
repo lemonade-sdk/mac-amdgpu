@@ -45,6 +45,7 @@
 #include "amdgpu/amdgpu_buffer_io.h"
 #include "amdgpu/amdgpu_vram_accounting.h"
 #include "amdgpu/amdgpu_vram_io.h"
+#include "amdgpu/amdgpu_clock.h"
 
 #define MACAMDGPU_LOG(fmt, ...) \
     os_log(OS_LOG_DEFAULT, "mac.amdgpu: " fmt, ##__VA_ARGS__)
@@ -120,6 +121,7 @@ enum {
     kMacAMDGPUMethodAQLQueueCreate    = 56,
     kMacAMDGPUMethodAQLQueueKick      = 57,
     kMacAMDGPUMethodAQLQueueDestroy   = 58,
+    kMacAMDGPUMethodAQLQueueService   = 59,
     kMacAMDGPUMethodAQLDispatch       = 55, // bounded owned AQL queue, dispatch and verified unmap
     kMacAMDGPUMethodHostWindow        = 54, // establish/query common CPU/GPU GART address range
 };
@@ -339,6 +341,10 @@ struct MacAMDGPU_IVars {
     MacAMDGPUUserClient_IVars *quarantinedClient; // backing retained after failed reset
     amdgpu::ClientSubmission submission;
     uint64_t nextAQLHandle; // Never reset with the bringup arena.
+    uint16_t deviceID;
+    uint16_t pciBDF;
+    uint8_t revision;
+    uint64_t timestampFrequency;
 
     // Phase 1B: per-device bringup state shared across user clients.
     // Populated lazily when PCI is opened. Stages run on demand via
@@ -1165,6 +1171,8 @@ IMPL(MacAMDGPU, Start)
     pci->ConfigurationRead16(kIOPCIConfigurationOffsetVendorID, &vendorID);
     pci->ConfigurationRead16(kIOPCIConfigurationOffsetDeviceID, &deviceID);
     pci->ConfigurationRead32(kIOPCIConfigurationOffsetRevisionID, &classRev);
+    ivars->deviceID=deviceID;ivars->revision=uint8_t(classRev);
+    ivars->pciBDF=(uint16_t(bus)<<8)|(uint16_t(device)<<3)|function;
 
     uint16_t cmd = 0, status = 0;
     uint8_t  headerType = 0;
@@ -3349,6 +3357,26 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         return kIOReturnSuccess;
     }
 
+    case kMacAMDGPUMethodAQLQueueService: {
+        if (!arguments->scalarInput || arguments->scalarInputCount!=1 ||
+            !arguments->scalarOutput || arguments->scalarOutputCount<2 || arguments->structureInput ||
+            arguments->structureInputDescriptor || arguments->structureOutputDescriptor ||
+            arguments->structureOutputMaximumSize) return kIOReturnBadArgument;
+        auto &b=driver->ivars->bringup;
+        amdgpu::PersistentAQLQueue *queue=nullptr;
+        for (auto &q:b.aqlQueues)
+            if (q.owner==ivars && q.handle==arguments->scalarInput[0] && q.handle) queue=&q;
+        if (!queue) return kIOReturnBadArgument;
+        auto *ring=mac_amdgpu_bo_lookup(ivars,queue->ringHandle);
+        if (!ring || !ring->cpu_addr || ring->domain!=kBODomainGTT || !ring->gttBinding.ready)
+            return kIOReturnNotReady;
+        uint64_t inactive=0;
+        const auto status=amdgpu::aql_queue_service(b.device,b.gmc,b.gfx,*queue,ring->cpu_addr,inactive);
+        arguments->scalarOutput[0]=uint32_t(status);arguments->scalarOutput[1]=inactive;
+        arguments->scalarOutputCount=2;
+        return kIOReturnSuccess;
+    }
+
     case kMacAMDGPUMethodAQLDispatch: {
         if (arguments->scalarInputCount || !arguments->scalarOutput ||
             arguments->scalarOutputCount < 5 || !arguments->structureInput ||
@@ -4046,6 +4074,26 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         case kMacAMDGPUInfoBringupReached:
             arguments->scalarOutput[0] = static_cast<uint64_t>(b.reached);
             return kIOReturnSuccess;
+        case 6: { // Owned initialized session: hardware topology and ATOM clock.
+            if (arguments->scalarOutputCount<10) return kIOReturnBadArgument;
+            if (!ivars->claimed || !driver->ivars->pciOpen || driver->ivars->shutdownBlocked ||
+                driver->ivars->shutdownInProgress ||
+                b.reached!=amdgpu::BringupStage::SDMAInit || !b.gfx.inited)
+                return kIOReturnNotReady;
+            if (!driver->ivars->timestampFrequency)
+                amdgpu::gfx1201_timestamp_frequency_hz(b.device,driver->ivars->timestampFrequency);
+            arguments->scalarOutput[0]=driver->ivars->deviceID;
+            arguments->scalarOutput[1]=driver->ivars->revision;
+            arguments->scalarOutput[2]=driver->ivars->pciBDF;
+            arguments->scalarOutput[3]=0; // One macOS PCI domain; BDF is from IOPCIDevice.
+            arguments->scalarOutput[4]=b.gfx.num_active_cus;
+            arguments->scalarOutput[5]=b.gfx.max_shader_engines;
+            arguments->scalarOutput[6]=b.gfx.max_sh_per_se;
+            arguments->scalarOutput[7]=driver->ivars->timestampFrequency;
+            arguments->scalarOutput[8]=b.gfx.max_waves_per_simd*2;
+            arguments->scalarOutput[9]=b.gfx.wave_front_size;
+            arguments->scalarOutputCount=10;return kIOReturnSuccess;
+        }
         default:
             return kIOReturnUnsupported;
         }

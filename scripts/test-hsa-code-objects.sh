@@ -10,4 +10,6 @@ mkdir -p build/tests
 xcrun clang++ -std=c++20 -Wall -Wextra -Werror -fsanitize=address,undefined \
   -fno-sanitize-recover=all -I hsa/src tests/hsa_code_object_test.cpp \
   hsa/src/code_object.cpp -o build/tests/hsa-code-object-test
-build/tests/hsa-code-object-test build/tests/hsa-code-object.hsaco
+bash scripts/build-resource-test.sh > build/tests/hsa-resource-metadata.txt
+build/tests/hsa-code-object-test build/tests/hsa-code-object.hsaco build/tests/hsa-resource-object.hsaco \
+  upstream/hrx-lse-pin/runtime/src/iree/hal/drivers/amdgpu/device/binaries/prebuilt/amdgcn-amd-amdhsa--gfx12-generic.so

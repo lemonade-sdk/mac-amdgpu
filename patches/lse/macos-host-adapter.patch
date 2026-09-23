@@ -1,0 +1,609 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8143b41..8d237af 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -89,12 +89,17 @@ add_subdirectory(src/backends)
+ # is chosen from the endpoint string and the declared capabilities, never
+ # named by a caller.
+ # ---------------------------------------------------------------------------
++if(APPLE)
++  set(LSE_POLLER_SOURCE src/communication/poller_kqueue.cpp)
++else()
++  set(LSE_POLLER_SOURCE src/communication/poller_epoll.cpp)
++endif()
+ add_library(lse_communication
+   src/communication/endpoint.cpp
+   src/communication/capabilities.cpp
+   src/communication/transport.cpp
+   src/communication/reactor.cpp
+-  src/communication/poller_epoll.cpp
++  ${LSE_POLLER_SOURCE}
+   src/communication/stream_link.cpp
+   src/communication/socket.cpp
+   src/communication/rdma.cpp
+@@ -104,8 +109,12 @@ add_library(lse::communication ALIAS lse_communication)
+ # machine what it has. It is not a build dependency on any fabric: there is none.
+ target_link_libraries(lse_communication PUBLIC lse_core ${CMAKE_DL_LIBS})
+ # Transports self-register from a TU with no referenced symbols.
+-target_link_options(lse_communication INTERFACE
++if(APPLE)
++  target_link_options(lse_communication INTERFACE "LINKER:-force_load,$<TARGET_FILE:lse_communication>")
++else()
++  target_link_options(lse_communication INTERFACE
+   "LINKER:--whole-archive,$<TARGET_FILE:lse_communication>,--no-whole-archive")
++endif()
+ lse_apply_common_flags(lse_communication)
+ 
+ # ---------------------------------------------------------------------------
+@@ -139,8 +148,12 @@ add_library(lse_dist
+ add_library(lse::dist ALIAS lse_dist)
+ target_link_libraries(lse_dist PUBLIC lse_core lse_ir lse_backend_registry lse_communication)
+ # Transports self-register from a TU with no referenced symbols.
+-target_link_options(lse_dist INTERFACE
++if(APPLE)
++  target_link_options(lse_dist INTERFACE "LINKER:-force_load,$<TARGET_FILE:lse_dist>")
++else()
++  target_link_options(lse_dist INTERFACE
+   "LINKER:--whole-archive,$<TARGET_FILE:lse_dist>,--no-whole-archive")
++endif()
+ lse_apply_common_flags(lse_dist)
+ 
+ # ---------------------------------------------------------------------------
+@@ -231,16 +244,24 @@ add_library(lse::kernels ALIAS lse_kernels)
+ target_link_libraries(lse_kernels PUBLIC lse_core lse_ir lse_graph)
+ # Each primitive self-registers from a TU nothing references, so the archive
+ # has to be linked whole or none of them exist at run time.
+-target_link_options(lse_kernels INTERFACE
++if(APPLE)
++  target_link_options(lse_kernels INTERFACE "LINKER:-force_load,$<TARGET_FILE:lse_kernels>")
++else()
++  target_link_options(lse_kernels INTERFACE
+   "LINKER:--whole-archive,$<TARGET_FILE:lse_kernels>,--no-whole-archive")
++endif()
+ lse_apply_common_flags(lse_kernels)
+ 
+ # No backend edge here, in either direction of the build: lse_backend_hrx links
+ # lse_graph because it implements graph's emitter and compiler seams, so an edge
+ # back would be a cycle. Executables link lse_backends to make one selectable.
+ # Primitives self-register from a TU with no referenced symbols.
+-target_link_options(lse_graph INTERFACE
++if(APPLE)
++  target_link_options(lse_graph INTERFACE "LINKER:-force_load,$<TARGET_FILE:lse_graph>")
++else()
++  target_link_options(lse_graph INTERFACE
+   "LINKER:--whole-archive,$<TARGET_FILE:lse_graph>,--no-whole-archive")
++endif()
+ 
+ lse_apply_common_flags(lse_graph)
+ # Review copies of generated HIP land in ${CMAKE_BINARY_DIR}/hip/.
+@@ -307,8 +328,12 @@ add_library(lse_model
+ )
+ add_library(lse::model ALIAS lse_model)
+ # Model kernels self-register from a TU nothing references.
+-target_link_options(lse_model INTERFACE
++if(APPLE)
++  target_link_options(lse_model INTERFACE "LINKER:-force_load,$<TARGET_FILE:lse_model>")
++else()
++  target_link_options(lse_model INTERFACE
+   "LINKER:--whole-archive,$<TARGET_FILE:lse_model>,--no-whole-archive")
++endif()
+ target_link_libraries(lse_model PUBLIC lse_core lse_graph lse_ops)
+ lse_apply_common_flags(lse_model)
+ 
+@@ -335,8 +360,12 @@ target_compile_definitions(lse_place PRIVATE
+   LSE_CONFIGURED_ROCM_PATH="${LSE_ROCM_PATH}")
+ # The set registers itself as graph's device-set factory from a TU with no
+ # referenced symbols, the same way transports and backends register.
+-target_link_options(lse_place INTERFACE
++if(APPLE)
++  target_link_options(lse_place INTERFACE "LINKER:-force_load,$<TARGET_FILE:lse_place>")
++else()
++  target_link_options(lse_place INTERFACE
+   "LINKER:--whole-archive,$<TARGET_FILE:lse_place>,--no-whole-archive")
++endif()
+ lse_apply_common_flags(lse_place)
+ 
+ # ---------------------------------------------------------------------------
+diff --git a/include/lse/communication/poller.hpp b/include/lse/communication/poller.hpp
+index e51c708..fdf066f 100644
+--- a/include/lse/communication/poller.hpp
++++ b/include/lse/communication/poller.hpp
+@@ -73,7 +73,7 @@ class Poller {
+   Poller() = default;
+ 
+   int epoll_fd_ = -1;
+-  int wake_fd_ = -1;
++  [[maybe_unused]] int wake_fd_ = -1; // kqueue uses an EVFILT_USER event.
+   std::map<int, IReady*> owners_;
+   std::vector<unsigned char> scratch_;
+ };
+diff --git a/include/lse/ir/args.hpp b/include/lse/ir/args.hpp
+index 37e1df9..d3a715c 100644
+--- a/include/lse/ir/args.hpp
++++ b/include/lse/ir/args.hpp
+@@ -21,14 +21,20 @@
+ // than that. Requiring 202603 turned a compiler that works into one that
+ // stops at the first header, which is a worse answer than trying.
+ #if !defined(__cpp_impl_reflection) || __cpp_impl_reflection < 202506L
+-#error "kernel_args.hpp needs P2996 reflection (g++-16 -std=c++26 -freflection)"
++#define LSE_PORTABLE_AGGREGATE_ARGS 1
+ #endif
+ 
+ #include <cstddef>
+ #include <cstdint>
+ #include <span>
+ #include <string>
++#if !defined(LSE_PORTABLE_AGGREGATE_ARGS)
+ #include <meta>
++#else
++#include <tuple>
++#include <type_traits>
++#include <utility>
++#endif
+ 
+ #include "lse/core/dtype.hpp"
+ #include "lse/ir/env.hpp"
+@@ -100,14 +106,53 @@ struct arg_traits<InOut<T, Emit>> {
+   using elem = T;
+ };
+ 
++#ifndef LSE_PORTABLE_AGGREGATE_ARGS
+ template <class A>
+ consteval auto members() {
+   return std::define_static_array(std::meta::nonstatic_data_members_of(
+       ^^A, std::meta::access_context::current()));
+ }
+ 
++#else
++// The portable path supports plain aggregate parameter bundles only. Member
++// order comes from C++ structured binding, retaining the reflected ABI order.
++struct AggregateElement { template<class T> constexpr operator T() const noexcept; };
++template<class A, std::size_t... I>
++consteval bool initializes(std::index_sequence<I...>) {
++  return requires { A{(static_cast<void>(I), AggregateElement{})...}; };
++}
++template<class A, std::size_t N=0> consteval std::size_t member_count() {
++  static_assert(std::is_aggregate_v<A>, "kernel parameter bundle must be an aggregate");
++  if constexpr (initializes<A>(std::make_index_sequence<N+1>{})) {
++    static_assert(N<16, "portable kernel parameter bundle exceeds 16 members");
++    return member_count<A,N+1>();
++  } else return N;
++}
++template<class A> auto member_refs(A& value) {
++  constexpr auto count=member_count<A>();
++  if constexpr (count==0) return std::tuple<>();
++  else if constexpr (count==1) { auto& [m0]=value; return std::tie(m0); }
++  else if constexpr (count==2) { auto& [m0, m1]=value; return std::tie(m0, m1); }
++  else if constexpr (count==3) { auto& [m0, m1, m2]=value; return std::tie(m0, m1, m2); }
++  else if constexpr (count==4) { auto& [m0, m1, m2, m3]=value; return std::tie(m0, m1, m2, m3); }
++  else if constexpr (count==5) { auto& [m0, m1, m2, m3, m4]=value; return std::tie(m0, m1, m2, m3, m4); }
++  else if constexpr (count==6) { auto& [m0, m1, m2, m3, m4, m5]=value; return std::tie(m0, m1, m2, m3, m4, m5); }
++  else if constexpr (count==7) { auto& [m0, m1, m2, m3, m4, m5, m6]=value; return std::tie(m0, m1, m2, m3, m4, m5, m6); }
++  else if constexpr (count==8) { auto& [m0, m1, m2, m3, m4, m5, m6, m7]=value; return std::tie(m0, m1, m2, m3, m4, m5, m6, m7); }
++  else if constexpr (count==9) { auto& [m0, m1, m2, m3, m4, m5, m6, m7, m8]=value; return std::tie(m0, m1, m2, m3, m4, m5, m6, m7, m8); }
++  else if constexpr (count==10) { auto& [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9]=value; return std::tie(m0, m1, m2, m3, m4, m5, m6, m7, m8, m9); }
++  else if constexpr (count==11) { auto& [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10]=value; return std::tie(m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10); }
++  else if constexpr (count==12) { auto& [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11]=value; return std::tie(m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11); }
++  else if constexpr (count==13) { auto& [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12]=value; return std::tie(m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12); }
++  else if constexpr (count==14) { auto& [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13]=value; return std::tie(m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13); }
++  else if constexpr (count==15) { auto& [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14]=value; return std::tie(m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14); }
++  else if constexpr (count==16) { auto& [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15]=value; return std::tie(m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15); }
++}
++#endif
++
+ }  // namespace detail
+ 
++#ifndef LSE_PORTABLE_AGGREGATE_ARGS
+ template <class A>
+ consteval std::size_t input_count() {
+   std::size_t n = 0;
+@@ -132,6 +177,20 @@ consteval std::size_t output_count() {
+   return n;
+ }
+ 
++#else
++template<class A, bool Inputs> consteval std::size_t count_arguments() {
++  using Fields=decltype(detail::member_refs(std::declval<A&>()));
++  return []<std::size_t... I>(std::index_sequence<I...>) {
++    return (std::size_t{0} + ... + (Inputs ?
++      detail::arg_traits<std::remove_cvref_t<std::tuple_element_t<I,Fields>>>::is_in :
++      detail::arg_traits<std::remove_cvref_t<std::tuple_element_t<I,Fields>>>::is_out));
++  }(std::make_index_sequence<std::tuple_size_v<Fields>>{});
++}
++template<class A> consteval std::size_t input_count() { return count_arguments<A,true>(); }
++template<class A> consteval std::size_t output_count() { return count_arguments<A,false>(); }
++
++#endif
++
+ // Attach every member to the recorder: In members take input slots in
+ // declaration order, the Out member takes the output. A member that is
+ // neither is a mistake the compiler reports here, not a silent skip.
+@@ -150,6 +209,7 @@ template <class A>
+                         DType out_dtype) {
+   std::size_t index = 0;
+   bool ok = true;
++#ifndef LSE_PORTABLE_AGGREGATE_ARGS
+   template for (constexpr std::meta::info m : detail::members<A>()) {
+     using M = typename[:std::meta::type_of(m):];
+     using Tr = detail::arg_traits<M>;
+@@ -172,6 +232,31 @@ template <class A>
+       args.[:m:].tt = &k.types();
+     }
+   }
++#else
++  const auto attach = [&](auto& member) {
++    using M = std::remove_cvref_t<decltype(member)>;
++    using Tr = detail::arg_traits<M>;
++    static_assert(Tr::is_in || Tr::is_out,
++                  "kernel args members must be env::In or env::Out");
++    if constexpr (Tr::is_in) {
++      if (!in_dtypes.empty() && index < in_dtypes.size() &&
++          in_dtypes[index] != elem_dtype<typename Tr::elem>::value) {
++        ok = false;
++      }
++      // Names follow the emitter's binding convention directly; this is the
++      // one place that convention is spelled for authored kernels.
++      member.b =
++          Buffer<typename Tr::elem>(&k, &k.types(), k.input_name(index++));
++      member.tt = &k.types();
++    } else if constexpr (Tr::is_out) {
++      if (out_dtype != elem_dtype<typename Tr::elem>::value) ok = false;
++      member.b =
++          Buffer<typename Tr::elem>(&k, &k.types(), k.output_name());
++      member.tt = &k.types();
++    }
++  };
++  std::apply([&](auto&... member) { (attach(member), ...); }, detail::member_refs(args));
++#endif
+   // At most one: kernels that return their element value or store through
+   // the emitter's hook declare no Out at all.
+   static_assert(output_count<A>() <= 1,
+diff --git a/src/backends/cpu/CMakeLists.txt b/src/backends/cpu/CMakeLists.txt
+index 6d62302..a4ee4fa 100644
+--- a/src/backends/cpu/CMakeLists.txt
++++ b/src/backends/cpu/CMakeLists.txt
+@@ -9,7 +9,11 @@ target_link_libraries(lse_backend_cpu PUBLIC lse_core lse_backend_registry)
+ 
+ # The registrar is a static initializer in a TU with no referenced symbols;
+ # without whole-archive the linker drops it and the backend silently vanishes.
+-target_link_options(lse_backend_cpu INTERFACE
++if(APPLE)
++  target_link_options(lse_backend_cpu INTERFACE "LINKER:-force_load,$<TARGET_FILE:lse_backend_cpu>")
++else()
++  target_link_options(lse_backend_cpu INTERFACE
+   "LINKER:--whole-archive,$<TARGET_FILE:lse_backend_cpu>,--no-whole-archive")
++endif()
+ target_include_directories(lse_backend_cpu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+ lse_apply_common_flags(lse_backend_cpu)
+diff --git a/src/backends/hrx/CMakeLists.txt b/src/backends/hrx/CMakeLists.txt
+index 2f05ce3..49d3d0a 100644
+--- a/src/backends/hrx/CMakeLists.txt
++++ b/src/backends/hrx/CMakeLists.txt
+@@ -80,7 +80,11 @@ else()
+ endif()
+ 
+ # See the cpu backend: self-registration requires whole-archive linking.
+-target_link_options(lse_backend_hrx INTERFACE
++if(APPLE)
++  target_link_options(lse_backend_hrx INTERFACE "LINKER:-force_load,$<TARGET_FILE:lse_backend_hrx>")
++else()
++  target_link_options(lse_backend_hrx INTERFACE
+   "LINKER:--whole-archive,$<TARGET_FILE:lse_backend_hrx>,--no-whole-archive")
++endif()
+ 
+ lse_apply_common_flags(lse_backend_hrx)
+diff --git a/src/backends/hrx/hrx_backend.cpp b/src/backends/hrx/hrx_backend.cpp
+index 76bb223..d1b7916 100644
+--- a/src/backends/hrx/hrx_backend.cpp
++++ b/src/backends/hrx/hrx_backend.cpp
+@@ -702,9 +702,17 @@ Status accelerator_up() {
+   // for here because bringing the accelerator up is once per process and the
+   // topology is fixed at that moment.
+   const std::string group = backend::requested_device_group("hrx");
++#if defined(__APPLE__)
++  if (!group.empty()) {
++    return LSE_ERROR(kUnimplemented,
++                     "the macOS HRX adapter does not support spanning GPU groups");
++  }
++  const hrx_status_t status = hrx_gpu_initialize(0);
++#else
+   const hrx_status_t status =
+       group.empty() ? hrx_gpu_initialize(0)
+                     : hrx_gpu_initialize_over(group.c_str(), 0);
++#endif
+   if (hrx_status_is_ok(status)) {
+     g_accelerator_up.store(true, std::memory_order_release);
+     return OkStatus();
+diff --git a/src/communication/socket.cpp b/src/communication/socket.cpp
+index 3ad7a35..0abc576 100644
+--- a/src/communication/socket.cpp
++++ b/src/communication/socket.cpp
+@@ -11,6 +11,7 @@
+ #include <sys/stat.h>
+ #include <sys/un.h>
+ #include <unistd.h>
++#include <fcntl.h>
+ 
+ #include <algorithm>
+ #include <array>
+@@ -91,7 +92,7 @@ Result<Address> inet_address(std::string_view authority) {
+   sockaddr_in v4{};
+   if (::inet_pton(AF_INET, host.c_str(), &v4.sin_addr) == 1) {
+     v4.sin_family = AF_INET;
+-    v4.sin_port = ::htons(static_cast<std::uint16_t>(port_value));
++    v4.sin_port = htons(static_cast<std::uint16_t>(port_value));
+     std::memcpy(&out.storage, &v4, sizeof(v4));
+     out.len = sizeof(v4);
+     out.family = AF_INET;
+@@ -100,7 +101,7 @@ Result<Address> inet_address(std::string_view authority) {
+   sockaddr_in6 v6{};
+   if (::inet_pton(AF_INET6, host.c_str(), &v6.sin6_addr) == 1) {
+     v6.sin6_family = AF_INET6;
+-    v6.sin6_port = ::htons(static_cast<std::uint16_t>(port_value));
++    v6.sin6_port = htons(static_cast<std::uint16_t>(port_value));
+     std::memcpy(&out.storage, &v6, sizeof(v6));
+     out.len = sizeof(v6);
+     out.family = AF_INET6;
+@@ -125,6 +126,9 @@ Result<Address> unix_address(const Endpoint& ep) {
+   // A leading '@' is the abstract namespace: no filesystem entry, so nothing to
+   // unlink and nothing left behind by a crash.
+   const bool abstract = name.front() == '@';
++#ifdef __APPLE__
++  if (abstract) return LSE_ERROR(kUnimplemented, "macOS unix sockets require a filesystem path; abstract namespace is Linux-only");
++#endif
+   const std::string body = abstract ? name.substr(1) : name;
+   if (body.size() + 1 > sizeof(un.sun_path)) {
+     return LSE_ERROR(kOutOfRange, "unix socket name '", name, "' is longer than ",
+@@ -151,9 +155,34 @@ Result<Address> address_of(const Endpoint& ep) {
+   return inet_address(ep.authority());
+ }
+ 
++#ifdef __APPLE__
++bool configure_socket(int fd) {
++  const int flags=::fcntl(fd,F_GETFL,0);
++  const int descriptor_flags=::fcntl(fd,F_GETFD,0);
++  const int one=1;
++  return flags>=0 && descriptor_flags>=0 &&
++      ::fcntl(fd,F_SETFL,flags|O_NONBLOCK)==0 &&
++      ::fcntl(fd,F_SETFD,descriptor_flags|FD_CLOEXEC)==0 &&
++      ::setsockopt(fd,SOL_SOCKET,SO_NOSIGPIPE,&one,sizeof(one))==0;
++}
++int darwin_socket(int family) {
++  const int fd=::socket(family,SOCK_STREAM,0);
++  if (fd>=0 && !configure_socket(fd)) { const int saved=errno;::close(fd);errno=saved;return -1; }
++  return fd;
++}
++int darwin_accept(int listener) {
++  const int fd=::accept(listener,nullptr,nullptr);
++  if (fd>=0 && !configure_socket(fd)) { const int saved=errno;::close(fd);errno=saved;return -1; }
++  return fd;
++}
++#endif
++
+ Result<int> make_socket(int family) {
+-  const int fd =
+-      ::socket(family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
++#ifdef __APPLE__
++  const int fd = darwin_socket(family);
++#else
++  const int fd = ::socket(family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
++#endif
+   if (fd < 0) {
+     return LSE_ERROR(kIoError, "socket(): ", std::strerror(errno));
+   }
+@@ -178,7 +207,7 @@ std::string describe_peer(int fd, const Endpoint& fallback) {
+     std::array<char, INET_ADDRSTRLEN> text{};
+     ::inet_ntop(AF_INET, &v4.sin_addr, text.data(), text.size());
+     return "tcp://" + std::string(text.data()) + ":" +
+-           std::to_string(::ntohs(v4.sin_port));
++           std::to_string(ntohs(v4.sin_port));
+   }
+   if (ss.ss_family == AF_INET6) {
+     sockaddr_in6 v6{};
+@@ -186,7 +215,7 @@ std::string describe_peer(int fd, const Endpoint& fallback) {
+     std::array<char, INET6_ADDRSTRLEN> text{};
+     ::inet_ntop(AF_INET6, &v6.sin6_addr, text.data(), text.size());
+     return "tcp://[" + std::string(text.data()) + "]:" +
+-           std::to_string(::ntohs(v6.sin6_port));
++           std::to_string(ntohs(v6.sin6_port));
+   }
+   return fallback.str();
+ }
+@@ -205,14 +234,14 @@ Result<Endpoint> bound_endpoint(int fd, const Endpoint& requested) {
+     std::array<char, INET_ADDRSTRLEN> text{};
+     ::inet_ntop(AF_INET, &v4.sin_addr, text.data(), text.size());
+     authority = std::string(text.data()) + ":" +
+-                std::to_string(::ntohs(v4.sin_port));
++                std::to_string(ntohs(v4.sin_port));
+   } else {
+     sockaddr_in6 v6{};
+     std::memcpy(&v6, &ss, sizeof(v6));
+     std::array<char, INET6_ADDRSTRLEN> text{};
+     ::inet_ntop(AF_INET6, &v6.sin6_addr, text.data(), text.size());
+     authority = "[" + std::string(text.data()) + "]:" +
+-                std::to_string(::ntohs(v6.sin6_port));
++                std::to_string(ntohs(v6.sin6_port));
+   }
+   std::string text = std::string(requested.scheme()) + "://" + authority;
+   bool first = true;
+@@ -564,8 +593,12 @@ constexpr std::uint64_t kAcceptRetryNs = 50'000'000ull;
+ 
+ void SocketListener::accept_ready() {
+   for (;;) {
++#ifdef __APPLE__
++    const int fd = darwin_accept(fd_);
++#else
+     const int fd = ::accept4(fd_, nullptr, nullptr,
+                              SOCK_NONBLOCK | SOCK_CLOEXEC);
++#endif
+     if (fd < 0) {
+       // Out of descriptors: the connection stays queued and the listening
+       // socket stays readable, so waiting on it again would report ready
+diff --git a/src/trace/record.cpp b/src/trace/record.cpp
+index 9f17d38..35db5ad 100644
+--- a/src/trace/record.cpp
++++ b/src/trace/record.cpp
+@@ -1,6 +1,9 @@
+ #include "lse/trace/record.hpp"
+ 
+ #include <ctime>
++#ifdef __APPLE__
++#include <mach/mach_time.h>
++#endif
+ 
+ #include <algorithm>
+ 
+@@ -20,7 +23,16 @@ std::uint64_t clock_ns(clockid_t id) noexcept {
+ HostClockPair read_host_clocks() noexcept {
+   HostClockPair pair;
+   pair.monotonic_ns = clock_ns(CLOCK_MONOTONIC);
++#ifdef __APPLE__
++  // Darwin's continuous clock includes time spent asleep, matching BOOTTIME.
++  static const mach_timebase_info_data_t scale=[] {
++    mach_timebase_info_data_t value{};mach_timebase_info(&value);return value;
++  }();
++  if (scale.denom) pair.boottime_ns=static_cast<std::uint64_t>(
++      static_cast<__uint128_t>(mach_continuous_time())*scale.numer/scale.denom);
++#else
+   pair.boottime_ns = clock_ns(CLOCK_BOOTTIME);
++#endif
+   return pair;
+ }
+ 
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index a787603..236f61d 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -35,7 +35,7 @@ endif()
+ 
+ if(LSE_ENABLE_CPU)
+   lse_add_test(test_backend_cpu lse_backend_cpu)
+-  lse_add_test(test_graph lse_graph lse_backends)
++  lse_add_test(test_graph lse_graph lse_kernels lse_backends)
+   lse_add_test(test_primitive lse_graph lse_backends)
+ endif()
+ 
+diff --git a/src/communication/poller_kqueue.cpp b/src/communication/poller_kqueue.cpp
+new file mode 100644
+index 0000000..c492dcd
+--- /dev/null
++++ b/src/communication/poller_kqueue.cpp
+@@ -0,0 +1,118 @@
++#include "lse/communication/poller.hpp"
++#include <array>
++#include <cerrno>
++#include <cstring>
++#include <fcntl.h>
++#include <sys/event.h>
++#include <sys/time.h>
++#include <unistd.h>
++#include <utility>
++
++namespace lse::comm {
++namespace {
++constexpr uintptr_t kWake = UINTPTR_MAX;
++Status arm(int queue, int fd, Interest interest) {
++  struct kevent changes[2];
++  EV_SET(&changes[0], static_cast<uintptr_t>(fd), EVFILT_READ,
++         EV_ADD | (wants_read(interest) ? EV_ENABLE : EV_DISABLE), 0, 0,
++         nullptr);
++  EV_SET(&changes[1], static_cast<uintptr_t>(fd), EVFILT_WRITE,
++         EV_ADD | (wants_write(interest) ? EV_ENABLE : EV_DISABLE), 0, 0,
++         nullptr);
++  if (::kevent(queue, changes, 2, nullptr, 0, nullptr) < 0)
++    return LSE_ERROR(kIoError, "kevent(arm): ", std::strerror(errno));
++  return OkStatus();
++}
++} // namespace
++Result<Poller> Poller::create() {
++  Poller p;
++  p.epoll_fd_ = ::kqueue();
++  if (p.epoll_fd_ < 0)
++    return LSE_ERROR(kIoError, "kqueue: ", std::strerror(errno));
++  if (::fcntl(p.epoll_fd_, F_SETFD, FD_CLOEXEC) < 0)
++    return LSE_ERROR(kIoError, "fcntl(kqueue): ", std::strerror(errno));
++  struct kevent wake;
++  EV_SET(&wake, kWake, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, nullptr);
++  if (::kevent(p.epoll_fd_, &wake, 1, nullptr, 0, nullptr) < 0)
++    return LSE_ERROR(kIoError, "kevent(wake): ", std::strerror(errno));
++  return p;
++}
++Poller::~Poller() {
++  if (epoll_fd_ >= 0)
++    ::close(epoll_fd_);
++}
++Poller::Poller(Poller &&other) noexcept
++    : epoll_fd_(std::exchange(other.epoll_fd_, -1)),
++      owners_(std::move(other.owners_)), scratch_(std::move(other.scratch_)) {}
++Poller &Poller::operator=(Poller &&other) noexcept {
++  if (this != &other) {
++    if (epoll_fd_ >= 0)
++      ::close(epoll_fd_);
++    epoll_fd_ = std::exchange(other.epoll_fd_, -1);
++    owners_ = std::move(other.owners_);
++    scratch_ = std::move(other.scratch_);
++  }
++  return *this;
++}
++Status Poller::add(int fd, Interest interest, IReady *owner) {
++  if (fd < 0 || !owner)
++    return LSE_ERROR(kInvalidArgument, "invalid poller descriptor/owner");
++  if (owners_.contains(fd))
++    return LSE_ERROR(kAlreadyExists, "descriptor already registered");
++  auto status = arm(epoll_fd_, fd, interest);
++  if (!status.ok()) {
++    remove(fd);
++    return status;
++  }
++  owners_[fd] = owner;
++  return OkStatus();
++}
++Status Poller::modify(int fd, Interest interest) {
++  if (!owners_.contains(fd))
++    return LSE_ERROR(kNotFound, "descriptor not registered");
++  return arm(epoll_fd_, fd, interest);
++}
++void Poller::remove(int fd) noexcept {
++  struct kevent change;
++  for (auto filter : {EVFILT_READ, EVFILT_WRITE}) {
++    EV_SET(&change, static_cast<uintptr_t>(fd), filter, EV_DELETE, 0, 0,
++           nullptr);
++    ::kevent(epoll_fd_, &change, 1, nullptr, 0, nullptr);
++  }
++  owners_.erase(fd);
++}
++Status Poller::wait(std::uint64_t timeout_ns) {
++  std::array<struct kevent, 128> events{};
++  const timespec timeout{static_cast<time_t>(timeout_ns / 1'000'000'000ull),
++                         static_cast<long>(timeout_ns % 1'000'000'000ull)};
++  const int count = ::kevent(epoll_fd_, nullptr, 0, events.data(),
++                             static_cast<int>(events.size()), &timeout);
++  if (count < 0) {
++    if (errno == EINTR)
++      return OkStatus();
++    return LSE_ERROR(kIoError, "kevent(wait): ", std::strerror(errno));
++  }
++  for (int i = 0; i < count; ++i) {
++    const auto &event = events[static_cast<std::size_t>(i)];
++    if (event.filter == EVFILT_USER && event.ident == kWake)
++      continue;
++    const int fd = static_cast<int>(event.ident);
++    const auto found = owners_.find(fd);
++    if (found == owners_.end())
++      continue;
++    Readiness ready;
++    ready.readable = event.filter == EVFILT_READ;
++    ready.writable = event.filter == EVFILT_WRITE;
++    ready.hangup = (event.flags & (EV_EOF | EV_ERROR)) != 0;
++    found->second->on_ready(fd, ready);
++  }
++  return OkStatus();
++}
++void Poller::wake() noexcept {
++  if (epoll_fd_ < 0)
++    return;
++  struct kevent event;
++  EV_SET(&event, kWake, EVFILT_USER, 0, NOTE_TRIGGER, 0, nullptr);
++  ::kevent(epoll_fd_, &event, 1, nullptr, 0, nullptr);
++}
++} // namespace lse::comm
