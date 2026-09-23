@@ -70,7 +70,7 @@ static hsa_status_t findExecutable(hsa_executable_t handle, std::shared_ptr<Exec
 }
 using namespace mac_hsa::detail;
 extern "C" {
-hsa_status_t mac_hsa_executable_dispatch(hsa_executable_symbol_t handle,
+static hsa_status_t dispatchExecutable(bool aql, hsa_executable_symbol_t handle,
     const void *kernarg, size_t kernargSize, const uint32_t groups[3],
     const uint32_t threads[3], const void *const *buffers, size_t bufferCount,
     uint64_t *fence) {
@@ -135,7 +135,27 @@ hsa_status_t mac_hsa_executable_dispatch(hsa_executable_symbol_t handle,
     request.userSGPR[0] = uint32_t(arguments.buffer.address);
     request.userSGPR[1] = uint32_t(arguments.buffer.address >> 32);
     request.buffers[bufferCount] = arguments.buffer.handle;
+    if (aql) {
+        amdgpu::AQLDispatchRequest packet{};
+        packet.version=1; packet.codeHandle=image.buffer.handle;
+        packet.descriptorOffset=kernel.descriptor; packet.kernargHandle=arguments.buffer.handle;
+        packet.kernargBytes=kernargSize; packet.timeoutUS=request.timeoutUS;
+        for (unsigned i=0;i<3;++i) { packet.groups[i]=groups[i]; packet.threads[i]=threads[i]; }
+        for (size_t i=0;i<bufferCount;++i) packet.buffers[i]=request.buffers[i];
+        if (!amdgpu::aql_dispatch_shape(packet)) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        return image.connection->dispatchAQL(packet,*fence);
+    }
     return image.connection->dispatch(request, *fence);
+}
+hsa_status_t mac_hsa_executable_dispatch(hsa_executable_symbol_t symbol,
+    const void *kernarg, size_t bytes, const uint32_t groups[3], const uint32_t threads[3],
+    const void *const *buffers, size_t count, uint64_t *fence) {
+    return dispatchExecutable(false,symbol,kernarg,bytes,groups,threads,buffers,count,fence);
+}
+hsa_status_t mac_hsa_executable_dispatch_aql(hsa_executable_symbol_t symbol,
+    const void *kernarg, size_t bytes, const uint32_t groups[3], const uint32_t threads[3],
+    const void *const *buffers, size_t count, uint64_t *completion) {
+    return dispatchExecutable(true,symbol,kernarg,bytes,groups,threads,buffers,count,completion);
 }
 hsa_status_t hsa_code_object_reader_create_from_memory(const void *data, size_t size,
                                                        hsa_code_object_reader_t *out) {

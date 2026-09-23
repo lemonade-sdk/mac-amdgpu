@@ -436,3 +436,33 @@ uses cached properties, not live requester/egress-control registers; these
 results do not isolate every cause of the SDMA timeout or establish shader
 atomic behavior. Shared transfers remain usable, but concurrent system atomics,
 payload publication ordering and hardware AQL queues remain unverified.
+
+### Build 184: bounded AQL dispatch (hardware passed)
+
+`mac_hsa_executable_dispatch_aql` accepts the same frozen symbols and kernel
+limits as the native launch API. Selector 55 validates owned code, kernarg and
+data BOs, builds a gfx1201 compute MQD and AMD queue metadata in visible VRAM,
+then maps one reserved legacy compute queue through uni-MES KIQ. Its first
+AQL packet uses write-pointer shadow 1 and doorbell value 0, matching ROCr’s
+packet-index convention. Completion is a GPU-only VRAM signal changing 1 to 0.
+The host polls it; no CPU/GPU concurrent atomic updates are required.
+
+The queue is removed through MES REMOVE_QUEUE and a trailing scheduler query
+before storage can be freed. Mapping, completion, queue error, removal or
+read-pointer failures retain backing and block normal operations until a
+verified reset. Driver calls are serialized, and MES cannot schedule other
+work onto the reserved pipe-0/queue-0 slot.
+
+After installing build 184:
+
+```sh
+build/hsa/mac-hsa-kernel-test --aql build/tests/hsa-code-object.hsaco
+build/hsa/mac-hsa-kernel-test --aql-shared build/tests/hsa-code-object.hsaco
+```
+
+Both commands check actual outputs and all guards for two dispatch sizes,
+including queue removal/recreation between calls. Both modes passed on driver
+184: 128 and 256 outputs, every allocation byte, completion 1 → 0 and confirmed
+queue removal. Public `hsa_queue_create` remains disabled; this bounded
+native API does not establish persistent HSA queues, coherent shared signals,
+or HRX inference support.

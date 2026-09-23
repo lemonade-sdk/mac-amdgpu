@@ -5,6 +5,7 @@
 #include <vector>
 #include <string>
 #include "../../dext/amdgpu/amdgpu_dispatch_abi.h"
+#include "../../dext/amdgpu/amdgpu_aql_abi.h"
 
 namespace mac_hsa {
 
@@ -38,6 +39,7 @@ public:
     virtual hsa_status_t freeSharedBuffer(const SharedBuffer &) { return HSA_STATUS_ERROR; }
     // Diagnostic only: raw SDMA submission claims an exclusive client lease.
     virtual hsa_status_t testSharedAtomicAdd(const SharedBuffer &, uint64_t, int64_t, uint32_t) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
+    virtual hsa_status_t dispatchAQL(const amdgpu::AQLDispatchRequest &, uint64_t &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
     virtual hsa_status_t dispatch(const amdgpu::ComputeDispatchRequest &, uint64_t &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
     virtual hsa_status_t copyBuffers(const DeviceBuffer &, uint64_t, const DeviceBuffer &, uint64_t, size_t) { return HSA_STATUS_ERROR; }
     virtual hsa_status_t exportBuffer(const DeviceBuffer &, BufferToken &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }

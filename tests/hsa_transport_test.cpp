@@ -9,6 +9,7 @@
 #include <atomic>
 #include <algorithm>
 #include "../dext/amdgpu/amdgpu_dispatch_abi.h"
+#include "../dext/amdgpu/amdgpu_aql_abi.h"
 
 namespace {
 struct Buffer { std::vector<uint8_t> bytes; uint64_t domain; };
@@ -25,7 +26,7 @@ unsigned hostChecks = 0, sharedMaps = 0, sharedUnmaps = 0;
 std::vector<std::array<uint64_t, 10>> atomicPackets;
 bool atomicTimeout = false, streamLive = false;
 unsigned submittedStreams = 0;
-unsigned computeCalls = 0, computeFault = 0;
+unsigned computeCalls = 0, computeFault = 0, aqlCalls = 0, aqlFault = 0;
 kern_return_t mockOpen(io_service_t, task_port_t, uint32_t, io_connect_t *port) { *port = ++opens; return KERN_SUCCESS; }
 kern_return_t mockClose(io_connect_t) { ++closes; return KERN_SUCCESS; }
 kern_return_t mockRelease(io_object_t) { return KERN_SUCCESS; }
@@ -136,6 +137,20 @@ kern_return_t mockUnmap(io_connect_t, uint32_t memory, task_port_t, mach_vm_addr
 }
 kern_return_t mockMethod(mach_port_t, uint32_t selector, const uint64_t *in, uint32_t count,
     const void *structureIn, size_t inSize, uint64_t *scalarOut, uint32_t *scalarCount, void *structureOut, size_t *outSize) {
+    if (selector == 55) {
+        assert(!count && !in && inSize==sizeof(amdgpu::AQLDispatchRequest));
+        const auto &r=*static_cast<const amdgpu::AQLDispatchRequest *>(structureIn);
+        assert(amdgpu::aql_dispatch_shape(r) && buffers.contains(r.codeHandle) && buffers.contains(r.kernargHandle));
+        assert(*scalarCount==5 && !structureOut && !outSize);
+        ++aqlCalls;
+        scalarOut[0]=aqlFault==1 ? kIOReturnTimeout : 0;
+        scalarOut[1]=aqlFault==2 ? 1 : 0;
+        scalarOut[2]=aqlFault==3 ? 4 : 5;
+        scalarOut[3]=aqlFault==4 ? 2 : 0;
+        scalarOut[4]=aqlFault==5 ? 0 : 1;
+        if (aqlFault==6) *scalarCount=4;
+        return aqlFault==7 ? kIOReturnTimeout : KERN_SUCCESS;
+    }
     if (selector == 51) {
         assert(count == 0 && in == nullptr);
         const auto &request = *static_cast<const amdgpu::ComputeDispatchRequest *>(structureIn);
@@ -313,5 +328,32 @@ int main() {
         assert(connection.freeBuffer(code) == HSA_STATUS_ERROR && buffers.contains(code.handle));
         assert(connection.dispatch(request, fence) == HSA_STATUS_ERROR);
     }
+    for (aqlFault=0;aqlFault<=7;++aqlFault) {
+        mac_hsa::IOKitConnection connection; connection.service=123; connection.registryID=456;
+        mac_hsa::DeviceBuffer code,args;
+        assert(connection.allocateBuffer(16384,code)==0 && connection.allocateBuffer(16384,args)==0);
+        amdgpu::AQLDispatchRequest r{};
+        r.version=1; r.codeHandle=code.handle;r.kernargHandle=args.handle;r.kernargBytes=12;r.timeoutUS=100000;
+        r.groups[0]=r.groups[1]=r.groups[2]=1;r.threads[0]=32;r.threads[1]=r.threads[2]=1;
+        uint64_t done=123;
+        driverBuild=183;
+        const auto calls=aqlCalls;
+        assert(connection.dispatchAQL(r,done)==HSA_STATUS_ERROR_OUT_OF_RESOURCES && done==UINT64_MAX && aqlCalls==calls);
+        driverBuild=184;
+        auto bad=r;bad.descriptorOffset=1;
+        assert(connection.dispatchAQL(bad,done)==HSA_STATUS_ERROR_INVALID_ARGUMENT && aqlCalls==calls);
+        const auto result=connection.dispatchAQL(r,done);
+        assert(aqlCalls==calls+1);
+        if (aqlFault) {
+            assert(result==HSA_STATUS_ERROR && done==UINT64_MAX);
+            assert(connection.freeBuffer(code)==HSA_STATUS_ERROR && buffers.contains(code.handle));
+            assert(connection.freeBuffer(args)==HSA_STATUS_ERROR && buffers.contains(args.handle));
+            assert(connection.dispatchAQL(r,done)==HSA_STATUS_ERROR && aqlCalls==calls+1);
+        } else {
+            assert(result==0 && done==0);
+            assert(connection.freeBuffer(code)==0 && connection.freeBuffer(args)==0);
+        }
+    }
+    assert(opens==closes);
     puts("HSA: transient observers, owner Busy without reset, single concurrent initialization, firmware mapping, unaligned SDMA staging/guards and fault retention pass");
 }

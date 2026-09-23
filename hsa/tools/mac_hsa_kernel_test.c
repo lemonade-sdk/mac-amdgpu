@@ -22,10 +22,11 @@ static int check(hsa_status_t status, const char *step) {
     fprintf(stderr, "%s failed: HSA status %#x\n", step, (unsigned)status); return 0;
 }
 int main(int argc, char **argv) {
-    if (argc != 3 || (strcmp(argv[1], "--run") && strcmp(argv[1], "--shared"))) {
-        fprintf(stderr, "Usage: %s --run|--shared build/tests/hsa-code-object.hsaco (driver 183+)\n", argv[0]); return 2;
+    if (argc != 3 || (strcmp(argv[1], "--run") && strcmp(argv[1], "--shared") && strcmp(argv[1], "--aql") && strcmp(argv[1], "--aql-shared"))) {
+        fprintf(stderr, "Usage: %s --run|--shared|--aql|--aql-shared build/tests/hsa-code-object.hsaco (183+ native, 184+ AQL)\n", argv[0]); return 2;
     }
-    const int shared = !strcmp(argv[1], "--shared");
+    const int aql = !strcmp(argv[1], "--aql") || !strcmp(argv[1], "--aql-shared");
+    const int shared = !strcmp(argv[1], "--shared") || !strcmp(argv[1], "--aql-shared");
     setvbuf(stdout, NULL, _IONBF, 0);
     FILE *file = fopen(argv[2], "rb");
     if (!file) { perror("open code object"); return 1; }
@@ -45,8 +46,8 @@ int main(int argc, char **argv) {
     uint64_t previous_fence = 0;
     mac_hsa_device_info_t device = {0};
     if (!check(hsa_iterate_agents(agent, NULL), "enumerate GPU") || !gpu.handle) goto cleanup;
-    if (!check(mac_hsa_agent_get_driver_info(gpu, &device, sizeof(device)), "driver build") || device.driver_build < 183) {
-        fputs("Install driver 0.1.83 before running the kernel test. No GPU work submitted.\n", stderr); goto cleanup;
+    if (!check(mac_hsa_agent_get_driver_info(gpu, &device, sizeof(device)), "driver build") || device.driver_build < (aql ? 184u : 183u)) {
+        fprintf(stderr,"Install driver build %u before this test. No GPU work submitted.\n",aql ? 184u : 183u); goto cleanup;
     }
     if (hsa_amd_agent_iterate_memory_pools(gpu, pool, NULL) != HSA_STATUS_INFO_BREAK) goto cleanup;
     if (!check(hsa_code_object_reader_create_from_memory(bytes, count, &reader), "reader")) goto cleanup;
@@ -73,8 +74,8 @@ int main(int argc, char **argv) {
         const uint32_t groups[3] = {group_count, 1, 1}, threads[3] = {32, 1, 1};
         const void *buffers[] = {data};
         uint64_t fence = 0;
-        if (!check(mac_hsa_executable_dispatch(symbol, args, sizeof(args), groups, threads, buffers, 1, &fence), "launch HSA-loaded kernel")) goto cleanup;
-        if (fence <= previous_fence) { fputs("Non-increasing GPU fence\n", stderr); goto cleanup; }
+        if (!check((aql ? mac_hsa_executable_dispatch_aql : mac_hsa_executable_dispatch)(symbol, args, sizeof(args), groups, threads, buffers, 1, &fence), "launch HSA-loaded kernel")) goto cleanup;
+        if (aql ? fence != 0 : fence <= previous_fence) { fputs("Invalid GPU completion\n", stderr); goto cleanup; }
         previous_fence = fence;
         if (shared) { atomic_thread_fence(memory_order_seq_cst); memcpy(observed, data, sizeof(observed)); }
         else if (!check(hsa_memory_copy(observed, data, sizeof(observed)), "download GPU result")) goto cleanup;
@@ -83,7 +84,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Mismatch at word %zu: %#x expected %#x\n", i, observed[i], expected[i]); goto cleanup;
             }
         }
-        printf("PASS: %u computed outputs; all 16384 input/output/guard bytes verified; GPU fence=%llu\n", group_count * 32, (unsigned long long)fence);
+        printf("PASS: %u computed outputs; all 16384 input/output/guard bytes verified; %s=%llu\n", group_count * 32, aql ? "AQL completion (queue removed)" : "GPU fence", (unsigned long long)fence);
     }
     passed = 1;
 cleanup:
@@ -92,6 +93,7 @@ cleanup:
     if (reader.handle && !check(hsa_code_object_reader_destroy(reader), "destroy reader")) passed = 0;
     if (!check(hsa_shut_down(), "runtime shutdown")) passed = 0;
     free(bytes);
-    puts("Native synchronous launch only: hardware AQL queues and HRX inference are not tested.");
+    puts(aql ? "Bounded AQL test only: persistent HSA queues, shared atomic signals and HRX inference are not tested." :
+        "Native synchronous launch only: hardware AQL queues and HRX inference are not tested.");
     return passed ? 0 : 1;
 }

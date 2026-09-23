@@ -12,7 +12,9 @@ submission = source[start:end]
 diag_start = submission.index('static void\nmes_log_queue_state(')
 diag_end = submission.index('//------------------------------------------------------------------\n// mes_submit_pkt', diag_start)
 submission = submission[:diag_start] + submission[diag_end:]
-Path('build/tests/mes_submission_under_test.inc').write_text(submission)
+a=source.index('kern_return_t\nmes_unmap_legacy_queue(')
+b=source.index('\n}',a)+2
+Path('build/tests/mes_submission_under_test.inc').write_text(submission+'\n'+source[a:b])
 alloc_start = source.index('static kern_return_t\nmes_alloc_vram_block(')
 alloc_end = source.index('//------------------------------------------------------------------\n// mes_alloc_storage', alloc_start)
 Path('build/tests/mes_allocation_under_test.inc').write_text(source[alloc_start:alloc_end])

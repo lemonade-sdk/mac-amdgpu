@@ -1846,3 +1846,34 @@ computed results and all 16,384 input/output/guard bytes, with fences 1 and 2.
 Shared mode at CPU/GPU `0x110000000` passed the same checks through direct CPU
 stores and shader writes/readback, also with fences 1 and 2. Both tools exited
 successfully after cleanup. No hardware AQL queue or HRX inference is claimed.
+
+
+## Build 184 — bounded AQL lifecycle (hardware passed)
+
+- Added a gfx1201 compute MQD and ROCr-compatible packet/queue/signal storage
+  builder, with Linux structure offsets and register-mask checks.
+- Reserved MEC pipe 0/queue 0 from MES scheduling, using an unused doorbell
+  inside the existing MEC range. AQL publication uses packet indices: shadow
+  1, first doorbell 0.
+- Added uni-MES KIQ REMOVE_QUEUE using the Linux packet layout. Both API and
+  trailing query acknowledgements are required. Failed mapping, publication,
+  completion or unmap keeps GPU backing until verified reset.
+- Added selector 55 and `mac_hsa_executable_dispatch_aql`, retaining executable,
+  kernarg and data allocations through the bounded call. Completion is a
+  GPU-only VRAM signal, not a coherent CPU/GPU HSA signal.
+- Added `--aql` and `--aql-shared` kernel test modes with full result/guard
+  checks. Both modes passed on installed driver 184.
+- Replaced the README release history with working, unfinished and upcoming
+  capability lists. No installer behavior changed.
+- Validation: 30/30 driver regression scripts and nine HSA ASan/UBSan suites
+  passed. The extended IOKit transport test also passed all seven malformed or
+  failed AQL reply cases, the minimum-build gate and faulted-session retention.
+  Xcode build and strict app/driver signature verification passed. Installed
+  driver 184 was verified directly before hardware testing. Stop GPU completed
+  before opening the new host app for installation.
+- Hardware: `--aql` passed in VRAM at `0x8010004000`; `--aql-shared`
+  passed at the identical CPU/GPU address `0x110000000`. Each mode verified
+  128 and 256 computed outputs and all 16,384 input/output/guard bytes. Every
+  dispatch observed completion 0, inactive/error signal 0, read index 1 and
+  successful MES removal before queue storage was freed. Queues were recreated
+  between dispatches. Public HSA queues and HRX inference remain incomplete.

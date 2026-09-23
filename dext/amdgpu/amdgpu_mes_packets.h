@@ -88,4 +88,35 @@ static_assert(sizeof(MES_SetHwResources1) == 256);
 static_assert(offsetof(MES_SetHwResources1, timestamp) == 24);
 static_assert(offsetof(MES_SetHwResources1, cleaner_shader_fence_mc_addr) == 64);
 
+struct MES_RemoveQueue {
+    MES_Header_Wire header;
+    uint32_t doorbell_offset;
+    uint64_t gang_context_addr;
+    uint32_t flags;
+    uint32_t alignment_pad;
+    MES_API_Status api_status;
+    uint32_t pipe_id, queue_id;
+    uint64_t tf_addr;
+    uint32_t tf_data, queue_type;
+    uint64_t timestamp;
+    uint32_t gang_context_array_index;
+    uint32_t padding[45];
+};
+static_assert(sizeof(MES_RemoveQueue) == 256);
+static_assert(offsetof(MES_RemoveQueue, api_status) == 24);
+
+inline bool mes_build_legacy_unmap(MES_RemoveQueue &packet, uint32_t queueType,
+    uint32_t pipe, uint32_t queue, uint32_t doorbell)
+{
+    if (queueType > 2 || pipe >= 4 || queue >= 8 || (doorbell & 1) || doorbell > 0x03fffffeu)
+        return false;
+    packet = {};
+    packet.header.u32All = mes_api_header(kMES_API_TYPE_SCHEDULER,
+        MESSchOp::REMOVE_QUEUE, kMES_API_FRAME_DWORDS);
+    packet.doorbell_offset = doorbell;
+    packet.flags = 1u << 3; // Linux unmap_legacy_queue, not preempt-without-unmap
+    packet.pipe_id = pipe; packet.queue_id = queue; packet.queue_type = queueType;
+    return true;
+}
+
 } // namespace amdgpu

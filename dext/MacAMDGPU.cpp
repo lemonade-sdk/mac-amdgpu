@@ -117,6 +117,7 @@ enum {
     kMacAMDGPUMethodComputeDispatch    = 51, // owned code BO + launch parameters
     kMacAMDGPUMethodBOExport          = 52, // owned device VRAM -> random sharing token
     kMacAMDGPUMethodBOImport          = 53, // token -> reference in this client's BO table
+    kMacAMDGPUMethodAQLDispatch       = 55, // bounded owned AQL queue, dispatch and verified unmap
     kMacAMDGPUMethodHostWindow        = 54, // establish/query common CPU/GPU GART address range
 };
 
@@ -3272,6 +3273,47 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             MACAMDGPU_LOG("discovery parse failed: %{public}s", res.err);
         }
         return r;
+    }
+
+    case kMacAMDGPUMethodAQLDispatch: {
+        if (arguments->scalarInputCount || !arguments->scalarOutput ||
+            arguments->scalarOutputCount < 5 || !arguments->structureInput ||
+            arguments->structureInput->getLength() != sizeof(amdgpu::AQLDispatchRequest) ||
+            arguments->structureInputDescriptor || arguments->structureOutputDescriptor ||
+            arguments->structureOutputMaximumSize) return kIOReturnBadArgument;
+        amdgpu::AQLDispatchRequest request{};
+        memcpy(&request, arguments->structureInput->getBytesNoCopy(), sizeof(request));
+        if (!amdgpu::aql_dispatch_shape(request)) return kIOReturnBadArgument;
+        auto *code = mac_amdgpu_bo_lookup(ivars, request.codeHandle);
+        auto *args = mac_amdgpu_bo_lookup(ivars, request.kernargHandle);
+        uint64_t descriptorVA=0, kernargVA=0;
+        if (!code || !amdgpu::buffer_vram_domain(code->domain) ||
+            !amdgpu::buffer_gpu_range(code->gpu_va, code->size, request.descriptorOffset, 64, descriptorVA) ||
+            (descriptorVA & 63) || !args || !amdgpu::buffer_vram_domain(args->domain) ||
+            !amdgpu::buffer_gpu_range(args->gpu_va, args->size, request.kernargOffset,
+                request.kernargBytes ? request.kernargBytes : 16, kernargVA) || (kernargVA & 15))
+            return kIOReturnBadArgument;
+        for (const auto handle : request.buffers) {
+            if (!handle) continue;
+            auto *buffer = mac_amdgpu_bo_lookup(ivars, handle);
+            if (!buffer || (!amdgpu::buffer_vram_domain(buffer->domain) &&
+                !(buffer->domain == kBODomainGTT && buffer->gttBinding.ready))) return kIOReturnBadArgument;
+        }
+        auto &b=driver->ivars->bringup;
+        if (b.reached != amdgpu::BringupStage::SDMAInit) return kIOReturnNotReady;
+        amdgpu::AQLLaunchResult result{};
+        const auto status=amdgpu::aql_launch(b.device,b.gmc,b.mes,b.gfx,b.aqlLaunch,
+            descriptorVA,kernargVA,request,result);
+        if (b.aqlLaunch.retained) driver->ivars->shutdownBlocked=true;
+        arguments->scalarOutput[0]=static_cast<uint32_t>(status);
+        arguments->scalarOutput[1]=result.completion;
+        arguments->scalarOutput[2]=result.stage;
+        arguments->scalarOutput[3]=result.inactive;
+        arguments->scalarOutput[4]=result.readIndex;
+        arguments->scalarOutputCount=5;
+        MACAMDGPU_LOG("AQL dispatch: status=%#x stage=%u completion=%#llx inactive=%#llx rptr=%llu retained=%d",
+            status,result.stage,result.completion,result.inactive,result.readIndex,b.aqlLaunch.retained);
+        return kIOReturnSuccess;
     }
 
     case kMacAMDGPUMethodComputeDispatch: {

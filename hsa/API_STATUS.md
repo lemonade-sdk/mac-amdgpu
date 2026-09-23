@@ -30,9 +30,15 @@ concurrent CPU/GPU atomic updates failed. Build 183 adds explicit coarse shared
 allocations and native synchronous dispatch of frozen HSA-loaded kernels.
 Both VRAM and direct shared-memory shader tests passed on build 183. These are
 separate native APIs, not HSA fine-grained pools, signals or AQL queues.
-No HRX/LSE inference has run.
+Build 184 adds a bounded native AQL dispatch path with MES queue removal;
+both VRAM and shared-memory hardware tests passed with verified queue removal. Public
+HSA queue creation remains unavailable. No HRX/LSE inference has run.
 
 ## Validation
+
+- Driver 184 executed two AQL dispatches in each of VRAM and shared host-memory
+  modes: 128 and 256 correct results, all 16 KiB verified, GPU completion 1 → 0
+  and firmware-acknowledged queue removal after every call.
 
 - Driver 183 executed HSA-loaded `vector_add.kd` in VRAM and shared host memory.
   Each mode verified 128 and 256 results, all 16 KiB of input/output/guard bytes,

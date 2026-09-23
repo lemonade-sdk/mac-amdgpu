@@ -1,53 +1,32 @@
 # Status
 
-**v0.1.83 — HSA-loaded native kernel launches (hardware passed).**
-The runtime now connects frozen gfx1201 executable symbols to the working
-compute queue, preserves compiler resource registers and retains code,
-arguments and referenced allocations through a real GPU fence. An explicit
-coarse shared allocator allows shader data at identical CPU/GPU addresses.
-The new kernel test checks 128 and 256 results plus all allocation guards in
-both VRAM and shared-memory modes. Both hardware modes passed with increasing
-GPU fences and successful cleanup. HSA AQL queues and HRX inference
-remain incomplete.
+## Working
 
-**v0.1.82 — AMD loader extension and shared-memory transfers (hardware passed).**
-AMD loader extension 1.03 now returns real descriptor translations, loaded-code
-metadata and object/executable enumeration. The loader passed on the actual GPU,
-including descriptor lookup after reader destruction. The new driver enables
-GTT buffers only after bidirectional DMA/direct-CPU verification, and can place
-its GART window at CPU-mappable addresses. The hardware test verified identical
-CPU/GPU addresses, 64,003 unaligned bytes each way, all 128 KiB of shared memory
-and VRAM guards. Separate GPU atomic decrement/carry tests passed, but concurrent
-CPU/GPU additions lost updates and eventually timed out. The PCIe path lacks
-advertised host AtomicOp completion/routing; coherent signals remain blocked.
-GPU-visible signals, hardware HSA queues and HRX inference remain unfinished.
+- GPU discovery, firmware loading and initialization on the Radeon AI PRO R9700 (`gfx1201`) over Thunderbolt.
+- Verified SDMA transfers, VRAM allocations and cross-process GPU-buffer sharing.
+- Loading linked gfx1201 HSA code objects, freezing executables and resolving kernel descriptors.
+- Native synchronous compute: HSA-loaded kernels passed with 128 and 256 results in both VRAM and shared host memory, including every byte of the input/output guards.
+- Bounded hardware AQL dispatch: kernels passed in VRAM and shared host memory, with firmware-acknowledged queue removal and recreation between launches.
+- Coarse shared allocations with identical CPU/GPU addresses. CPU access is allowed between completed GPU operations.
+- HSA host services, CPU signals and software queues. All 119 entry points required by LSE’s pinned HRX resolve; the [behavior status](hsa/API_STATUS.md) explains their limits.
+- [amdgpu_mtop](amdgpu_mtop/README.md) device enumeration, GPU selection, capacity queries and JSON output.
+- Stop/Restart GPU through transaction draining and verified reset; recovery still depends on a responsive device and link.
 
-**v0.1.81 — HSA host services and shared GPU buffers (IPC hardware passed).**
-HSA now resolves all 119 symbols required by LSE's pinned HRX. New working paths
-include host virtual-memory aliases, page locking, CPU IPC signals and GPU
-buffer export/import. Driver-owned references keep imported VRAM alive after
-its exporter exits. The hardware IPC test verified all 16,384 bytes before and
-after exporter process exit, then verified imported writes and final cleanup.
-Seven platform-specific APIs explicitly return unsupported-operation errors;
-GPU HSA queues, shared host/GPU mappings and inference remain incomplete.
-See the [behavior status](hsa/API_STATUS.md) for the exact limits.
+## Not working yet
 
-The native [amdgpu_mtop monitor](amdgpu_mtop/README.md) enumerates attached
-MacAMDGPU devices with GPU switching and JSON output. Live discovery and VRAM
-capacity queries work; dynamic firmware metrics require a verified interface-0x33 layout.
+- Persistent hardware HSA queues, GPU-visible HSA signals and fine-grained shared memory. Concurrent CPU/GPU atomic updates failed on the current PCIe path.
+- HRX/LSE model inference. No end-to-end AI workload has run.
+- General executable linking, scratch/LDS kernel support and the full HSA feature set. Some platform-specific APIs explicitly return unsupported errors.
+- Live firmware telemetry in amdgpu_mtop: usage, clocks, temperature and power need a verified firmware metrics layout.
+- Larger PCIe BAR allocation through a public Apple API, and Mesa/Vulkan integration.
 
-The current target is AI compute and model inference. The initial [HSA runtime](hsa/README.md)
-now initializes the GPU and provides data-verified device allocations, copies,
-asynchronous completion, host pools, CPU signals and software queues. Its
-native synchronous executable-launch extension passed in VRAM and shared memory.
-All 119 functions resolved by LSE’s pinned HRX are exported; seven platform
-paths explicitly fail, and several other families are currently host-only.
-A bounded gfx1201 ELF loader now uploads linked kernels and exposes their
-descriptors; a compiler-produced kernel passed hardware loading and symbol
-resolution. GPU-visible signals, HSA queue dispatch, shared HSA pool integration and
-HRX/LSE inference remain required. HRX inference has not run.
+## Upcoming
 
-Older release history and detailed hardware results are in [PROGRESS.md](PROGRESS.md).
+- Complete persistent queue lifecycle, barriers and completion handling, then integrate shared allocations with HSA pools.
+- Resolve the host/GPU signal requirements for HRX and verify a real inference workload with LSE.
+- Finish the firmware telemetry path for amdgpu_mtop.
+
+Detailed changes and hardware results are in [PROGRESS.md](PROGRESS.md).
 
 **Stop GPU** disables PCI bus mastering, drains pending transactions and requires
 a successful function-level reset before closing PCI and freeing session storage.

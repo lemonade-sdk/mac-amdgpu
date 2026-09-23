@@ -17,6 +17,19 @@ using namespace amdgpu;
 static_assert(sizeof(MES_QueryStatus) == sizeof(MESAPI__QUERY_MES_STATUS));
 static_assert(offsetof(MES_QueryStatus, api_status) == offsetof(MESAPI__QUERY_MES_STATUS, api_status));
 static_assert(offsetof(MES_QueryStatus, timestamp) == offsetof(MESAPI__QUERY_MES_STATUS, timestamp));
+static_assert(sizeof(MES_RemoveQueue) == sizeof(MESAPI__REMOVE_QUEUE));
+#define CHECK_REMOVE(field) static_assert(offsetof(MES_RemoveQueue, field) == offsetof(MESAPI__REMOVE_QUEUE, field))
+CHECK_REMOVE(doorbell_offset);
+CHECK_REMOVE(gang_context_addr);
+CHECK_REMOVE(api_status);
+CHECK_REMOVE(pipe_id);
+CHECK_REMOVE(queue_id);
+CHECK_REMOVE(tf_addr);
+CHECK_REMOVE(tf_data);
+CHECK_REMOVE(queue_type);
+CHECK_REMOVE(timestamp);
+CHECK_REMOVE(gang_context_array_index);
+#undef CHECK_REMOVE
 static_assert(sizeof(MES_SetHwResources1) == sizeof(MESAPI_SET_HW_RESOURCES_1));
 static_assert(sizeof(MES_SetHwResources) == sizeof(MESAPI_SET_HW_RESOURCES));
 static_assert(offsetof(MES_SetHwResources, gc_base) == offsetof(MESAPI_SET_HW_RESOURCES, gc_base));
@@ -76,6 +89,7 @@ struct MESInstance {
     void *ring_cpu, *wb_cpu;
     uint32_t ring_size_dwords = 256, doorbell_index = 0x40;
     uint64_t vram_base = 0x8000000000, published_wptr = 0;
+    uint64_t sch_ctx_bus=0x8000040000, resource_1_bus=0x8000044000;
     uint64_t ring_bus = vram_base + 0x10000, wb_bus = vram_base + 0x20000;
 };
 static unsigned snapshots = 0;
@@ -108,7 +122,7 @@ struct GMCContext {
     VRAMBumpAllocator vram_alloc;
 };
 #include "mes_allocation_under_test.inc"
-struct MESContext { MESInstance pipe[2]; };
+struct MESContext { MESInstance pipe[2]; bool uni_mes_active=true; };
 static uint64_t test_time_ns;
 static volatile uint64_t *test_wb;
 static int completion_mode;
@@ -193,6 +207,38 @@ int main() {
         memcpy(&query_addr, ring + 64 + 2, 8);
         assert(query_addr == mes.pipe[0].wb_bus + 0xd0);
     }
+    // Byte-for-byte REMOVE_QUEUE oracle and actual KIQ submission wrapper.
+    MES_RemoveQueue remove{};
+    MESAPI__REMOVE_QUEUE linuxRemove{};
+    linuxRemove.header.type=1; linuxRemove.header.opcode=3; linuxRemove.header.dwsize=64;
+    linuxRemove.unmap_legacy_queue=1; linuxRemove.queue_type=static_cast<MES_QUEUE_TYPE>(1);
+    linuxRemove.pipe_id=2; linuxRemove.queue_id=7; linuxRemove.doorbell_offset=0x80;
+    assert(mes_build_legacy_unmap(remove,1,2,7,0x80));
+    assert(memcmp(&remove,&linuxRemove,sizeof(remove))==0);
+    assert(!mes_build_legacy_unmap(remove,3,0,0,0));
+    assert(!mes_build_legacy_unmap(remove,1,4,0,0));
+    assert(!mes_build_legacy_unmap(remove,1,0,8,0));
+    assert(!mes_build_legacy_unmap(remove,1,0,0,1));
+    assert(!mes_build_legacy_unmap(remove,1,0,0,0x4000000));
+    mes.pipe[1]=mes.pipe[0];
+    for (int mode=0;mode<3;++mode) {
+        memset(wb,0,sizeof(wb)); memset(pci.vram,0,sizeof(pci.vram));
+        mes.pipe[1].published_wptr=0; mes.pipe[1].submission_pending=false;
+        test_time_ns=0; completion_mode=mode;
+        const auto r=mes_unmap_legacy_queue(dev,mes,1,2,7,0x80);
+        assert(r==(mode==0 ? kIOReturnTimeout : mode==1 ? kIOReturnSuccess : kIOReturnInternalError));
+        assert(test_time_ns==(mode==0 ? 500000000ull : 5000000ull));
+        assert(mes.pipe[1].submission_pending==(mode==0));
+        MES_RemoveQueue published; memcpy(&published,pci.vram+0x10000,sizeof(published));
+        assert(published.api_status.fence_addr==mes.pipe[1].wb_bus+0xc0);
+        published.api_status={};
+        assert(memcmp(&published,&linuxRemove,sizeof(published))==0);
+    }
+    const auto beforeUnmap=pci.doorbells;
+    mes.uni_mes_active=false;
+    assert(mes_unmap_legacy_queue(dev,mes,1,0,0,0x80)==kIOReturnNotReady);
+    assert(pci.doorbells==beforeUnmap);
+    mes.uni_mes_active=true;
     // A wrapped storage offset must not wrap the monotonic hardware pointer.
     wb[0x80 / 8] = (1ull << 32) + 252;
     mes.pipe[0].published_wptr = wb[0x80 / 8];
@@ -204,7 +250,7 @@ int main() {
     assert(pci.value == (1ull << 32) + 260);
     assert(memcmp(pci.vram + 0x10000 + 252 * 4, words, 4 * 4) == 0);
     assert(memcmp(pci.vram + 0x10000, words + 4, 4 * 4) == 0);
-    assert(snapshots == 1);
+    assert(snapshots == 2);
 
     // Lost BAR writes must be detected before the queue is published.
     const unsigned before = pci.doorbells;

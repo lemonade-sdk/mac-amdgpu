@@ -37,6 +37,17 @@ hsa_status_t mac_hsa_executable_dispatch(hsa_executable_symbol_t symbol,
     const uint32_t threads[3], const void *const *buffers, size_t buffer_count,
     uint64_t *completion_fence);
 
+// Bounded hardware AQL dispatch (driver 184+), with the same kernel limits as
+// the native PM4 path above. Success proves a GPU-only VRAM completion signal
+// changed from 1 to 0 and firmware acknowledged queue removal. This does not
+// expose a persistent hsa_queue_t or CPU/GPU atomic signals. Output is the
+// observed signal value (zero on success), not a monotonic fence sequence.
+__attribute__((visibility("default")))
+hsa_status_t mac_hsa_executable_dispatch_aql(hsa_executable_symbol_t symbol,
+    const void *kernarg, size_t kernarg_size, const uint32_t groups[3],
+    const uint32_t threads[3], const void *const *buffers, size_t buffer_count,
+    uint64_t *completion);
+
 // Explicit coarse shared allocation for the native launch path. CPU and GPU
 // addresses are identical. CPU access is allowed only between completed GPU
 // operations; this does not provide system atomics or HSA fine-grained memory.

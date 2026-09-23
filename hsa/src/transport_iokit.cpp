@@ -142,6 +142,27 @@ public:
         if (status != HSA_STATUS_SUCCESS) state = State::Faulted;
         return status;
     }
+    hsa_status_t dispatchAQL(const amdgpu::AQLDispatchRequest &request, uint64_t &completion) override {
+        std::lock_guard lock(sessionMutex);
+        completion=UINT64_MAX;
+        if (state != State::Ready) return HSA_STATUS_ERROR;
+        if (!amdgpu::aql_dispatch_shape(request)) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        std::array<uint64_t,3> build{};
+        const auto buildStatus=scalar(43,{},build);
+        if (buildStatus != HSA_STATUS_SUCCESS) return buildStatus;
+        if (build[2]<184) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+        std::array<uint64_t,5> output{};
+        uint32_t count=output.size();
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        const auto status=IOConnectCallMethod(ownerPort,55,nullptr,0,&request,sizeof(request),
+            output.data(),&count,nullptr,nullptr);
+        if (status != KERN_SUCCESS || count != output.size() || output[0] || output[1] ||
+            output[2]!=5 || output[3] || output[4]!=1) {
+            state=State::Faulted; return HSA_STATUS_ERROR;
+        }
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        completion=output[1]; return HSA_STATUS_SUCCESS;
+    }
     hsa_status_t dispatch(const amdgpu::ComputeDispatchRequest &request, uint64_t &fence) override {
         std::lock_guard lock(sessionMutex);
         fence = 0;

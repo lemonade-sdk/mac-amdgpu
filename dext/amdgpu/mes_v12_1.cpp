@@ -803,6 +803,23 @@ mes_map_legacy_queue(const DeviceContext &dev, MESContext &mes,
 }
 
 //------------------------------------------------------------------
+// mes_unmap_legacy_queue — uni-MES counterpart of mes_v12_0_unmap_legacy_queue.
+//------------------------------------------------------------------
+kern_return_t
+mes_unmap_legacy_queue(const DeviceContext &dev, MESContext &mes,
+    uint32_t queueType, uint32_t pipe, uint32_t queue, uint32_t doorbell)
+{
+    MES_RemoveQueue packet{};
+    if (!mes_build_legacy_unmap(packet, queueType, pipe, queue, doorbell)) return kIOReturnBadArgument;
+    if (!mes.uni_mes_active || !mes.pipe[1].enabled || !mes.pipe[1].inited ||
+        !mes.pipe[1].sch_ctx_bus || !mes.pipe[1].resource_1_bus)
+        return kIOReturnNotReady;
+    return mes_submit_pkt(dev, mes, MESPipe::KIQ,
+        reinterpret_cast<const uint32_t *>(&packet),
+        offsetof(MES_RemoveQueue, api_status) / 4, 500000);
+}
+
+//------------------------------------------------------------------
 // mes_add_hw_queue — port of mes_v12_0_add_hw_queue.
 //------------------------------------------------------------------
 kern_return_t
@@ -1039,11 +1056,12 @@ mes_init_full(DeviceContext &dev, PSPContext &psp,
     // VMIDs 1..7 are MES-scheduled compute VMIDs. We keep GFX HQD 0
     // for the direct CP_RB0 path (used by SubmitIB/SubmitTestPM4)
     // so gfx_hqd_mask[0] = 0xFE — MES owns 1..7. Compute HQDs are
-    // all owned by MES; SDMA HQDs likewise.
+    // owned by MES except pipe 0/queue 0 for bounded native AQL; SDMA HQDs likewise.
     MESSetHwResourcesInput in{};
     in.vmid_mask_mmhub  = 0xFE;
     in.vmid_mask_gfxhub = 0xFE;
     for (int i = 0; i < 8; i++) in.compute_hqd_mask[i] = 0xFF;
+    in.compute_hqd_mask[0] = 0xFE; // reserve the bounded legacy compute queue
     in.gfx_hqd_mask[0]  = 0xFE;
     in.gfx_hqd_mask[1]  = 0x00;
     in.sdma_hqd_mask[0] = 0x0F;

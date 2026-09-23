@@ -6,7 +6,7 @@
 #include <iterator>
 
 static std::map<uint64_t, std::vector<uint8_t>> storage;
-static uint64_t nextBuffer, launches;
+static uint64_t nextBuffer, launches, aqlLaunches;
 static uint64_t expectedDataAddress;
 static unsigned sharedLive = 0;
 static std::function<void()> duringDispatch;
@@ -40,6 +40,21 @@ struct DispatchConnection : Connection {
     hsa_status_t writeBuffer(const DeviceBuffer &buffer, uint64_t offset, const void *data, size_t bytes) override {
         assert(offset <= buffer.size && bytes <= buffer.size - offset);
         std::memcpy(storage.at(buffer.handle).data() + offset, data, bytes); return HSA_STATUS_SUCCESS;
+    }
+    hsa_status_t dispatchAQL(const amdgpu::AQLDispatchRequest &r, uint64_t &completion) override {
+        assert(amdgpu::aql_dispatch_shape(r) && storage.size()==3);
+        assert(r.groups[0]==4 && r.threads[0]==32 && r.kernargBytes==12);
+        const auto &code=storage.at(r.codeHandle);
+        assert(r.descriptorOffset+64<=code.size());
+        uint16_t properties; std::memcpy(&properties,code.data()+r.descriptorOffset+56,2);
+        assert(properties==0x408);
+        const auto &args=storage.at(r.kernargHandle);
+        uint64_t pointer; uint32_t seed;
+        std::memcpy(&pointer,args.data(),8); std::memcpy(&seed,args.data()+8,4);
+        assert(pointer==expectedDataAddress && seed==0x12345678);
+        if (duringDispatch) duringDispatch();
+        assert(storage.contains(r.codeHandle) && storage.contains(r.kernargHandle) && storage.contains(r.buffers[0]));
+        completion=0; ++aqlLaunches; return HSA_STATUS_SUCCESS;
     }
     hsa_status_t dispatch(const amdgpu::ComputeDispatchRequest &r, uint64_t &fence) override {
         assert(amdgpu::compute_dispatch_shape(r) && r.codeOffset % 256 == 0 && r.codeBytes);
@@ -101,6 +116,7 @@ int main(int argc, char **argv) {
     assert(mac_hsa_executable_dispatch(symbol, args, 12, invalidGroups, threads, buffers, 1, &fence) == HSA_STATUS_ERROR_INCOMPATIBLE_ARGUMENTS);
     assert(storage.size() == 2 && !launches);
     assert(mac_hsa_executable_dispatch(symbol, args, 12, groups, threads, buffers, 1, &fence) == 0 && fence == 1);
+    assert(mac_hsa_executable_dispatch_aql(symbol,args,12,groups,threads,buffers,1,&fence)==0 && fence==0 && aqlLaunches==1);
     assert(hsa_memory_free(data) == 0);
     assert(mac_hsa_memory_allocate_shared({}, 16384, &data) == HSA_STATUS_ERROR_INVALID_AGENT && !data);
     assert(mac_hsa_memory_allocate_shared(gpu, 0, &data) == HSA_STATUS_ERROR_INVALID_ALLOCATION);
@@ -114,12 +130,13 @@ int main(int argc, char **argv) {
     assert(info.global_flags == HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED);
     assert(hsa_amd_agents_allow_access(accessibleCount, accessible, nullptr, data) == 0);
     std::free(accessible);
+    assert(mac_hsa_executable_dispatch(symbol,args,12,groups,threads,buffers,1,&fence)==0 && fence==2);
     duringDispatch = [&] {
         assert(hsa_memory_free(data) == 0);
         assert(hsa_executable_destroy(executable) == 0);
         assert(storage.size() == 3); // public destruction cannot recycle in-flight BOs
     };
-    assert(mac_hsa_executable_dispatch(symbol, args, 12, groups, threads, buffers, 1, &fence) == 0 && fence == 2);
+    assert(mac_hsa_executable_dispatch_aql(symbol,args,12,groups,threads,buffers,1,&fence)==0 && fence==0 && aqlLaunches==2);
     assert(storage.empty() && !sharedLive);
     assert(mac_hsa_executable_dispatch(symbol, args, 12, groups, threads, nullptr, 0, &fence) == HSA_STATUS_ERROR_INVALID_EXECUTABLE_SYMBOL && !fence);
     assert(hsa_shut_down() == 0);

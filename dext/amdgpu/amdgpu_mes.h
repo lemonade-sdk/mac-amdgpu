@@ -473,6 +473,11 @@ kern_return_t mes_map_legacy_queue(const DeviceContext &dev, MESContext &mes,
     uint32_t queueType, uint32_t pipe, uint32_t queue, uint32_t doorbell,
     uint64_t mqdAddress, uint64_t wptrAddress);
 
+// Success means the REMOVE_QUEUE API and trailing scheduler query completed.
+// On failure the caller must retain all queue backing until a verified reset.
+kern_return_t mes_unmap_legacy_queue(const DeviceContext &dev, MESContext &mes,
+    uint32_t queueType, uint32_t pipe, uint32_t queue, uint32_t doorbell);
+
 // Build + submit an ADD_QUEUE message. Pipes always SCHED.
 kern_return_t mes_add_hw_queue(const DeviceContext &dev, MESContext &mes,
                                const MESAddQueueInput &in);

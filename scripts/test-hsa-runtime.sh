@@ -11,7 +11,7 @@ symbols = subprocess.check_output(['nm', '-gU', 'build/hsa/libhsa-runtime64.dyli
 exported = set(re.findall(r'\b_(hsa_\w+)$', symbols, re.M))
 native = set(re.findall(r'\b_(mac_hsa_\w+)$', symbols, re.M))
 assert {'mac_hsa_agent_get_driver_info', 'mac_hsa_executable_dispatch',
-        'mac_hsa_memory_allocate_shared'} <= native, 'Missing native runtime entry points'
+        'mac_hsa_memory_allocate_shared', 'mac_hsa_executable_dispatch_aql'} <= native, 'Missing native runtime entry points'
 required = {'hsa_signal_create', 'hsa_signal_destroy', 'hsa_amd_signal_create',
             'hsa_amd_signal_wait_all', 'hsa_amd_signal_wait_any'}
 for suffix in ['relaxed', 'scacquire']:
