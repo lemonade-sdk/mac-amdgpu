@@ -470,3 +470,69 @@ A short resident PP64 check returned the same text as the validated baseline,
 with one warm sample at 64.2187 prompt tokens/s and 12.6409 decode tokens/s.
 These results establish working inference and guide optimization; they do not
 claim parity with a different quantization or backend.
+
+### Shared Q6 operand selection and FP8 qualification
+
+The shared HIP/Loom implementation retains packed MLX Q6 weights in VRAM. It
+stages decoded workgroup tiles in LDS and can feed BF16, OCP E4M3 FP8, or OCP
+E5M2 BF8 matrix operations with FP32 accumulation. The FP8/BF8 paths use scaled
+high/residual operands and three matrix products to limit additional rounding.
+Ordinary single-product FP8 was not accurate enough for this qualification.
+
+Matched R9700 projection tests used one warm iteration followed by eight
+checked host evaluation-plus-retirement intervals. These are kernel workload
+measurements including submission overhead, not GPU timestamps or model TPS.
+The monitor remained running. Each iteration checked every output and guards.
+
+| M / N / K | E4M3 FP8 | E5M2 BF8 | Staged BF16 |
+|---|---:|---:|---:|
+| 64 / 17408 / 5120 | 4.171 ms | 1.988 ms | **1.878 ms** |
+| 512 / 17408 / 5120 | 18.451 ms | 9.671 ms | **6.711 ms** |
+| 64 / 5120 / 17408 | 4.375 ms | 3.662 ms | **3.005 ms** |
+| 512 / 5120 / 17408 | 13.622 ms | 11.046 ms | **8.313 ms** |
+
+The original FP32 projection took 4.946 ms and 18.448 ms for the first two
+shapes in a preceding controlled comparison. Workgroup reuse therefore matters
+more here than choosing the smallest matrix operand. Automatic selection uses
+the accepted staged-BF16 records for these exact shapes on gfx1201/64 CU;
+unknown shapes and single-token decode retain the existing floating-point path.
+The measurements do not establish a winner for untested shapes or other GPUs.
+
+OCP conversion passed both formats, all 256 decode byte values, representable
+roundtrips, rounding midpoints, overflow, signed zero, NaN/infinity, two replays,
+offsets and buffer guards. The complete E4M3 model candidate produced finite
+logits for all 248,320 vocabulary entries after the same 64-token prompt:
+relative L2 difference 0.12055%, KL divergence 1.26e-6, identical highest-scoring
+token and top-20 membership. This single prompt is not a broad model-quality
+evaluation. BF8 failed the cancellation-safe absolute budget on two numerical
+fixtures and is not an accepted automatic Q6 choice.
+
+One fixture with inputs around 1e-38 differed from the CPU FP32 reference in
+both the new exceptional-block fallback and the original scalar GPU path, with
+the same reported relative error of 0.2921. Its absolute errors were below
+3.81e-38. The requested code-object denormal mode is NO_FLUSH, so the cause is
+not established; this is recorded as a separate existing tiny-input discrepancy,
+not relabeled a passing precision test. A NaN-comparison bug discovered during
+qualification was fixed: Loom floating-point `!=` now matches HIP/C++ unordered
+not-equal semantics.
+
+Evidence: `build/tests/driver195-hardware/q6-final-*-*.log`,
+`q6-residual-*-r2-numeric.log`, `q6-subnormal-control.log`,
+`fp8-conversion.log`, and
+`build/fp8-model-qualification/auto-fp8-comparison.json`.
+
+The final production selector was tested through the resident HTTP server with
+**no FP8/BF8 selection flag**: 64 prompt tokens, exactly 33 output tokens
+(32 decode steps), KV128, no MTP, `LSE_FLUSH_INTERVAL=64` and
+`MAC_HSA_BLOCKED_POLL_US=64`. One warmup was excluded; three measured requests
+gave prompt rates 87.9492, 87.2835 and 87.0842 tokens/s, and decode rates 12.6333,
+12.6069 and 12.6003 tokens/s. Medians are **87.2835 PP/s and 12.6069 TPS**.
+All generated text exactly matches the preceding combined implementation;
+the server drained requests and exited successfully. The monitor was running.
+
+Compared with the preceding combined single warm sample (64.2187 PP/s,
+12.6409 TPS), prompt throughput is about 36% higher and decode is essentially
+unchanged. The earlier sample is not a three-request paired baseline. This
+update targets prefill matrix work and does not claim a single-token decode
+speedup. Evidence and executable/runtime hashes:
+`build/tests/driver195-hardware/qwen-final-auto-operands-pp64/result.json`.

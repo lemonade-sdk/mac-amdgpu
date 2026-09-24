@@ -17,10 +17,10 @@ working or published engine.
   `src/backends/hrx/hipc/hip_sources.cpp`. Shared matrix descriptors, lane maps,
   and operand widths live in `include/lse/math.hpp` and
   `include/lse/kernels/wmma.hpp`.
-- The existing mixed INT8 dot path in `quant_linear.cpp` selects Q4. The shared
-  `wmma_quant_linear.cpp` independently restricts its activation-quantizing
-  matrix path to Q4. Q6 and Q8 therefore do not automatically select INT8/FP8
-  because the device advertises those instructions.
+- `LSE_HRX_INT8=1` explicitly enables the existing Q4 activation-quantized
+  dot/WMMA paths. Q6/Q8 do not become INT8 merely because the GPU supports it.
+  Q6 now has shared staged BF16 and residual FP8/BF8 matrix implementations;
+  accepted accuracy and matched timing records determine automatic selection.
 - The validated Q6 path retains MLX affine six-bit storage and dequantizes
   within the kernel. Its current accumulation is FP32. No expanded full-size
   weight tensor is written back to VRAM. Eight-row prompt reuse shares decoded
@@ -35,7 +35,7 @@ working or published engine.
 
 ## Qualified implementation
 
-The shared implementation is promoted to LSE main at `c247d8a`. Its Mac adapter
+The shared implementation is promoted to LSE main. Its Mac adapter
 is synchronized with `~/Documents/Development/LemonSeed-Engine`. Experimental
 changes use testing branches; a successful replacement removes superseded code
 rather than retaining permanent old/new implementation switches. An explicit
@@ -49,17 +49,22 @@ is a separate policy.
 | Matrix instructions | 36 numerical/replay cases pass for F16, BF16, I8, mixed signedness, FP8 and BF8 | Includes tails, offsets, unchanged inputs and output guards |
 | Matrix calibration | F16/BF16/I8 production probes pass full output/guard checks; cost model consumes all three measured rates | Completion-wall rates, not GPU timestamp measurements; FP8/BF8 remain unmeasured |
 | KV buffer growth | Four guarded opaque-HRX copy sizes pass; full model completes 1,024 input plus 1,024 output tokens with KV2048 | Single local device, checked owner and stream retirement |
-| INT8 dot | Native mixed-sign lowering and CPU selection tests pass | Model activation-conversion policy and numerical qualification remain separate |
+| INT8 policy | Both flag states pass 12 guarded Q4 numerical/replay cases; shared HIP/Loom selection and cache tests pass | Explicit opt-in; Q6/Q8 remain floating-point |
+| FP8/BF8 conversion | Both formats pass all 256 decode bytes, rounding edges, exceptions, replay and guards | OCP formats on gfx1201, matching HIP conversion semantics |
+| Automatic Q6 operands | Tiled BF16 wins four matched large projection shapes; final model returns identical fixture text | 87.28 PP/s and 12.61 TPS; unknown shapes/M1 retain the existing path |
 
 The combined short model fixture matches the validated baseline text. The long
 request and timings are recorded in [performance results](LSE_PERFORMANCE.md).
 The repeat was interrupted at user request and is not counted as another long
 qualification pass.
 
-The packed-Q6 matrix prefill experiment is still separate: F16 guarded cases and
-the full-size projection pass, but model-level precision/performance selection
-has not yet been accepted. GPU timestamp instrumentation and decode arithmetic
-experiments also remain outside the promoted implementation.
+The accepted Q6 matrix path stages workgroup tiles in LDS and accumulates in
+FP32. The E4M3 residual candidate also runs the actual model successfully on the
+64-token logit fixture, but was slower than staged BF16. BF8 failed two
+cancellation-safe numerical budgets. Neither is forced as the automatic winner.
+The obsolete manual Q6 matrix modes are removed. A separate tiny-input GPU/CPU
+discrepancy remains recorded in the performance report. GPU timestamp
+instrumentation and decode arithmetic experiments remain outside this promotion.
 
 ## Device-side dispatch boundary
 

@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 8143b41..8d237af 100644
+index 8143b41..6373625 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -89,12 +89,17 @@ add_subdirectory(src/backends)
@@ -49,7 +49,13 @@ index 8143b41..8d237af 100644
  lse_apply_common_flags(lse_dist)
  
  # ---------------------------------------------------------------------------
-@@ -231,16 +244,24 @@ add_library(lse::kernels ALIAS lse_kernels)
+@@ -226,21 +239,30 @@ add_library(lse_kernels
+   src/kernels/transpose.cpp
+   src/kernels/wmma_linear.cpp
+   src/kernels/wmma_quant_linear.cpp
++  src/kernels/wmma_q6_linear.cpp
+ )
+ add_library(lse::kernels ALIAS lse_kernels)
  target_link_libraries(lse_kernels PUBLIC lse_core lse_ir lse_graph)
  # Each primitive self-registers from a TU nothing references, so the archive
  # has to be linked whole or none of them exist at run time.
@@ -76,7 +82,7 @@ index 8143b41..8d237af 100644
  
  lse_apply_common_flags(lse_graph)
  # Review copies of generated HIP land in ${CMAKE_BINARY_DIR}/hip/.
-@@ -307,8 +328,12 @@ add_library(lse_model
+@@ -307,8 +329,12 @@ add_library(lse_model
  )
  add_library(lse::model ALIAS lse_model)
  # Model kernels self-register from a TU nothing references.
@@ -90,7 +96,7 @@ index 8143b41..8d237af 100644
  target_link_libraries(lse_model PUBLIC lse_core lse_graph lse_ops)
  lse_apply_common_flags(lse_model)
  
-@@ -335,8 +360,12 @@ target_compile_definitions(lse_place PRIVATE
+@@ -335,8 +361,12 @@ target_compile_definitions(lse_place PRIVATE
    LSE_CONFIGURED_ROCM_PATH="${LSE_ROCM_PATH}")
  # The set registers itself as graph's device-set factory from a TU with no
  # referenced symbols, the same way transports and backends register.
@@ -505,6 +511,19 @@ index 94da274..fdcdbc8 100644
    // The base index of the iteration-space window this launch covers. Unlike a
    // size it may enter an address — with a constant coefficient, so the stride
    // the inner loop walks is unchanged and only the origin moves.
+diff --git a/include/lse/kernels/wmma.hpp b/include/lse/kernels/wmma.hpp
+index a33f1e8..531501a 100644
+--- a/include/lse/kernels/wmma.hpp
++++ b/include/lse/kernels/wmma.hpp
+@@ -44,6 +44,8 @@ const graph::KernelPrimitiveBase* wmma_linear_for(const graph::KernelShapes& s);
+ const graph::KernelPrimitiveBase* wmma_quant_linear_for(
+     const graph::KernelShapes& s);
+ 
++const graph::KernelPrimitiveBase* wmma_q6_linear_for(const graph::KernelShapes& s);
++
+ // Which family of matrix instructions this device speaks. Not "does it have a
+ // matrix core" — the families are different instructions with different
+ // operand layouts, so a row belongs to exactly one of them.
 diff --git a/include/lse/model/hybrid_lm.hpp b/include/lse/model/hybrid_lm.hpp
 index 1017269..b9eefa9 100644
 --- a/include/lse/model/hybrid_lm.hpp
@@ -663,6 +682,96 @@ index 2f05ce3..5c93fd5 100644
 +endif()
  
  lse_apply_common_flags(lse_backend_hrx)
+diff --git a/src/backends/hrx/hipc/hip_emitter.cpp b/src/backends/hrx/hipc/hip_emitter.cpp
+index b974cfb..98e6099 100644
+--- a/src/backends/hrx/hipc/hip_emitter.cpp
++++ b/src/backends/hrx/hipc/hip_emitter.cpp
+@@ -1,4 +1,7 @@
+ #include "lse/backends/hrx/hipc/hip_emitter.hpp"
++#include "lse/kernels/int8_policy.hpp"
++#include "lse/kernels/quant_operand_policy.hpp"
++#include "lse/kernels/quant_operand_cache.hpp"
+ 
+ #include "lse/backends/hrx/device_info.hpp"
+ #include "lse/backends/hrx/hipc/hip_types.hpp"
+@@ -513,7 +516,7 @@ graph::DialectSourceTable HipEmitter::sources() const noexcept {
+ 
+ std::uint64_t HipEmitter::cache_key(const FusionGroup& group,
+                                     const DeviceInfo& device) const {
+-  std::uint64_t h = group.signature();
++  std::uint64_t h = kernels::quant_operand_specialization_key(kernels::quant_operand_cache_key(kernels::activation_int8_cache_key(group.signature())), group, device, hip_types(), hip_sources());
+   const KernelPrimitiveBase* self = nullptr;
+   if (kernels::linked_bindings(group).ok) {
+     KernelShapes dummy;
+@@ -599,7 +602,7 @@ graph::IKernelEmitter::RunScratch HipEmitter::run_scratch(
+   g.anchor = run.front()->kind;
+   g.anchor_class = run.front()->fclass;
+ 
+-  const std::uint64_t key = g.signature();
++  const std::uint64_t key = kernels::quant_operand_specialization_key(kernels::quant_operand_cache_key(kernels::activation_int8_cache_key(g.signature())), g, device, hip_types(), hip_sources());
+   if (const auto it = run_scratch_cache_.find(key);
+       it != run_scratch_cache_.end()) {
+     return it->second;
+@@ -773,7 +776,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
+       out.traffic = run;
+     }
+ 
+-    std::uint64_t sig = group.signature();
++    std::uint64_t sig = kernels::quant_operand_specialization_key(kernels::quant_operand_cache_key(kernels::activation_int8_cache_key(group.signature())), group, device, hip_types(), hip_sources());
+     for (const IndexedStage& st : stages) mix_name(sig, st.prim->name());
+     if (const auto it = lds_refused_.find(sig); it != lds_refused_.end()) {
+       return LSE_ERROR(kOutOfMemory, "fused run needs ",
+@@ -937,7 +940,8 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
+       // This is why removing the per-stage barriers that `lds_fold` used to
+       // leave behind was not the win it looked like.
+       if (si + 1 < stages.size()) {
+-        const ir::RecordOptions opts{{}, {}, "c" + std::to_string(si) + "_"};
++        const std::string convoy_prefix = "c" + std::to_string(si) + "_";
++        const ir::RecordOptions opts{{}, {}, convoy_prefix};
+         const ir::KernelBody::Recording rec(opts);
+         ir::KernelBody::Capture cap;
+         {
+@@ -1110,7 +1114,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
+ 
+   // specialize() picks a different body (LDS vs WMMA vs scalar) for the same
+   // graph node; the group hash only sees the generic primitive name.
+-  std::uint64_t sig = group.signature();
++  std::uint64_t sig = kernels::quant_operand_specialization_key(kernels::quant_operand_cache_key(kernels::activation_int8_cache_key(group.signature())), group, device, hip_types(), hip_sources());
+   if (self_indexed != nullptr) {
+     sig ^= 0x9e3779b97f4a7c15ull;
+     for (char c : self_indexed->name()) {
+diff --git a/src/backends/hrx/hipc/hip_sources.cpp b/src/backends/hrx/hipc/hip_sources.cpp
+index 1ae8cb6..bff52d2 100644
+--- a/src/backends/hrx/hipc/hip_sources.cpp
++++ b/src/backends/hrx/hipc/hip_sources.cpp
+@@ -14,7 +14,7 @@ namespace lse::backend {
+ 
+ namespace {
+ 
+-constexpr std::array<graph::PrimitiveSource, 61> kHipSources{{
++constexpr std::array<graph::PrimitiveSource, 71> kHipSources{{
+     {"add", "$0 + $1"},
+     {"sub", "$0 - $1"},
+     {"mul", "$0 * $1"},
+@@ -158,6 +158,18 @@ constexpr std::array<graph::PrimitiveSource, 61> kHipSources{{
+     {"mfma.f32.32x32x16.fp8_fp8",
+      "__builtin_amdgcn_mfma_f32_32x32x16_fp8_fp8($0, $1, $2, 0, 0, 0)"},
+ 
++    // OCP conversion: finite saturation, RNE; exceptional inputs retain HIP semantics.
++    {"pack4.fp8.ocp", "__builtin_amdgcn_cvt_pk_fp8_f32((__builtin_isfinite($2) ? __builtin_amdgcn_fmed3f($2, 448.0f, -448.0f) : $2), (__builtin_isfinite($3) ? __builtin_amdgcn_fmed3f($3, 448.0f, -448.0f) : $3), __builtin_amdgcn_cvt_pk_fp8_f32((__builtin_isfinite($0) ? __builtin_amdgcn_fmed3f($0, 448.0f, -448.0f) : $0), (__builtin_isfinite($1) ? __builtin_amdgcn_fmed3f($1, 448.0f, -448.0f) : $1), 0, false), true)"},
++    {"value.fp8.0", "__builtin_amdgcn_cvt_f32_fp8($0, 0)"},
++    {"value.fp8.1", "__builtin_amdgcn_cvt_f32_fp8($0, 1)"},
++    {"value.fp8.2", "__builtin_amdgcn_cvt_f32_fp8($0, 2)"},
++    {"value.fp8.3", "__builtin_amdgcn_cvt_f32_fp8($0, 3)"},
++    {"pack4.bf8.ocp", "__builtin_amdgcn_cvt_pk_bf8_f32((__builtin_isfinite($2) ? __builtin_amdgcn_fmed3f($2, 57344.0f, -57344.0f) : $2), (__builtin_isfinite($3) ? __builtin_amdgcn_fmed3f($3, 57344.0f, -57344.0f) : $3), __builtin_amdgcn_cvt_pk_bf8_f32((__builtin_isfinite($0) ? __builtin_amdgcn_fmed3f($0, 57344.0f, -57344.0f) : $0), (__builtin_isfinite($1) ? __builtin_amdgcn_fmed3f($1, 57344.0f, -57344.0f) : $1), 0, false), true)"},
++    {"value.bf8.0", "__builtin_amdgcn_cvt_f32_bf8($0, 0)"},
++    {"value.bf8.1", "__builtin_amdgcn_cvt_f32_bf8($0, 1)"},
++    {"value.bf8.2", "__builtin_amdgcn_cvt_f32_bf8($0, 2)"},
++    {"value.bf8.3", "__builtin_amdgcn_cvt_f32_bf8($0, 3)"},
++
+     {"thread.local_id", "threadIdx.x"},
+     {"thread.workgroup_id.x", "blockIdx.x"},
+     {"thread.workgroup_id.y", "blockIdx.y"},
 diff --git a/src/backends/hrx/hrx_backend.cpp b/src/backends/hrx/hrx_backend.cpp
 index 76bb223..6072aca 100644
 --- a/src/backends/hrx/hrx_backend.cpp
@@ -1538,11 +1647,14 @@ index 8cadbf3..e9504f0 100644
    bool usable_ = false;
    std::string declined_;
 diff --git a/src/backends/hrx/loomc/loom_emitter.cpp b/src/backends/hrx/loomc/loom_emitter.cpp
-index 7558527..2d361a5 100644
+index 7558527..d472e49 100644
 --- a/src/backends/hrx/loomc/loom_emitter.cpp
 +++ b/src/backends/hrx/loomc/loom_emitter.cpp
-@@ -1,6 +1,9 @@
+@@ -1,6 +1,12 @@
  #include "lse/backends/hrx/loomc/loom_emitter.hpp"
++#include "lse/kernels/int8_policy.hpp"
++#include "lse/kernels/quant_operand_policy.hpp"
++#include "lse/kernels/quant_operand_cache.hpp"
  
  #include <algorithm>
 +#include <bit>
@@ -1551,7 +1663,7 @@ index 7558527..2d361a5 100644
  #include <unordered_map>
  #include <unordered_set>
  #include <vector>
-@@ -10,6 +13,8 @@
+@@ -10,6 +16,8 @@
  #include "lse/backends/hrx/loomc/loom_print.hpp"
  #include "lse/backends/hrx/loomc/loom_types.hpp"
  #include "lse/graph/kernel_primitive.hpp"
@@ -1560,7 +1672,7 @@ index 7558527..2d361a5 100644
  #include "lse/graph/ops.hpp"
  
  namespace lse::backend {
-@@ -18,6 +23,116 @@ using namespace lse::graph;
+@@ -18,6 +26,120 @@ using namespace lse::graph;
  
  namespace {
  
@@ -1580,7 +1692,11 @@ index 7558527..2d361a5 100644
 +    key.append(value);
 +  };
 +  text("loom");
-+  number(1);  // identity format
++  number(3);  // identity includes the shared compute-operand policy
++  number(kernels::activation_int8_enabled());
++  number(kernels::quant_operand_cache_key(0));
++  number(kernels::quant_operand_specialization_key(0, group, device,
++                                                  loom_types(), loom_sources()));
 +  text(device.arch);
 +  // Kernel selection overrides also distinguish persistent JIT identities.
 +  // FLASH_SDPA and WMMA_MIN_M are latched by their kernels for the process.
@@ -1677,7 +1793,7 @@ index 7558527..2d361a5 100644
  kir::Scalar elem_of(DType dt) {
    switch (dt) {
      case DType::kF16: return kir::Scalar::kF16;
-@@ -231,13 +346,7 @@ std::string kernel_header(const EmittedKernel& out,
+@@ -231,13 +353,7 @@ std::string kernel_header(const EmittedKernel& out,
  
  std::uint64_t LoomEmitter::cache_key(const FusionGroup& group,
                                       const DeviceInfo& device) const {
@@ -1692,7 +1808,7 @@ index 7558527..2d361a5 100644
  }
  
  Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
-@@ -291,7 +400,13 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -291,7 +407,13 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
      return s;
    };
  
@@ -1707,7 +1823,7 @@ index 7558527..2d361a5 100644
      KernelShapes probe;
      if (kernels::linked_kernel_for(group, probe) != nullptr) {
        return LSE_ERROR(kUnimplemented,
-@@ -321,9 +436,26 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -321,9 +443,26 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
      break;
    }
  
@@ -1735,7 +1851,7 @@ index 7558527..2d361a5 100644
  
    std::unordered_map<const Node*, std::size_t> binding_of;
    auto bind = [&](const NodePtr& n) {
-@@ -334,7 +466,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -334,7 +473,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
    // A self-indexing primitive names its operands in0..inN in its own order, so
    // they are bound first and an epilogue's extra inputs cannot shift them.
    if (self_indexed != nullptr && anchor) {
@@ -1744,7 +1860,7 @@ index 7558527..2d361a5 100644
    }
    for (const NodePtr& in : group.inputs) bind(in);
    const std::size_t input_count = out.binding_order.size();
-@@ -348,6 +480,35 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -348,6 +487,35 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
    }
    out.constants.add("count", 4);
  
@@ -1780,7 +1896,7 @@ index 7558527..2d361a5 100644
    // The launch parameters, and the views the body reads through. Parameter
    // names follow the emitter convention the recorder already binds against:
    // `in0..inN` and `out` for a self-indexed body, `b0..bN` for the per-element
-@@ -365,7 +526,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -365,7 +533,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
                         ", which is a block layout rather than a Loom element "
                         "type");
      }
@@ -1789,7 +1905,7 @@ index 7558527..2d361a5 100644
      const std::string name =
          si ? (is_out ? std::string("out") : "in" + std::to_string(i))
             : "b" + std::to_string(i);
-@@ -405,7 +566,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -405,7 +573,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
    // on the pair.
    const int inplace =
        (si && anchor && anchor->prim) ? anchor->prim->inplace_input() : -1;
@@ -1798,7 +1914,7 @@ index 7558527..2d361a5 100644
    if (!aliased && out.binding_order.size() > 1) {
      std::string lhs;
      std::string rhs;
-@@ -444,7 +605,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -444,7 +612,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
  
    if (si) {
      // ---- a primitive that owns its indexing -------------------------------
@@ -1807,7 +1923,7 @@ index 7558527..2d361a5 100644
      Status epilogue_error;
      bool stored = false;
      Mint hook_mint;
-@@ -453,6 +614,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -453,6 +621,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
        stored = true;
        std::string s;
        std::unordered_map<const Node*, std::string> value_of;
@@ -1815,7 +1931,7 @@ index 7558527..2d361a5 100644
        value_of[anchor.get()] = std::string(value);
        const std::string idx(index);
  
-@@ -460,7 +622,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -460,7 +629,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
          const NodePtr& n = out.binding_order[j];
          // A kernel primitive indexes its own operands; they must not be
          // pre-loaded at the output index, because the shapes do not line up.
@@ -1824,7 +1940,7 @@ index 7558527..2d361a5 100644
          for (const NodePtr& m : group.nodes) {
            if (dynamic_cast<const KernelPrimitiveBase*>(m->prim) == nullptr) {
              continue;
-@@ -561,8 +723,19 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -561,8 +730,19 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
      si_shapes.types = type_table;
      si_shapes.intrinsics = &spellings;
  
@@ -1845,7 +1961,7 @@ index 7558527..2d361a5 100644
      if (!epilogue_error.ok()) return epilogue_error;
      if (text.empty() || !cap.has()) {
        return LSE_ERROR(kUnimplemented, "primitive '",
-@@ -595,6 +768,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -595,6 +775,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
      }
      out.source = kernel_header(out, params) + prologue + printed->text +
                   "  kernel.return\n}\n";
@@ -1853,7 +1969,7 @@ index 7558527..2d361a5 100644
      return out;
    }
  
-@@ -607,7 +781,8 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -607,7 +788,8 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
  
    std::unordered_set<const Node*> pointer_inputs;
    for (const NodePtr& n : group.nodes) {
@@ -1863,7 +1979,7 @@ index 7558527..2d361a5 100644
      for (const NodePtr& in : n->inputs) pointer_inputs.insert(in.get());
    }
  
-@@ -624,6 +799,8 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -624,6 +806,8 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
  
    std::string inner;
    std::unordered_map<const Node*, std::string> value_of;
@@ -1872,7 +1988,7 @@ index 7558527..2d361a5 100644
    for (std::size_t i = 0; i < input_count; ++i) {
      const NodePtr& n = out.binding_order[i];
      if (pointer_inputs.count(n.get()) != 0) continue;
-@@ -716,6 +893,79 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -716,6 +900,79 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
        continue;
      }
  
@@ -1952,7 +2068,7 @@ index 7558527..2d361a5 100644
      std::vector<std::string> args;
      args.reserve(n->inputs.size());
      for (const NodePtr& in : n->inputs) {
-@@ -785,7 +1035,8 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -785,7 +1042,8 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
        inner += "  scf.if " + ok + " {\n";
        guard_close = "  }\n";
      }
@@ -1962,7 +2078,7 @@ index 7558527..2d361a5 100644
          narrow_from_f32(it->second, n->dtype, mint, inner);
      const std::string dst = bounded("%i", n->element_count(), mint, inner);
      inner += "  view.store " + narrowed + ", %" + names[i] + "_view[" + dst +
-@@ -809,7 +1060,13 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -809,7 +1067,13 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
    out.lds_bytes = 0;
    out.source =
        kernel_header(out, params) + prologue + body + "  kernel.return\n}\n";
@@ -1977,7 +2093,7 @@ index 7558527..2d361a5 100644
 +
  }  // namespace lse::backend
 diff --git a/src/backends/hrx/loomc/loom_print.cpp b/src/backends/hrx/loomc/loom_print.cpp
-index 50b9aef..8e754a6 100644
+index 50b9aef..a83c2eb 100644
 --- a/src/backends/hrx/loomc/loom_print.cpp
 +++ b/src/backends/hrx/loomc/loom_print.cpp
 @@ -12,6 +12,7 @@
@@ -2134,6 +2250,15 @@ index 50b9aef..8e754a6 100644
      const std::string res = name(o.result);
      const std::string& k = o.key;
  
+@@ -542,7 +578,7 @@ class Printer {
+                : k == "<=" ? "ole"
+                : k == ">=" ? "oge"
+                : k == "==" ? "oeq"
+-                           : "one";
++                           : "une";
+         line(depth, res + " = scalar.cmpf " + pred + ", " + lhs + ", " + rhs +
+                         " : " + a->type);
+       } else if (a->cls == Cls::kIndex || a->cls == Cls::kUnsignedInt ||
 @@ -662,6 +698,15 @@ class Printer {
        define(o.result, dst_type, o.cast_to, dst_cls);
        return Status{};
@@ -2285,7 +2410,7 @@ index 50b9aef..8e754a6 100644
    std::unordered_map<std::string, ValueId> raw_names_;
    std::string retarget_;
 diff --git a/src/backends/hrx/loomc/loom_sources.cpp b/src/backends/hrx/loomc/loom_sources.cpp
-index b67d0d5..25f7349 100644
+index b67d0d5..7236db8 100644
 --- a/src/backends/hrx/loomc/loom_sources.cpp
 +++ b/src/backends/hrx/loomc/loom_sources.cpp
 @@ -15,11 +15,9 @@
@@ -2316,7 +2441,7 @@ index b67d0d5..25f7349 100644
  namespace {
  
 -constexpr std::array<graph::PrimitiveSource, 35> kLoomSources{{
-+constexpr std::array<graph::PrimitiveSource, 37> kLoomSources{{
++constexpr std::array<graph::PrimitiveSource, 47> kLoomSources{{
      {"add", "$r = scalar.addf $0, $1 : f32"},
      {"sub", "$r = scalar.subf $0, $1 : f32"},
      {"mul", "$r = scalar.mulf $0, $1 : f32"},
@@ -2337,7 +2462,7 @@ index b67d0d5..25f7349 100644
      {"min", "$r = scalar.minnumf $0, $1 : f32"},
      {"neg_inf", "$r = scalar.constant -inf : f32"},
      {"abs", "$r = scalar.absf $0 : f32"},
-@@ -145,6 +152,18 @@ constexpr std::array<graph::PrimitiveSource, 35> kLoomSources{{
+@@ -145,6 +152,141 @@ constexpr std::array<graph::PrimitiveSource, 35> kLoomSources{{
       "$t1 = scalar.bitcast $t0 : i16 to f16\n"
       "$r = scalar.extf $t1 : f16 to f32"},
  
@@ -2353,23 +2478,148 @@ index b67d0d5..25f7349 100644
 +     "$r = vector.extract $t5[0] : vector<1xi32> -> i32"},
 +    {"rint", "$r = scalar.roundevenf $0 : f32"},
 +
++    // The same HIP OCP finite-saturating RNE conversion. Loom E4M3
++    // fptrunc saturates infinities, so turn those into signed NaNs first.
++    {"pack4.fp8.ocp",
++     "$t0 = scalar.constant 448.0 : f32\n"
++     "$t1 = scalar.constant -448.0 : f32\n"
++     "$t2 = scalar.constant inf : f32\n"
++     "$t3 = scalar.absf $0 : f32\n"
++     "$t4 = scalar.cmpf olt, $t3, $t2 : f32\n"
++     "$t5 = scalar.maxnumf $0, $t1 : f32\n"
++     "$t6 = scalar.minnumf $t5, $t0 : f32\n"
++     "$t7 = scf.select $t4, $t6, $0 : f32\n"
++     "$t8 = scalar.cmpf oeq, $t3, $t2 : f32\n"
++     "$t9 = scalar.bitcast $0 : f32 to i32\n"
++     "$t10 = scalar.constant 4194304 : i32\n"
++     "$t11 = scalar.ori $t9, $t10 : i32\n"
++     "$t12 = scalar.bitcast $t11 : i32 to f32\n"
++     "$t13 = scf.select $t8, $t12, $t7 : f32\n"
++     "$t14 = scalar.absf $1 : f32\n"
++     "$t15 = scalar.cmpf olt, $t14, $t2 : f32\n"
++     "$t16 = scalar.maxnumf $1, $t1 : f32\n"
++     "$t17 = scalar.minnumf $t16, $t0 : f32\n"
++     "$t18 = scf.select $t15, $t17, $1 : f32\n"
++     "$t19 = scalar.cmpf oeq, $t14, $t2 : f32\n"
++     "$t20 = scalar.bitcast $1 : f32 to i32\n"
++     "$t21 = scalar.constant 4194304 : i32\n"
++     "$t22 = scalar.ori $t20, $t21 : i32\n"
++     "$t23 = scalar.bitcast $t22 : i32 to f32\n"
++     "$t24 = scf.select $t19, $t23, $t18 : f32\n"
++     "$t25 = scalar.absf $2 : f32\n"
++     "$t26 = scalar.cmpf olt, $t25, $t2 : f32\n"
++     "$t27 = scalar.maxnumf $2, $t1 : f32\n"
++     "$t28 = scalar.minnumf $t27, $t0 : f32\n"
++     "$t29 = scf.select $t26, $t28, $2 : f32\n"
++     "$t30 = scalar.cmpf oeq, $t25, $t2 : f32\n"
++     "$t31 = scalar.bitcast $2 : f32 to i32\n"
++     "$t32 = scalar.constant 4194304 : i32\n"
++     "$t33 = scalar.ori $t31, $t32 : i32\n"
++     "$t34 = scalar.bitcast $t33 : i32 to f32\n"
++     "$t35 = scf.select $t30, $t34, $t29 : f32\n"
++     "$t36 = scalar.absf $3 : f32\n"
++     "$t37 = scalar.cmpf olt, $t36, $t2 : f32\n"
++     "$t38 = scalar.maxnumf $3, $t1 : f32\n"
++     "$t39 = scalar.minnumf $t38, $t0 : f32\n"
++     "$t40 = scf.select $t37, $t39, $3 : f32\n"
++     "$t41 = scalar.cmpf oeq, $t36, $t2 : f32\n"
++     "$t42 = scalar.bitcast $3 : f32 to i32\n"
++     "$t43 = scalar.constant 4194304 : i32\n"
++     "$t44 = scalar.ori $t42, $t43 : i32\n"
++     "$t45 = scalar.bitcast $t44 : i32 to f32\n"
++     "$t46 = scf.select $t41, $t45, $t40 : f32\n"
++     "$t47 = vector.from_elements $t13, $t24, $t35, $t46 : vector<4xf32>\n"
++     "$t48 = vector.fptrunc $t47 : vector<4xf32> to vector<4xf8E4M3>\n"
++     "$t49 = vector.bitcast $t48 : vector<4xf8E4M3> to vector<1xi32>\n"
++     "$r = vector.extract $t49[0] : vector<1xi32> -> i32"},
++    {"value.fp8.0",
++     "$t0 = vector.splat $0 : vector<1xi32>\n"
++     "$t1 = vector.bitcast $t0 : vector<1xi32> to vector<4xf8E4M3>\n"
++     "$t2 = vector.extract $t1[0] : vector<4xf8E4M3> -> f8E4M3\n"
++     "$r = scalar.extf $t2 : f8E4M3 to f32"},
++    {"value.fp8.1",
++     "$t0 = vector.splat $0 : vector<1xi32>\n"
++     "$t1 = vector.bitcast $t0 : vector<1xi32> to vector<4xf8E4M3>\n"
++     "$t2 = vector.extract $t1[1] : vector<4xf8E4M3> -> f8E4M3\n"
++     "$r = scalar.extf $t2 : f8E4M3 to f32"},
++    {"value.fp8.2",
++     "$t0 = vector.splat $0 : vector<1xi32>\n"
++     "$t1 = vector.bitcast $t0 : vector<1xi32> to vector<4xf8E4M3>\n"
++     "$t2 = vector.extract $t1[2] : vector<4xf8E4M3> -> f8E4M3\n"
++     "$r = scalar.extf $t2 : f8E4M3 to f32"},
++    {"value.fp8.3",
++     "$t0 = vector.splat $0 : vector<1xi32>\n"
++     "$t1 = vector.bitcast $t0 : vector<1xi32> to vector<4xf8E4M3>\n"
++     "$t2 = vector.extract $t1[3] : vector<4xf8E4M3> -> f8E4M3\n"
++     "$r = scalar.extf $t2 : f8E4M3 to f32"},
++    {"pack4.bf8.ocp",
++     "$t0 = scalar.constant 57344.0 : f32\n"
++     "$t1 = scalar.constant -57344.0 : f32\n"
++     "$t2 = scalar.constant inf : f32\n"
++     "$t3 = scalar.absf $0 : f32\n"
++     "$t4 = scalar.cmpf olt, $t3, $t2 : f32\n"
++     "$t5 = scalar.maxnumf $0, $t1 : f32\n"
++     "$t6 = scalar.minnumf $t5, $t0 : f32\n"
++     "$t7 = scf.select $t4, $t6, $0 : f32\n"
++     "$t8 = scalar.absf $1 : f32\n"
++     "$t9 = scalar.cmpf olt, $t8, $t2 : f32\n"
++     "$t10 = scalar.maxnumf $1, $t1 : f32\n"
++     "$t11 = scalar.minnumf $t10, $t0 : f32\n"
++     "$t12 = scf.select $t9, $t11, $1 : f32\n"
++     "$t13 = scalar.absf $2 : f32\n"
++     "$t14 = scalar.cmpf olt, $t13, $t2 : f32\n"
++     "$t15 = scalar.maxnumf $2, $t1 : f32\n"
++     "$t16 = scalar.minnumf $t15, $t0 : f32\n"
++     "$t17 = scf.select $t14, $t16, $2 : f32\n"
++     "$t18 = scalar.absf $3 : f32\n"
++     "$t19 = scalar.cmpf olt, $t18, $t2 : f32\n"
++     "$t20 = scalar.maxnumf $3, $t1 : f32\n"
++     "$t21 = scalar.minnumf $t20, $t0 : f32\n"
++     "$t22 = scf.select $t19, $t21, $3 : f32\n"
++     "$t23 = vector.from_elements $t7, $t12, $t17, $t22 : vector<4xf32>\n"
++     "$t24 = vector.fptrunc $t23 : vector<4xf32> to vector<4xf8E5M2>\n"
++     "$t25 = vector.bitcast $t24 : vector<4xf8E5M2> to vector<1xi32>\n"
++     "$r = vector.extract $t25[0] : vector<1xi32> -> i32"},
++    {"value.bf8.0",
++     "$t0 = vector.splat $0 : vector<1xi32>\n"
++     "$t1 = vector.bitcast $t0 : vector<1xi32> to vector<4xf8E5M2>\n"
++     "$t2 = vector.extract $t1[0] : vector<4xf8E5M2> -> f8E5M2\n"
++     "$r = scalar.extf $t2 : f8E5M2 to f32"},
++    {"value.bf8.1",
++     "$t0 = vector.splat $0 : vector<1xi32>\n"
++     "$t1 = vector.bitcast $t0 : vector<1xi32> to vector<4xf8E5M2>\n"
++     "$t2 = vector.extract $t1[1] : vector<4xf8E5M2> -> f8E5M2\n"
++     "$r = scalar.extf $t2 : f8E5M2 to f32"},
++    {"value.bf8.2",
++     "$t0 = vector.splat $0 : vector<1xi32>\n"
++     "$t1 = vector.bitcast $t0 : vector<1xi32> to vector<4xf8E5M2>\n"
++     "$t2 = vector.extract $t1[2] : vector<4xf8E5M2> -> f8E5M2\n"
++     "$r = scalar.extf $t2 : f8E5M2 to f32"},
++    {"value.bf8.3",
++     "$t0 = vector.splat $0 : vector<1xi32>\n"
++     "$t1 = vector.bitcast $t0 : vector<1xi32> to vector<4xf8E5M2>\n"
++     "$t2 = vector.extract $t1[3] : vector<4xf8E5M2> -> f8E5M2\n"
++     "$r = scalar.extf $t2 : f8E5M2 to f32"},
++
      {"thread.local_id", "$r = kernel.workitem.id<x> : index"},
      {"thread.workgroup_id.x", "$r = kernel.workgroup.id<x> : index"},
      {"thread.workgroup_id.y", "$r = kernel.workgroup.id<y> : index"},
-@@ -170,8 +189,11 @@ struct ResultType {
+@@ -170,8 +312,13 @@ struct ResultType {
  };
  
  // Everything not listed produces f32, which is what every arithmetic row does.
 -constexpr std::array<ResultType, 6> kNonFloatResults{{
-+constexpr std::array<ResultType, 9> kNonFloatResults{{
++constexpr std::array<ResultType, 11> kNonFloatResults{{
      {"bits.f16", "i32"},
++    {"pack4.fp8.ocp", "i32"},
++    {"pack4.bf8.ocp", "i32"},
 +    {"dot4.i32.iu8", "i32"},
 +    {"min.u32", "i32"},
 +    {"max.u32", "i32"},
      {"thread.local_id", "index"},
      {"thread.workgroup_id.x", "index"},
      {"thread.workgroup_id.y", "index"},
-@@ -179,13 +201,77 @@ constexpr std::array<ResultType, 6> kNonFloatResults{{
+@@ -179,13 +326,77 @@ constexpr std::array<ResultType, 6> kNonFloatResults{{
      {"thread.grid_dim.x", "index"},
  }};
  
@@ -3560,10 +3810,10 @@ index 8525a9b..43e66d9 100644
        if (auto in = e.when(j < D)) {
          const auto idx = ((b * heads + h) * D + row) * D + j;
 diff --git a/src/kernels/quant_linear.cpp b/src/kernels/quant_linear.cpp
-index bbfbcfc..733b506 100644
+index bbfbcfc..71c9847 100644
 --- a/src/kernels/quant_linear.cpp
 +++ b/src/kernels/quant_linear.cpp
-@@ -19,12 +19,14 @@
+@@ -19,12 +19,15 @@
  // codes with v_dot4_i32_iu8, spending no per-weight instruction on the scale
  // or the bias at all. quant/group_affine_codec.hpp carries the algebra, and
  // `dot_ok` below carries what a device must have for it.
@@ -3574,11 +3824,33 @@ index bbfbcfc..733b506 100644
  
  #include "lse/backends/hrx/device_info.hpp"
  #include "lse/kernels/lds_linear.hpp"
++#include "lse/kernels/int8_policy.hpp"
 +#include "lse/kernels/quant_panel.hpp"
  #include "lse/kernels/vec_mem.hpp"
  #include "lse/kernels/wmma.hpp"
  #include "lse/graph/kernel_args.hpp"
-@@ -322,6 +324,30 @@ bool body_dot(const KernelShapes& s, const QuantDims& d) {
+@@ -281,9 +284,9 @@ std::uint32_t dot_ksplits(const QuantDims& d, std::uint32_t rows,
+ // Whether this device and this shape take the integer path.
+ //
+ // has_dot4_iu8 is the arch database's answer for the live device, so a part
+-// without the instruction runs the fma codec and gets the same numbers more
+-// slowly. That is a hardware capability, not a switch: there is no way to ask
+-// for one path on a device that has the other.
++// without the instruction runs the float codec. Converting activations to
++// int8 also requires explicit process-wide accuracy-policy opt-in; hardware
++// support alone does not authorize the additional rounding.
+ //
+ // It has to be has_dot4_iu8 and not has_dot4_i8: the latter is the
+ // same-signedness v_dot4_i32_i8, which RDNA2 and every CDNA also have, but
+@@ -292,6 +295,7 @@ std::uint32_t dot_ksplits(const QuantDims& d, std::uint32_t rows,
+ // where the emitted kernel does not compile at all.
+ bool dot_ok(const KernelShapes& s, const QuantDims& d, std::uint32_t wave,
+             std::uint32_t cpl) {
++  if (!activation_int8_enabled()) return false;
+   if (!d.valid || d.spec.bits != quant::kDot4Bits) return false;
+   if (s.device == nullptr || s.intrinsics == nullptr) return false;
+   const AmdDeviceInfo* amd = device_extension<AmdDeviceInfo>(*s.device);
+@@ -322,6 +326,30 @@ bool body_dot(const KernelShapes& s, const QuantDims& d) {
    return quant_hoisted || budget == 0 || dot_lds_bytes(d) <= budget;
  }
  
@@ -3609,7 +3881,7 @@ index bbfbcfc..733b506 100644
  // Exactly the workgroup-shared arrays emit_body declares when it covers `rows`
  // rows, under exactly the same conditions and in the same order of decision.
  // The plan and the body cannot be allowed to disagree: this is the number a
-@@ -337,6 +363,9 @@ bool body_dot(const KernelShapes& s, const QuantDims& d) {
+@@ -337,6 +365,9 @@ bool body_dot(const KernelShapes& s, const QuantDims& d) {
  std::uint32_t body_lds_bytes_at(const KernelShapes& s, const QuantDims& d,
                                  std::uint32_t rows) {
    if (!d.valid || rows == 0) return 0;
@@ -3619,7 +3891,7 @@ index bbfbcfc..733b506 100644
    const auto k = static_cast<std::uint32_t>(d.k);
    const std::uint32_t budget = workgroup_lds_bytes(s.device);
    const bool quant_hoisted =
-@@ -440,6 +469,8 @@ constexpr std::uint32_t kMaxRowsPerGroup = 8;
+@@ -440,6 +471,8 @@ constexpr std::uint32_t kMaxRowsPerGroup = 8;
  // available where the rows agree on the matrix.
  std::uint32_t rows_per_group(const KernelShapes& s, const QuantDims& d,
                               bool indexed) {
@@ -3628,7 +3900,7 @@ index bbfbcfc..733b506 100644
    if (!d.valid || indexed || d.m <= 1 || !body_dot(s, d)) return 1;
    if (s.device == nullptr) return 1;
    const auto m = static_cast<std::uint32_t>(d.m);
-@@ -747,7 +778,7 @@ void emit_chunk(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
+@@ -747,7 +780,7 @@ void emit_chunk(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
                  const kir::Val<kir::u32>& x_base,
                  const kir::Val<kir::u32>& chunk,
                  const kir::LValue<kir::f32>& acc,
@@ -3637,7 +3909,7 @@ index bbfbcfc..733b506 100644
    const auto vals = static_cast<std::uint32_t>(spec.values_per_chunk());
    const auto words = static_cast<std::uint32_t>(spec.words_per_chunk());
    const auto group = e.let(chunk / chunks_per_group);
-@@ -758,13 +789,90 @@ void emit_chunk(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
+@@ -758,13 +791,90 @@ void emit_chunk(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
        e, a.packed, spec, e.let(row_base + chunk * words), scale, bias,
        [&](int c, const kir::Val<kir::f32>& w) {
          const auto idx = e.let(k_base + static_cast<std::uint32_t>(c));
@@ -3729,7 +4001,7 @@ index bbfbcfc..733b506 100644
    const auto n = static_cast<std::uint32_t>(d.n);
    const auto k = static_cast<std::uint32_t>(d.k);
    const auto m = static_cast<std::uint32_t>(d.m);
-@@ -831,6 +939,12 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
+@@ -831,6 +941,12 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
      fill = true;
    }
    const bool stage = static_cast<bool>(xs);
@@ -3742,7 +4014,7 @@ index bbfbcfc..733b506 100644
  
    // A run whose stages all quantize this row the same way hoists the int8 form
    // once, the way it already hoists the float row. Reading it costs this body
-@@ -875,7 +989,8 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
+@@ -875,7 +991,8 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
    if (auto in_grid = e.when(tile < ntiles && row < m)) {
      if (fill) {
        for (auto t : e.range(lid, e.u32(k), kBlock)) {
@@ -3752,7 +4024,7 @@ index bbfbcfc..733b506 100644
        }
        e.barrier();
      }
-@@ -920,7 +1035,7 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
+@@ -920,7 +1037,7 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
            for (std::uint32_t u = 0; u < cpl; ++u) {
              emit_chunk<A>(e, a, stage ? &xs : nullptr, d.spec, row_base,
                            scale_base, x_base, e.let(chunk0 + u), acc[0],
@@ -3761,7 +4033,7 @@ index bbfbcfc..733b506 100644
            }
          }
        }
-@@ -932,7 +1047,8 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
+@@ -932,7 +1049,8 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
                              chunks_per_group, cb);
            } else {
              emit_chunk<A>(e, a, stage ? &xs : nullptr, d.spec, row_base,
@@ -3771,7 +4043,7 @@ index bbfbcfc..733b506 100644
            }
          }
        }
-@@ -1051,6 +1167,9 @@ struct QuantLinearKernel final : KernelPrimitive<QuantLinearKernel> {
+@@ -1051,6 +1169,9 @@ struct QuantLinearKernel final : KernelPrimitive<QuantLinearKernel> {
    StagedRow staged_row(const KernelShapes& s) const override {
      const QuantDims d = dims_of(s, false);
      if (!shape_ok(d) || !device_fits(s)) return {};
@@ -3780,6 +4052,14 @@ index bbfbcfc..733b506 100644
 +    if (q6_prefill_rows(s, d, false) > 1) return {};
      return {0, static_cast<std::uint32_t>(d.k),
              static_cast<std::uint32_t>(d.m)};
+   }
+@@ -1059,6 +1180,7 @@ struct QuantLinearKernel final : KernelPrimitive<QuantLinearKernel> {
+   // thirds of its vector instructions unpacking nibbles. Decode is one row and
+   // bandwidth bound, and the gate below leaves it here.
+   const KernelPrimitiveBase* specialize(const KernelShapes& s) const override {
++    if (const KernelPrimitiveBase* w = wmma_q6_linear_for(s)) return w;
+     if (const KernelPrimitiveBase* w = wmma_quant_linear_for(s)) return w;
+     return this;
    }
 diff --git a/src/kernels/sdpa.cpp b/src/kernels/sdpa.cpp
 index f1b0753..e7098f4 100644
@@ -4161,6 +4441,26 @@ index f1b0753..e7098f4 100644
      (void)e.ret_if(r >= rows);
      const auto mb =
          e.let(e.u32(static_cast<std::uint32_t>(kv::kStepMetaHeader)) +
+diff --git a/src/kernels/wmma_quant_linear.cpp b/src/kernels/wmma_quant_linear.cpp
+index c31971a..172f2a9 100644
+--- a/src/kernels/wmma_quant_linear.cpp
++++ b/src/kernels/wmma_quant_linear.cpp
+@@ -26,6 +26,7 @@
+ #include "lse/graph/kernel_primitive.hpp"
+ #include "lse/kernels/vec_mem.hpp"
+ #include "lse/kernels/wmma.hpp"
++#include "lse/kernels/int8_policy.hpp"
+ #include "lse/math.hpp"
+ #include "lse/quant/group_affine_codec.hpp"
+ 
+@@ -538,6 +539,7 @@ const QuantWmmaKernel kQuantWmma;
+ // disagree on their expert -- a routed row picks its own matrix and there is
+ // no shared operand for a tile to hold.
+ const graph::KernelPrimitiveBase* wmma_quant_linear_for(const KernelShapes& s) {
++  if (!activation_int8_enabled()) return nullptr;
+   const Dims d = dims_of(s);
+   if (!d.valid || s.device == nullptr || s.intrinsics == nullptr) return nullptr;
+ 
 diff --git a/src/model/hybrid_lm.cpp b/src/model/hybrid_lm.cpp
 index fcd14f6..b0b3d20 100644
 --- a/src/model/hybrid_lm.cpp
@@ -4808,7 +5108,7 @@ index 9f17d38..35db5ad 100644
  }
  
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index a787603..82243de 100644
+index a787603..72630cf 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
 @@ -12,6 +12,56 @@ function(lse_add_test name)
@@ -4973,7 +5273,7 @@ index a787603..82243de 100644
    lse_add_test(test_primitive lse_graph lse_backends)
  endif()
  
-@@ -86,3 +222,46 @@ if(LSE_ROCM_RUNTIME_DIR)
+@@ -86,3 +222,85 @@ if(LSE_ROCM_RUNTIME_DIR)
    set_tests_properties(${lse_tests} PROPERTIES
      ENVIRONMENT "LD_LIBRARY_PATH=${LSE_ROCM_RUNTIME_DIR}")
  endif()
@@ -5019,6 +5319,45 @@ index a787603..82243de 100644
 +  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
 +if(TARGET lse_backend_hrx AND LSE_HAVE_LOOMC)
 +  lse_add_test(test_loom_dot_native lse_backend_hrx lse_graph lse_kernels lse_ir)
++endif()
++
++if(TARGET lse_backend_hrx)
++  lse_add_test(test_q6_wmma lse_backend_hrx lse_graph lse_kernels lse_ir)
++endif()
++
++# Tests of the existing approximate Q4 algorithms explicitly opt in. The
++# independent policy suite below exercises the default and both flag values.
++if(TEST test_jit)
++  set_property(TEST test_jit APPEND PROPERTY ENVIRONMENT "LSE_HRX_INT8=1")
++endif()
++set_property(TEST test_loom_dot APPEND PROPERTY ENVIRONMENT "LSE_HRX_INT8=1")
++find_package(Python3 QUIET COMPONENTS Interpreter)
++if(TARGET lse_backend_hrx AND LSE_HAVE_LOOMC AND Python3_Interpreter_FOUND)
++  add_executable(test_int8_policy test_int8_policy.cpp)
++  target_link_libraries(test_int8_policy PRIVATE lse_backend_hrx lse_graph lse_kernels lse_ir)
++  target_include_directories(test_int8_policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
++  lse_apply_common_flags(test_int8_policy)
++  add_test(NAME test_int8_policy COMMAND ${Python3_EXECUTABLE}
++    ${CMAKE_CURRENT_SOURCE_DIR}/test_int8_policy.py $<TARGET_FILE:test_int8_policy>)
++endif()
++
++add_test(NAME test_loom_matrix_int8 COMMAND ${CMAKE_COMMAND} -E env
++  LSE_HRX_INT8=1 $<TARGET_FILE:test_loom_matrix>)
++
++lse_add_test(test_fp8_conversion lse_ir lse_graph)
++if(TARGET lse_backend_hrx AND LSE_HAVE_LOOMC)
++  lse_add_test(test_fp8_conversion_native lse_backend_hrx lse_graph lse_kernels lse_ir)
++endif()
++
++add_executable(test_quant_operand_policy test_quant_operand_policy.cpp)
++target_include_directories(test_quant_operand_policy PRIVATE ${PROJECT_SOURCE_DIR}/include)
++lse_apply_common_flags(test_quant_operand_policy)
++add_test(NAME test_quant_operand_policy COMMAND test_quant_operand_policy)
++if(TARGET lse_backend_hrx)
++  add_executable(test_quant_operand_cache test_quant_operand_cache.cpp)
++  target_link_libraries(test_quant_operand_cache PRIVATE lse_backend_hrx lse_graph lse_kernels lse_ir)
++  lse_apply_common_flags(test_quant_operand_cache)
++  add_test(NAME test_quant_operand_cache COMMAND test_quant_operand_cache)
 +endif()
 diff --git a/tests/test_ir.cpp b/tests/test_ir.cpp
 index 56fefa9..1a578b0 100644
@@ -5818,6 +6157,407 @@ index 0000000..6d5ea6e
 +}
 +
 +} // namespace lse::graph
+diff --git a/include/lse/kernels/int8_policy.hpp b/include/lse/kernels/int8_policy.hpp
+new file mode 100644
+index 0000000..caebc8a
+--- /dev/null
++++ b/include/lse/kernels/int8_policy.hpp
+@@ -0,0 +1,32 @@
++#pragma once
++
++#include <cstdlib>
++#include <cstdint>
++#include <string_view>
++
++namespace lse::kernels {
++// Activation conversion is an accuracy policy, not an instruction capability.
++// Only the explicit value "1" enables it; missing or malformed values keep
++// floating-point activation math. Genuine integer operations are unaffected.
++[[nodiscard]] constexpr bool parse_activation_int8(const char* value) noexcept {
++  return value != nullptr && std::string_view(value) == "1";
++}
++
++// Latch before the first kernel selection and keep replayed plans consistent.
++// Set LSE_HRX_INT8 before starting the process; changing its environment after
++// emission cannot safely reinterpret already-compiled or retained programs.
++[[nodiscard]] inline bool activation_int8_enabled() noexcept {
++  static const bool enabled = parse_activation_int8(std::getenv("LSE_HRX_INT8"));
++  return enabled;
++}
++
++[[nodiscard]] inline std::uint64_t activation_int8_cache_key(
++    std::uint64_t key) noexcept {
++  // Include the policy version and value even when the generic primitive name
++  // does not change (the dot/float bodies share that primitive).
++  key ^= 0x696e7438706f6c31ull;
++  key *= 1099511628211ull;
++  key ^= static_cast<std::uint64_t>(activation_int8_enabled());
++  return key * 1099511628211ull;
++}
++}  // namespace lse::kernels
+diff --git a/include/lse/kernels/quant_operand_cache.hpp b/include/lse/kernels/quant_operand_cache.hpp
+new file mode 100644
+index 0000000..3d473d8
+--- /dev/null
++++ b/include/lse/kernels/quant_operand_cache.hpp
+@@ -0,0 +1,37 @@
++#pragma once
++#include "lse/graph/graph.hpp"
++#include "lse/graph/kernel_primitive.hpp"
++#include "lse/kernels/quant_operand_policy.hpp"
++#include <vector>
++
++namespace lse::kernels {
++// Selection runs before the cache lookup: a generic quant_matmul node can
++// specialize to different registered implementations under one graph shape.
++// Names are registered implementation identities; a new strategy/revision must
++// have a distinct name. Cost samples themselves never enter this fingerprint.
++[[nodiscard]] inline std::uint64_t quant_operand_specialization_key(
++    std::uint64_t key, const graph::FusionGroup& group,
++    const backend::DeviceInfo& device, graph::kir::TypeTable types,
++    const graph::DialectSourceTable& intrinsics) {
++  std::vector<Shape> inputs;
++  std::vector<DType> dtypes;
++  for (const auto& node : group.nodes) {
++    if (node->kind != graph::OpKind::kQuantMatMul) continue;
++    const auto* primitive = dynamic_cast<const graph::KernelPrimitiveBase*>(node->prim);
++    if (!primitive) continue;
++    inputs.clear(); dtypes.clear();
++    for (const auto& input : node->inputs) {
++      inputs.push_back(input->shape); dtypes.push_back(input->dtype);
++    }
++    graph::KernelShapes probe;
++    probe.inputs=inputs; probe.input_dtypes=dtypes;
++    probe.output=node->shape; probe.output_dtype=node->dtype;
++    probe.attrs=node->attrs; probe.iattrs=node->iattrs;
++    probe.device=&device; probe.types=types; probe.intrinsics=&intrinsics;
++    const auto* chosen=primitive->specialize(probe);
++    key ^= quant_operand_implementation_id(chosen ? chosen->name() : "unavailable");
++    key *= 1099511628211ull;
++  }
++  return key;
++}
++}  // namespace lse::kernels
+diff --git a/include/lse/kernels/quant_operand_policy.hpp b/include/lse/kernels/quant_operand_policy.hpp
+new file mode 100644
+index 0000000..2c72626
+--- /dev/null
++++ b/include/lse/kernels/quant_operand_policy.hpp
+@@ -0,0 +1,314 @@
++#pragma once
++
++#include <cstdint>
++#include <span>
++#include <string>
++#include <string_view>
++
++namespace lse::kernels {
++// Storage quantization and compute rounding are separate contracts. This
++// profile is a qualification target, not a claim that Q6 implies FP8 accuracy.
++enum class QuantOperand : std::uint8_t {
++  kExisting,
++  kE4M3,
++  kE5M2,
++  kFP32,
++  kBF16
++};
++enum class QuantOperandStrategy : std::uint8_t {
++  kSingleProduct,
++  kResidualThreeProduct,
++  kNative
++};
++enum class OperandQualification : std::uint8_t { kCandidate, kAccepted };
++enum class OperandReason : std::uint8_t {
++  kSelected,
++  kStorage,
++  kArchitecture,
++  kShape,
++  kResources,
++  kUnavailable,
++  kUnsafeConversion,
++  kAccuracy,
++  kUnqualified,
++  kCostEvidence
++};
++struct QuantOperandRequest {
++  std::string_view arch;
++  std::uint32_t wave = 0, bits = 0, group = 0;
++  std::uint64_t m = 0, n = 0, k = 0;
++  std::uint32_t lds_bytes = 0;
++  bool f32_activation_output = false, bf16_scale_bias = false;
++  bool indexed = false, caller_staged = false;
++};
++[[nodiscard]] constexpr std::uint64_t
++quant_operand_implementation_id(std::string_view name) noexcept {
++  std::uint64_t hash = 1469598103934665603ull;
++  for (char c : name) {
++    hash ^= static_cast<unsigned char>(c);
++    hash *= 1099511628211ull;
++  }
++  return hash;
++}
++struct QuantOperandKernel {
++  QuantOperand operand = QuantOperand::kExisting;
++  QuantOperandStrategy strategy = QuantOperandStrategy::kResidualThreeProduct;
++  std::uint64_t implementation_id = 0;
++  std::uint32_t implementation_revision = 1;
++  bool implemented = false, matrix_intrinsic = false,
++       conversion_intrinsic = false;
++  // Both are mandatory. Finite saturation alone would conceal invalid input.
++  bool block_absmax_scaling = false, fp32_exceptional_block_fallback = false;
++  std::uint32_t lds_bytes = 0;
++};
++struct QuantOperandProfile {
++  std::uint32_t revision = 1;
++  OperandQualification qualification = OperandQualification::kCandidate;
++  QuantOperand preferred = QuantOperand::kE4M3;
++  QuantOperandStrategy strategy = QuantOperandStrategy::kResidualThreeProduct;
++  std::uint32_t min_m = 16, min_n = 16, k_multiple = 64;
++  std::uint32_t max_m = 2048, max_n = 32768, max_k = 18432;
++  // Five parts per thousand relative L2. Absolute/cancellation and nonfinite
++  // checks are independent mandatory acceptance conditions in the fixture.
++  std::uint32_t relative_l2_limit_ppm = 5000;
++  // Zero means no measured result yet, not zero error. Only accepted profiles
++  // carry a nonzero measurement count and all acceptance checks.
++  std::uint32_t measured_cases = 0, measured_relative_l2_ppm = 0;
++  bool absolute_error_pass = false, nonfinite_pass = false;
++  bool model_quality_pass = false, performance_pass = false;
++  // Production never runs an unvalidated profile. Standalone qualification
++  // tests may explicitly enable a local profile; no environment override exists.
++  bool run_qualification_candidate = false;
++};
++inline constexpr QuantOperandProfile kQuantOperandProfile{};
++struct QuantOperandDecision {
++  QuantOperand operand = QuantOperand::kExisting;
++  QuantOperandStrategy strategy = QuantOperandStrategy::kResidualThreeProduct;
++  OperandReason reason = OperandReason::kUnavailable;
++  OperandQualification qualification = OperandQualification::kCandidate;
++  std::uint32_t relative_l2_limit_ppm = 0;
++  std::uint32_t implementation_revision = 0;
++  std::uint64_t implementation_id = 0;
++};
++
++[[nodiscard]] constexpr QuantOperandDecision select_quant_operand(
++    const QuantOperandRequest &r, const QuantOperandKernel &kernel,
++    const QuantOperandProfile &p = kQuantOperandProfile) noexcept {
++  QuantOperandDecision result{
++      QuantOperand::kExisting,     p.strategy,
++      OperandReason::kUnavailable, p.qualification,
++      p.relative_l2_limit_ppm,     kernel.implementation_revision,
++      kernel.implementation_id};
++  auto decline = [&](OperandReason why) {
++    result.reason = why;
++    return result;
++  };
++  if (r.bits != 6 || r.group != 64 || !r.f32_activation_output ||
++      !r.bf16_scale_bias || r.indexed || r.caller_staged)
++    return decline(OperandReason::kStorage);
++  if (r.arch != "gfx1201" || r.wave != 32)
++    return decline(OperandReason::kArchitecture);
++  const bool scalar = kernel.operand == QuantOperand::kFP32;
++  const bool fp8 = kernel.operand == QuantOperand::kE4M3 ||
++                   kernel.operand == QuantOperand::kE5M2;
++  if (!r.m || !r.n || !r.k || (!scalar && (r.m < p.min_m || r.n < p.min_n)) ||
++      !p.k_multiple || r.k % p.k_multiple || r.m > p.max_m || r.n > p.max_n ||
++      r.k > p.max_k)
++    return decline(OperandReason::kShape);
++  if ((!scalar && !kernel.lds_bytes) || kernel.lds_bytes > r.lds_bytes)
++    return decline(OperandReason::kResources);
++  if (kernel.operand == QuantOperand::kExisting ||
++      kernel.operand != p.preferred || kernel.strategy != p.strategy ||
++      !kernel.implemented || !kernel.implementation_id ||
++      (!scalar && (!kernel.matrix_intrinsic || !kernel.conversion_intrinsic)))
++    return decline(OperandReason::kUnavailable);
++  if (fp8 &&
++      (!kernel.block_absmax_scaling || !kernel.fp32_exceptional_block_fallback))
++    return decline(OperandReason::kUnsafeConversion);
++  if (!p.relative_l2_limit_ppm || p.relative_l2_limit_ppm > 5000)
++    return decline(OperandReason::kAccuracy);
++  if (p.qualification == OperandQualification::kAccepted) {
++    if (!p.measured_cases ||
++        p.measured_relative_l2_ppm > p.relative_l2_limit_ppm ||
++        !p.absolute_error_pass || !p.nonfinite_pass || !p.model_quality_pass ||
++        !p.performance_pass)
++      return decline(OperandReason::kAccuracy);
++  } else if (!p.run_qualification_candidate) {
++    return decline(OperandReason::kUnqualified);
++  }
++  result.operand = kernel.operand;
++  result.reason = OperandReason::kSelected;
++  return result;
++}
++
++[[nodiscard]] constexpr std::string_view
++quant_operand_name(QuantOperand value) {
++  switch (value) {
++  case QuantOperand::kE4M3:
++    return "fp8-e4m3";
++  case QuantOperand::kE5M2:
++    return "bf8-e5m2";
++  case QuantOperand::kFP32:
++    return "fp32";
++  case QuantOperand::kBF16:
++    return "bf16";
++  default:
++    return "existing-floating-point";
++  }
++}
++[[nodiscard]] constexpr std::string_view
++quant_operand_reason(OperandReason value) {
++  switch (value) {
++  case OperandReason::kSelected:
++    return "selected";
++  case OperandReason::kStorage:
++    return "storage-contract";
++  case OperandReason::kArchitecture:
++    return "device-capability";
++  case OperandReason::kShape:
++    return "matrix-shape";
++  case OperandReason::kResources:
++    return "lds-budget";
++  case OperandReason::kUnavailable:
++    return "kernel-or-intrinsic-unavailable";
++  case OperandReason::kUnsafeConversion:
++    return "conversion-safety";
++  case OperandReason::kAccuracy:
++    return "accuracy-or-promotion-evidence";
++  case OperandReason::kUnqualified:
++    return "unqualified-profile";
++  case OperandReason::kCostEvidence:
++    return "no-comparable-cost-evidence";
++  }
++  return "unknown";
++}
++[[nodiscard]] inline std::string
++quant_operand_diagnostic(const QuantOperandRequest &r,
++                         const QuantOperandDecision &d) {
++  return "operand=" + std::string(quant_operand_name(d.operand)) +
++         " strategy=" +
++         (d.operand == QuantOperand::kExisting          ? "unchanged"
++          : d.strategy == QuantOperandStrategy::kNative ? "native"
++          : d.strategy == QuantOperandStrategy::kResidualThreeProduct
++              ? "residual-three-product"
++              : "single-product") +
++         " conversion=" +
++         (d.operand == QuantOperand::kExisting ? "unchanged"
++          : d.strategy == QuantOperandStrategy::kNative
++              ? "native"
++              : "block-absmax-rne-fp32-exceptional-fallback") +
++         " shape=" + std::to_string(r.m) + "x" + std::to_string(r.n) + "x" +
++         std::to_string(r.k) +
++         " reason=" + std::string(quant_operand_reason(d.reason)) +
++         " qualification=" +
++         (d.qualification == OperandQualification::kAccepted
++              ? "accepted"
++              : "candidate-unvalidated") +
++         " target_relative_l2_ppm=" + std::to_string(d.relative_l2_limit_ppm);
++}
++
++// Profile changes invalidate both emission and persistent JIT identities,
++// including failed selection. Chosen primitive names also distinguish formats.
++[[nodiscard]] constexpr std::uint64_t quant_operand_cache_key(
++    std::uint64_t key,
++    const QuantOperandProfile &p = kQuantOperandProfile) noexcept {
++  auto mix = [&](std::uint64_t value) {
++    key ^= value;
++    key *= 1099511628211ull;
++  };
++  mix(0x716f706572616e31ull);
++  mix(p.revision);
++  mix(static_cast<unsigned>(p.qualification));
++  mix(static_cast<unsigned>(p.preferred));
++  mix(static_cast<unsigned>(p.strategy));
++  mix(p.min_m);
++  mix(p.min_n);
++  mix(p.k_multiple);
++  mix(p.max_m);
++  mix(p.max_n);
++  mix(p.max_k);
++  mix(p.relative_l2_limit_ppm);
++  mix(p.measured_cases);
++  mix(p.measured_relative_l2_ppm);
++  mix(p.absolute_error_pass);
++  mix(p.nonfinite_pass);
++  mix(p.model_quality_pass);
++  mix(p.performance_pass);
++  mix(p.run_qualification_candidate);
++  return key;
++}
++
++// Accepted cost records describe a matched experiment. Host intervals and
++// device queue intervals are different clocks and must never be ranked
++// together.
++enum class OperandCostClock : std::uint8_t {
++  kHostEvalRetire,
++  kGpuQueueInterval
++};
++enum class OperandCostStatistic : std::uint8_t { kMean, kMedian };
++struct QuantOperandCost {
++  std::string_view arch;
++  std::uint64_t m = 0, n = 0, k = 0;
++  std::uint64_t cohort = 0, cost_ns = 0;
++  std::uint32_t wave = 0, bits = 0, group = 0, samples = 0;
++  std::uint32_t accepted_profile_revision = 0, implementation_revision = 0;
++  OperandCostClock clock = OperandCostClock::kHostEvalRetire;
++  std::uint64_t implementation_id = 0;
++  OperandCostStatistic statistic = OperandCostStatistic::kMean;
++};
++struct QuantOperandOption {
++  QuantOperandKernel kernel;
++  QuantOperandProfile profile;
++  QuantOperandCost cost;
++};
++struct QuantOperandRanking {
++  QuantOperandDecision decision{};
++  std::size_t option = static_cast<std::size_t>(-1);
++  std::uint64_t cost_ns = 0;
++};
++[[nodiscard]] constexpr QuantOperandRanking rank_quant_operands(
++    const QuantOperandRequest &r, std::span<const QuantOperandOption> options,
++    std::uint64_t cohort, OperandCostClock clock,
++    OperandCostStatistic statistic = OperandCostStatistic::kMean) noexcept {
++  QuantOperandRanking best;
++  best.decision.reason = OperandReason::kCostEvidence;
++  for (std::size_t i = 0; i < options.size(); ++i) {
++    const auto &o = options[i];
++    const auto d = select_quant_operand(r, o.kernel, o.profile);
++    if (d.reason != OperandReason::kSelected ||
++        o.profile.qualification != OperandQualification::kAccepted)
++      continue;
++    const auto &c = o.cost;
++    if (!cohort || c.cohort != cohort || c.clock != clock ||
++        c.statistic != statistic || !c.cost_ns || c.samples < 3 ||
++        c.accepted_profile_revision != o.profile.revision ||
++        !c.implementation_revision ||
++        c.implementation_revision != o.kernel.implementation_revision ||
++        c.implementation_id != o.kernel.implementation_id || c.arch != r.arch ||
++        c.wave != r.wave || c.bits != r.bits || c.group != r.group ||
++        c.m != r.m || c.n != r.n || c.k != r.k)
++      continue;
++    if (best.option == static_cast<std::size_t>(-1) ||
++        c.cost_ns < best.cost_ns) {
++      best = {d, i, c.cost_ns};
++    }
++  }
++  return best;
++}
++// Timing observations do not belong in the JIT identity. A change in the
++// selected strategy/profile does; repeated measurements of the same accepted
++// strategy need not invalidate code. Shape/device are in the emitter key.
++[[nodiscard]] constexpr std::uint64_t
++quant_operand_choice_key(std::uint64_t key, const QuantOperandDecision &d,
++                         std::uint32_t accepted_profile_revision) noexcept {
++  for (auto value : {static_cast<std::uint64_t>(d.operand),
++                     static_cast<std::uint64_t>(d.strategy),
++                     static_cast<std::uint64_t>(d.implementation_revision),
++                     d.implementation_id,
++                     static_cast<std::uint64_t>(accepted_profile_revision)}) {
++    key ^= value;
++    key *= 1099511628211ull;
++  }
++  return key;
++}
++} // namespace lse::kernels
 diff --git a/include/lse/kernels/quant_panel.hpp b/include/lse/kernels/quant_panel.hpp
 new file mode 100644
 index 0000000..11796ce
@@ -5839,6 +6579,121 @@ index 0000000..11796ce
 +}
 +
 +}  // namespace lse::kernels
+diff --git a/include/lse/math/fp8.hpp b/include/lse/math/fp8.hpp
+new file mode 100644
+index 0000000..003cff9
+--- /dev/null
++++ b/include/lse/math/fp8.hpp
+@@ -0,0 +1,109 @@
++#pragma once
++
++#include <bit>
++#include <cmath>
++#include <cstdint>
++#include <limits>
++
++#include "lse/math.hpp"
++
++namespace lse::math {
++
++// OCP operands used by gfx12, not the incompatible gfx94 FNUZ formats.
++// SATFINITE clamps finite overflow; HIP preserves exceptional inputs:
++// E4M3 infinity becomes NaN, while E5M2 infinity remains infinity.
++// Host NaNs canonicalize to signed 0x7f; device NaN payload/sign is not part
++// of the contract. Finite values, signed zero, and E5M2 infinity are exact.
++template <MatrixElem Element>
++struct Fp8Format {
++  static_assert(Element == MatrixElem::kFp8 || Element == MatrixElem::kBf8);
++  static constexpr bool e4m3 = Element == MatrixElem::kFp8;
++  static constexpr unsigned mantissa_bits = e4m3 ? 3 : 2;
++  static constexpr unsigned exponent_bias = e4m3 ? 7 : 15;
++  static constexpr unsigned max_finite_code = e4m3 ? 0x7e : 0x7b;
++  static constexpr float max_finite = e4m3 ? 448.0f : 57344.0f;
++  static constexpr float min_normal = e4m3 ? 0x1p-6f : 0x1p-14f;
++  static constexpr float min_subnormal = e4m3 ? 0x1p-9f : 0x1p-16f;
++  static constexpr std::string_view pack_key = e4m3 ? "pack4.fp8.ocp" : "pack4.bf8.ocp";
++  static constexpr std::string_view value_keys[4] = {
++      e4m3 ? "value.fp8.0" : "value.bf8.0",
++      e4m3 ? "value.fp8.1" : "value.bf8.1",
++      e4m3 ? "value.fp8.2" : "value.bf8.2",
++      e4m3 ? "value.fp8.3" : "value.bf8.3"};
++};
++
++template <MatrixElem Element>
++[[nodiscard]] inline float fp8_value(std::uint8_t bits) {
++  using F = Fp8Format<Element>;
++  const unsigned magnitude = bits & 0x7f;
++  const bool negative = (bits & 0x80) != 0;
++  if ((F::e4m3 && magnitude == 0x7f) ||
++      (!F::e4m3 && magnitude > 0x7c)) {
++    return std::bit_cast<float>((negative ? 0x80000000u : 0u) | 0x7fc00000u);
++  }
++  if (!F::e4m3 && magnitude == 0x7c)
++    return negative ? -std::numeric_limits<float>::infinity()
++                    : std::numeric_limits<float>::infinity();
++  const unsigned exponent = magnitude >> F::mantissa_bits;
++  const unsigned mantissa = magnitude & ((1u << F::mantissa_bits) - 1);
++  const float value = exponent == 0
++      ? static_cast<float>(mantissa) * F::min_subnormal
++      : std::ldexp(static_cast<float>((1u << F::mantissa_bits) + mantissa),
++                   static_cast<int>(exponent) - static_cast<int>(F::exponent_bias) -
++                   static_cast<int>(F::mantissa_bits));
++  return negative ? -value : value;
++}
++
++template <MatrixElem Element>
++[[nodiscard]] inline std::uint8_t fp8_bits(float value) {
++  using F = Fp8Format<Element>;
++  const auto raw = std::bit_cast<std::uint32_t>(value);
++  const unsigned sign = raw >> 24 & 0x80;
++  const unsigned magnitude = raw & 0x7fffffffu;
++  if (magnitude > 0x7f800000u) return static_cast<std::uint8_t>(sign | 0x7f);
++  if (magnitude == 0x7f800000u)
++    return static_cast<std::uint8_t>(sign | (F::e4m3 ? 0x7f : 0x7c));
++  const float positive = std::bit_cast<float>(magnitude);
++  if (positive >= F::max_finite)
++    return static_cast<std::uint8_t>(sign | F::max_finite_code);
++  // Search representable magnitudes, then compare exact dyadic distances in
++  // double. This host oracle is independent of GPU bit-shift conversion.
++  unsigned lo = 0, hi = F::max_finite_code;
++  while (lo + 1 < hi) {
++    const unsigned mid = (lo + hi) / 2;
++    if (fp8_value<Element>(static_cast<std::uint8_t>(mid)) <= positive) lo = mid;
++    else hi = mid;
++  }
++  const double below = double(positive) - double(fp8_value<Element>(static_cast<std::uint8_t>(lo)));
++  const double above = double(fp8_value<Element>(static_cast<std::uint8_t>(hi))) - double(positive);
++  const unsigned rounded = above < below || (above == below && (lo & 1)) ? hi : lo;
++  return static_cast<std::uint8_t>(sign | rounded);
++}
++
++template <MatrixElem Element>
++[[nodiscard]] inline std::uint32_t pack_fp8(float a, float b, float c, float d) {
++  return std::uint32_t(fp8_bits<Element>(a)) |
++         (std::uint32_t(fp8_bits<Element>(b)) << 8) |
++         (std::uint32_t(fp8_bits<Element>(c)) << 16) |
++         (std::uint32_t(fp8_bits<Element>(d)) << 24);
++}
++
++template <MatrixElem Element>
++[[nodiscard]] inline Val<ir::u32> pack_fp8(const Val<lse::f32>& a,
++    const Val<lse::f32>& b, const Val<lse::f32>& c, const Val<lse::f32>& d) {
++  return detail::invoke<ir::u32>(Fp8Format<Element>::pack_key, a, b, c, d);
++}
++
++template <MatrixElem Element, unsigned Byte>
++[[nodiscard]] inline float unpack_fp8(std::uint32_t packed) {
++  static_assert(Byte < 4);
++  return fp8_value<Element>(static_cast<std::uint8_t>(packed >> (Byte * 8)));
++}
++
++template <MatrixElem Element, unsigned Byte>
++[[nodiscard]] inline Val<lse::f32> unpack_fp8(const Val<ir::u32>& packed) {
++  static_assert(Byte < 4);
++  return detail::invoke<lse::f32>(Fp8Format<Element>::value_keys[Byte], packed);
++}
++
++}  // namespace lse::math
 diff --git a/include/lse/runtime/decode_sample.hpp b/include/lse/runtime/decode_sample.hpp
 new file mode 100644
 index 0000000..1e0c3d6
@@ -6381,6 +7236,705 @@ index 0000000..e03e6e2
 +};
 +
 +}  // namespace lse::graph::detail
+diff --git a/src/kernels/q6_fp8_residual.inc b/src/kernels/q6_fp8_residual.inc
+new file mode 100644
+index 0000000..f0ec881
+--- /dev/null
++++ b/src/kernels/q6_fp8_residual.inc
+@@ -0,0 +1,276 @@
++// Shared HIP/Loom scaled residual feeder. Only format conversion and matrix
++// instruction spellings are supplied by the backend intrinsic table.
++constexpr std::uint32_t kResidualLdsBytes = 16384 + 512 + 80;
++template <math::MatrixElem T>
++std::string emit_residual(const KernelShapes &s, const Dims &d) {
++  using Tile = Base<T>;
++  using Op = typename Tile::Op;
++  constexpr auto row = Tile::kRow;
++  constexpr auto geo = geometry_of(row);
++  constexpr float limit = T == math::MatrixElem::kFp8 ? 448.0f : 57344.0f;
++  constexpr float minNormal = std::numeric_limits<float>::min();
++  constexpr float maxFloat = std::numeric_limits<float>::max();
++  static_assert(row.a_len == 2 && row.b_len == 2 && geo.wave == 32 &&
++                geo.split_k && geo.lane_k == 8);
++  kir::KernelBody body(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
++  body.set_store(s.store);
++  Args a;
++  if (!env::bind(body, a, s))
++    return {};
++  env::Emit e{&body};
++  const auto packed = e.lds<kir::i32>(4096u);
++  const auto scales = e.lds<kir::f32>(128u);
++  // Per-wave invalid, maxA, maxB, minA and minB. Every entry has one writer.
++  const auto summary = e.lds<kir::f32>(20u);
++  const auto lid = e.let(math::local_id()), lane = e.let(lid % 32u);
++  const auto wave = e.let(lid / 32u), lo = e.let(lane % 16u),
++             hi = e.let(lane / 16u);
++  const auto wg = e.let(math::workgroup_id_x());
++  const auto nblocks = (d.n + 63) / 64;
++  const auto mbase = e.let((wg / nblocks) * 64u),
++             nbase = e.let((wg % nblocks) * 64u);
++  const auto am = e.let((wave % 2u) * 32u), bn = e.let((wave / 2u) * 32u);
++  // Four-byte packs rotate in pairs, preserving eight-byte matrix fragments.
++  const auto address = [&](const kir::Val<kir::u32> &r,
++                           const kir::Val<kir::u32> &k) {
++    return r * 16u + ((k / 8u + r % 8u) % 8u) * 2u + (k % 8u) / 4u;
++  };
++  std::vector<kir::Local<kir::f32, 8>> acc;
++  for (unsigned i = 0; i < 4; ++i) {
++    acc.push_back(e.local<kir::f32, 8>());
++    for (auto j : e.unroll(8u))
++      acc.back()[j] = e.f32(0);
++  }
++  for (auto kb : e.range(0u, d.k, 64u)) {
++    auto bad = e.var(0.0f), maxA = e.var(0.0f), maxB = e.var(0.0f);
++    auto minA = e.var(maxFloat), minB = e.var(maxFloat);
++    for (auto block : e.unroll(2u)) {
++      const auto r = e.let(lid / 4u + block * 32u),
++                 kc = e.let((lid % 4u) * 16u);
++      const auto ar = e.let(mbase + r), bc = e.let(nbase + r);
++      const auto av = e.local<kir::f32, 16>(), bv = e.local<kir::f32, 16>();
++      for (auto j : e.unroll(16u)) {
++        av[j] = e.f32(0);
++        bv[j] = e.f32(0);
++      }
++      if (auto active = e.when(ar < d.m)) {
++        for (unsigned v = 0; v < 4; ++v) {
++          const auto loaded = e.load(a.x, ar * d.k + kb + kc + v * 4u, 16u);
++          for (unsigned j = 0; j < 4; ++j)
++            av[v * 4 + j] = loaded[j];
++        }
++      }
++      if (auto active = e.when(bc < d.n)) {
++        const auto gi = e.let(bc * d.groups + (kb + kc) / d.group);
++        const auto scale = e.let(math::widen(a.scales[gi])),
++                   bias = e.let(math::widen(a.biases[gi]));
++        const auto wb = e.let(bc * d.words + ((kb + kc) / 16u) * 3u);
++        const std::array<kir::Val<kir::u32>, 3> words{e.let(a.packed[wb]),
++                                                      e.let(a.packed[wb + 1u]),
++                                                      e.let(a.packed[wb + 2u])};
++        for (unsigned j = 0; j < 16; ++j) {
++          const unsigned off = (j * 6) % 32, wi = j * 6 / 32;
++          auto code = words[wi] / (1u << off);
++          if (off > 26)
++            code = code +
++                   (words[wi + 1] % (1u << (off - 26))) * (1u << (32 - off));
++          else
++            code = code % 64u;
++          bv[j] = math::fma(math::cast<kir::f32>(e.let(code)), scale, bias);
++        }
++      }
++      auto ax = e.var(0.0f), bw = e.var(0.0f), rowBad = e.var(0.0f);
++      for (auto j : e.unroll(16u)) {
++        const auto x = av[j].read(), w = bv[j].read();
++        // Ordered floating comparisons make NaN != NaN false in this IR.
++        // Start invalid and clear only after a positive finite-range proof.
++        auto invalid=e.var(1.0f);
++        if(auto finite=e.when(math::abs(x)<=maxFloat && math::abs(w)<=maxFloat))
++          invalid=e.f32(0);
++        rowBad=math::max(rowBad.read(),invalid.read());
++        ax = math::max(ax.read(), math::abs(x));
++        bw = math::max(bw.read(), math::abs(w));
++      }
++      for (unsigned bit : {1u, 2u}) {
++        ax = math::max(ax.read(), math::shfl_xor(ax.read(), e.u32(bit)));
++        bw = math::max(bw.read(), math::shfl_xor(bw.read(), e.u32(bit)));
++        rowBad =
++            math::max(rowBad.read(), math::shfl_xor(rowBad.read(), e.u32(bit)));
++      }
++      auto sx = e.var(1.0f), sw = e.var(1.0f);
++      if (auto live = e.when(ax.read() > 0.0f))
++        sx = ax.read() * (1.0f / limit);
++      if (auto live = e.when(bw.read() > 0.0f))
++        sw = bw.read() * (1.0f / limit);
++      // Tiny/invalid scale blocks use the original FP32 path, not a silent
++      // quantization-to-zero. Zero rows retain a benign unit scale.
++      if (auto invalid =
++              e.when(sx.read() < minNormal || sw.read() < minNormal ||
++                     sx.read() > maxFloat || sw.read() > maxFloat))
++        rowBad = e.f32(1);
++      bad = math::max(bad.read(), rowBad.read());
++      maxA = math::max(maxA.read(), sx.read());
++      maxB = math::max(maxB.read(), sw.read());
++      minA = math::min(minA.read(), sx.read());
++      minB = math::min(minB.read(), sw.read());
++      if (auto leader = e.when(lid % 4u == 0u)) {
++        scales[r] = sx.read();
++        scales[64u + r] = sw.read();
++      }
++      for (unsigned pack = 0; pack < 4; ++pack) {
++        const auto at = e.let(address(r, kc + pack * 4u));
++        packed[at] = math::cast<kir::i32>(e.u32(0));
++        packed[1024u + at] = math::cast<kir::i32>(e.u32(0));
++        packed[2048u + at] = math::cast<kir::i32>(e.u32(0));
++        packed[3072u + at] = math::cast<kir::i32>(e.u32(0));
++        if (auto valid = e.when(rowBad.read() == 0.0f)) {
++          std::array<kir::Val<kir::f32>, 4> x{
++              av[pack * 4].read() / sx.read(),
++              av[pack * 4 + 1].read() / sx.read(),
++              av[pack * 4 + 2].read() / sx.read(),
++              av[pack * 4 + 3].read() / sx.read()};
++          std::array<kir::Val<kir::f32>, 4> w{
++              bv[pack * 4].read() / sw.read(),
++              bv[pack * 4 + 1].read() / sw.read(),
++              bv[pack * 4 + 2].read() / sw.read(),
++              bv[pack * 4 + 3].read() / sw.read()};
++          const auto xh = e.let(math::pack_fp8<T>(x[0], x[1], x[2], x[3]));
++          const auto wh = e.let(math::pack_fp8<T>(w[0], w[1], w[2], w[3]));
++          packed[at] = math::cast<kir::i32>(xh);
++          packed[2048u + at] = math::cast<kir::i32>(wh);
++          packed[1024u + at] = math::cast<kir::i32>(
++              math::pack_fp8<T>(x[0] - math::unpack_fp8<T, 0>(xh),
++                                x[1] - math::unpack_fp8<T, 1>(xh),
++                                x[2] - math::unpack_fp8<T, 2>(xh),
++                                x[3] - math::unpack_fp8<T, 3>(xh)));
++          packed[3072u + at] = math::cast<kir::i32>(
++              math::pack_fp8<T>(w[0] - math::unpack_fp8<T, 0>(wh),
++                                w[1] - math::unpack_fp8<T, 1>(wh),
++                                w[2] - math::unpack_fp8<T, 2>(wh),
++                                w[3] - math::unpack_fp8<T, 3>(wh)));
++        }
++      }
++    }
++    for (unsigned bit : {1u, 2u, 4u, 8u, 16u}) {
++      bad = math::max(bad.read(), math::shfl_xor(bad.read(), e.u32(bit)));
++      maxA = math::max(maxA.read(), math::shfl_xor(maxA.read(), e.u32(bit)));
++      maxB = math::max(maxB.read(), math::shfl_xor(maxB.read(), e.u32(bit)));
++      minA = math::min(minA.read(), math::shfl_xor(minA.read(), e.u32(bit)));
++      minB = math::min(minB.read(), math::shfl_xor(minB.read(), e.u32(bit)));
++    }
++    if (auto leader = e.when(lane == 0u)) {
++      summary[wave] = bad.read();
++      summary[4u + wave] = maxA.read();
++      summary[8u + wave] = maxB.read();
++      summary[12u + wave] = minA.read();
++      summary[16u + wave] = minB.read();
++    }
++    e.barrier();
++    auto blockBad = e.var(0.0f), maxSx = e.var(0.0f), maxSw = e.var(0.0f);
++    auto minSx = e.var(maxFloat), minSw = e.var(maxFloat);
++    for (auto w : e.unroll(4u)) {
++      blockBad = math::max(blockBad.read(), summary[w]);
++      maxSx = math::max(maxSx.read(), summary[4u + w]);
++      maxSw = math::max(maxSw.read(), summary[8u + w]);
++      minSx = math::min(minSx.read(), summary[12u + w]);
++      minSw = math::min(minSw.read(), summary[16u + w]);
++    }
++    // Conservative uniform scale-product bounds prevent intermediate overflow
++    // or underflow even when the final exact contraction would cancel.
++    if (auto unsafe =
++            e.when(maxSx.read() >
++                       (maxFloat / (2.0f * limit * limit * 64.0f)) / maxSw.read() ||
++                   minSx.read() < minNormal / minSw.read()))
++      blockBad = e.f32(1);
++    if (auto normal = e.when(blockBad.read() == 0.0f)) {
++      std::vector<kir::Local<kir::f32, 8>> partial;
++      for (unsigned i = 0; i < 4; ++i) {
++        partial.push_back(e.local<kir::f32, 8>());
++        for (auto j : e.unroll(8u))
++          partial.back()[j] = e.f32(0);
++      }
++      for (auto slice : e.unroll(4u)) {
++        std::vector<kir::Local<kir::i32, 2>> ah, al, bh, bl;
++        for (unsigned i = 0; i < 2; ++i) {
++          ah.push_back(e.local<kir::i32, 2>());
++          al.push_back(e.local<kir::i32, 2>());
++          bh.push_back(e.local<kir::i32, 2>());
++          bl.push_back(e.local<kir::i32, 2>());
++          const auto ar = e.let(am + i * 16u + lo),
++                     bc = e.let(bn + i * 16u + lo);
++          for (auto j : e.unroll(2u)) {
++            const auto k = e.let(slice * 16u + hi * 8u + j * 4u);
++            const auto ai = e.let(address(ar, k)), bi = e.let(address(bc, k));
++            ah.back()[j] = math::cast<kir::i32>(packed[ai].read());
++            al.back()[j] = math::cast<kir::i32>(packed[1024u + ai].read());
++            bh.back()[j] = math::cast<kir::i32>(packed[2048u + bi].read());
++            bl.back()[j] = math::cast<kir::i32>(packed[3072u + bi].read());
++          }
++        }
++        for (unsigned m = 0; m < 2; ++m)
++          for (unsigned n = 0; n < 2; ++n) {
++            partial[m * 2 + n] = math::mma<Op>(ah[m].value(), bh[n].value(),
++                                               partial[m * 2 + n].value());
++            partial[m * 2 + n] = math::mma<Op>(al[m].value(), bh[n].value(),
++                                               partial[m * 2 + n].value());
++            partial[m * 2 + n] = math::mma<Op>(ah[m].value(), bl[n].value(),
++                                               partial[m * 2 + n].value());
++          }
++      }
++      for (unsigned m = 0; m < 2; ++m)
++        for (unsigned n = 0; n < 2; ++n) {
++          const auto col = e.let(bn + n * 16u + lo);
++          for (auto j : e.unroll(8u)) {
++            const auto rr =
++                e.let(am + m * 16u + j * geo.slot_step + hi * geo.half_rows);
++            const auto scale =
++                e.let(scales[rr].read() * scales[64u + col].read());
++            acc[m * 2 + n][j] = math::fma(partial[m * 2 + n][j].read(), scale,
++                                          acc[m * 2 + n][j].read());
++          }
++        }
++    }
++    if (auto exceptional = e.when(blockBad.read() != 0.0f)) {
++      // Reload only exceptional blocks. No original FP32 panel needs to remain
++      // live in LDS during the fast path.
++      for (unsigned m = 0; m < 2; ++m)
++        for (unsigned n = 0; n < 2; ++n) {
++          const auto col = e.let(nbase + bn + n * 16u + lo);
++          for (auto j : e.unroll(8u)) {
++            const auto rr = e.let(mbase + am + m * 16u + j * geo.slot_step +
++                                  hi * geo.half_rows);
++            if (auto active = e.when(rr < d.m && col < d.n)) {
++              for (auto chunk : e.range(kb / 16u, kb / 16u + 4u, 1u)) {
++                const auto gi = e.let(col * d.groups + (chunk * 16u) / d.group);
++                const auto scale = e.let(math::widen(a.scales[gi])),
++                           bias = e.let(math::widen(a.biases[gi]));
++                quant::dequant_chunk(
++                    e, a.packed, quant::GroupAffine{6, 64},
++                    e.let(col * d.words + chunk * 3u), scale, bias,
++                    [&](int q, const kir::Val<kir::f32> &weight) {
++                      const auto x = a.x[rr * d.k + chunk * 16u +
++                                         static_cast<unsigned>(q)];
++                      acc[m * 2 + n][j] =
++                          math::fma(x, weight, acc[m * 2 + n][j].read());
++                    });
++              }
++            }
++          }
++        }
++    }
++    e.barrier();
++  }
++  for (unsigned m = 0; m < 2; ++m)
++    for (unsigned n = 0; n < 2; ++n) {
++      const auto col = e.let(nbase + bn + n * 16u + lo);
++      for (auto j : e.unroll(8u)) {
++        const auto rr = e.let(mbase + am + m * 16u + j * geo.slot_step +
++                              hi * geo.half_rows);
++        if (auto active = e.when(rr < d.m && col < d.n))
++          e.store(rr * d.n + col, acc[m * 2 + n][j].read());
++      }
++    }
++  if (!body.lds().ok())
++    return {};
++  return body.str();
++}
+diff --git a/src/kernels/wmma_q6_linear.cpp b/src/kernels/wmma_q6_linear.cpp
+new file mode 100644
+index 0000000..a309ce4
+--- /dev/null
++++ b/src/kernels/wmma_q6_linear.cpp
+@@ -0,0 +1,411 @@
++// Measured floating-operand matrix contraction over unchanged MLX affine Q6.
++// Weight storage remains packed; staged operands feed the measured matrix core.
++#include "lse/graph/kernel_args.hpp"
++#include "lse/kernels/quant_operand_policy.hpp"
++#include "lse/kernels/wmma.hpp"
++#include "lse/math/fp8.hpp"
++#include "lse/quant/group_affine_codec.hpp"
++#include <cstdlib>
++#include <cstring>
++#include <limits>
++namespace lse::kernels {
++namespace {
++namespace env = graph::env;
++namespace kir = graph::kir;
++using namespace graph;
++namespace math = lse::math;
++struct Dims {
++  std::uint32_t m = 0, n = 0, k = 0, words = 0, groups = 0, group = 0;
++  bool valid = false;
++};
++Dims dims_of(const KernelShapes &s) {
++  Dims d;
++  if (s.inputs.size() != 4 || s.input_dtypes.size() != 4 ||
++      s.iattrs.size() < 2 || s.iattrs[0] != 6 || s.iattrs[1] <= 0 ||
++      s.iattrs[1] % 32 || s.inputs[1].rank() != 2 || s.inputs[0].rank() == 0)
++    return d;
++  const auto n = s.inputs[1].dim(0), words = s.inputs[1].dim(1);
++  const std::int64_t group = s.iattrs[1];
++  if (n <= 0 || words <= 0 || words % 3 || n > UINT32_MAX ||
++      words > UINT32_MAX / 32)
++    return d;
++  const auto k = words * 32 / 6;
++  if (k % group || s.inputs[0].dim(s.inputs[0].rank() - 1) != k ||
++      s.output.elem_count() % n)
++    return d;
++  const auto m = s.output.elem_count() / n;
++  if (m < 16 || m > UINT32_MAX || m * k > UINT32_MAX ||
++      n * words > UINT32_MAX || m * n > UINT32_MAX)
++    return d;
++  if (s.inputs[2].elem_count() != n * (k / group) ||
++      s.inputs[3].elem_count() != n * (k / group) ||
++      s.input_dtypes[0] != DType::kF32 || s.input_dtypes[1] != DType::kU32 ||
++      s.input_dtypes[2] != DType::kBF16 || s.input_dtypes[3] != DType::kBF16)
++    return d;
++  d = {static_cast<std::uint32_t>(m),
++       static_cast<std::uint32_t>(n),
++       static_cast<std::uint32_t>(k),
++       static_cast<std::uint32_t>(words),
++       static_cast<std::uint32_t>(k / group),
++       static_cast<std::uint32_t>(group),
++       true};
++  return d;
++}
++template <math::MatrixElem T>
++using Base = MatrixTile<struct UnusedQ6Tile, math::MatrixTarget::kRdna4,
++                        math::MatrixElem::kF32, T, 16, 16, 16>;
++struct Args {
++  env::In<kir::f32, env::Emit> x;
++  env::In<std::uint32_t, env::Emit> packed;
++  env::In<lse::bf16, env::Emit> scales, biases;
++  env::Out<kir::f32, env::Emit> out;
++};
++// A workgroup covers64x64 output values. Four waves each retain a32x32
++// quadrant, reusing two A and two B fragments across four accumulators.
++// Packed model storage is unchanged; only the staged operands are narrowed.
++std::string emit_staged_bf16(const KernelShapes &s, const Dims &d) {
++  using Tile = Base<math::MatrixElem::kBF16>;
++  using F = typename Tile::AFrag;
++  using Op = typename Tile::Op;
++  constexpr auto geo = geometry_of(Tile::kRow);
++  static_assert(geo.wave == 32 && geo.split_k && geo.lane_k == 8);
++  kir::KernelBody body(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
++  body.set_store(s.store);
++  Args a;
++  if (!env::bind(body, a, s))
++    return {};
++  env::Emit e{&body};
++  const auto xs = e.lds<F>(64u * 64u), ws = e.lds<F>(64u * 64u);
++  const auto lid = e.let(math::local_id()), lane = e.let(lid % 32u);
++  const auto wave = e.let(lid / 32u), lo = e.let(lane % 16u),
++             hi = e.let(lane / 16u);
++  const auto wg = e.let(math::workgroup_id_x());
++  const auto nblocks = (d.n + 63) / 64;
++  const auto mbase = e.let((wg / nblocks) * 64u),
++             nbase = e.let((wg % nblocks) * 64u);
++  const auto am = e.let((wave % 2u) * 32u), bn = e.let((wave / 2u) * 32u);
++  // Rotate eight-half spans by row. Every span remains contiguous, while
++  // neighboring lanes read different LDS bank groups rather than stride64.
++  const auto address = [&](const kir::Val<kir::u32> &r,
++                           const kir::Val<kir::u32> &k) {
++    return r * 64u + ((k / 8u + r % 8u) % 8u) * 8u + k % 8u;
++  };
++  std::vector<kir::Local<kir::f32, 8>> acc;
++  for (unsigned i = 0; i < 4; ++i) {
++    acc.push_back(e.local<kir::f32, 8>());
++    for (auto j : e.unroll(8u))
++      acc.back()[j] = e.f32(0);
++  }
++  for (auto kb : e.range(0u, d.k, 64u)) {
++    // Each lane stages two16-value row fragments. All128 lanes execute
++    // both barriers, including lanes covering padded M/N output edges.
++    for (auto block : e.unroll(2u)) {
++      const auto r = e.let(lid / 4u + block * 32u),
++                 kc = e.let((lid % 4u) * 16u);
++      const auto ar = e.let(mbase + r), bc = e.let(nbase + r);
++      const auto av = e.local<F, 16>(), bv = e.local<F, 16>();
++      for (auto j : e.unroll(16u)) {
++        av[j] = math::narrow<F>(e.f32(0));
++        bv[j] = math::narrow<F>(e.f32(0));
++      }
++      if (auto active = e.when(ar < d.m)) {
++        for (unsigned v = 0; v < 4; ++v) {
++          const auto loaded = e.load(a.x, ar * d.k + kb + kc + v * 4u, 16u);
++          for (unsigned j = 0; j < 4; ++j)
++            av[v * 4 + j] = math::narrow<F>(loaded[j]);
++        }
++      }
++      if (auto active = e.when(bc < d.n)) {
++        const auto gi = e.let(bc * d.groups + (kb + kc) / d.group);
++        const auto scale = e.let(math::widen(a.scales[gi])),
++                   bias = e.let(math::widen(a.biases[gi]));
++        const auto wb = e.let(bc * d.words + ((kb + kc) / 16u) * 3u);
++        const std::array<kir::Val<kir::u32>, 3> packed{
++            e.let(a.packed[wb]), e.let(a.packed[wb + 1u]),
++            e.let(a.packed[wb + 2u])};
++        for (unsigned j = 0; j < 16; ++j) {
++          const unsigned off = (j * 6) % 32, wi = j * 6 / 32;
++          auto code = packed[wi] / (1u << off);
++          if (off > 26)
++            code = code +
++                   (packed[wi + 1] % (1u << (off - 26))) * (1u << (32 - off));
++          else
++            code = code % 64u;
++          bv[j] = math::narrow<F>(
++              math::fma(math::cast<kir::f32>(e.let(code)), scale, bias));
++        }
++      }
++      for (auto j : e.unroll(16u)) {
++        const auto index = e.let(address(r, kc + j));
++        xs[index] = av[j].read();
++        ws[index] = bv[j].read();
++      }
++    }
++    e.barrier();
++    for (auto slice : e.unroll(4u)) {
++      std::vector<kir::Local<F, 8>> af, bf;
++      for (unsigned i = 0; i < 2; ++i) {
++        af.push_back(e.local<F, 8>());
++        bf.push_back(e.local<F, 8>());
++        const auto ar = e.let(am + i * 16u + lo), bc = e.let(bn + i * 16u + lo);
++        for (auto j : e.unroll(8u)) {
++          const auto k = e.let(slice * 16u + hi * 8u + j);
++          af.back()[j] = xs[e.let(address(ar, k))];
++          bf.back()[j] = ws[e.let(address(bc, k))];
++        }
++      }
++      for (unsigned m = 0; m < 2; ++m)
++        for (unsigned n = 0; n < 2; ++n)
++          acc[m * 2 + n] = math::mma<Op>(af[m].value(), bf[n].value(),
++                                         acc[m * 2 + n].value());
++    }
++    e.barrier();
++  }
++  for (unsigned m = 0; m < 2; ++m)
++    for (unsigned n = 0; n < 2; ++n) {
++      const auto col = e.let(nbase + bn + n * 16u + lo);
++      for (auto j : e.unroll(8u)) {
++        const auto rr = e.let(mbase + am + m * 16u + j * geo.slot_step +
++                              hi * geo.half_rows);
++        if (auto active = e.when(rr < d.m && col < d.n))
++          e.store(rr * d.n + col, acc[m * 2 + n][j].read());
++      }
++    }
++  if (!body.lds().ok())
++    return {};
++  return body.str();
++}
++#include "q6_fp8_residual.inc"
++struct StagedBF16Kernel final : KernelPrimitive<StagedBF16Kernel> {
++  static constexpr std::string_view kName = "quant_linear.q6_wmma_bf16_reuse";
++  static constexpr std::string_view kEntry = "lse_q6_wmma_bf16_reuse";
++  static constexpr std::string_view kSource = {};
++  std::size_t arity() const noexcept override { return 4; }
++  bool owns_indexing() const noexcept override { return true; }
++  std::string emit_kernel(const KernelShapes &s) const override {
++    const auto d = dims_of(s);
++    if (!d.valid || !s.store || !s.types.scalar || !s.intrinsics)
++      return {};
++    return emit_staged_bf16(s, d);
++  }
++  Result<Shape> infer_shape(std::span<const Shape> in) const override {
++    if (in.size() != 4 || in[1].rank() != 2)
++      return LSE_ERROR(kInvalidArgument, "Q6 matrix requires four operands");
++    Shape o;
++    for (std::size_t i = 0; i + 1 < in[0].rank(); ++i)
++      o.push_back(in[0].dim(i));
++    o.push_back(in[1].dim(0));
++    return o;
++  }
++  DType infer_dtype(std::span<const DType>) const override {
++    return DType::kF32;
++  }
++  static ThreadPlan plan_impl(const KernelShapes &s) {
++    ThreadPlan p;
++    auto d = dims_of(s);
++    if (!d.valid)
++      return p;
++    p.workgroup_size[0] = 128;
++    p.workgroup_count[0] = ((d.m + 63) / 64) * ((d.n + 63) / 64);
++    p.lds_bytes = 16384;
++    p.workgroup_count[1] = p.workgroup_count[2] = 1;
++    return p;
++  }
++};
++const KernelPrimitiveBase *select_staged_bf16(const KernelShapes &s) {
++  constexpr auto r = Base<math::MatrixElem::kBF16>::kRow;
++  if (!r.emittable() || !math::has_cap(device_matrix_caps(*s.device), r.cap) ||
++      s.intrinsics->find(r.key).empty())
++    return nullptr;
++  static const StagedBF16Kernel kernel;
++  return &kernel;
++}
++
++QuantOperandRequest residual_request(const KernelShapes &s, const Dims &d) {
++  return {s.device->arch,
++          s.device->wavefront_size,
++          6,
++          d.group,
++          d.m,
++          d.n,
++          d.k,
++          workgroup_lds_bytes(s.device),
++          true,
++          true,
++          false,
++          !s.staged.name.empty() || !s.staged_quant.codes.empty()};
++}
++template <math::MatrixElem T>
++struct ResidualKernel final : KernelPrimitive<ResidualKernel<T>> {
++  static constexpr std::string_view kName =
++      T == math::MatrixElem::kFp8 ? "quant_linear.q6_fp8_residual3_v2"
++                                  : "quant_linear.q6_bf8_residual3_v2";
++  static constexpr std::string_view kEntry = T == math::MatrixElem::kFp8
++                                                 ? "lse_q6_fp8_residual3_v2"
++                                                 : "lse_q6_bf8_residual3_v2";
++  static constexpr std::string_view kSource = {};
++  std::size_t arity() const noexcept override { return 4; }
++  bool owns_indexing() const noexcept override { return true; }
++  std::string emit_kernel(const KernelShapes &s) const override {
++    const auto d = dims_of(s);
++    if (!d.valid || !s.store || !s.types.scalar || !s.intrinsics)
++      return {};
++    const auto request = residual_request(s, d);
++    QuantOperandDecision decision;
++    decision.operand =
++        T == math::MatrixElem::kFp8 ? QuantOperand::kE4M3 : QuantOperand::kE5M2;
++    decision.strategy = QuantOperandStrategy::kResidualThreeProduct;
++    decision.reason = OperandReason::kSelected;
++    decision.qualification = kQuantOperandProfile.qualification;
++    decision.relative_l2_limit_ppm = kQuantOperandProfile.relative_l2_limit_ppm;
++    return "// " + quant_operand_diagnostic(request, decision) + "\n" +
++           emit_residual<T>(s, d);
++  }
++  Result<Shape> infer_shape(std::span<const Shape> in) const override {
++    if (in.size() != 4 || in[1].rank() != 2 || !in[0].rank())
++      return LSE_ERROR(kInvalidArgument,
++                       "Q6 residual matrix requires four operands");
++    Shape out;
++    for (std::size_t i = 0; i + 1 < in[0].rank(); ++i)
++      out.push_back(in[0].dim(i));
++    out.push_back(in[1].dim(0));
++    return out;
++  }
++  DType infer_dtype(std::span<const DType>) const override {
++    return DType::kF32;
++  }
++  static ThreadPlan plan_impl(const KernelShapes &s) {
++    ThreadPlan p;
++    const auto d = dims_of(s);
++    if (!d.valid)
++      return p;
++    p.workgroup_size[0] = 128;
++    p.workgroup_count[0] = ((d.m + 63) / 64) * ((d.n + 63) / 64);
++    p.workgroup_count[1] = p.workgroup_count[2] = 1;
++    p.lds_bytes = kResidualLdsBytes;
++    return p;
++  }
++};
++template <math::MatrixElem T>
++QuantOperandKernel residual_descriptor(const KernelShapes &s) {
++  constexpr auto row = Base<T>::kRow;
++  const auto operand =
++      T == math::MatrixElem::kFp8 ? QuantOperand::kE4M3 : QuantOperand::kE5M2;
++  const bool matrix = row.emittable() &&
++                      math::has_cap(device_matrix_caps(*s.device), row.cap) &&
++                      !s.intrinsics->find(row.key).empty();
++  // The backend supplies the same conversion semantics to both dialects.
++  bool conversion = !s.intrinsics->find(math::Fp8Format<T>::pack_key).empty();
++  for (const auto key : math::Fp8Format<T>::value_keys)
++    conversion = conversion && !s.intrinsics->find(key).empty();
++  QuantOperandKernel kernel;
++  kernel.operand = operand;
++  kernel.strategy = QuantOperandStrategy::kResidualThreeProduct;
++  kernel.implementation_id =
++      quant_operand_implementation_id(ResidualKernel<T>::kName);
++  kernel.implementation_revision = 2;
++  kernel.implemented = true;
++  kernel.matrix_intrinsic = matrix;
++  kernel.conversion_intrinsic = conversion;
++  kernel.block_absmax_scaling = true;
++  kernel.fp32_exceptional_block_fallback = true;
++  kernel.lds_bytes = kResidualLdsBytes;
++  return kernel;
++}
++} // namespace
++const graph::KernelPrimitiveBase *
++wmma_q6_linear_for(const graph::KernelShapes &s) {
++  const auto dims = dims_of(s);
++  const auto *global = std::getenv("LSE_WMMA");
++  if (!s.device || !s.intrinsics || !dims.valid ||
++      s.device->max_threads_per_workgroup < 128 ||
++      s.device->compute_units != 64 ||
++      (global && std::strcmp(global, "0") == 0))
++    return nullptr;
++  const auto request = residual_request(s, dims);
++  // Matched driver195 projection experiments: eight post-warm host
++  // eval+retire intervals per implementation. These are not device timestamps.
++  struct Measured {
++    uint32_t m, n, k;
++    uint64_t bf16, e4m3, e5m2;
++  };
++  static constexpr Measured records[] = {
++      {64, 17408, 5120, 1877865, 4170963, 1987625},
++      {512, 17408, 5120, 6711219, 18451005, 9670537},
++      {64, 5120, 17408, 3005271, 4375042, 3662411},
++      {512, 5120, 17408, 8312625, 13622156, 11045698}};
++  const Measured *record = nullptr;
++  for (const auto &r : records)
++    if (r.m == dims.m && r.n == dims.n && r.k == dims.k)
++      record = &r;
++  if (!record)
++    return nullptr; // Unknown shapes and M1 retain the scalar path.
++  constexpr uint64_t cohort = 0x202609230001ull;
++  std::array<QuantOperandOption, 3> options{};
++  auto &bf16 = options[0];
++  bf16.kernel.operand = QuantOperand::kBF16;
++  bf16.kernel.strategy = QuantOperandStrategy::kNative;
++  bf16.kernel.implementation_id =
++      quant_operand_implementation_id(StagedBF16Kernel::kName);
++  bf16.kernel.implemented = true;
++  bf16.kernel.matrix_intrinsic = select_staged_bf16(s) != nullptr;
++  bf16.kernel.conversion_intrinsic = true; // Shared F32→BF16 cast lowering.
++  bf16.kernel.lds_bytes = 16384;
++  bf16.profile.preferred = QuantOperand::kBF16;
++  bf16.profile.strategy = QuantOperandStrategy::kNative;
++  bf16.profile.revision = 2;
++  bf16.profile.qualification = OperandQualification::kAccepted;
++  // Fifteen guarded projection fixtures plus complete-model logits. The
++  // worst original-FP32 projection error was0.41996%; full-model error
++  // was0.30484%. Cancellation-safe absolute checks and all guards passed.
++  bf16.profile.measured_cases = 16;
++  bf16.profile.measured_relative_l2_ppm = 4200;
++  bf16.profile.absolute_error_pass = true;
++  bf16.profile.nonfinite_pass = true;
++  bf16.profile.model_quality_pass = true;
++  bf16.profile.performance_pass = true;
++  bf16.profile.run_qualification_candidate = false;
++  options[1].kernel = residual_descriptor<math::MatrixElem::kFp8>(s);
++  options[2].kernel = residual_descriptor<math::MatrixElem::kBf8>(s);
++  for (size_t i = 1; i < options.size(); ++i) {
++    options[i].profile.preferred = options[i].kernel.operand;
++    options[i].profile.strategy = QuantOperandStrategy::kResidualThreeProduct;
++    options[i].profile.run_qualification_candidate = false;
++    // Both implementations exist, but neither wins the measured throughput
++    // comparison. BF8 additionally fails the outlier quality qualification.
++    // Keep them ineligible until an accepted quality/performance record exists.
++    options[i].profile.performance_pass = false;
++  }
++  const uint64_t costs[] = {record->bf16, record->e4m3, record->e5m2};
++  for (size_t i = 0; i < options.size(); ++i) {
++    auto &c = options[i].cost;
++    c.arch = "gfx1201";
++    c.wave = 32;
++    c.bits = 6;
++    c.group = 64;
++    c.m = dims.m;
++    c.n = dims.n;
++    c.k = dims.k;
++    c.cohort = cohort;
++    c.samples = 8;
++    c.cost_ns = costs[i];
++    c.accepted_profile_revision = options[i].profile.revision;
++    c.implementation_id = options[i].kernel.implementation_id;
++    c.implementation_revision = options[i].kernel.implementation_revision;
++  }
++  const auto winner = rank_quant_operands(request, options, cohort,
++                                          OperandCostClock::kHostEvalRetire);
++  if (winner.option == 0)
++    return select_staged_bf16(s);
++  if (winner.option == 1) {
++    static const ResidualKernel<math::MatrixElem::kFp8> kernel;
++    return &kernel;
++  }
++  if (winner.option == 2) {
++    static const ResidualKernel<math::MatrixElem::kBf8> kernel;
++    return &kernel;
++  }
++  return nullptr;
++}
++
++} // namespace lse::kernels
 diff --git a/tests/compile_loom_matrix.cpp b/tests/compile_loom_matrix.cpp
 new file mode 100644
 index 0000000..dcbbde4
@@ -6544,6 +8098,35 @@ index 0000000..dcbbde4
 +       ok;
 +  return ok ? 0 : 1;
 +}
+diff --git a/tests/fp8_conversion_fixture.hpp b/tests/fp8_conversion_fixture.hpp
+new file mode 100644
+index 0000000..6771d22
+--- /dev/null
++++ b/tests/fp8_conversion_fixture.hpp
+@@ -0,0 +1,23 @@
++#pragma once
++#include "loom_dot_fixture.hpp"
++#include "lse/math/fp8.hpp"
++namespace fp8_fixture {
++using namespace lse;
++template<math::MatrixElem E> Result<backend::LoomBody> body(unsigned byte) {
++  auto types = backend::loom_types();
++  auto sources = backend::loom_sources();
++  ir::KernelBody b(types, sources);
++  ir::env::Emit e{&b};
++  ir::Buffer<ir::f32> values(&b, &types, "values");
++  auto i = e.thread_id();
++  auto x = e.let(values[i].read());
++  auto packed = e.let(math::pack_fp8<E>(x, e.f32(0.0f) - x, x + e.f32(1.0f), x - e.f32(1.0f)));
++  if (byte == 0) e.ret(math::unpack_fp8<E, 0>(packed));
++  if (byte == 1) e.ret(math::unpack_fp8<E, 1>(packed));
++  if (byte == 2) e.ret(math::unpack_fp8<E, 2>(packed));
++  if (byte == 3) e.ret(math::unpack_fp8<E, 3>(packed));
++  backend::LoomPrintOptions options;
++  options.buffers.emplace("values", backend::LoomBufferView{ir::Scalar::kF32, 128, "%values_view"});
++  return backend::loom_print(b.ir(), options);
++}
++}
 diff --git a/tests/loaded_runtime_fixture.cpp b/tests/loaded_runtime_fixture.cpp
 new file mode 100644
 index 0000000..268c708
@@ -6635,6 +8218,45 @@ index 0000000..9507596
 + return LSE_ERROR(kInternal,"projection group missing");
 +}
 +}
+diff --git a/tests/loom_float_compare_fixture.hpp b/tests/loom_float_compare_fixture.hpp
+new file mode 100644
+index 0000000..40c0d2a
+--- /dev/null
++++ b/tests/loom_float_compare_fixture.hpp
+@@ -0,0 +1,33 @@
++#pragma once
++#include "lse/backends/hrx/loomc/loom_print.hpp"
++#include "lse/backends/hrx/loomc/loom_types.hpp"
++#include "lse/graph/kernel_env.hpp"
++namespace float_compare_fixture {
++inline lse::Result<lse::backend::LoomBody> body(bool not_equal) {
++  namespace ir=lse::ir;
++  auto types=lse::backend::loom_types();
++  const ir::DialectSourceTable intrinsics{std::span<const ir::PrimitiveSource>{}};
++  ir::KernelBody recorded(types,intrinsics);ir::env::Emit e{&recorded};
++  ir::Buffer<ir::f32> a(&recorded,&types,"a"),b(&recorded,&types,"b");
++  auto i=e.thread_id();auto x=e.let(a[i].read()),y=e.let(b[i].read());
++  auto comparison=not_equal ? x!=y : x==y;
++  e.ret(ir::select(comparison,e.f32(1.0f),e.f32(0.0f)));
++  lse::backend::LoomPrintOptions options;
++  for(const char* name:{"a","b"})options.buffers.emplace(name,lse::backend::LoomBufferView{ir::Scalar::kF32,32,std::string("%")+name+"_view"});
++  return lse::backend::loom_print(recorded.ir(),options);
++}
++inline std::string kernel(const lse::backend::LoomBody& b) {
++  return R"(kernel.def export("float_compare") @float_compare() {
++ %one = index.constant 1 : index
++ %lanes = index.constant 32 : index
++ kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%lanes, %one, %one) : index
++} launch(%a: buffer, %b: buffer, %out: buffer) {
++ %base = index.constant 0 : offset
++ %a_view = buffer.view %a[%base] : buffer -> view<32xf32, #dense>
++ %b_view = buffer.view %b[%base] : buffer -> view<32xf32, #dense>
++ %out_view = buffer.view %out[%base] : buffer -> view<32xf32, #dense>
++ %lane = kernel.workitem.id<x> : index
++ %i = index.assume %lane [range(%lane, 0, 31)] : index
++)"+b.text+" view.store "+b.result+", %out_view[%i] : f32, view<32xf32, #dense>\n kernel.return\n}\n";
++}
++} // namespace float_compare_fixture
 diff --git a/tests/test_attention_decode.cpp b/tests/test_attention_decode.cpp
 new file mode 100644
 index 0000000..c66a23a
@@ -6980,6 +8602,103 @@ index 0000000..51f11ce
 +  LSE_EXPECT_EQ(rows[0].second.submit_ns, 11u);
 +}
 +LSE_TEST_MAIN()
+diff --git a/tests/test_fp8_conversion.cpp b/tests/test_fp8_conversion.cpp
+new file mode 100644
+index 0000000..c5e0254
+--- /dev/null
++++ b/tests/test_fp8_conversion.cpp
+@@ -0,0 +1,49 @@
++#include "harness.hpp"
++#include "lse/math/fp8.hpp"
++#include <bit>
++#include <limits>
++
++using namespace lse;
++namespace {
++template <math::MatrixElem E> void check_format() {
++  using F = math::Fp8Format<E>;
++  for (unsigned code = 0; code <= F::max_finite_code; ++code) {
++    for (unsigned sign : {0u, 0x80u}) {
++      const float x = math::fp8_value<E>(code | sign);
++      LSE_EXPECT(math::fp8_bits<E>(x) == (code | sign));
++      if (code == 0) LSE_EXPECT(std::signbit(x) == (sign != 0));
++    }
++    if (code == F::max_finite_code) break;
++    const float lo = math::fp8_value<E>(code), hi = math::fp8_value<E>(code + 1);
++    const float midpoint = (lo + hi) * 0.5f;
++    const unsigned tie = code + (code & 1);
++    LSE_EXPECT(math::fp8_bits<E>(midpoint) == tie);
++    LSE_EXPECT(math::fp8_bits<E>(-midpoint) == (tie | 0x80));
++    LSE_EXPECT(math::fp8_bits<E>(std::nextafter(midpoint, lo)) == code);
++    LSE_EXPECT(math::fp8_bits<E>(std::nextafter(midpoint, hi)) == code + 1);
++  }
++  LSE_EXPECT(math::fp8_bits<E>(std::numeric_limits<float>::max()) == F::max_finite_code);
++  LSE_EXPECT(math::fp8_bits<E>(-std::numeric_limits<float>::max()) == (F::max_finite_code | 0x80));
++  LSE_EXPECT(math::fp8_bits<E>(std::numeric_limits<float>::infinity()) == (F::e4m3 ? 0x7f : 0x7c));
++  LSE_EXPECT(math::fp8_bits<E>(-std::numeric_limits<float>::infinity()) == (F::e4m3 ? 0xff : 0xfc));
++  for (unsigned raw : {0x7fc00001u, 0x7f800001u, 0xffc12345u})
++    LSE_EXPECT(math::fp8_bits<E>(std::bit_cast<float>(raw)) == ((raw >> 24 & 0x80) | 0x7f));
++  auto packed = math::pack_fp8<E>(0.0f, -0.0f, F::max_finite, -F::min_subnormal);
++  LSE_EXPECT((packed & 0xffff) == 0x8000);
++  LSE_EXPECT(math::unpack_fp8<E, 2>(packed) == F::max_finite);
++  LSE_EXPECT(math::unpack_fp8<E, 3>(packed) == -F::min_subnormal);
++}
++}
++LSE_TEST(ocp_e4m3_all_representable_values_and_rounding_boundaries) {
++  check_format<math::MatrixElem::kFp8>();
++  LSE_EXPECT(math::fp8_value<math::MatrixElem::kFp8>(0x38) == 1.0f);
++  LSE_EXPECT(math::fp8_value<math::MatrixElem::kFp8>(0x7e) == 448.0f);
++  LSE_EXPECT(math::fp8_value<math::MatrixElem::kFp8>(1) == 0x1p-9f);
++}
++LSE_TEST(ocp_e5m2_all_representable_values_and_rounding_boundaries) {
++  check_format<math::MatrixElem::kBf8>();
++  LSE_EXPECT(math::fp8_value<math::MatrixElem::kBf8>(0x3c) == 1.0f);
++  LSE_EXPECT(math::fp8_value<math::MatrixElem::kBf8>(0x7b) == 57344.0f);
++  LSE_EXPECT(math::fp8_value<math::MatrixElem::kBf8>(1) == 0x1p-16f);
++}
++LSE_TEST_MAIN()
+diff --git a/tests/test_fp8_conversion_native.cpp b/tests/test_fp8_conversion_native.cpp
+new file mode 100644
+index 0000000..2ec02b5
+--- /dev/null
++++ b/tests/test_fp8_conversion_native.cpp
+@@ -0,0 +1,36 @@
++#include "harness.hpp"
++#include "fp8_conversion_fixture.hpp"
++#include "lse/backends/hrx/loomc/loomc_compiler.hpp"
++#include "lse/backends/hrx/hipc/hip_sources.hpp"
++#include <fstream>
++namespace {
++template<lse::math::MatrixElem E> void compile_format() {
++  lse::backend::LoomcCompiler compiler;
++  LSE_EXPECT(compiler.available());
++  if (!compiler.available()) return;
++  for (unsigned byte = 0; byte != 4; ++byte) {
++    auto body = fp8_fixture::body<E>(byte);
++    LSE_EXPECT(body.ok());
++    if (!body.ok()) { std::fprintf(stderr, "%s\n", body.status().to_string().c_str()); continue; }
++    const auto source = dot_fixture::kernel(*body);
++    auto code = compiler.compile(source, "gfx1201");
++    LSE_EXPECT(code.ok());
++    if (!code.ok()) std::fprintf(stderr, "%s\n%s\n", code.status().to_string().c_str(), source.c_str());
++    else {
++      LSE_EXPECT(!code->code.empty());
++      if (const char* dir = std::getenv("LSE_FP8_ARTIFACT_DIR")) {
++        const std::string base = std::string(dir) + "/" + (E == lse::math::MatrixElem::kFp8 ? "fp8" : "bf8") + std::to_string(byte);
++        std::ofstream(base + ".loom") << source;
++        std::ofstream f(base + ".hsaco", std::ios::binary);
++        f.write(reinterpret_cast<const char*>(code->code.data()), code->code.size());
++      }
++    }
++  }
++  auto hip = lse::backend::hip_sources().find(lse::math::Fp8Format<E>::pack_key);
++  LSE_EXPECT(hip.find("__builtin_amdgcn_cvt_pk_") != std::string_view::npos);
++  LSE_EXPECT(hip.find("__builtin_isfinite") != std::string_view::npos);
++}
++}
++LSE_TEST(ocp_fp8_shared_pack_unpack_emit_native_gfx1201) { compile_format<lse::math::MatrixElem::kFp8>(); }
++LSE_TEST(ocp_bf8_shared_pack_unpack_emit_native_gfx1201) { compile_format<lse::math::MatrixElem::kBf8>(); }
++LSE_TEST_MAIN()
 diff --git a/tests/test_gdn_pair.cpp b/tests/test_gdn_pair.cpp
 new file mode 100644
 index 0000000..e943642
@@ -7248,6 +8967,163 @@ index 0000000..38cf319
 +  LSE_EXPECT(detail::own_single_device_copy(DeviceIndex{1}, 1, 1, src, dst));
 +}
 +LSE_TEST_MAIN()
+diff --git a/tests/test_int8_policy.cpp b/tests/test_int8_policy.cpp
+new file mode 100644
+index 0000000..e1645e3
+--- /dev/null
++++ b/tests/test_int8_policy.cpp
+@@ -0,0 +1,116 @@
++#include "loom_dot_fixture.hpp"
++#include "lse/backends/hrx/arch_database.hpp"
++#include "lse/backends/hrx/hipc/hip_emitter.hpp"
++#include "lse/backends/hrx/loomc/loom_emitter.hpp"
++#include "lse/backends/hrx/loomc/loomc_compiler.hpp"
++#include "lse/graph/ops.hpp"
++#include "lse/kernels/int8_policy.hpp"
++#include <cstdio>
++#include <stdexcept>
++using namespace lse;
++using namespace lse::graph;
++namespace {
++void require(bool yes, const char *message) {
++  if (!yes)
++    throw std::runtime_error(message);
++}
++Array leaf(Shape shape, DType type) {
++  auto node = std::make_shared<Node>();
++  node->shape = shape;
++  node->dtype = type;
++  return Array(node);
++}
++FusionGroup projection(int rows, int bits) {
++  auto out = quant_linear(
++      leaf({rows, 64}, DType::kF32), leaf({17, 64 * bits / 32}, DType::kU32),
++      leaf({17, 1}, DType::kBF16), leaf({17, 1}, DType::kBF16), bits, 64);
++  const NodePtr roots[]{out.node()};
++  for (const auto &group : Partitioner::partition(roots))
++    if (group.anchor == OpKind::kQuantMatMul)
++      return group;
++  throw std::runtime_error("quantized projection group missing");
++}
++} // namespace
++int main(int argc, char **argv) {
++  try {
++    require(argc == 2 && (std::string_view(argv[1]) == "0" ||
++                          std::string_view(argv[1]) == "1"),
++            "expected policy argument 0 or 1");
++    const bool enabled = std::string_view(argv[1]) == "1";
++    require(!kernels::parse_activation_int8(nullptr), "absent policy enabled");
++    for (const char *raw : {"", "0", "true", "01", " 1", "1 ", "-1", "2"})
++      require(!kernels::parse_activation_int8(raw), "malformed policy enabled");
++    require(kernels::parse_activation_int8("1"), "explicit enable rejected");
++    require(kernels::activation_int8_enabled() == enabled,
++            "process policy mismatch");
++    // A later environment edit cannot reinterpret retained dispatch plans.
++    setenv("LSE_HRX_INT8", enabled ? "0" : "1", 1);
++    require(kernels::activation_int8_enabled() == enabled,
++            "process policy changed after selection");
++    backend::DeviceInfo device;
++    backend::AmdDeviceInfo amd;
++    device.arch = "gfx1201";
++    device.wavefront_size = 32;
++    device.compute_units = 64;
++    device.lds_bytes_per_workgroup = 65536;
++    device.max_threads_per_workgroup = 1024;
++    backend::apply_arch_defaults(device, amd);
++    device.extension_id = backend::AmdDeviceInfo::kExtensionId;
++    device.extension = &amd;
++    backend::HipEmitter hip;
++    backend::LoomEmitter loom;
++    backend::LoomcCompiler compiler;
++    require(compiler.available(), "native Loom compiler unavailable");
++    for (int rows : {1, 32})
++      for (int bits : {4, 6, 8}) {
++        auto group = projection(rows, bits);
++        const auto hip_key = hip.cache_key(group, device),
++                   loom_key = loom.cache_key(group, device);
++        auto h = hip.emit(group, device), l = loom.emit(group, device);
++        if (!h.ok())
++          throw std::runtime_error(h.status().to_string());
++        if (!l.ok())
++          throw std::runtime_error(l.status().to_string());
++        const bool expected = enabled && bits == 4;
++        const bool hip_dot =
++            h->source.find("__builtin_amdgcn_sudot4") != std::string::npos;
++        const bool hip_matrix =
++            h->source.find("__builtin_amdgcn_wmma_i32") != std::string::npos;
++        const bool loom_dot =
++            l->source.find("vector.dot4i<s8u8>") != std::string::npos;
++        const bool loom_matrix =
++            l->source.find("vector.mma") != std::string::npos &&
++            l->source.find("element_format=i8") != std::string::npos &&
++            l->source.find("element_format=u8") != std::string::npos;
++        require((hip_dot || hip_matrix) == expected,
++                "HIP activation-conversion selection mismatch");
++        require((loom_dot || loom_matrix) == expected,
++                "Loom activation-conversion selection mismatch");
++        if (expected) {
++          require(rows == 1 ? hip_dot : hip_matrix, "HIP wrong INT8 route");
++          require(rows == 1 ? loom_dot : loom_matrix, "Loom wrong INT8 route");
++        }
++        auto cached = loom.emit(group, device);
++        require(cached.ok() && cached->source == l->source,
++                "cached emission changed");
++        auto code = compiler.compile(l->source, device.arch);
++        if (!code.ok())
++          throw std::runtime_error(code.status().to_string());
++        require(!code->code.empty(), "native shader empty");
++        std::printf("KEY m%d_q%d hip=%llu loom=%llu policy=%d\n", rows, bits,
++                    static_cast<unsigned long long>(hip_key),
++                    static_cast<unsigned long long>(loom_key), enabled);
++      }
++    // Raw integer arithmetic is not activation conversion and stays available.
++    auto raw = dot_fixture::body(0);
++    require(raw.ok() &&
++                raw->text.find("vector.dot4i<s8u8>") != std::string::npos,
++            "raw integer dot was disabled");
++    std::puts("PASS INT8 policy, shared HIP/Loom selection, cached replay, and "
++              "six native shaders; no GPU opened");
++    return 0;
++  } catch (const std::exception &error) {
++    std::fprintf(stderr, "FAIL: %s\n", error.what());
++    return 1;
++  }
++}
+diff --git a/tests/test_int8_policy.py b/tests/test_int8_policy.py
+new file mode 100644
+index 0000000..ed26657
+--- /dev/null
++++ b/tests/test_int8_policy.py
+@@ -0,0 +1,29 @@
++#!/usr/bin/env python3
++"""Compare real emitted kernel cache identities across independent policies."""
++import os
++import re
++import subprocess
++import sys
++
++results = {}
++for name, value, expected in [("unset", None, "0"), ("off", "0", "0"),
++                              ("invalid", "true", "0"), ("on", "1", "1")]:
++    env = os.environ.copy()
++    env.pop("LSE_HRX_INT8", None)
++    if value is not None:
++        env["LSE_HRX_INT8"] = value
++    env["LSE_WMMA_MIN_M"] = "16"
++    env.pop("LSE_WMMA", None)
++    completed = subprocess.run([sys.argv[1], expected], env=env, text=True,
++                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
++                               timeout=90, check=False)
++    print(f"{name}:\n{completed.stdout}", end="")
++    completed.check_returncode()
++    results[name] = dict((key, (hip, loom)) for key, hip, loom in
++                        re.findall(r"KEY (\S+) hip=(\d+) loom=(\d+)", completed.stdout))
++    assert len(results[name]) == 6
++assert results["unset"] == results["off"] == results["invalid"]
++for shape, keys in results["off"].items():
++    for dialect in (0, 1):
++        assert keys[dialect] != results["on"][shape][dialect], (shape, dialect)
++print("PASS cross-process HIP/Loom cache separation and canonical disabled policy")
 diff --git a/tests/test_loaded_runtime.cpp b/tests/test_loaded_runtime.cpp
 new file mode 100644
 index 0000000..5950a35
@@ -7499,10 +9375,11 @@ index 0000000..e2b301c
 +LSE_TEST_MAIN()
 diff --git a/tests/test_loom_dot.cpp b/tests/test_loom_dot.cpp
 new file mode 100644
-index 0000000..ce8c16c
+index 0000000..52cd3e9
 --- /dev/null
 +++ b/tests/test_loom_dot.cpp
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,38 @@
++#include "lse/kernels/int8_policy.hpp"
 +#include "harness.hpp"
 +#include "loom_dot_fixture.hpp"
 +LSE_TEST(mixed_dot_signed_result_and_same_width_casts_keep_signed_conversion) {
@@ -7531,7 +9408,8 @@ index 0000000..ce8c16c
 +LSE_TEST(q4_mixed_dot_is_gated_by_actual_arch_capability) {
 + for(const auto* arch:{"gfx1030","gfx90a","gfx942","gfx950","gfx1100","gfx1201"}) {
 +  auto out=dot_fixture::projection(arch,4);LSE_EXPECT(out.ok());if(!out.ok()){std::fprintf(stderr,"%s: %s\n",arch,out.status().to_string().c_str());continue;}
-+  const bool expected=std::string_view(arch)=="gfx1100" || std::string_view(arch)=="gfx1201";
++  const bool expected=lse::kernels::activation_int8_enabled() &&
++      (std::string_view(arch)=="gfx1100" || std::string_view(arch)=="gfx1201");
 +  LSE_EXPECT((out->source.find("vector.dot4i<s8u8>")!=std::string::npos)==expected);
 + }
 + auto disabled=dot_fixture::projection("gfx1201",4,true);LSE_EXPECT(disabled.ok());
@@ -7541,11 +9419,12 @@ index 0000000..ce8c16c
 +LSE_TEST_MAIN()
 diff --git a/tests/test_loom_dot_native.cpp b/tests/test_loom_dot_native.cpp
 new file mode 100644
-index 0000000..85b47c2
+index 0000000..c5491ca
 --- /dev/null
 +++ b/tests/test_loom_dot_native.cpp
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,37 @@
 +#include "harness.hpp"
++#include "loom_float_compare_fixture.hpp"
 +#include "loom_dot_fixture.hpp"
 +#include "lse/backends/hrx/loomc/loomc_compiler.hpp"
 +namespace {
@@ -7568,6 +9447,17 @@ index 0000000..85b47c2
 +}
 +LSE_TEST(workgroup_uniform_unsigned_minmax_emit_shader_bytes) {
 + compile_fixture(2);
++}
++LSE_TEST(ordered_equal_and_unordered_not_equal_compile_native_shaders) {
++ lse::backend::LoomcCompiler compiler;LSE_EXPECT(compiler.available());
++ if(!compiler.available())return;
++ for(bool ne:{false,true}) {
++  auto printed=float_compare_fixture::body(ne);LSE_EXPECT(printed.ok());if(!printed.ok())continue;
++  auto code=compiler.compile(float_compare_fixture::kernel(*printed),"gfx1201");
++  LSE_EXPECT(code.ok());
++  if(!code.ok())std::fprintf(stderr,"float comparison: %s\n",code.status().to_string().c_str());
++  else LSE_EXPECT(!code->code.empty());
++ }
 +}
 +LSE_TEST_MAIN()
 diff --git a/tests/test_loom_extent.cpp b/tests/test_loom_extent.cpp
@@ -7797,10 +9687,11 @@ index 0000000..de5b67c
 +LSE_TEST_MAIN()
 diff --git a/tests/test_loom_matrix.cpp b/tests/test_loom_matrix.cpp
 new file mode 100644
-index 0000000..649b73b
+index 0000000..9bdd165
 --- /dev/null
 +++ b/tests/test_loom_matrix.cpp
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,194 @@
++#include "lse/kernels/int8_policy.hpp"
 +#include "harness.hpp"
 +#include "lse/backends/hrx/arch_database.hpp"
 +#include "lse/backends/hrx/loomc/loom_print.hpp"
@@ -7959,7 +9850,7 @@ index 0000000..649b73b
 +      s.intrinsics = &sources;
 +      s.types = types;
 +      const auto *specialized = kernels::wmma_quant_linear_for(s);
-+      if (bits == 4)
++      if (bits == 4 && kernels::activation_int8_enabled())
 +        LSE_EXPECT(specialized != nullptr);
 +      else
 +        LSE_EXPECT(specialized == nullptr);
@@ -7996,12 +9887,15 @@ index 0000000..649b73b
 +LSE_TEST_MAIN()
 diff --git a/tests/test_loom_print.cpp b/tests/test_loom_print.cpp
 new file mode 100644
-index 0000000..adaa508
+index 0000000..9e633a4
 --- /dev/null
 +++ b/tests/test_loom_print.cpp
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,77 @@
 +// Source-only regressions: no Loom compiler, HRX library or GPU is required.
 +#include "harness.hpp"
++#include "loom_float_compare_fixture.hpp"
++#include <cmath>
++#include <limits>
 +#include "lse/backends/hrx/loomc/loom_print.hpp"
 +#include "lse/backends/hrx/loomc/loom_types.hpp"
 +#include "lse/graph/kernel_env.hpp"
@@ -8053,6 +9947,26 @@ index 0000000..adaa508
 +  }
 +}
 +
++LSE_TEST(float_inequality_preserves_cpp_nan_and_finite_semantics) {
++  const float nan=std::numeric_limits<float>::quiet_NaN();
++  const float inf=std::numeric_limits<float>::infinity();
++  for (const auto [a,b] : {std::pair{nan,nan},std::pair{nan,1.0f},
++                          std::pair{1.0f,nan},std::pair{1.0f,1.0f},
++                          std::pair{1.0f,2.0f},std::pair{0.0f,-0.0f},
++                          std::pair{inf,inf},std::pair{inf,-inf}}) {
++    const bool ordered_equal=!std::isnan(a)&&!std::isnan(b)&&a==b;
++    const bool unordered_not_equal=std::isnan(a)||std::isnan(b)||a!=b;
++    LSE_EXPECT_EQ(ordered_equal,a==b);
++    LSE_EXPECT_EQ(unordered_not_equal,a!=b);
++  }
++  for(bool ne:{false,true}) {
++    auto printed=float_compare_fixture::body(ne);LSE_EXPECT(printed.ok());
++    if(printed.ok()) {
++      LSE_EXPECT(printed->text.find(ne?"scalar.cmpf une,":"scalar.cmpf oeq,")!=std::string::npos);
++      LSE_EXPECT(printed->text.find("scalar.cmpf one,")==std::string::npos);
++    }
++  }
++}
 +LSE_TEST_MAIN()
 diff --git a/tests/test_loom_probe.cpp b/tests/test_loom_probe.cpp
 new file mode 100644
@@ -8818,6 +10732,469 @@ index 0000000..987b3e9
 +}
 +#endif
 +LSE_TEST_MAIN()
+diff --git a/tests/test_q6_wmma.cpp b/tests/test_q6_wmma.cpp
+new file mode 100644
+index 0000000..2194c9b
+--- /dev/null
++++ b/tests/test_q6_wmma.cpp
+@@ -0,0 +1,67 @@
++#include "harness.hpp"
++#include "lse/backends/hrx/arch_database.hpp"
++#include "lse/backends/hrx/hipc/hip_emitter.hpp"
++#include "lse/backends/hrx/loomc/loom_emitter.hpp"
++#include "lse/backends/hrx/loomc/loomc_compiler.hpp"
++#include "lse/graph/ops.hpp"
++#include "lse/kernels/quant_operand_policy.hpp"
++#include <cstdlib>
++using namespace lse;
++namespace {
++graph::FusionGroup make_group(int m,int n,int k) {
++ using namespace graph;
++ auto leaf=[](Shape shape,DType dt){auto p=std::make_shared<Node>();p->shape=shape;p->dtype=dt;return Array(p);};
++ auto out=quant_linear(leaf({m,k},DType::kF32),leaf({n,k*6/32},DType::kU32),
++   leaf({n,k/64},DType::kBF16),leaf({n,k/64},DType::kBF16),6,64);
++ const NodePtr roots[]={out.node()};
++ for(auto g:Partitioner::partition(roots))if(g.anchor==OpKind::kQuantMatMul)return g;
++ std::abort();
++}
++struct Fixture {
++ backend::DeviceInfo device;backend::AmdDeviceInfo amd;
++ backend::HipEmitter hip;backend::LoomEmitter loom;backend::LoomcCompiler compiler;
++ Fixture(){device.arch="gfx1201";device.wavefront_size=32;device.compute_units=64;
++  device.max_threads_per_workgroup=1024;device.lds_bytes_per_workgroup=65536;
++  backend::apply_arch_defaults(device,amd);device.extension_id=backend::AmdDeviceInfo::kExtensionId;device.extension=&amd;}
++ void check(int m,int n,int k,bool matrix,bool native=true) {
++  const auto group=make_group(m,n,k);
++  unsetenv("LSE_Q6_WMMA");
++  const auto hk=hip.cache_key(group,device),lk=loom.cache_key(group,device);
++  auto h=hip.emit(group,device),l=loom.emit(group,device);
++  LSE_EXPECT(h.ok());LSE_EXPECT(l.ok());if(!h.ok()||!l.ok())return;
++  LSE_EXPECT((h->source.find("__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12")!=std::string::npos)==matrix);
++  LSE_EXPECT((l->source.find("vector.mma")!=std::string::npos)==matrix);
++  LSE_EXPECT(l->source.find("element_format=fp8")==std::string::npos);
++  LSE_EXPECT(l->source.find("element_format=bf8")==std::string::npos);
++  if(matrix){LSE_EXPECT(l->lds_bytes==16384);LSE_EXPECT(l->dims.workgroup_size[0]==128);LSE_EXPECT(l->source.find("element_format=bf16")!=std::string::npos);}
++  // The removed switch cannot change either selection or persisted identity.
++  for(const char* old:{"f16","bf16","f16-lds","bf16-lds","invalid"}) {
++   setenv("LSE_Q6_WMMA",old,1);
++   LSE_EXPECT_EQ(hip.cache_key(group,device),hk);LSE_EXPECT_EQ(loom.cache_key(group,device),lk);
++   auto hh=hip.emit(group,device),ll=loom.emit(group,device);
++   LSE_EXPECT(hh.ok());LSE_EXPECT(ll.ok());
++   if(hh.ok())LSE_EXPECT(hh->source==h->source);
++   if(ll.ok())LSE_EXPECT(ll->source==l->source);
++  }
++  unsetenv("LSE_Q6_WMMA");
++  if(native){LSE_EXPECT(compiler.available());if(!compiler.available())return;
++   auto code=compiler.compile(l->source,"gfx1201");LSE_EXPECT(code.ok());
++   if(!code.ok())std::fprintf(stderr,"M%d N%d K%d: %s\n",m,n,k,code.status().to_string().c_str());
++   else LSE_EXPECT(!code->code.empty());}
++ }
++};
++}
++LSE_TEST(q6_ranked_selection_uses_measured_bf16_winners_in_both_dialects) {
++ unsetenv("LSE_WMMA");LSE_EXPECT(!kernels::kQuantOperandProfile.run_qualification_candidate);
++ Fixture f;
++ for(int m:{64,512}){f.check(m,17408,5120,true);f.check(m,5120,17408,true);}
++}
++LSE_TEST(q6_unknown_decode_and_unsupported_device_keep_scalar_without_old_override) {
++ unsetenv("LSE_WMMA");Fixture f;
++ f.check(17,19,1088,false);f.check(1,17408,5120,false);
++ f.device.compute_units=32;f.check(64,17408,5120,false,false);
++ f.device.compute_units=64;f.device.lds_bytes_per_workgroup=8192;f.check(64,17408,5120,false,false);
++ f.device.lds_bytes_per_workgroup=65536;setenv("LSE_WMMA","0",1);f.check(64,17408,5120,false);
++ unsetenv("LSE_WMMA");
++}
++LSE_TEST_MAIN()
+diff --git a/tests/test_quant_operand_cache.cpp b/tests/test_quant_operand_cache.cpp
+new file mode 100644
+index 0000000..ad85dcc
+--- /dev/null
++++ b/tests/test_quant_operand_cache.cpp
+@@ -0,0 +1,67 @@
++#include "lse/backends/hrx/arch_database.hpp"
++#include "lse/backends/hrx/hipc/hip_emitter.hpp"
++#include "lse/backends/hrx/loomc/loom_emitter.hpp"
++#include "lse/graph/ops.hpp"
++#include "lse/graph/kernel_primitive.hpp"
++#include <cstdio>
++#include <stdexcept>
++using namespace lse;
++using namespace lse::graph;
++namespace {
++void require(bool x,const char* message){if(!x)throw std::runtime_error(message);}
++struct NamedKernel final:KernelPrimitiveBase {
++ const KernelPrimitiveBase* base;std::string_view label;
++ NamedKernel(const KernelPrimitiveBase* p,std::string_view n):base(p),label(n){}
++ std::string_view name()const noexcept override{return label;}
++ std::string_view entry_name()const noexcept override{return label;}
++ size_t arity()const noexcept override{return base->arity();}
++ bool supports(Dialect d)const noexcept override{return base->supports(d);}
++ void eval_cpu(std::span<const float*const> in,float*out,size_t count,const std::array<float,4>&attrs)const override{base->eval_cpu(in,out,count,attrs);}
++ Result<Shape> infer_shape(std::span<const Shape> a)const override{return base->infer_shape(a);}
++ DType infer_dtype(std::span<const DType> a)const override{return base->infer_dtype(a);}
++ std::string emit_kernel(const KernelShapes&s)const override{return base->specialize(s)->emit_kernel(s);}
++ ThreadPlan plan(const KernelShapes&s)const override{auto p=base->specialize(s)->plan(s);p.workgroup_size[0]=label=="mock_quant_a"?128:256;return p;}
++ bool owns_indexing()const noexcept override{return true;}
++};
++struct SelectingKernel final:KernelPrimitiveBase {
++ const KernelPrimitiveBase*base;NamedKernel a,b;bool second=false;
++ explicit SelectingKernel(const KernelPrimitiveBase*p):base(p),a(p,"mock_quant_a"),b(p,"mock_quant_b"){}
++ std::string_view name()const noexcept override{return "unchanged_abstract_quant";}
++ std::string_view entry_name()const noexcept override{return "abstract_quant";}
++ size_t arity()const noexcept override{return base->arity();}
++ bool supports(Dialect d)const noexcept override{return base->supports(d);}
++ void eval_cpu(std::span<const float*const> in,float*out,size_t count,const std::array<float,4>&attrs)const override{base->eval_cpu(in,out,count,attrs);}
++ Result<Shape> infer_shape(std::span<const Shape>a)const override{return base->infer_shape(a);}
++ DType infer_dtype(std::span<const DType>a)const override{return base->infer_dtype(a);}
++ std::string emit_kernel(const KernelShapes&s)const override{return specialize(s)->emit_kernel(s);}
++ ThreadPlan plan(const KernelShapes&s)const override{return specialize(s)->plan(s);}
++ const KernelPrimitiveBase*specialize(const KernelShapes&)const override{return second?&b:&a;}
++};
++Array leaf(Shape shape,DType type){auto n=std::make_shared<Node>();n->shape=shape;n->dtype=type;return Array(n);}
++}
++int main(){try{
++ auto out=quant_linear(leaf({32,64},DType::kF32),leaf({17,12},DType::kU32),
++                       leaf({17,1},DType::kBF16),leaf({17,1},DType::kBF16),6,64);
++ auto* original=dynamic_cast<const KernelPrimitiveBase*>(out.node()->prim);require(original,"primitive absent");
++ SelectingKernel selector(original);out.node()->prim=&selector;
++ const NodePtr roots[]{out.node()};FusionGroup group;
++ for(auto& g:Partitioner::partition(roots))if(g.anchor==OpKind::kQuantMatMul)group=g;
++ require(!group.nodes.empty(),"quant group absent");
++ backend::DeviceInfo device;backend::AmdDeviceInfo amd;
++ device.arch="gfx1201";device.wavefront_size=32;device.compute_units=64;
++ device.lds_bytes_per_workgroup=65536;device.max_threads_per_workgroup=1024;
++ backend::apply_arch_defaults(device,amd);device.extension_id=backend::AmdDeviceInfo::kExtensionId;device.extension=&amd;
++ backend::HipEmitter hip;backend::LoomEmitter loom;
++ for(IKernelEmitter* e:{static_cast<IKernelEmitter*>(&hip),static_cast<IKernelEmitter*>(&loom)}){
++  selector.second=false;auto k1=e->cache_key(group,device);auto a=e->emit(group,device);require(a.ok(),"first emit failed");
++  // Same graph/profile, changed winner. These wrappers use the real Q6 body;
++  // this is a cache test, not FP8 execution or a performance measurement.
++  selector.second=true;auto k2=e->cache_key(group,device);auto b=e->emit(group,device);require(b.ok(),"second emit failed");
++  require(k1!=k2,"persistent keys alias different selected implementation");
++  require(a->dims.workgroup_size[0]!=b->dims.workgroup_size[0],"emission cache returned prior implementation plan");
++  auto again=e->emit(group,device);require(again.ok()&&again->source==b->source,"same winner unstable");
++  require(e->cache_key(group,device)==k2,"same winner persistent key unstable");
++  selector.second=false;auto back=e->emit(group,device);require(back.ok()&&back->source==a->source,"return to first winner missed identity");
++ }
++ std::puts("PASS HIP/Loom actual selected-implementation emission and persistent cache identities; no GPU");
++}catch(const std::exception&e){std::fprintf(stderr,"FAIL %s\n",e.what());return 1;}}
+diff --git a/tests/test_quant_operand_policy.cpp b/tests/test_quant_operand_policy.cpp
+new file mode 100644
+index 0000000..50def63
+--- /dev/null
++++ b/tests/test_quant_operand_policy.cpp
+@@ -0,0 +1,311 @@
++#include "lse/kernels/quant_operand_policy.hpp"
++#include <array>
++#include <cstdio>
++#include <stdexcept>
++using namespace lse::kernels;
++namespace {
++void require(bool value, const char *message) {
++  if (!value)
++    throw std::runtime_error(message);
++}
++QuantOperandRequest request() {
++  return {"gfx1201", 32,    6,    64,   512,   17408,
++          5120,      65536, true, true, false, false};
++}
++QuantOperandKernel kernel() {
++  QuantOperandKernel k;
++  k.operand = QuantOperand::kE4M3;
++  k.implementation_id = quant_operand_implementation_id("mock-residual");
++  k.strategy = QuantOperandStrategy::kResidualThreeProduct;
++  k.implemented = k.matrix_intrinsic = k.conversion_intrinsic = true;
++  k.block_absmax_scaling = k.fp32_exceptional_block_fallback = true;
++  k.lds_bytes = 16384;
++  return k;
++}
++void rejected(QuantOperandRequest r, QuantOperandKernel k,
++              OperandReason expected, QuantOperandProfile p = {}) {
++  auto d = select_quant_operand(r, k, p);
++  require(d.operand == QuantOperand::kExisting && d.reason == expected,
++          "rejected candidate selected or wrong fallback reason");
++}
++} // namespace
++int main() {
++  try {
++    auto r = request();
++    auto k = kernel();
++    auto p = kQuantOperandProfile;
++    require(!p.run_qualification_candidate, "production qualification default enabled");
++    rejected(r,k,OperandReason::kUnqualified,p);
++    p.run_qualification_candidate=true;
++    auto d = select_quant_operand(r, k, p);
++    require(
++        d.operand == QuantOperand::kE4M3 &&
++            d.reason == OperandReason::kSelected,
++        "explicit local qualification did not select available residual E4M3");
++    require(d.qualification == OperandQualification::kCandidate,
++            "unvalidated candidate presented as accepted");
++    for (int fault = 0; fault < 6; ++fault) {
++      auto x = r;
++      if (fault == 0)
++        x.bits = 8;
++      if (fault == 1)
++        x.group = 32;
++      if (fault == 2)
++        x.f32_activation_output = false;
++      if (fault == 3)
++        x.bf16_scale_bias = false;
++      if (fault == 4)
++        x.indexed = true;
++      if (fault == 5)
++        x.caller_staged = true;
++      rejected(x, k, OperandReason::kStorage);
++    }
++    auto x = r;
++    x.arch = "gfx1100";
++    rejected(x, k, OperandReason::kArchitecture);
++    x = r;
++    x.wave = 64;
++    rejected(x, k, OperandReason::kArchitecture);
++    for (auto m : {0u, 1u, 15u}) {
++      x = r;
++      x.m = m;
++      rejected(x, k, OperandReason::kShape);
++    }
++    for (auto n : {0u, 1u, 15u}) {
++      x = r;
++      x.n = n;
++      rejected(x, k, OperandReason::kShape);
++    }
++    for (auto n : {0u, 63u, 65u}) {
++      x = r;
++      x.k = n;
++      rejected(x, k, OperandReason::kShape);
++    }
++    x = r;
++    x.m = 2049;
++    rejected(x, k, OperandReason::kShape);
++    x = r;
++    x.n = 32769;
++    rejected(x, k, OperandReason::kShape);
++    x = r;
++    x.k = 18496;
++    rejected(x, k, OperandReason::kShape);
++    x = r;
++    x.lds_bytes = 16383;
++    rejected(x, k, OperandReason::kResources);
++    for (int fault = 0; fault < 6; ++fault) {
++      auto y = k;
++      if (fault == 0)
++        y.implemented = false;
++      if (fault == 1)
++        y.matrix_intrinsic = false;
++      if (fault == 2)
++        y.conversion_intrinsic = false;
++      if (fault == 3)
++        y.operand = QuantOperand::kE5M2;
++      if (fault == 4)
++        y.operand = QuantOperand::kExisting;
++      if (fault == 5)
++        y.strategy = QuantOperandStrategy::kSingleProduct;
++      rejected(r, y, OperandReason::kUnavailable);
++    }
++    auto y = k;
++    y.block_absmax_scaling = false;
++    rejected(r, y, OperandReason::kUnsafeConversion);
++    y = k;
++    y.fp32_exceptional_block_fallback = false;
++    rejected(r, y, OperandReason::kUnsafeConversion);
++    p.run_qualification_candidate = false;
++    rejected(r, k, OperandReason::kUnqualified, p);
++    p = {};
++    p.relative_l2_limit_ppm = 5001;
++    rejected(r, k, OperandReason::kAccuracy, p);
++    p = {};
++    p.qualification = OperandQualification::kAccepted;
++    rejected(r, k, OperandReason::kAccuracy, p);
++    p.measured_cases = 60;
++    p.measured_relative_l2_ppm = 900;
++    p.absolute_error_pass = p.nonfinite_pass = p.model_quality_pass =
++        p.performance_pass = true;
++    require(select_quant_operand(r, k, p).operand == QuantOperand::kE4M3,
++            "accepted evidence rejected");
++    for (int missing = 0; missing < 6; ++missing) {
++      auto q = p;
++      if (missing == 0)
++        q.measured_cases = 0;
++      if (missing == 1)
++        q.measured_relative_l2_ppm = 5001;
++      if (missing == 2)
++        q.absolute_error_pass = false;
++      if (missing == 3)
++        q.nonfinite_pass = false;
++      if (missing == 4)
++        q.model_quality_pass = false;
++      if (missing == 5)
++        q.performance_pass = false;
++      rejected(r, k, OperandReason::kAccuracy, q);
++    }
++    // BF8 is an independently qualified strategy, not a fallback inferred from
++    // exponent range or Q6's storage bit count.
++    auto bf = p;
++    bf.preferred = QuantOperand::kE5M2;
++    y = k;
++    y.operand = QuantOperand::kE5M2;
++    require(select_quant_operand(r, y, bf).operand == QuantOperand::kE5M2,
++            "explicit BF8 profile rejected");
++    auto id = quant_operand_cache_key(42);
++    require(id != quant_operand_cache_key(43), "base identity lost");
++    for (int field = 0; field < 18; ++field) {
++      QuantOperandProfile q;
++      switch (field) {
++      case 0:
++        ++q.revision;
++        break;
++      case 1:
++        q.qualification = OperandQualification::kAccepted;
++        break;
++      case 2:
++        q.preferred = QuantOperand::kE5M2;
++        break;
++      case 3:
++        q.strategy = QuantOperandStrategy::kSingleProduct;
++        break;
++      case 4:
++        ++q.min_m;
++        break;
++      case 5:
++        ++q.min_n;
++        break;
++      case 6:
++        ++q.k_multiple;
++        break;
++      case 7:
++        --q.relative_l2_limit_ppm;
++        break;
++      case 8:
++        ++q.measured_cases;
++        break;
++      case 9:
++        ++q.measured_relative_l2_ppm;
++        break;
++      case 10:
++        q.absolute_error_pass = true;
++        break;
++      case 11:
++        q.nonfinite_pass = true;
++        break;
++      case 12:
++        q.model_quality_pass = true;
++        break;
++      case 13:
++        q.performance_pass = true;
++        break;
++      case 14:
++        q.run_qualification_candidate = true;
++        break;
++      case 15:
++        ++q.max_m;
++        break;
++      case 16:
++        ++q.max_n;
++        break;
++      case 17:
++        ++q.max_k;
++        break;
++      }
++      require(quant_operand_cache_key(42, q) != id,
++              "changed profile reused cache identity");
++    }
++    // Costs here are mock observations: prove ranking, not hardware speed.
++    std::array<QuantOperandOption, 3> options;
++    for (auto &o : options) {
++      o.kernel = k;
++      o.profile = p;
++      o.cost = {r.arch,
++                r.m,
++                r.n,
++                r.k,
++                73,
++                200,
++                32,
++                6,
++                64,
++                8,
++                p.revision,
++                1,
++                OperandCostClock::kHostEvalRetire,
++                k.implementation_id};
++    }
++    options[0].kernel.operand = options[0].profile.preferred =
++        QuantOperand::kFP32;
++    options[0].kernel.strategy = options[0].profile.strategy =
++        QuantOperandStrategy::kNative;
++    options[0].kernel.matrix_intrinsic =
++        options[0].kernel.conversion_intrinsic = false;
++    options[0].kernel.lds_bytes = 0;
++    options[0].cost.cost_ns = 500;
++    options[1].kernel.operand = options[1].profile.preferred =
++        QuantOperand::kBF16;
++    options[1].kernel.strategy = options[1].profile.strategy =
++        QuantOperandStrategy::kNative;
++    options[1].cost.cost_ns = 100;
++    auto ranked =
++        rank_quant_operands(r, options, 73, OperandCostClock::kHostEvalRetire);
++    require(ranked.option == 1 &&
++                ranked.decision.operand == QuantOperand::kBF16,
++            "slower FP8 displaced faster accepted BF16");
++    const auto oldkey =
++        quant_operand_choice_key(42, ranked.decision, p.revision);
++    options[1].cost.cost_ns = 90;
++    ranked =
++        rank_quant_operands(r, options, 73, OperandCostClock::kHostEvalRetire);
++    require(oldkey == quant_operand_choice_key(42, ranked.decision, p.revision),
++            "new timing of unchanged strategy invalidated JIT");
++    options[2].cost.cost_ns = 50;
++    ranked =
++        rank_quant_operands(r, options, 73, OperandCostClock::kHostEvalRetire);
++    require(ranked.option == 2 &&
++                ranked.decision.operand == QuantOperand::kE4M3,
++            "faster accepted FP8 not selected");
++    require(oldkey != quant_operand_choice_key(42, ranked.decision, p.revision),
++            "changed strategy reused JIT key");
++    for (int stale = 0; stale < 9; ++stale) {
++      auto row = options[2];
++      if (stale == 0)
++        ++row.cost.m;
++      if (stale == 1)
++        ++row.cost.cohort;
++      if (stale == 2)
++        row.cost.clock = OperandCostClock::kGpuQueueInterval;
++      if (stale == 3)
++        ++row.cost.accepted_profile_revision;
++      if (stale == 4)
++        ++row.cost.implementation_revision;
++      if (stale == 5)
++        row.cost.samples = 2;
++      if (stale == 6)
++        row.profile.qualification = OperandQualification::kCandidate;
++      if (stale == 7)
++        ++row.cost.implementation_id;
++      if (stale == 8)
++        row.cost.statistic = OperandCostStatistic::kMedian;
++      auto no = rank_quant_operands(r, std::span(&row, 1), 73,
++                                    OperandCostClock::kHostEvalRetire);
++      require(no.option == static_cast<std::size_t>(-1) &&
++                  no.decision.reason == OperandReason::kCostEvidence,
++              "incomparable or unaccepted performance record selected");
++    }
++    auto text = quant_operand_diagnostic(r, d);
++    for (auto part :
++         {"operand=fp8-e4m3", "residual-three-product", "512x17408x5120",
++          "candidate-unvalidated", "target_relative_l2_ppm=5000"})
++      require(text.find(part) != std::string::npos,
++              "automatic diagnostic incomplete");
++    std::puts(
++        "PASS automatic operand policy, residual strategy, "
++        "capability/shape/safety gates, evidence and cache identity; no GPU");
++  } catch (const std::exception &e) {
++    std::fprintf(stderr, "FAIL %s\n", e.what());
++    return 1;
++  }
++}
 diff --git a/tests/test_quant_prefill.cpp b/tests/test_quant_prefill.cpp
 new file mode 100644
 index 0000000..4a9bf19

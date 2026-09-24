@@ -40,8 +40,12 @@ and validation commands.
   Independent MLX references match exact prompt and generated token IDs on
   two qualified fixtures. [Inference validation](docs/LSE_PERFORMANCE.md)
 - **Measured optimizations:** Q6 weights are reused across prompt rows using
-  LDS; decode attention shares query/key scores; eligible single-device decode
-  selects its submission batch size from measured execution times.
+  LDS; shared HIP/Loom operand selection chooses the accepted tiled BF16 path
+  for four measured large projection shapes. Native FP8/BF8 conversion and Q6
+  residual matrix kernels also run correctly on qualified ordinary inputs,
+  but did not beat tiled BF16. Decode attention shares query/key scores;
+  eligible single-device decode selects its submission batch size from measured
+  execution times. [Operand evidence](docs/LOOM_HIP_PARITY.md)
 - **GPU monitoring:** [amdgpu_mtop](amdgpu_mtop/README.md) provides history
   graphs, device switching, clocks, temperatures, power, fan readings, driver
   work counters, VRAM accounting and JSON output. Press **h** for 0.1 s / 0.5 s
@@ -61,12 +65,14 @@ one warmup followed by three measured requests, each generating 33 tokens
 | Prompt length | Prompt processing | Decode |
 | --- | ---: | ---: |
 | 5 tokens | 14.12 tokens/s | **12.11 tokens/s** |
-| 64 tokens | **63.23 tokens/s** | **12.12 tokens/s** |
+| 64 tokens, automatic tiled operand selection | **87.28 tokens/s** | **12.61 tokens/s** |
 
 All requests produced the same text for their respective prompt. The 64-token
 fixture also retained exact agreement with its float32 MLX token reference.
-Automatic batching with the 64 µs polling override independently reached
-**12.23 decode tokens/s** on that fixture. The runtime's default blocked polling
+The previous combined implementation measured 64.22 PP/s and 12.64 TPS in one
+warm request: the new three-request median improves prompt processing by about
+36%, with essentially unchanged decode throughput. These were separate runs,
+not a simultaneous controlled comparison. The runtime's default blocked polling
 interval remains 1000 µs; the faster polling setting is an explicit override.
 
 These are bounded end-to-end inference measurements, not a claim of matched
