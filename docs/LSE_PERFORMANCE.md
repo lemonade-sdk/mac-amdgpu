@@ -396,3 +396,19 @@ Directories are under `build/tests/driver195-hardware/`. Selection is measured,
 not a fixed promise that one interval is best for every context or polling
 policy. Whole-step host timing includes dispatch, synchronization and sampling;
 it is not a GPU timestamp or a comparable llama-bench kernel rate.
+
+### Eight-row Q6 prefill reuse
+
+For gfx1201 FP32-activation/BF16-affine Q6 prompts of at least 32 rows, the
+validated schedule now uses eight rows per 512-K tile. This retains 16 KiB LDS
+and each lane's original FP32 FMA sequence. The isolated qualification passed
+63 full-output cases with identical baseline hashes and preserved guards/input
+bytes. Four large matrix shapes improved host dispatch-to-retirement times by
+19–21%; compiled VGPR use rose from 55 to 88 without scratch spills.
+
+The full-model PP64 fixture with fixed flush64/poll64, KV128 and 33 generated
+tokens reached median **63.122215 prompt tokens/s**, versus 54.007206 before.
+Median decode was 6.764287 tokens/s (expected to remain unchanged by this
+prefill-only change). All four requests returned identical text and the server
+exited normally; the driver was independently checked at stage0. Evidence:
+`build/tests/driver195-hardware/qwen-rows8-pp64/` and `q6-rows8-*` logs.

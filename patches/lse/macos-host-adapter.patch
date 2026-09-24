@@ -2641,7 +2641,7 @@ index 8525a9b..43e66d9 100644
        if (auto in = e.when(j < D)) {
          const auto idx = ((b * heads + h) * D + row) * D + j;
 diff --git a/src/kernels/quant_linear.cpp b/src/kernels/quant_linear.cpp
-index bbfbcfc..9c649dc 100644
+index bbfbcfc..733b506 100644
 --- a/src/kernels/quant_linear.cpp
 +++ b/src/kernels/quant_linear.cpp
 @@ -19,12 +19,14 @@
@@ -2659,13 +2659,19 @@ index bbfbcfc..9c649dc 100644
  #include "lse/kernels/vec_mem.hpp"
  #include "lse/kernels/wmma.hpp"
  #include "lse/graph/kernel_args.hpp"
-@@ -322,6 +324,22 @@ bool body_dot(const KernelShapes& s, const QuantDims& d) {
+@@ -322,6 +324,30 @@ bool body_dot(const KernelShapes& s, const QuantDims& d) {
    return quant_hoisted || budget == 0 || dot_lds_bytes(d) <= budget;
  }
  
 +// Exact-FP32 prefill schedule for the validated gfx1201 layout. Indexed rows may name different
 +// matrices, and externally staged panels have a caller-owned layout, so neither
 +// can participate in this reuse path.
++std::uint32_t q6_prefill_tile(std::uint32_t k, std::uint32_t rows) {
++  // Eight rows retain the validated four-row panel's 16 KiB maximum LDS.
++  // 512 is exactly one 32-lane wave of 16-code chunks, preserving K order.
++  return std::min(rows >= 8 ? 512u : 1024u, k);
++}
++
 +std::uint32_t q6_prefill_rows(const KernelShapes& s, const QuantDims& d,
 +                              bool indexed) {
 +  if (!d.valid || indexed || d.m < 2 || d.spec.bits != 6 ||
@@ -2674,25 +2680,27 @@ index bbfbcfc..9c649dc 100644
 +      s.input_dtypes[0] != DType::kF32 ||
 +      s.input_dtypes[2] != DType::kBF16 || !s.staged.name.empty() ||
 +      !s.staged_quant.codes.empty()) return 1;
++  const auto k = static_cast<std::uint32_t>(d.k);
++  const auto budget = workgroup_lds_bytes(s.device);
++  if (d.m >= 32 && budget >= 8u * q6_prefill_tile(k, 8u) * 4u) return 8u;
 +  const std::uint32_t rows = d.m >= 4 ? 4u : 2u;
-+  const auto tile = std::min<std::uint32_t>(1024u, static_cast<std::uint32_t>(d.k));
-+  return workgroup_lds_bytes(s.device) >= rows * tile * 4u ? rows : 1u;
++  return budget >= rows * q6_prefill_tile(k, rows) * 4u ? rows : 1u;
 +}
 +
  // Exactly the workgroup-shared arrays emit_body declares when it covers `rows`
  // rows, under exactly the same conditions and in the same order of decision.
  // The plan and the body cannot be allowed to disagree: this is the number a
-@@ -337,6 +355,9 @@ bool body_dot(const KernelShapes& s, const QuantDims& d) {
+@@ -337,6 +363,9 @@ bool body_dot(const KernelShapes& s, const QuantDims& d) {
  std::uint32_t body_lds_bytes_at(const KernelShapes& s, const QuantDims& d,
                                  std::uint32_t rows) {
    if (!d.valid || rows == 0) return 0;
 +  if (rows > 1 && d.spec.bits == 6 && !body_dot(s, d)) {
-+    return rows * std::min<std::uint32_t>(1024u, static_cast<std::uint32_t>(d.k)) * 4u;
++    return rows * q6_prefill_tile(static_cast<std::uint32_t>(d.k), rows) * 4u;
 +  }
    const auto k = static_cast<std::uint32_t>(d.k);
    const std::uint32_t budget = workgroup_lds_bytes(s.device);
    const bool quant_hoisted =
-@@ -440,6 +461,8 @@ constexpr std::uint32_t kMaxRowsPerGroup = 8;
+@@ -440,6 +469,8 @@ constexpr std::uint32_t kMaxRowsPerGroup = 8;
  // available where the rows agree on the matrix.
  std::uint32_t rows_per_group(const KernelShapes& s, const QuantDims& d,
                               bool indexed) {
@@ -2701,7 +2709,7 @@ index bbfbcfc..9c649dc 100644
    if (!d.valid || indexed || d.m <= 1 || !body_dot(s, d)) return 1;
    if (s.device == nullptr) return 1;
    const auto m = static_cast<std::uint32_t>(d.m);
-@@ -747,7 +770,7 @@ void emit_chunk(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
+@@ -747,7 +778,7 @@ void emit_chunk(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
                  const kir::Val<kir::u32>& x_base,
                  const kir::Val<kir::u32>& chunk,
                  const kir::LValue<kir::f32>& acc,
@@ -2710,7 +2718,7 @@ index bbfbcfc..9c649dc 100644
    const auto vals = static_cast<std::uint32_t>(spec.values_per_chunk());
    const auto words = static_cast<std::uint32_t>(spec.words_per_chunk());
    const auto group = e.let(chunk / chunks_per_group);
-@@ -758,13 +781,90 @@ void emit_chunk(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
+@@ -758,13 +789,90 @@ void emit_chunk(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
        e, a.packed, spec, e.let(row_base + chunk * words), scale, bias,
        [&](int c, const kir::Val<kir::f32>& w) {
          const auto idx = e.let(k_base + static_cast<std::uint32_t>(c));
@@ -2732,7 +2740,7 @@ index bbfbcfc..9c649dc 100644
 +  const auto k = static_cast<std::uint32_t>(d.k);
 +  const auto lanes = static_cast<std::uint32_t>(d.lanes);
 +  const auto groups = static_cast<std::uint32_t>(d.groups);
-+  const auto tile_k = std::min(1024u, k);
++  const auto tile_k = q6_prefill_tile(k, rows);
 +  constexpr std::uint32_t wave = 32;
 +  constexpr std::uint32_t values = 16;
 +  constexpr std::uint32_t words = 3;
@@ -2802,7 +2810,7 @@ index bbfbcfc..9c649dc 100644
    const auto n = static_cast<std::uint32_t>(d.n);
    const auto k = static_cast<std::uint32_t>(d.k);
    const auto m = static_cast<std::uint32_t>(d.m);
-@@ -831,6 +931,12 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
+@@ -831,6 +939,12 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
      fill = true;
    }
    const bool stage = static_cast<bool>(xs);
@@ -2815,7 +2823,7 @@ index bbfbcfc..9c649dc 100644
  
    // A run whose stages all quantize this row the same way hoists the int8 form
    // once, the way it already hoists the float row. Reading it costs this body
-@@ -875,7 +981,8 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
+@@ -875,7 +989,8 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
    if (auto in_grid = e.when(tile < ntiles && row < m)) {
      if (fill) {
        for (auto t : e.range(lid, e.u32(k), kBlock)) {
@@ -2825,7 +2833,7 @@ index bbfbcfc..9c649dc 100644
        }
        e.barrier();
      }
-@@ -920,7 +1027,7 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
+@@ -920,7 +1035,7 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
            for (std::uint32_t u = 0; u < cpl; ++u) {
              emit_chunk<A>(e, a, stage ? &xs : nullptr, d.spec, row_base,
                            scale_base, x_base, e.let(chunk0 + u), acc[0],
@@ -2834,7 +2842,7 @@ index bbfbcfc..9c649dc 100644
            }
          }
        }
-@@ -932,7 +1039,8 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
+@@ -932,7 +1047,8 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
                              chunks_per_group, cb);
            } else {
              emit_chunk<A>(e, a, stage ? &xs : nullptr, d.spec, row_base,
@@ -2844,7 +2852,7 @@ index bbfbcfc..9c649dc 100644
            }
          }
        }
-@@ -1051,6 +1159,9 @@ struct QuantLinearKernel final : KernelPrimitive<QuantLinearKernel> {
+@@ -1051,6 +1167,9 @@ struct QuantLinearKernel final : KernelPrimitive<QuantLinearKernel> {
    StagedRow staged_row(const KernelShapes& s) const override {
      const QuantDims d = dims_of(s, false);
      if (!shape_ok(d) || !device_fits(s)) return {};
@@ -6132,10 +6140,10 @@ index 0000000..987b3e9
 +LSE_TEST_MAIN()
 diff --git a/tests/test_quant_prefill.cpp b/tests/test_quant_prefill.cpp
 new file mode 100644
-index 0000000..012f8fd
+index 0000000..4a9bf19
 --- /dev/null
 +++ b/tests/test_quant_prefill.cpp
-@@ -0,0 +1,297 @@
+@@ -0,0 +1,298 @@
 +// Host-only contracts for the shared HIP/Loom Q6 prefill schedule.
 +#include "harness.hpp"
 +#include "lse/backends/hrx/arch_database.hpp"
@@ -6199,14 +6207,14 @@ index 0000000..012f8fd
 +  const auto* p = primitive();
 +  LSE_EXPECT(p != nullptr);
 +  if (!p) return;
-+  for (int m : {1, 2, 3, 4, 5, 17, 128, 256}) {
++  for (int m : {1, 2, 3, 4, 5, 17, 31, 32, 33, 63, 128, 256}) {
 +    for (int k : {64, 576, 1024, 1088, 4096, 5120, 17408}) {
 +      Fixture f(m, k);
-+      const unsigned rows = m >= 4 ? 4u : (m >= 2 ? 2u : 1u);
++      const unsigned rows = m >= 32 ? 8u : (m >= 4 ? 4u : (m >= 2 ? 2u : 1u));
 +      const auto plan = p->plan(f.shapes);
 +      LSE_EXPECT_EQ(plan.workgroup_count[0], 3u);
 +      LSE_EXPECT_EQ(plan.workgroup_count[1], (unsigned(m) + rows - 1) / rows);
-+      LSE_EXPECT_EQ(plan.lds_bytes, m > 1 ? rows * unsigned(std::min(k, 1024)) * 4u
++      LSE_EXPECT_EQ(plan.lds_bytes, m > 1 ? rows * unsigned(std::min(k, rows >= 8 ? 512 : 1024)) * 4u
 +                                       : (k <= 16384 ? unsigned(k) * 4u : 0u));
 +      if (m > 1) LSE_EXPECT_EQ(p->staged_row(f.shapes).count, 0u);
 +    }
@@ -6249,7 +6257,7 @@ index 0000000..012f8fd
 +}
 +
 +LSE_TEST(q6_prefill_hip_and_loom_emit_matching_launch_and_lds_requirements) {
-+  for (int m : {3, 5, 17}) {
++  for (int m : {3, 5, 17, 31, 32, 33, 128}) {
 +    Fixture f(m, 1088);
 +    auto y = quant_linear(input(f.inputs[0], f.dtypes[0]),
 +                          input(f.inputs[1], f.dtypes[1]),
@@ -6263,9 +6271,9 @@ index 0000000..012f8fd
 +    auto loom = backend::LoomEmitter{}.emit(groups.front(), f.device);
 +    LSE_EXPECT(hip.ok() && loom.ok());
 +    if (!hip.ok() || !loom.ok()) continue;
-+    const unsigned rows = m >= 4 ? 4u : 2u;
++    const unsigned rows = m >= 32 ? 8u : (m >= 4 ? 4u : 2u);
 +    LSE_EXPECT_EQ(hip->dims.workgroup_count[1], (unsigned(m) + rows - 1) / rows);
-+    LSE_EXPECT_EQ(hip->lds_bytes, rows * 4096u);
++    LSE_EXPECT_EQ(hip->lds_bytes, rows * (rows >= 8 ? 2048u : 4096u));
 +    LSE_EXPECT_EQ(loom->lds_bytes, hip->lds_bytes);
 +    LSE_EXPECT_EQ(loom->dims.workgroup_count[1], hip->dims.workgroup_count[1]);
 +    auto actual_shared = backend::HipEmitter::shared_bytes(hip->source);
@@ -6343,10 +6351,11 @@ index 0000000..012f8fd
 +  }
 +  std::puts("PASS physical panel bounds/permutation and per-instruction bank distribution (not measured stalls)");
 +  unsigned checked = 0;
-+  for (unsigned m : {2u, 3u, 4u, 5u, 17u, 128u}) {
++  for (unsigned m : {2u, 3u, 4u, 5u, 17u, 31u, 32u, 33u, 63u, 128u}) {
 +    for (unsigned k : {64u, 576u, 1088u, 4096u, 17408u}) {
 +      constexpr unsigned n = 17;
-+      const unsigned rows = m >= 4 ? 4 : 2, tile = k < 1024 ? k : 1024;
++      const unsigned rows = m >= 32 ? 8 : (m >= 4 ? 4 : 2);
++      const unsigned tile = std::min(k, rows >= 8 ? 512u : 1024u);
 +      std::vector<float> expected(m * n), actual(m * n, NAN);
 +      std::uint64_t baseline_weights = 0, reused_weights = 0;
 +      for (unsigned row = 0; row < m; ++row) for (unsigned col = 0; col < n; ++col) {
@@ -6361,7 +6370,7 @@ index 0000000..012f8fd
 +        expected[row * n + col] = reduce(sums);
 +      }
 +      for (unsigned row = 0; row < m; row += rows) for (unsigned col = 0; col < n; ++col) {
-+        std::array<std::array<float, 32>, 4> sums{};
++        std::array<std::array<float, 32>, 8> sums{};
 +        for (unsigned base = 0; base < k; base += tile) {
 +          std::vector<float> panel(rows * tile);
 +          for (unsigned r = 0; r < rows; ++r)

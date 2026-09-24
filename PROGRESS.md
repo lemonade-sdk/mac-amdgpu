@@ -2183,3 +2183,8 @@ The 64-token continuation also now exactly matches 64 prompt IDs and 33 generate
 - Monitor percentage graphs now retain a fixed 0–100 scale and clear stale
   headlines. Owned-idle testing found SMU interface 0x33 reporting 100% despite
   idle GRBM/CP and no queues; the monitor labels this raw counter explicitly.
+
+- Eight-row Q6 prefill reuse preserves exact output hashes across 63 fixtures
+  and reduces large matrix dispatch times by 19–21%. Full-model PP64 improved
+  from 54.01 to 63.12 prompt tokens/s with identical response text and clean
+  shutdown; decode remained approximately 6.76 tokens/s before attention changes.
