@@ -15,7 +15,8 @@ enum { kMacAMDGPUMethodRuntimeBuild, kMacAMDGPUMethodPing,
        kMacAMDGPUMethodCollectMetrics, kMacAMDGPUMethodMetricsSnapshot, kMacAMDGPUMethodSoftwareSnapshot,
        kMacAMDGPUMethodLoadFirmware, kMacAMDGPUMethodSetIPBase,
        kMacAMDGPUMethodLoadDiscoveryBin, kMacAMDGPUMethodResetDevice,
-       kMacAMDGPUMethodSetupInterrupts, kMacAMDGPUMethodAtomicRequesterExperiment };
+       kMacAMDGPUMethodSetupInterrupts, kMacAMDGPUMethodAtomicRequesterExperiment,
+       kMacAMDGPUMethodSetPowerState, kMacAMDGPUMethodDisableSmuFeatures };
 struct IOService {};
 static unsigned openCalls;
 #define OSDynamicCast(type, pointer) static_cast<type *>(pointer)
@@ -44,7 +45,10 @@ namespace amdgpu { enum class BringupStage { None, SDMAInit }; }
 struct State {
     bool pciOpen = false, shutdownBlocked = false;
     uint16_t deviceID=0;uint8_t revision=0;
-    struct { amdgpu::BringupStage reached = amdgpu::BringupStage::None; } bringup;
+    struct {
+        amdgpu::BringupStage reached = amdgpu::BringupStage::None;
+        struct { bool smuOnline = false; } device;
+    } bringup;
     amdgpu::ClientSessions sessions;
     amdgpu::ClientSubmission submission;
 };
@@ -121,6 +125,12 @@ int main() {
     auto call = [&](IOService &client, uint64_t selector) {
         return mac_amdgpu_admit_external(&client, &driver, &pci, selector);
     };
+    // A power button pressed before bringup leaves the app connected, but must
+    // not prevent a different runtime client from acquiring bootstrap ownership.
+    assert(call(observer, kMacAMDGPUMethodSetPowerState) == kIOReturnNotReady);
+    assert(call(observer, kMacAMDGPUMethodDisableSmuFeatures) == kIOReturnNotReady);
+    assert(openCalls == 0 && !observerState.claimed && !state.pciOpen);
+    assert(state.sessions.participants == 0 && !state.sessions.initializationClient);
     assert(call(observer, kMacAMDGPUMethodMESAddQueue) == kIOReturnUnsupported && openCalls == 0);
     assert(call(observer, kMacAMDGPUMethodSampleCachedSensors) == 0 && openCalls == 0);
     assert(call(observer, kMacAMDGPUMethodClockSnapshot) == 0 && openCalls == 0);
@@ -128,6 +138,26 @@ int main() {
     assert(call(observer, kMacAMDGPUMethodMetricsSnapshot) == 0 && openCalls == 0);
     assert(call(owner, kMacAMDGPUMethodCollectMetrics) == kIOReturnNotOpen && openCalls == 0);
     assert(call(owner, kMacAMDGPUMethodBOFree) == 0 && state.sessions.initializationClient == &owner && pci.openedBy == &driver);
+    const uint64_t monitorSelectors[] = {
+        kMacAMDGPUMethodRuntimeBuild, kMacAMDGPUMethodQueryInfo,
+        kMacAMDGPUMethodMetricsSnapshot, kMacAMDGPUMethodClockSnapshot,
+        kMacAMDGPUMethodSoftwareSnapshot, kMacAMDGPUMethodSampleCachedSensors
+    };
+    auto observeWithoutLease = [&] {
+        const auto participants = state.sessions.participants;
+        const auto initializer = state.sessions.initializationClient;
+        const auto exclusive = state.sessions.exclusiveClient;
+        const auto opens = openCalls;
+        for (auto selector : monitorSelectors) {
+            const auto expected = selector == kMacAMDGPUMethodSampleCachedSensors &&
+                                  state.submission.pending ? kIOReturnBusy : kIOReturnSuccess;
+            assert(call(observer, selector) == expected);
+        }
+        assert(!observerState.claimed && state.sessions.participants == participants);
+        assert(state.sessions.initializationClient == initializer);
+        assert(state.sessions.exclusiveClient == exclusive && openCalls == opens);
+    };
+    observeWithoutLease(); // monitoring during initialization
     assert(call(observer, kMacAMDGPUMethodSubmitIB) == kIOReturnBusy);
     unsigned before = openCalls;
     assert(call(owner, kMacAMDGPUMethodCollectMetrics) == 0 && openCalls == before);
@@ -138,6 +168,7 @@ int main() {
     volatile uint32_t fence = 0;
     const auto first = state.submission.beginSDMA(&fence);
     assert(first == 1 && !state.submission.poll());
+    observeWithoutLease(); // cached monitoring during a pending submission
     before = openCalls;
     assert(call(owner, kMacAMDGPUMethodCollectMetrics) == kIOReturnBusy && openCalls == before);
     assert(call(observer, kMacAMDGPUMethodMetricsSnapshot) == 0 && state.submission.pending);
@@ -175,8 +206,11 @@ int main() {
         assert(endpoint.openedBy == &root && shared.sessions.participants == 1);
         assert(mac_amdgpu_ensure_open(&b, &root, &endpoint) == kIOReturnBusy);
         shared.bringup.reached = amdgpu::BringupStage::SDMAInit;
+        shared.bringup.device.smuOnline = true;
         assert(mac_amdgpu_ensure_open(&b, &root, &endpoint) == 0);
         assert(shared.sessions.participants == 2 && !shared.sessions.initializationClient);
+        assert(mac_amdgpu_admit_external(&b, &root, &endpoint, kMacAMDGPUMethodSetPowerState) == 0);
+        assert(mac_amdgpu_admit_external(&b, &root, &endpoint, kMacAMDGPUMethodDisableSmuFeatures) == 0);
         assert(mac_amdgpu_admit_external(&a, &root, &endpoint, kMacAMDGPUMethodBOFree) == 0);
         assert(mac_amdgpu_admit_external(&b, &root, &endpoint, kMacAMDGPUMethodBOFree) == 0);
         assert(mac_amdgpu_admit_external(&a, &root, &endpoint, kMacAMDGPUMethodSubmitIB) == kIOReturnBusy);

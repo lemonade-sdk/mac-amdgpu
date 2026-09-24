@@ -857,6 +857,11 @@ static kern_return_t
 mac_amdgpu_admit_external(IOService *client, MacAMDGPU *driver,
                           IOPCIDevice *pci, uint64_t selector)
 {
+    // A rejected power request must not reserve bootstrap ownership. An idle
+    // host app otherwise prevents another client from initializing the GPU.
+    if ((selector == kMacAMDGPUMethodSetPowerState ||
+         selector == kMacAMDGPUMethodDisableSmuFeatures) &&
+        !driver->ivars->bringup.device.smuOnline) return kIOReturnNotReady;
     if (selector == kMacAMDGPUMethodMESAddQueue) return kIOReturnUnsupported;
     if (selector == kMacAMDGPUMethodAtomicRequesterExperiment) return kIOReturnSuccess; // transition owns admission
     if (selector == kMacAMDGPUMethodSampleCachedSensors) {

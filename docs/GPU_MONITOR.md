@@ -7,6 +7,29 @@ telemetry here: its backend relies on `libdrm`, `libdrm_amdgpu`, Linux driver
 interfaces, sysfs and process fdinfo. The new backend enumerates every
 `MacAMDGPU` service and opens each by its IOKit registry identity.
 
+## Concurrent inference
+
+The monitor uses observer selectors and does not acquire a workload or
+initialization lease. It can stay open while LSE initializes and runs the GPU.
+Cached counters remain readable during work; a busy sensor sampler skips that
+sample without blocking inference.
+
+On the Mac/R9700 with driver 195, a resident Qwen3.8-27B MLX Q6 run passed one
+warmup and three identical requests while the terminal monitor stayed open.
+The 100 ms observer capture recorded 196 error-free stage-15 samples, one
+workload participant, and advancing packet counters. Median measured throughput
+was 63.01 prompt tokens/sec (64 tokens) and 12.17 decode tokens/sec (32 steps).
+This confirms coexistence; it is not a controlled measurement of monitor overhead.
+Results are in `build/tests/driver195-hardware/qwen-monitor-concurrent/` and
+`qwen-monitor-concurrent-observer.jsonl` beside it.
+
+A separate driver admission bug could make LSE return Busy: a host-app power
+request before SMU initialization acquired the bootstrap lease before returning
+NotReady. The source fix checks SMU readiness before claiming ownership for both
+SetPowerState and DisableSmuFeatures. Lifecycle regressions and an Xcode build
+pass; this fix is not part of installed build 195. Stop GPU released the stale
+host session without closing the monitor or rebooting the machine.
+
 ## Implemented and pending
 
 Build 193 adds software counters and graphs, current clocks and AC DPM ranges,
