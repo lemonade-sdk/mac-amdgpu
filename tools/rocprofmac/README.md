@@ -54,6 +54,16 @@ python3 tools/rocprofmac/cpu.py --tool sample --run --seconds 10 \
 
 The wrapper never kills the attached process and does not silently fall back between tools. `sample` requires an explicit positive PID and a new `.txt` output path. Evidence: `build/tests/rocprofmac-cpu-native.sample.txt`.
 
+An eight-second attach also completed during actual Qwen long-context decode.
+On the inference request thread, 4,992 of 6,899 stack observations were waiting
+for GPU completion. Active body stacks concentrated in emission/cache identity
+construction, hashing and allocation; no Loom compiler stack appeared. These
+are observations of one thread, not process CPU-time percentages. The existing
+`LSE_TIME_STEPS=1` spans help distinguish replay from first-use compilation.
+Evidence: `build/tests/driver195-hardware/qwen-rms-production-cpu.txt` and the
+matching `qwen-rms-production-1k1k/server.log`. The workload's repeated-text
+check failed separately; successful sampling does not qualify model accuracy.
+
 
 macOS already provides sampled CPU stacks through Instruments Time Profiler. The bounded wrapper preserves each command argument and requires explicit execution:
 

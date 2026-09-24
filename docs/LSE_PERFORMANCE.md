@@ -8,7 +8,9 @@ against another engine.
 
 The earlier **HIPC** (`--dialect hip`) throughput is reported at approximately
 **34 decode tokens/s**. The current qualified **macOS Loom** (`--dialect loom`)
-64-input/33-output resident-server median is **12.61 decode tokens/s**.
+64-input/33-output resident-server stable median is **12.61 decode tokens/s**.
+The cooperative RMS experiment reached **16.75**, but remains on a testing
+branch because long-request repeatability qualification failed.
 These must not be presented as one backend's performance. The HIPC figure is
 recalled rather than recovered from a benchmark artifact; its exact checkpoint,
 quantization, context, MTP settings and platform need verification before a
@@ -545,3 +547,107 @@ unchanged. The earlier sample is not a three-request paired baseline. This
 update targets prefill matrix work and does not claim a single-token decode
 speedup. Evidence and executable/runtime hashes:
 `build/tests/driver195-hardware/qwen-final-auto-operands-pp64/result.json`.
+
+## Cooperative RMS normalization experiment
+
+**Not promoted:** the faster implementation is preserved on
+[`testing/r9700-cooperative-rms`](https://github.com/Geramy/LSE/tree/testing/r9700-cooperative-rms).
+Stable source and the default local server retain the preceding implementation.
+Short-fixture results below passed, but the long-repeat failure described below
+blocks acceptance. No runtime switch hides the rejected implementation in stable.
+
+Hardware profiling found that the original 5120-wide RMS kernel repeated a
+serial row reduction across all 160 waves. The replacement assigns one
+256-thread workgroup per row, with FP32 partial sums and a 1024-byte LDS tree.
+Gain dtype, epsilon placement and output epilogues are retained; floating-point
+reduction association changes. Unsupported layouts and multi-output groups keep
+the general scalar implementation. Selected implementation identity participates
+in emission and persistent cache keys.
+
+Five host suites, 52 native shader compilations and independent source review
+preceded R9700 tests. Both baseline and candidate passed every output and guard
+check for ragged rows, BF16/F32 gains, zero-centered gain, outliers, fused tails,
+shared outputs, transpose, aliases and nine recurrent normalization passes.
+The fixture distinguishes a one-kernel fused epilogue from a two-kernel diamond
+that consumes the normalization output twice; both match actual scheduler plans.
+
+Paired microbenchmarks ran baseline/candidate/candidate/baseline, 16 measured
+iterations after warmup. These are host evaluation-plus-retirement means, not
+hardware kernel timestamps:
+
+| Shape | Baseline A | Candidate A | Candidate B | Baseline B |
+| --- | ---: | ---: | ---: | ---: |
+| 1 × 5120 | 0.311930 ms | 0.229047 ms | 0.230060 ms | 0.372724 ms |
+| 64 × 5120 | 1.446659 ms | 0.227794 ms | 0.247646 ms | 1.442133 ms |
+
+The actual Qwen3.8-27B MLX Q6 server used one warmup and three measured requests,
+64 input / 33 output tokens, KV128, no MTP, flush64/poll64. Only the RMS kernel
+and necessary emitter/cache changes differed between candidate and baseline.
+The optimized run preceded the immediate unchanged-baseline rerun; all outputs
+matched exactly and all processes returned zero after graceful shutdown.
+
+| Build / settings | Median PP/s | Median decode tokens/s |
+| --- | ---: | ---: |
+| Unchanged baseline, flush64 | 86.5802 | 12.5290 |
+| Cooperative RMS, flush64 | **115.9037** | **16.7535** |
+| Cooperative RMS, flush256 | 113.9165 | 16.6644 |
+
+The matched gain is 33.87% for prompt processing and 33.72% for decode. Increasing
+batch size did not improve this fixture, so flush64 is retained. This is not a
+matched HIPC comparison and does not establish long-context throughput.
+
+Local evidence: `build/tests/driver195-hardware/rms-*-r2.log`,
+`rms-perf-*.log`, `qwen-rms-baseline-pp64/result.json`,
+`qwen-rms-cooperative-pp64/result.json`, and
+`qwen-rms-cooperative-batch256/result.json`. Isolated source, build inputs and
+hashes are recorded in `build/perf-rms-cooperative/model/build-manifest.json`.
+The published v0.4.0 archives predate this optimization; the actual macOS archive
+passed GPU-only generation with exact baseline text and clean shutdown at
+86.30 PP/s and 12.56 TPS in one warm request.
+
+The rebuilt canonical server independently returned the same short-fixture text
+at a three-request median **116.21 PP/s and 16.82 TPS**. Hardware profiling of
+110,154 dispatches matched all 95 metadata signatures and counts against the
+previous capture. The main 5120-wide decode RMS median dropped from 170.56 to
+16.20 µs; the 64-row RMS median dropped from 1392.18 to 15.32 µs. Summed RMS
+kernel durations fell 91.47%. Q6 matrix kernels now account for 87.95% of summed
+GPU dispatch durations; this percentage is not wall-time GPU utilization.
+Evidence: `build/tests/rms-profile-analysis/matched.json` and
+`build/tests/driver195-hardware/qwen-rms-production-pp64/result.json`.
+
+### Long-request repeatability blocks promotion
+
+The optimized server completed two 1,024-input/1,024-output greedy requests with
+KV2048 and flush64/poll64, but produced different text at generated token index
+337 (zero-based). A repeat without the CPU sampler or concurrent monitor failed
+in the same way. All four requests completed, had zero host groups, and both
+server processes shut down successfully; throughput alone is not acceptance.
+The matched unchanged baseline passed two identical full requests with equal
+text at 11.09 and 11.18 decode tokens/s.
+
+Two complete output sequences recur: SHA-256 `5e154337667d179c8384371b64b13937b7d5b5709c326ee55f6f31a612493307`
+and `86ce25cdb801c4c19c5c26fc838e76c0f385b21d8abbaad31a3d77fdae374d39`.
+The first optimized run returned A/B, the uninstrumented rerun B/A, and the
+matched baseline B/B. The old single completed long fixture also returned A.
+This isolates a reproducible acceptance failure without establishing its cause;
+RMS numerical reassociation, retained state, bindings and near-tied logits still
+need direct investigation. The successful short fixture does not supersede it.
+
+Evidence is under `build/tests/driver195-hardware/qwen-rms-production-1k1k`,
+`qwen-rms-production-1k1k-plain`, and `qwen-rms-baseline-1k1k`.
+The first run also collected 299 error-free monitor snapshots and an eight-second
+native CPU sample; sampling success is separate from inference correctness.
+
+Linux CI on experimental commit `4178d1d` passed all 58 tests and real GPU/HTTP
+smoke after fixing physical-versus-virtual row indexing in HIP fused phases.
+That correction is retained on the testing branch; it does not explain the Mac
+standalone Loom repeatability failure.
+
+A separate deterministic stress fixture subsequently passed **480 native RMS
+evaluations** across 15 graph/shape cases, two simultaneously live allocations
+and 16 alternating rounds. Every output bit, guard and cached replay was checked.
+An offline binding test also kept all bindings within the current graph across
+483 cache hits and 39 identities. These isolate the standalone kernel/cache
+contracts; they do not erase the model-level failure. Evidence:
+`build/tests/driver195-hardware/rms-repeatability-r3.log` and
+`build/perf-rms-cooperative/bindings-r3.log`.

@@ -94,6 +94,12 @@ These are bounded end-to-end inference measurements, not a claim of matched
 llama.cpp benchmark parity. See [conditions and evidence](docs/LSE_PERFORMANCE.md)
 and the [reproduction command](LOCAL_RUN.md#experimental-resident-benchmark).
 
+The [cooperative RMS testing branch](https://github.com/Geramy/LSE/tree/testing/r9700-cooperative-rms)
+measured 16.75–16.82 TPS and about 116 PP/s on the short fixture, but failed
+repeated 1K-input/1K-output greedy text equality. It is **not the stable default**;
+the unchanged baseline passed that repeatability check. Investigation continues
+before the faster implementation can be promoted.
+
 ## Current scope
 
 The working hardware configuration is **Apple Silicon + Thunderbolt 5 + R9700**.
