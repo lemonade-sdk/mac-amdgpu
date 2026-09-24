@@ -30,6 +30,22 @@ SetPowerState and DisableSmuFeatures. Lifecycle regressions and an Xcode build
 pass; this fix is not part of installed build 195. Stop GPU released the stale
 host session without closing the monitor or rebooting the machine.
 
+## Terminal display
+
+The updated monitor prioritizes firmware-average GFX/MEM MHz, separate DPM
+limits, power, fan, temperatures and driver-pool VRAM usage above two 60-second
+charts. Those panels fit a one-device 110×35 display. Raw SMU snapshot clocks
+and their observed min/max are labeled separately; they are not claimed to be
+effective current clocks. UI refresh is 100/500 ms with `h`, while firmware
+sampling remains 1 Hz and observer queries run outside the rendering thread.
+
+Kitty/iTerm2 terminals receive real PNG pixel charts. Apple Terminal uses a
+Braille fallback. Tracked copy rates average one second of monotonic completed
+payload counters and separate H2D/D2H/device-local directions; they omit HRX
+compute-blit payloads and do not measure physical PCIe bandwidth. See
+[monitor controls, protocol support and validation](../amdgpu_mtop/README.md)
+for exact semantics and full-frame preview commands.
+
 ## Implemented and pending
 
 Build 193 adds software counters and graphs, current clocks and AC DPM ranges,

@@ -28,9 +28,10 @@ build/amdgpu_mtop/amdgpu_mtop
 - `q` or `Ctrl-C`: quit and restore normal terminal input.
 
 The dashboard adapts to terminal size. Histories cover the last 60 seconds with
-peak values per time bucket; changing refresh speed does not change their time
-axis. Dots identify missing samples. Software rates use actual monotonic elapsed
-time and reset their baseline when the counter generation changes.
+mean values per time bucket; changing refresh speed does not change their time
+axis. Dots identify missing samples. Software rates use a one-second rolling window of actual driver monotonic elapsed
+time. The first second is unavailable. A reset, rollback, disconnect or stale gap
+restarts the baseline; duplicate snapshots never create zero-rate samples.
 
 ```sh
 build/amdgpu_mtop/amdgpu_mtop --fast
@@ -162,3 +163,105 @@ The decoder tests require this repository's local `upstream/linux` reference.
 These tests do not access the GPU. Driver integration, exact ABI details,
 firmware provenance and validity rules are in
 [GPU_MONITOR.md](../docs/GPU_MONITOR.md).
+
+## Pixel charts and responsive rendering
+
+The monitor renders real RGB PNG charts inside terminals supporting the
+[Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/)
+or [iTerm2 inline images](https://iterm2.com/documentation-images.html). It uses
+macOS's system zlib, with no image library, browser or GPU rendering dependency.
+Kitty transmissions are chunked to 4096 base64 bytes; a fixed set of image IDs
+is replaced and freed on each frame. Current iTerm2 (3.7+) selects Kitty.
+Older iTerm2 selects OSC 1337. Explicit selection is available:
+
+```sh
+build/amdgpu_mtop-candidate/amdgpu_mtop --graphics kitty --fast
+build/amdgpu_mtop-candidate/amdgpu_mtop --graphics iterm
+build/amdgpu_mtop-candidate/amdgpu_mtop --graphics text
+```
+
+`auto` uses terminal environment identity, not a capability query. Unknown
+terminals, Apple Terminal, and multiplexers fall back to 2×4-dot Braille charts;
+users can override the protocol when their terminal or multiplexer supports it.
+Apple Terminal was the running terminal during development, so native pixel
+placement was validated through captured protocol payloads rather than its UI.
+Official iTerm2 3.7.3 is staged locally at `build/support-apps/iTerm.app`. Open it
+manually and run the first command above; this does not change the default
+terminal. PNG data is never emitted into JSON or ordinary redirected output.
+
+The terminal uses differential text updates in one buffered write, avoiding
+per-line erase/redraw flicker. Pixel plots occupy reserved rows and use a fixed
+60-second horizontal span. A worker performs observer queries; slow driver or
+sensor calls do not block `h`, `n`, `p`, or redraw. Quit joins an outstanding
+observer call before releasing its resources. UI cadence remains 100/500 ms;
+firmware captures remain limited to 1 Hz. More pixels do not invent additional
+sensor measurements. Compact terminals omit the secondary raw-snapshot/extrema rows. The DPM limits
+remain separate from the primary firmware-average clock headline.
+
+Clock groups use both labels and color: firmware-average GFX MHz is cyan and
+MEM MHz is magenta in the primary headline. The separate SMU raw snapshot is
+not called the current effective frequency: measured raw GFX and firmware
+average values can differ substantially. Observed raw extrema cover the counter
+epoch; DPM minimum/AC maximum are firmware operating limits, not measured extrema.
+Power, fan, temperatures and VRAM pool allocation appear above both charts.
+A one-device 110×35 or 110×42 frame includes those values and both entire charts. Firmware averages are the existing activity-selected
+pre/post-sleep SMU fields, not a monitor-computed time average. This follows
+[NN/g dashboard guidance](https://www.nngroup.com/articles/dashboards-preattentive/)
+on clear grouping and using color as a secondary cue rather than the only label.
+
+## Copy-rate scope and correction
+
+The old chart summed H2D, D2H, device-local, host-local and unknown payloads,
+then divided newly observed completions by one short display interval. Batch
+retirement could create a large refresh-dependent spike. It also displayed a
+peak for each history column. Neither calculation measured PCIe link bandwidth.
+
+The new chart is **tracked payload completed per second**, averaged over at
+least one second and displayed in binary MiB/s (1 MiB = 1,048,576 bytes).
+H2D, D2H, VRAM-to-VRAM, host-to-host, and unknown directions are shown separately.
+A copy counts its payload once; device-local reads plus writes are not doubled.
+The numerator excludes failed or reset-retired operations. Driver counters use
+CLOCK_UPTIME_RAW sample timestamps; UI redraw time and firmware timestamps are
+not used as the denominator. Delayed asynchronous completion reports can still
+produce bursts; this is observation time, not GPU transfer duration.
+
+The counters do **not** include arbitrary kernel traffic or HRX's compute-blit
+payloads, and CPU BAR copy totals remain separate JSON counters. Zero tracked
+copy throughput therefore does not mean the GPU or PCIe link is idle. UMC
+activity is an independent firmware percentage, never converted to bandwidth.
+Accurate whole-runtime bandwidth requires runtime transfer instrumentation or
+hardware traffic counters; the monitor does not infer it from memory allocation,
+clock frequency, AQL packet count, or nominal link speed.
+
+## Validation and preview
+
+```sh
+cmake -S amdgpu_mtop -B build/amdgpu_mtop-candidate -DCMAKE_BUILD_TYPE=Release
+cmake --build build/amdgpu_mtop-candidate --parallel 4
+ctest --test-dir build/amdgpu_mtop-candidate --output-on-failure
+python3 scripts/test-mtop-terminal.py
+build/amdgpu_mtop-candidate/amdgpu_mtop --demo --graphics kitty
+build/amdgpu_mtop-candidate/amdgpu_mtop --preview-png /tmp/mtop-chart.png
+```
+
+`--demo` is explicitly labeled synthetic and never opens the GPU. The terminal
+test runs the actual binary under a PTY, verifies fast/slow toggle and clean
+quit, checks that a full-screen clear occurs only once, validates chunk limits,
+and decodes PNG checksums and pixel streams for both protocols. Extracted images
+and terminal captures are under `build/tests/mtop-terminal`. Unit tests cover
+clock labels/staleness, rate epochs/rollbacks/burst averaging, UTF-8 clipping,
+unchanged-frame suppression, PNG/escape encoding, and keyboard responsiveness
+while a mock observer query is blocked. Pixel placement in an actual iTerm2
+window still needs manual visual confirmation.
+
+Full-frame offline reconstruction from the actual PTY capture:
+
+```sh
+python3 scripts/test-mtop-terminal.py --rows 35 --output build/tests/mtop-terminal-35
+python3 scripts/preview-mtop-terminal.py build/tests/mtop-terminal-35/kitty.ansi --rows 35
+```
+
+The `.frame.txt` file records every terminal row and exact pixel placement;
+`.frame.html` embeds the actual PNG payloads at their captured cell coordinates.
+These are protocol reconstructions with labeled synthetic values, not screenshots
+of a native terminal window or claimed hardware telemetry.

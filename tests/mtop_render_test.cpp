@@ -31,7 +31,7 @@ int main() {
     assert(output.find("\"excluded_bytes\":26214400") != std::string::npos);
     assert(output.find("\"vram_used_bytes\":null") != std::string::npos);
     assert(output.find("\"umc_activity_percent\":null") != std::string::npos);
-    assert(output.find("0.23 GiB / 0.00 GiB / 0.23 GiB / 0.23 GiB") != std::string::npos);
+    assert(output.find("CPU-visible used 0.00 GiB / 0.23 GiB") != std::string::npos);
     d.accounting = snapshot(false, 0, 0, 0, low, high);
     assert(!mtop::hasAccounting(d));
     captured.str(""); captured.clear();
@@ -70,14 +70,14 @@ int main() {
     std::cout.rdbuf(previous);output=captured.str();
     assert(output.find("\"host_to_device_bytes\":1048576")!=std::string::npos);
     assert(output.find("\"gfx_activity_percent\":null")!=std::string::npos);
-    assert(output.find("avg -- | SMU raw 1000 | raw peak 1200")!=std::string::npos);
-    assert(output.find("DPM min 500 | AC DPM max 2900 MHz")!=std::string::npos);
+    assert(output.find("SMU raw snapshot  GFX 1000  MEM 1500 MHz")!=std::string::npos);
+    assert(output.find("DPM min / AC max  GFX 500 / 2900")!=std::string::npos);
     assert(output.find("\"gfx\":{\"raw_current_mhz\":1000,\"dpm_min_mhz\":500,\"ac_dpm_max_mhz\":2900}")!=std::string::npos);
     assert(output.find("\"retired_packets\":0")!=std::string::npos);
     assert(output.find("[h] fast/slow")!=std::string::npos && output.find("FAST 0.1 s")!=std::string::npos);
     assert(output.find("SMU REPORTED GFX  -- %  [scale 0..100]")!=std::string::npos);
     assert(output.find("SUBMISSIONS  ")==std::string::npos);
-    assert(output.find("WORK  submissions")!=std::string::npos);
+    assert(output.find("WORK  queues")!=std::string::npos);
     // A low absolute hardware percentage must not fill the chart by being
     // normalized to its own peak. Compatible firmware retains its raw reading.
     d.telemetrySupported=true;
@@ -101,7 +101,7 @@ int main() {
     const auto end=output.find("SMU activity:",gfx);
     const auto plot=output.substr(gfx,end-gfx);
     // Four-row graph:5% occupies only the bottom row, not all four.
-    assert(std::count(plot.begin(),plot.end(),'#')==1);
+    assert(std::count(plot.begin(),plot.end(),'#')==0); // Braille subcell chart
     captured.str("");captured.clear();previous=std::cout.rdbuf(captured.rdbuf());
     dashboard({d},selected,{},false,false,&histories,{},80,40,now+kSMUMetricsStaleAfterNs+1);
     std::cout.rdbuf(previous);output=captured.str();
@@ -117,17 +117,26 @@ int main() {
     assert(output.find("SMU REPORTED GFX  100.0 %  [scale 0..100]")!=std::string::npos);
     assert(output.find("\"gfx_activity_percent\":100")!=std::string::npos);
     assert(output.find("idle can report 100%; workload utilization unverified")!=std::string::npos);
+    // Common dashboard heights retain all primary data and both complete charts.
+    for(unsigned height:{35u,42u}) {
+        mtop::Frame layout;
+        captured.str("");captured.clear();previous=std::cout.rdbuf(captured.rdbuf());
+        dashboard({d},selected,{},true,false,&histories,{},110,height,now,mtop::Graphics::Text,&layout);
+        std::cout.rdbuf(previous);
+        std::string visible;for(auto&row:layout.previous)visible+=row+"\n";
+        for(const char*label:{"CLOCKS  firmware average","DPM min / AC max","POWER  ","TEMP   edge","VRAM allocation:","SMU REPORTED GFX","TRACKED COPY COMPLETIONS","Host copy","60 s history"})
+            assert(visible.find(label)!=std::string::npos);
+    }
     // A narrow terminal is clipped by columns and reserves its final row for controls.
     captured.str("");captured.clear();previous=std::cout.rdbuf(captured.rdbuf());
-    dashboard({d},selected,{},true,false,&histories,{},40,12,now);
+    mtop::Frame frame;
+    dashboard({d},selected,{},true,false,&histories,{},40,12,now,mtop::Graphics::Text,&frame);
     std::cout.rdbuf(previous);output=captured.str();
-    std::string plain;
-    for(size_t i=0;i<output.size();++i) {
-        if(output[i]=='\033' && i+1<output.size() && output[i+1]=='[') {
-            i+=2;while(i<output.size() && !(output[i]>='@' && output[i]<='~')) ++i;
-        } else plain+=output[i];
-    }
-    std::istringstream rows(plain);std::string row;unsigned count=0;
-    while(std::getline(rows,row)) {assert(row.size()<=40);++count;}
-    assert(count<=12 && plain.find("[h] fast/slow")!=std::string::npos);
+    assert(frame.previous.size()==12);
+    for(const auto &row:frame.previous) assert(mtop::clipColumns(row,39)==row);
+    assert(frame.previous.back().find("[h] fast/slow")!=std::string::npos);
+    captured.str("");captured.clear();previous=std::cout.rdbuf(captured.rdbuf());
+    dashboard({d},selected,{},true,false,&histories,{},40,12,now,mtop::Graphics::Text,&frame);
+    std::cout.rdbuf(previous);
+    assert(captured.str().empty()); // unchanged screen writes no clears or text
 }
