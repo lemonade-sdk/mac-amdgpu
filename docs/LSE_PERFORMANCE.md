@@ -924,8 +924,14 @@ fragment loads with one aligned 128-bit LDS load. Native inspection shows 192
 scalar LDS loads replaced by 24 vector loads, with unchanged matrix operations,
 barriers, register allocation and scratch usage. All 16 GPU numerical cases
 passed nine exact repeated-output hashes, and each case's final hash matched
-the original corrected implementation. Performance has not yet been measured.
+the original corrected implementation. With the corrected FP32 descriptor and
+matched compiler/runtime, the full up projection decreased from 6.669 to
+4.958 ms and the down projection from 6.270 to 4.442 ms (25.6% and 29.2% less
+elapsed time). Both output hashes matched their controls. These are isolated
+kernel measurements; model throughput with vector LDS remains unmeasured.
 Evidence: `q6-bf16-residual2-vector-lds-numeric.log` and
+`q6-residual2{,-vector}-fixed-perf-{up,down}.log` under
+`build/tests/driver195-hardware`, and
 `build/perf-q6-bf16-two-product-vector-lds`.
 
 ### First differing prefill layer
@@ -938,11 +944,27 @@ matched exactly. All 25 kernel identities/source hashes and launch geometries
 through that boundary matched. Both requests constructed fresh graphs.
 
 Later kernel sequences differed, first at dispatch 90, but that cannot explain
-the earlier layer 0 difference. The next diagnostic must inspect layer 0's
-intermediate operations and their inputs. Layer readbacks serialize execution;
+the earlier layer 0 difference. Layer readbacks serialize execution;
 the captured timings are not performance measurements. Evidence:
 `build/tests/driver195-hardware/layer-baseline-comparison.json` and
 `layer-baseline-series`.
+
+The finer diagnostic identifies the first differing result at dispatch 6,
+the fused query L2 normalization and scale multiply. Its captured FP32 inputs
+match, but its output overlaps the normalization input exactly (same buffer
+handle, offset and range). Each output thread rereads the reduction row, so
+writing an output can overwrite values that other threads still need. There
+were 861 differing output words; the maximum absolute difference was 0.001923.
+
+The slot planner used the original workgroup cuts even after fusion removed
+those launch boundaries. The candidate fix plans lifetimes against the final
+submitted groups, retaining inputs through the entire consuming launch while
+preserving reuse between launches. An actual Scheduler regression with a
+recyclable producer and reshape view fails on the old planner and passes with
+the correction; pointwise fusion and replay are covered too. GPU qualification
+is still required before promotion. Evidence:
+`build/tests/driver195-hardware/subop-baseline-old-mode-comparison.json` and
+`build/perf-final-group-slots-check`.
 
 ### FP32 subnormal descriptor correction
 
