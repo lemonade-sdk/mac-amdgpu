@@ -70,35 +70,29 @@ its log, model, quantization, context and MTP settings still need to be recovere
 for a matched comparison. It is not a measured macOS Loom result.
 
 The local Qwen3.8-27B-MLX-6bit checkpoint runs through GPU kernels using **Loom**.
-Cooperative RMS normalization is now the default for supported shapes. After
-fixing a fused-kernel buffer-lifetime bug, it completed two identical greedy
-**1,024-input/1,024-output** requests with clean shutdown. Full generated text
-also matched the corrected scalar control.
+Cooperative RMS normalization and the qualified vector BF16 prefill kernels are
+selected automatically for supported shapes through the shared HIP/Loom policy.
+The rebuilt default server passes GPU inference with identical repeated text
+and clean shutdown. The combined implementation also passed three full
+**1,024-input/1,024-output** requests.
 
 | Workload | Implementation | Prompt processing | Decode |
 | --- | --- | ---: | ---: |
-| Earlier 64 input / 33 output, KV128 | Scalar control | 87.28 tokens/s | 12.61 tokens/s |
-| Earlier 64 input / 33 output, KV128 | Cooperative RMS | about 116 tokens/s | 16.75–16.82 tokens/s |
-| 512 input / 33 output, KV1024 | Current cooperative RMS | **88.74 tokens/s** | **15.91 tokens/s** |
-| 512 input / 33 output, KV1024 | RMS + vector prefill candidate | **143.26 tokens/s** | **15.84 tokens/s** |
-| 1,024 input / 1,024 output, KV2048 | Corrected scalar control | warming cache | 11.18 tokens/s |
-| 1,024 input / 1,024 output, KV2048 | Corrected cooperative RMS | warming cache | **14.28 tokens/s** |
-| 1,024 input / 1,024 output, KV2048 | RMS + vector prefill candidate, warmed | **139.85 tokens/s** | **14.23 tokens/s** |
+| 512 input / 129 output, KV1024 | RMS + vector prefill, qualified control | **143.39 tokens/s** | **15.96 tokens/s** |
+| 1,024 input / 1,024 output, KV2048 | RMS + vector prefill | **139.85 tokens/s** | **14.23 tokens/s** |
+| 512 input / 129 output, KV1024 | Experimental four-column decode | **143.38 tokens/s** | **16.70 tokens/s** |
 
-The scalar/RMS long-run comparison uses second-request rates from separate sequential runs,
-with 1,023 decode steps each, MTP disabled, flush64 and 64 µs polling. They show
-about 28% higher decode throughput; they are not interleaved multi-run medians.
-The earlier short RMS fixture has not yet been remeasured on the final
-integration. Growing KV capacity can trigger new prefill specializations even
-on the second request, so those prompt rates are not steady-state results.
+All rows use MTP disabled, flush64 and 64 µs polling. Short-run rows are medians
+of three measured requests after two warmups; the long row is one measured
+request after two warmups. Compiler counters confirm zero new compilations in
+every measured request. Output token counts include the first token from
+prefill, so the rows contain 128 or 1,023 decode steps respectively.
 
-The matched 512-token comparison uses two warmups and three measured requests.
-Compiler counters confirm zero compiles in every measured request; all outputs
-match across the two implementations. Vector prefill is about **61% faster**
-on this fixture, with essentially unchanged decode. The combined candidate also
-passed three identical 1,024-input/1,024-output requests and clean shutdown.
-The table reports its third request, with zero new compilations after two
-warmups. Final source integration checks remain before it becomes the default.
+The rebuilt default server separately confirmed **143.69 PP/s and 15.93 TPS**
+on the same short workload, with text matching the frozen qualified control.
+Vector prefill previously improved the matched 512-input/33-output fixture
+by **61%**. Four-column decode improves the current short workload by **4.65%**;
+its long-generation qualification is still in progress before promotion.
 
 These measurements do not establish matched llama.cpp parity. Closing the
 remaining throughput gap is active work. See

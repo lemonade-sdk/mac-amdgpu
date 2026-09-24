@@ -507,10 +507,23 @@ index 87d7952..7bce537 100644
    [[nodiscard]] ir::Val<ir::u32> window_base(std::string_view dim,
                                               std::string_view field) {
 diff --git a/include/lse/ir/recorder.hpp b/include/lse/ir/recorder.hpp
-index 94da274..fdcdbc8 100644
+index 94da274..243a2b2 100644
 --- a/include/lse/ir/recorder.hpp
 +++ b/include/lse/ir/recorder.hpp
-@@ -580,6 +580,10 @@ class KernelBody {
+@@ -422,6 +422,12 @@ class Tile {
+   }
+   [[nodiscard]] ValueId id() const noexcept { return id_; }
+
++  // The selected vector must fit entirely within this view. The effective
++  // element index (including a slice offset) must have vector-byte alignment.
++  // As with Buffer::load, the caller establishes these index preconditions.
++  [[nodiscard]] Pack<T> load(const Val<u32>& index,
++                             std::uint32_t max_bytes) const;
++
+   template <typename I>
+   [[nodiscard]] LValue<T> operator[](const Val<I>& index) const {
+     if (off_ == 0) {
+@@ -580,6 +586,10 @@ class KernelBody {
              ir_.extent(name, ExtentBinding::kRuntime, ExtentRole::kSize,
                         std::string(field), 0)};
    }
@@ -521,6 +534,18 @@ index 94da274..fdcdbc8 100644
    // The base index of the iteration-space window this launch covers. Unlike a
    // size it may enter an address — with a constant coefficient, so the stride
    // the inner loop walks is unchanged and only the origin moves.
+@@ -834,6 +844,11 @@ Pack<T> Buffer<T>::load(const Val<u32>& index, std::uint32_t max_bytes) const {
+   return body_->load_pack<T>(id_, index, max_bytes);
+ }
+
++template <typename T>
++Pack<T> Tile<T>::load(const Val<u32>& index, std::uint32_t max_bytes) const {
++  return body_->load_pack<T>(id_, off_ ? index + off_ : index, max_bytes);
++}
++
+ template <typename T>
+ void Buffer<T>::store(const Val<u32>& index, const Pack<T>& value,
+                       std::uint32_t max_bytes) const {
 diff --git a/include/lse/kernels/wmma.hpp b/include/lse/kernels/wmma.hpp
 index a33f1e8..531501a 100644
 --- a/include/lse/kernels/wmma.hpp
@@ -3283,7 +3308,7 @@ index 9a56b49..e3613b1 100644
  
    return groups;
 diff --git a/src/graph/scheduler.cpp b/src/graph/scheduler.cpp
-index e5045ed..bb516fa 100644
+index e5045ed..f695b69 100644
 --- a/src/graph/scheduler.cpp
 +++ b/src/graph/scheduler.cpp
 @@ -1,3 +1,4 @@
@@ -3434,7 +3459,35 @@ index e5045ed..bb516fa 100644
    const Status accumulated = accumulate(acc_, trace_);
    if (!ran.ok()) return ran;
    return accumulated;
-@@ -1004,6 +1077,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
+@@ -972,6 +1045,27 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
+   LSE_RETURN_IF_ERROR(release_phase_tables());
+
+   const std::vector<NodePtr> order = Partitioner::unmaterialized(roots);
++  // Views must be valid before partitioning: a device-only view group may
++  // require no dispatch at all, so neither a kernel nor the host interpreter
++  // is guaranteed to validate it later.
++  for (const NodePtr& node : order) {
++    if (node->kind != OpKind::kReshape) continue;
++    if (node->inputs.size() != 1 || !node->inputs[0]) {
++      return LSE_ERROR(kInvalidArgument, "reshape requires one input");
++    }
++    const Node& source = *node->inputs[0];
++    if (source.dtype != node->dtype ||
++        source.element_count() != node->element_count()) {
++      return LSE_ERROR(kInvalidArgument, "reshape changes dtype or element count");
++    }
++    const std::size_t bytes =
++        dtype_storage_bytes(node->dtype, node->element_count());
++    if (source.materialized && source.buffer.valid() &&
++        (bytes == 0 || bytes > source.buffer.size_bytes)) {
++      return LSE_ERROR(kOutOfRange, "reshape exceeds its source buffer window");
++    }
++  }
++
+
+   std::vector<FusionGroup> phase_groups;
+   bool replayed = false;
+@@ -1004,6 +1098,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
    // ones and pays none of it, which is why this and `schedule` are two spans
    // and not one.
    SpanTimer build_span(trace_.spans.partition, setup_span.close());
@@ -3442,7 +3495,7 @@ index e5045ed..bb516fa 100644
    auto planned = replayed
                       ? std::vector<Workgroup>{}
                       : Partitioner::phases(roots, &backend().device_info());
-@@ -1019,6 +1093,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
+@@ -1019,6 +1114,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
      // the same one-group path a node it refuses to stage already takes.
      const IPhaseStaging* staging = emitter->staging();
      for (Workgroup& wg : planned) {
@@ -3450,7 +3503,7 @@ index e5045ed..bb516fa 100644
        FusionGroup g = Partitioner::phase_group(wg, roots);
        if (g.nodes.empty()) continue;
        alias_ready_reshapes(g);
-@@ -1077,18 +1152,13 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
+@@ -1077,18 +1173,13 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
          return 0;
        };
        auto join_gdn_pair = [&](const NodePtr& n) -> bool {
@@ -3473,7 +3526,7 @@ index e5045ed..bb516fa 100644
          return true;
        };
        auto join_wide_linear = [&](const NodePtr& n) -> bool {
-@@ -1207,6 +1277,12 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
+@@ -1207,6 +1298,12 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
          if (staging == nullptr || !staging->can_stage(*n)) {
            flush_staged();
            if (join_gdn_pair(n)) continue;
@@ -3486,7 +3539,7 @@ index e5045ed..bb516fa 100644
            FusionGroup one;
            one.nodes.push_back(n);
            one.outputs.push_back(n);
-@@ -1272,7 +1348,43 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
+@@ -1272,7 +1369,43 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
          staged.nodes.push_back(n);
        }
        flush_staged();
@@ -3531,7 +3584,7 @@ index e5045ed..bb516fa 100644
        // A workgroup is member-homogeneous by construction (the partitioner
        // splits phases where a value changes members), so its slots belong on
        // that member — allocated through the member's backend and stream, or
-@@ -1599,6 +1711,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
+@@ -1599,6 +1732,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
    // dispatch loop to the remainder rather than being folded in here — which is
    // what the old partition_ns did, silently.
    const auto t_repartition = place_span.close();
@@ -3539,7 +3592,7 @@ index e5045ed..bb516fa 100644
    std::vector<FusionGroup> groups =
        Partitioner::partition(roots, &backend().device_info());
    trace_.spans.partition.add(elapsed_ns(t_repartition, SpanClock::now()));
-@@ -1677,8 +1790,18 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
+@@ -1677,8 +1811,18 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
          ran.push_back(g);
          continue;
        }
@@ -3560,7 +3613,7 @@ index e5045ed..bb516fa 100644
        ++trace_.host_groups;
        trace_.host_group_reasons.push_back(dispatched.message());
      }
-@@ -1691,6 +1814,12 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
+@@ -1691,6 +1835,12 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
        launched = false;
      }
 
@@ -3573,7 +3626,7 @@ index e5045ed..bb516fa 100644
      // Host-only mode reaches here without passing the device-first arm above,
      // so nothing had counted this group. Leaving it uncounted printed
      // `groups device=0 host=0` beside a five-figure launch count, which reads
-@@ -1870,6 +1999,9 @@ ScopedMember::ScopedMember(std::size_t member) noexcept
+@@ -1870,6 +2020,9 @@ ScopedMember::ScopedMember(std::size_t member) noexcept
  ScopedMember::~ScopedMember() { g_preferred_member = previous_; }
 
  Scheduler* default_scheduler() {
@@ -5220,7 +5273,7 @@ index 9f17d38..35db5ad 100644
  }
  
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index a787603..7f302a7 100644
+index a787603..3030790 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
 @@ -12,6 +12,59 @@ function(lse_add_test name)
@@ -5388,7 +5441,7 @@ index a787603..7f302a7 100644
    lse_add_test(test_primitive lse_graph lse_backends)
  endif()
 
-@@ -86,3 +225,129 @@ if(LSE_ROCM_RUNTIME_DIR)
+@@ -86,3 +225,134 @@ if(LSE_ROCM_RUNTIME_DIR)
    set_tests_properties(${lse_tests} PROPERTIES
      ENVIRONMENT "LD_LIBRARY_PATH=${LSE_ROCM_RUNTIME_DIR}")
  endif()
@@ -5517,6 +5570,11 @@ index a787603..7f302a7 100644
 +    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
 +    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
 +    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
++endif()
++
++if(TARGET lse_backend_hrx)
++  lse_add_test(test_q6_m256_profile lse_backend_hrx lse_graph lse_kernels lse_ir)
++  lse_add_test(test_tile_vector_load lse_backend_hrx lse_graph lse_kernels lse_ir)
 +endif()
 diff --git a/tests/test_ir.cpp b/tests/test_ir.cpp
 index 56fefa9..1a578b0 100644
@@ -7692,10 +7750,10 @@ index 0000000..f0ec881
 +}
 diff --git a/src/kernels/wmma_q6_linear.cpp b/src/kernels/wmma_q6_linear.cpp
 new file mode 100644
-index 0000000..a309ce4
+index 0000000..c1cc996
 --- /dev/null
 +++ b/src/kernels/wmma_q6_linear.cpp
-@@ -0,0 +1,411 @@
+@@ -0,0 +1,687 @@
 +// Measured floating-operand matrix contraction over unchanged MLX affine Q6.
 +// Weight storage remains packed; staged operands feed the measured matrix core.
 +#include "lse/graph/kernel_args.hpp"
@@ -7873,6 +7931,175 @@ index 0000000..a309ce4
 +    return {};
 +  return body.str();
 +}
++std::string emit_staged_bf16_residual2(const KernelShapes &s, const Dims &d) {
++  using Tile = Base<math::MatrixElem::kBF16>;
++  using F = typename Tile::AFrag;
++  using Op = typename Tile::Op;
++  constexpr auto geo = geometry_of(Tile::kRow);
++  static_assert(geo.wave == 32 && geo.split_k && geo.lane_k == 8);
++  kir::KernelBody body(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
++  body.set_store(s.store);
++  Args a;
++  if (!env::bind(body, a, s))
++    return {};
++  env::Emit e{&body};
++  const auto xs = e.lds<F>(64u * 64u), ws = e.lds<F>(64u * 64u);
++  const auto wl = e.lds<F>(64u * 64u);
++  const auto flags = e.lds<kir::f32>(4u);
++  constexpr float min_normal = std::numeric_limits<float>::min();
++  constexpr float max_bf16 = 3.3895313892515355e38f;
++  const auto lid = e.let(math::local_id()), lane = e.let(lid % 32u);
++  const auto wave = e.let(lid / 32u), lo = e.let(lane % 16u),
++             hi = e.let(lane / 16u);
++  const auto wg = e.let(math::workgroup_id_x());
++  const auto nblocks = (d.n + 63) / 64;
++  const auto mbase = e.let((wg / nblocks) * 64u),
++             nbase = e.let((wg % nblocks) * 64u);
++  const auto am = e.let((wave % 2u) * 32u), bn = e.let((wave / 2u) * 32u);
++  // Rotate eight-half spans by row. Every span remains contiguous, while
++  // neighboring lanes read different LDS bank groups rather than stride64.
++  const auto address = [&](const kir::Val<kir::u32> &r,
++                           const kir::Val<kir::u32> &k) {
++    return r * 64u + ((k / 8u + r % 8u) % 8u) * 8u + k % 8u;
++  };
++  std::vector<kir::Local<kir::f32, 8>> acc;
++  for (unsigned i = 0; i < 4; ++i) {
++    acc.push_back(e.local<kir::f32, 8>());
++    for (auto j : e.unroll(8u))
++      acc.back()[j] = e.f32(0);
++  }
++  for (auto kb : e.range(0u, d.k, 64u)) {
++    auto bad = e.var(0.0f);
++    const auto mark_unsafe = [&](const kir::Val<kir::f32>& value) {
++      auto invalid=e.var(1.0f);
++      if(auto safe=e.when(math::abs(value)<=max_bf16 &&
++          (value==0.0f || math::abs(value)>=min_normal)))invalid=e.f32(0);
++      bad=math::max(bad.read(),invalid.read());
++    };
++    // Each lane stages two16-value row fragments. All128 lanes execute
++    // both barriers, including lanes covering padded M/N output edges.
++    for (auto block : e.unroll(2u)) {
++      const auto r = e.let(lid / 4u + block * 32u),
++                 kc = e.let((lid % 4u) * 16u);
++      const auto ar = e.let(mbase + r), bc = e.let(nbase + r);
++      const auto av = e.local<F, 16>(), bv = e.local<F, 16>(), bl = e.local<F, 16>();
++      for (auto j : e.unroll(16u)) {
++        av[j] = math::narrow<F>(e.f32(0));
++        bv[j] = math::narrow<F>(e.f32(0));
++        bl[j] = math::narrow<F>(e.f32(0));
++      }
++      if (auto active = e.when(ar < d.m)) {
++        for (unsigned v = 0; v < 4; ++v) {
++          const auto loaded = e.load(a.x, ar * d.k + kb + kc + v * 4u, 16u);
++          for (unsigned j = 0; j < 4; ++j) {
++            const auto original=e.let(loaded[j]);
++            mark_unsafe(original);
++            av[v * 4 + j] = math::narrow<F>(original);
++          }
++        }
++      }
++      if (auto active = e.when(bc < d.n)) {
++        const auto gi = e.let(bc * d.groups + (kb + kc) / d.group);
++        const auto scale = e.let(math::widen(a.scales[gi])),
++                   bias = e.let(math::widen(a.biases[gi]));
++        const auto wb = e.let(bc * d.words + ((kb + kc) / 16u) * 3u);
++        const std::array<kir::Val<kir::u32>, 3> packed{
++            e.let(a.packed[wb]), e.let(a.packed[wb + 1u]),
++            e.let(a.packed[wb + 2u])};
++        for (unsigned j = 0; j < 16; ++j) {
++          const unsigned off = (j * 6) % 32, wi = j * 6 / 32;
++          auto code = packed[wi] / (1u << off);
++          if (off > 26)
++            code = code +
++                   (packed[wi + 1] % (1u << (off - 26))) * (1u << (32 - off));
++          else
++            code = code % 64u;
++          const auto original=e.let(math::fma(math::cast<kir::f32>(e.let(code)), scale, bias));
++          mark_unsafe(original);
++          bv[j] = math::narrow<F>(original);
++          // Preserve the original FP32 dequantization and subtract the widened
++          // rounded high part. The low part is a second native BF16 operand.
++          const auto residual=e.let(original-math::widen(bv[j].read()));
++          mark_unsafe(residual);
++          bl[j] = math::narrow<F>(residual);
++        }
++      }
++      for (auto j : e.unroll(16u)) {
++        const auto index = e.let(address(r, kc + j));
++        xs[index] = av[j].read();
++        ws[index] = bv[j].read();
++        wl[index] = bl[j].read();
++      }
++    }
++    for(unsigned bit:{1u,2u,4u,8u,16u})
++      bad=math::max(bad.read(),math::shfl_xor(bad.read(),e.u32(bit)));
++    if(auto leader=e.when(lane==0u))flags[wave]=bad.read();
++    e.barrier();
++    const auto block_bad=e.let(flags[0u].read()+flags[1u].read()+flags[2u].read()+flags[3u].read());
++    if(auto regular=e.when(block_bad==0.0f)) {
++    for (auto slice : e.unroll(4u)) {
++      std::vector<kir::Local<F, 8>> af, bf, blf;
++      for (unsigned i = 0; i < 2; ++i) {
++        af.push_back(e.local<F, 8>());
++        bf.push_back(e.local<F, 8>());
++        blf.push_back(e.local<F, 8>());
++        const auto ar = e.let(am + i * 16u + lo), bc = e.let(bn + i * 16u + lo);
++        // K-major fragments occupy eight contiguous BF16 elements. The
++        // bank rotation preserves the eight-element alignment at each start.
++        const auto k = e.let(slice * 16u + hi * 8u);
++        const auto ap = xs.load(e.let(address(ar, k)), 16u);
++        const auto bp = ws.load(e.let(address(bc, k)), 16u);
++        const auto blp = wl.load(e.let(address(bc, k)), 16u);
++        for (auto j : e.unroll(8u)) {
++          af.back()[j] = ap[j];
++          bf.back()[j] = bp[j];
++          blf.back()[j] = blp[j];
++        }
++      }
++      for (unsigned m = 0; m < 2; ++m)
++        for (unsigned n = 0; n < 2; ++n) {
++          acc[m * 2 + n] = math::mma<Op>(af[m].value(), bf[n].value(),
++                                         acc[m * 2 + n].value());
++          acc[m * 2 + n] = math::mma<Op>(af[m].value(), blf[n].value(),
++                                         acc[m * 2 + n].value());
++        }
++    }
++    }
++    if(auto exceptional=e.when(block_bad!=0.0f)) {
++      for(unsigned m=0;m<2;++m)for(unsigned n=0;n<2;++n){
++        const auto col=e.let(nbase+bn+n*16u+lo);
++        for(auto j:e.unroll(8u)){
++          const auto rr=e.let(mbase+am+m*16u+j*geo.slot_step+hi*geo.half_rows);
++          if(auto active=e.when(rr<d.m && col<d.n)){
++            for(auto chunk:e.range(kb/16u,kb/16u+4u,1u)){
++              const auto gi=e.let(col*d.groups+(chunk*16u)/d.group);
++              const auto scale=e.let(math::widen(a.scales[gi])),bias=e.let(math::widen(a.biases[gi]));
++              quant::dequant_chunk(e,a.packed,quant::GroupAffine{6,64},e.let(col*d.words+chunk*3u),scale,bias,
++                [&](int q,const kir::Val<kir::f32>& weight){
++                  const auto x=a.x[rr*d.k+chunk*16u+static_cast<unsigned>(q)];
++                  acc[m*2+n][j]=math::fma(x,weight,acc[m*2+n][j].read());
++                });
++            }
++          }
++        }
++      }
++    }
++    e.barrier();
++  }
++  for (unsigned m = 0; m < 2; ++m)
++    for (unsigned n = 0; n < 2; ++n) {
++      const auto col = e.let(nbase + bn + n * 16u + lo);
++      for (auto j : e.unroll(8u)) {
++        const auto rr = e.let(mbase + am + m * 16u + j * geo.slot_step +
++                              hi * geo.half_rows);
++        if (auto active = e.when(rr < d.m && col < d.n))
++          e.store(rr * d.n + col, acc[m * 2 + n][j].read());
++      }
++    }
++  if (!body.lds().ok())
++    return {};
++  return body.str();
++}
 +#include "q6_fp8_residual.inc"
 +struct StagedBF16Kernel final : KernelPrimitive<StagedBF16Kernel> {
 +  static constexpr std::string_view kName = "quant_linear.q6_wmma_bf16_reuse";
@@ -7916,6 +8143,51 @@ index 0000000..a309ce4
 +      s.intrinsics->find(r.key).empty())
 +    return nullptr;
 +  static const StagedBF16Kernel kernel;
++  return &kernel;
++}
++
++struct StagedBF16Residual2Kernel final : KernelPrimitive<StagedBF16Residual2Kernel> {
++  static constexpr std::string_view kName = "quant_linear.q6_wmma_bf16_weight_residual2_vector_lds_v4";
++  static constexpr std::string_view kEntry = "lse_q6_wmma_bf16_weight_residual2_vector_lds_v4";
++  static constexpr std::string_view kSource = {};
++  std::size_t arity() const noexcept override { return 4; }
++  bool owns_indexing() const noexcept override { return true; }
++  std::string emit_kernel(const KernelShapes &s) const override {
++    const auto d = dims_of(s);
++    if (!d.valid || !s.store || !s.types.scalar || !s.intrinsics)
++      return {};
++    return emit_staged_bf16_residual2(s, d);
++  }
++  Result<Shape> infer_shape(std::span<const Shape> in) const override {
++    if (in.size() != 4 || in[1].rank() != 2)
++      return LSE_ERROR(kInvalidArgument, "Q6 matrix requires four operands");
++    Shape o;
++    for (std::size_t i = 0; i + 1 < in[0].rank(); ++i)
++      o.push_back(in[0].dim(i));
++    o.push_back(in[1].dim(0));
++    return o;
++  }
++  DType infer_dtype(std::span<const DType>) const override {
++    return DType::kF32;
++  }
++  static ThreadPlan plan_impl(const KernelShapes &s) {
++    ThreadPlan p;
++    auto d = dims_of(s);
++    if (!d.valid)
++      return p;
++    p.workgroup_size[0] = 128;
++    p.workgroup_count[0] = ((d.m + 63) / 64) * ((d.n + 63) / 64);
++    p.lds_bytes = 24592;
++    p.workgroup_count[1] = p.workgroup_count[2] = 1;
++    return p;
++  }
++};
++const KernelPrimitiveBase *select_staged_bf16_residual2(const KernelShapes &s) {
++  constexpr auto r = Base<math::MatrixElem::kBF16>::kRow;
++  if (!r.emittable() || !math::has_cap(device_matrix_caps(*s.device), r.cap) ||
++      s.intrinsics->find(r.key).empty())
++    return nullptr;
++  static const StagedBF16Residual2Kernel kernel;
 +  return &kernel;
 +}
 +
@@ -8010,6 +8282,67 @@ index 0000000..a309ce4
 +  kernel.lds_bytes = kResidualLdsBytes;
 +  return kernel;
 +}
++// Only these two M256 shapes have complete-model quality and measured cost
++// evidence for the two-product BF16 implementation. Other widths retain their
++// independently qualified implementation or scalar path.
++const KernelPrimitiveBase* select_m256_residual2(
++    const KernelShapes& s, const Dims& dims) {
++  struct Measured { uint32_t n, k; uint64_t vector_ns, residual2_ns; };
++  // Matched driver195 fixed-compiler host eval+retire means, eight samples.
++  static constexpr Measured records[] = {
++      {17408, 5120, 4958328, 6668635},
++      {5120, 17408, 4441641, 6269651}};
++  const Measured* record = nullptr;
++  for (const auto& row : records)
++    if (dims.m == 256 && row.n == dims.n && row.k == dims.k) record = &row;
++  if (!record || record->vector_ns >= record->residual2_ns) return nullptr;
++  QuantOperandOption option;
++  auto& kernel = option.kernel;
++  kernel.operand = QuantOperand::kBF16;
++  kernel.strategy = QuantOperandStrategy::kNative;
++  kernel.implementation_id =
++      quant_operand_implementation_id(StagedBF16Residual2Kernel::kName);
++  kernel.implementation_revision = 4;
++  kernel.implemented = true;
++  kernel.matrix_intrinsic = select_staged_bf16_residual2(s) != nullptr;
++  kernel.conversion_intrinsic = true;
++  kernel.fp32_exceptional_block_fallback = true;
++  kernel.lds_bytes = 24592;
++  auto& profile = option.profile;
++  profile.revision = 1;
++  profile.qualification = OperandQualification::kAccepted;
++  profile.preferred = QuantOperand::kBF16;
++  profile.strategy = QuantOperandStrategy::kNative;
++  profile.min_m = profile.max_m = 256;
++  // Sixteen guarded projection cases, two full-size projection checks and
++  // complete-model logits: max projection L2 0.003061827, model 0.004085221.
++  // Rounded upward in ppm. Model repeats are bit-identical with fixed slots.
++  profile.measured_cases = 19;
++  profile.measured_relative_l2_ppm = 4086;
++  profile.absolute_error_pass = true;
++  profile.nonfinite_pass = true;
++  profile.model_quality_pass = true;
++  profile.performance_pass = true;
++  constexpr uint64_t cohort = 0x202609240001ull;
++  auto& cost = option.cost;
++  cost.arch = "gfx1201";
++  cost.wave = 32;
++  cost.bits = 6;
++  cost.group = 64;
++  cost.m = dims.m;
++  cost.n = dims.n;
++  cost.k = dims.k;
++  cost.cohort = cohort;
++  cost.samples = 8;
++  cost.cost_ns = record->vector_ns;
++  cost.accepted_profile_revision = profile.revision;
++  cost.implementation_id = kernel.implementation_id;
++  cost.implementation_revision = kernel.implementation_revision;
++  const std::array options{option};
++  const auto winner = rank_quant_operands(residual_request(s, dims), options,
++                                         cohort, OperandCostClock::kHostEvalRetire);
++  return winner.option == 0 ? select_staged_bf16_residual2(s) : nullptr;
++}
 +} // namespace
 +const graph::KernelPrimitiveBase *
 +wmma_q6_linear_for(const graph::KernelShapes &s) {
@@ -8020,6 +8353,7 @@ index 0000000..a309ce4
 +      s.device->compute_units != 64 ||
 +      (global && std::strcmp(global, "0") == 0))
 +    return nullptr;
++  if (dims.m == 256) return select_m256_residual2(s, dims);
 +  const auto request = residual_request(s, dims);
 +  // Matched driver195 projection experiments: eight post-warm host
 +  // eval+retire intervals per implementation. These are not device timestamps.
@@ -11680,10 +12014,10 @@ index 0000000..4a9bf19
 +LSE_TEST_MAIN()
 diff --git a/tests/test_scheduler_epilogue.cpp b/tests/test_scheduler_epilogue.cpp
 new file mode 100644
-index 0000000..416cdce
+index 0000000..f967841
 --- /dev/null
 +++ b/tests/test_scheduler_epilogue.cpp
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,244 @@
 +#include <algorithm>
 +
 +#include "harness.hpp"
@@ -11865,6 +12199,66 @@ index 0000000..416cdce
 +  LSE_EXPECT_EQ(backend.impl().emitter.failures, 0u);
 +  // The real emitter may rebind the held group; no repartition is permitted.
 +  LSE_EXPECT(backend.impl().emitter.attempts >= attempts);
++}
++
++LSE_TEST(device_view_validation_precedes_partition_and_launch) {
++  backend::BackendAdapter<CaptureDevice> backend;
++  check(backend.init(0));
++  Scheduler scheduler(backend);
++  scheduler.set_dialect(Dialect::kLoom);
++  auto allocation = backend.allocate(8 * sizeof(float),
++      backend::MemoryClass::kDevice, backend::kDefaultStream);
++  LSE_EXPECT(allocation.ok());
++  if (!allocation.ok()) return;
++  auto window = allocation.release();
++  window.offset = 2 * sizeof(float);
++  window.size_bytes = 4 * sizeof(float);
++  auto base = Array::from_buffer(std::move(window), Shape{4}, DType::kF32);
++  auto evaluate = [&](Array& view) {
++    const NodePtr roots[] = {view.node()};
++    return scheduler.eval(roots, false);
++  };
++  auto valid = reshape(base, Shape{2, 2});
++  check(evaluate(valid));
++  LSE_EXPECT_EQ(valid.node()->buffer.handle, base.node()->buffer.handle);
++  LSE_EXPECT_EQ(valid.node()->buffer.offset, 2 * sizeof(float));
++  LSE_EXPECT(valid.node()->buffer.storage == base.node()->buffer.storage);
++  auto wrong_count = reshape(base, Shape{5});
++  LSE_EXPECT(evaluate(wrong_count).code() == StatusCode::kInvalidArgument);
++  LSE_EXPECT(!wrong_count.node()->materialized);
++  auto wrong_dtype = reshape(base, Shape{2, 2});
++  wrong_dtype.node()->dtype = DType::kF16;
++  LSE_EXPECT(evaluate(wrong_dtype).code() == StatusCode::kInvalidArgument);
++  auto missing_input = reshape(base, Shape{2, 2});
++  missing_input.node()->inputs.clear();
++  LSE_EXPECT(evaluate(missing_input).code() == StatusCode::kInvalidArgument);
++  auto null_input = reshape(base, Shape{2, 2});
++  null_input.node()->inputs[0].reset();
++  LSE_EXPECT(evaluate(null_input).code() == StatusCode::kInvalidArgument);
++  auto extra_input = reshape(base, Shape{2, 2});
++  extra_input.node()->inputs.push_back(base.node());
++  LSE_EXPECT(evaluate(extra_input).code() == StatusCode::kInvalidArgument);
++  auto nested = reshape(wrong_count, Shape{1, 5});
++  LSE_EXPECT(evaluate(nested).code() == StatusCode::kInvalidArgument);
++  LSE_EXPECT(!nested.node()->materialized);
++
++  auto retained_view = reshape(base, Shape{2, 2});
++  Program retained;
++  const NodePtr roots[] = {retained_view.node()};
++  check(scheduler.eval(roots, false, &retained));
++  LSE_EXPECT(retained.holds(roots));
++  retained.reset_compute();
++  LSE_EXPECT(!retained_view.node()->materialized);
++  base.node()->buffer.size_bytes = 3 * sizeof(float);
++  LSE_EXPECT(scheduler.eval(roots, false, &retained).code() ==
++             StatusCode::kOutOfRange);
++  LSE_EXPECT(!retained_view.node()->materialized);
++
++  auto short_view = reshape(base, Shape{2, 2});
++  base.node()->buffer.size_bytes = 3 * sizeof(float);
++  LSE_EXPECT(evaluate(short_view).code() == StatusCode::kOutOfRange);
++  LSE_EXPECT(!short_view.node()->materialized);
++  LSE_EXPECT_EQ(backend.impl().launches, 0u);
 +}
 +
 +LSE_TEST_MAIN()
@@ -13099,10 +13493,10 @@ index ea1b7ed..7a8d079 100644
      LSE_EXPECT_OK(o.eval());
      LSE_EXPECT_OK(s_out.eval());
 diff --git a/README.md b/README.md
-index 30ec016..9dac76c 100644
+index 30ec016..edf439a 100644
 --- a/README.md
 +++ b/README.md
-@@ -6,6 +6,67 @@ interleaved with gated GQA, dense or sparse-MoE feed-forward -- running on the
+@@ -6,6 +6,77 @@ interleaved with gated GQA, dense or sparse-MoE feed-forward -- running on the
  are generated at run time from the model's own shapes rather than selected from
  a library.
 
@@ -13141,11 +13535,21 @@ index 30ec016..9dac76c 100644
 +no MTP, flush64 and 64 µs polling. This is a long-context qualification result,
 +not a median across many runs.
 +
-+An earlier, different **64-input/33-output** fixture measured 16.75–16.82 decode
-+tokens/s and about 116 prompt tokens/s with cooperative RMS. That short-workload
-+result has not been remeasured on this final integration. Long-request prompt
-+rates are not yet reported as steady state: growing KV capacity can cause new
-+prefill specializations on the second request.
++**The accepted M256 Q6 prefill path now uses vector LDS loads.** In matched
++R9700 resident-server measurements with cooperative RMS, a **512-input/33-output**
++workload measured median **143.26 prompt tokens/s and 15.84 decode tokens/s**, versus
++88.74 prompt tokens/s and 15.91 decode tokens/s for the prior scalar-LDS control.
++The three measured requests in each run reported zero JIT compilations. The
++combined implementation also completed three identical **1,024-input/1,024-output**
++requests with clean shutdown; the final request measured **139.85 prompt tokens/s
++and 14.23 decode tokens/s**. These are different workloads, and the long-request
++result is one post-warmup measurement rather than a many-run median. Tests cover
++full projection outputs and guards, and model logits meet the stated acceptance
++budget; the matrix operand path is not a claim of bitwise FP32 equivalence.
++
++KV capacity growth can create additional prefill specializations on the second
++request. Warm up the resident workload twice and check the HTTP JIT timing
++counters before reporting steady-state prompt throughput.
 +
 +The repeatability investigation found a shared activation-slot lifetime bug:
 +fused normalization could overwrite an input still read by another wave. The
@@ -13170,7 +13574,7 @@ index 30ec016..9dac76c 100644
  ## Models
 
  The architecture is what a checkpoint is loaded as, not its name, so a family
-@@ -17,7 +78,7 @@ shares one kernel. `--list-models` prints what a build registers.
+@@ -17,7 +88,7 @@ shares one kernel. `--list-models` prints what a build registers.
  | `qwen3.5-moe` | The A3B-style MoE variants of the same families | MLX's SwitchGLU layout, experts stacked as one plane per projection |
  | `lemonseed` | [lemonseed-1.5b-base](https://huggingface.co/lemonade-sdk/lemonseed-1.5b-base) | Adds Mixture-of-Depths |
 
@@ -13179,7 +13583,7 @@ index 30ec016..9dac76c 100644
  multi-token-prediction module is used when the checkpoint has one, which is
  what `--mtp` names and `--no-mtp` declines; the text tower loads on its own
  where a checkpoint also ships a vision tower, which this build does not run.
-@@ -26,8 +87,8 @@ where a checkpoint also ships a vision tower, which this build does not run.
+@@ -26,8 +97,8 @@ where a checkpoint also ships a vision tower, which this build does not run.
 
  Ops are lazy: they record into a DAG and execute only when a host-visible read
  demands a value. On demand the graph is partitioned into fusion groups, each
@@ -13190,7 +13594,7 @@ index 30ec016..9dac76c 100644
  (`hrx_stream_dispatch`) — not through HIP. Every extension seam (backend,
  transport, quantization scheme, layer, sampler) is a CRTP base that owns the
  shared algorithms and calls into the derived type for the primitives.
-@@ -38,6 +99,36 @@ Releases are built by the **Build & Release** workflow in the Actions tab and
+@@ -38,6 +109,36 @@ Releases are built by the **Build & Release** workflow in the Actions tab and
  carry ahead-of-time kernels for the architectures selected for that build,
  which the release notes list.
 
@@ -13227,7 +13631,7 @@ index 30ec016..9dac76c 100644
  ```bash
  # Pick the asset from https://github.com/Geramy/LSE/releases
  curl -LO https://github.com/Geramy/LSE/releases/download/<tag>/lse-<tag>-linux-x86_64.tar.gz
-@@ -83,6 +174,35 @@ prediction module, or point at one:
+@@ -83,6 +184,35 @@ prediction module, or point at one:
  ./lse -m mlx-community/Qwen3.8-27B-4bit --mtp <path-or-repo-id> -n 256 "..."
  ```
 
@@ -13263,7 +13667,7 @@ index 30ec016..9dac76c 100644
  ### `lse` options
 
  | Option | Default | |
-@@ -133,6 +253,8 @@ works by changing the base URL.
+@@ -133,6 +263,8 @@ works by changing the base URL.
  | `--no-mtp` | off | Decode one token per pass, ignoring any MTP module |
  | `--tokenizer REPO` | `Qwen/Qwen3.6-27B` | HF repo for `tokenizer.json` when the model directory has none |
  | `--kv-len N` | from the config | Allocate the KV cache for N tokens |
@@ -13272,7 +13676,7 @@ index 30ec016..9dac76c 100644
 
  Binding beyond localhost gives anyone who can reach the machine use of the
  GPU, so pair `--host 0.0.0.0` with `--api-key`:
-@@ -430,3 +552,14 @@ warnings under the full warning set.
+@@ -430,3 +562,14 @@ warnings under the full warning set.
  Non-commercial use is free for everyone; commercial use requires a separate
  license, with exceptions for the organizations listed in Exhibit A. See
  **[LICENSE.md](LICENSE.md)**.
@@ -13719,3 +14123,124 @@ index 0000000..caa575b
 +}
 +
 +LSE_TEST_MAIN()
+diff --git a/tests/test_q6_m256_profile.cpp b/tests/test_q6_m256_profile.cpp
+new file mode 100644
+index 0000000..f3d9426
+--- /dev/null
++++ b/tests/test_q6_m256_profile.cpp
+@@ -0,0 +1,54 @@
++// Host-only selection contracts for the accepted M256 vector profile.
++#include "harness.hpp"
++#include "lse/backends/hrx/arch_database.hpp"
++#include "lse/backends/hrx/hipc/hip_sources.hpp"
++#include "lse/backends/hrx/loomc/loom_sources.hpp"
++#include "lse/graph/kernel_primitive.hpp"
++#include "lse/kernels/wmma.hpp"
++#include <array>
++#include <cstdlib>
++using namespace lse;
++using namespace lse::graph;
++struct Fixture {
++  backend::DeviceInfo device;
++  backend::AmdDeviceInfo amd;
++  std::array<Shape,4> inputs;
++  std::array<DType,4> dtypes{DType::kF32,DType::kU32,DType::kBF16,DType::kBF16};
++  DialectSourceTable intrinsics;
++  KernelShapes shapes;
++  Fixture(int m,int n,int k,bool loom):intrinsics(loom?backend::loom_sources():backend::hip_sources()) {
++    device.arch="gfx1201";device.compute_units=64;device.wavefront_size=32;
++    device.max_threads_per_workgroup=1024;device.lds_bytes_per_workgroup=65536;
++    backend::apply_arch_defaults(device,amd);device.extension_id=backend::AmdDeviceInfo::kExtensionId;device.extension=&amd;
++    inputs={Shape{m,k},Shape{n,k*6/32},Shape{n,k/64},Shape{n,k/64}};
++    shapes.inputs=inputs;shapes.input_dtypes=dtypes;shapes.output=Shape{m,n};shapes.iattrs={6,64,0,0};shapes.device=&device;shapes.intrinsics=&intrinsics;
++  }
++};
++LSE_TEST(m256_profile_preserves_other_shape_selection) {
++  unsetenv("LSE_WMMA");
++  for(bool loom:{false,true})for(int m:{1,17,64,128,256,512})for(auto [n,k]:{std::pair{17408,5120},std::pair{5120,17408}}){
++    Fixture f(m,n,k,loom);auto p=kernels::wmma_q6_linear_for(f.shapes);
++    LSE_EXPECT_EQ(p!=nullptr,m==64||m==256||m==512);if(!p)continue;
++    LSE_EXPECT_EQ(p->name().find("weight_residual2")!=std::string_view::npos,m==256);
++    LSE_EXPECT_EQ(p->name().find("vector_lds_v4")!=std::string_view::npos,m==256);
++    const auto plan=p->plan(f.shapes);LSE_EXPECT_EQ(plan.lds_bytes,m==256?24592u:16384u);
++  }
++}
++LSE_TEST(m256_profile_rejects_unmeasured_and_ineligible_requests) {
++  for(bool loom:{false,true})for(int reason=0;reason<12;++reason){
++    Fixture f(256,reason==0?19:17408,reason==11?1088:5120,loom);
++    if(reason==1)f.device.arch="gfx1200";
++    if(reason==2)f.device.wavefront_size=64;
++    if(reason==3)f.device.compute_units=32;
++    if(reason==4)f.device.max_threads_per_workgroup=64;
++    if(reason==5)f.device.lds_bytes_per_workgroup=16384;
++    if(reason==6)f.shapes.staged={"caller",5120};
++    if(reason==7)f.shapes.staged_quant.codes="caller";
++    if(reason==8)f.dtypes[0]=DType::kBF16;
++    if(reason==9)f.dtypes[2]=DType::kF32;
++    if(reason==10)f.intrinsics={};
++    LSE_EXPECT(kernels::wmma_q6_linear_for(f.shapes)==nullptr);
++  }
++  setenv("LSE_WMMA","0",1);Fixture f(256,17408,5120,true);LSE_EXPECT(kernels::wmma_q6_linear_for(f.shapes)==nullptr);unsetenv("LSE_WMMA");
++}
++LSE_TEST_MAIN()
+diff --git a/tests/test_tile_vector_load.cpp b/tests/test_tile_vector_load.cpp
+new file mode 100644
+index 0000000..4a44266
+--- /dev/null
++++ b/tests/test_tile_vector_load.cpp
+@@ -0,0 +1,55 @@
++// Host-only contracts for vector LDS loads shared by HIP and Loom emitters.
++#include "lse/backends/hrx/hipc/hip_types.hpp"
++#include "lse/backends/hrx/hipc/hip_sources.hpp"
++#include "lse/backends/hrx/loomc/loom_sources.hpp"
++#include "lse/backends/hrx/loomc/loom_types.hpp"
++#include "lse/backends/hrx/loomc/loom_print.hpp"
++#include "lse/ir/alias.hpp"
++#include "lse/ir/env.hpp"
++#include "lse/ir/lower.hpp"
++#include <cstdio>
++#include <stdexcept>
++#include <fstream>
++namespace ir=lse::ir;
++void need(bool v,const char *s){if(!v)throw std::runtime_error(s);}
++template<class T> void test(const ir::TypeTable& types,bool loom,unsigned bytes,unsigned width){
++ const auto intrinsics=loom?lse::backend::loom_sources():lse::backend::hip_sources();
++ ir::KernelBody body(types,intrinsics,65536);ir::env::Emit e{&body};
++ auto tile=e.lds<T>(64);need(bool(tile),"reserve");
++ // Two nested aligned slices: effective offset is 8 + 8 + 8 = 24 elements.
++ auto view=tile.slice(8,48).slice(8,32);
++ const auto p=view.load(e.u32(8u),bytes);
++ need(p.width()==width,"pack width");
++ e.ret(p[0]);
++ unsigned loads=0;
++ body.ir().walk([&](ir::OpId id){const auto &op=body.ir().op(id);if(op.kind!=ir::OpKind::kLoadVec)return;
++  ir::Access access;need(ir::access_of(body.ir(),id,&access),"alias recognizes load");
++  need(access.space==ir::Space::kWorkgroup,"alias preserves shared space");
++  need(access.buffer==tile.id() && !access.is_write && access.width==width,"alias range");
++  need(access.index.as_constant()==24,"nested slice offset preserved");++loads;
++ });need(loads==1,"exactly one vector load");
++ if(loom){auto print=lse::backend::loom_print(body.ir(),{});need(print.ok(),"Loom lowering");
++  need(print->text.find(width>1?"vector.load":"view.load")!=std::string::npos,"Loom load opcode");
++  if(width==8)need(print->text.find("vector<8xbf16>")!=std::string::npos,"Loom BF16 element type");
++  std::puts(print->text.c_str());
++ }else{auto text=ir::lower(body.ir());need(!text.empty(),"HIP lowering");
++  need(text.find("__shared__")!=std::string::npos,"HIP shared allocation");
++  if(width>1)need(text.find("= *(const ")!=std::string::npos,"HIP typed vector pointer load");
++  if(width==8)need(text.find("ext_vector_type(8)")!=std::string::npos,"HIP vector width");
++  std::puts(text.c_str());
++ }
++}
++int main(){try{
++ for(bool loom:{false,true}){auto types=loom?lse::backend::loom_types():lse::backend::hip_types();
++  test<ir::bf16>(types,loom,16,8);test<ir::bf16>(types,loom,8,4);
++  test<ir::f32>(types,loom,16,4);test<ir::f32>(types,loom,4,1);
++ }
++ // Every lane's eight-element WMMA fragment remains contiguous and 16-byte
++ // aligned after the existing K-major LDS bank rotation. Check all tiles.
++ auto address=[](unsigned r,unsigned k){return r*64+((k/8+r%8)%8)*8+k%8;};
++ for(unsigned r=0;r<64;++r)for(unsigned k=0;k<64;k+=8){
++  auto base=address(r,k);need(base%8==0 && base+8<=4096,"fragment alignment/bounds");
++  for(unsigned j=0;j<8;++j)need(address(r,k+j)==base+j,"fragment contiguity");
++ }
++ std::puts("PASS HIP/Loom BF16/F32 tile vector load, nested slices, shared alias ranges, all fragment alignments");return 0;
++}catch(const std::exception &e){std::fprintf(stderr,"FAIL %s\n",e.what());return 1;}}

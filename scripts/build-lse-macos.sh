@@ -48,9 +48,9 @@ cmake --build "$lse_build" --target lse lse-server --parallel "${LSE_BUILD_JOBS:
 python3 scripts/test-lse-server-cli.py "$lse_build/lse-server"
 # HRX-linked calibration lifecycle coverage uses CPU allocations and simulated
 # kernels only; the CPU-only configuration below cannot define this target.
-cmake --build "$lse_build" --target test_matrix_probe_lifecycle --parallel "${LSE_BUILD_JOBS:-4}"
+cmake --build "$lse_build" --target test_matrix_probe_lifecycle test_q6_m256_profile test_tile_vector_load --parallel "${LSE_BUILD_JOBS:-4}"
 LSE_BACKEND=cpu ctest --test-dir "$lse_build" --output-on-failure \
-  -R '^test_matrix_probe_lifecycle$'
+  -R '^test_(matrix_probe_lifecycle|q6_m256_profile|tile_vector_load)$'
 cmake -S "$lse_copy" -B "$lse_tests" "${lse_common_args[@]}" \
   -DLSE_ENABLE_HRX=OFF -DLSE_BUILD_TESTS=ON
 lse_test_targets=(test_kernel_env test_ir test_dtype test_shape test_quant test_graph test_backend_cpu test_primitive test_trace

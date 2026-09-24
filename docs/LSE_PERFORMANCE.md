@@ -11,9 +11,11 @@ The earlier **HIPC** (`--dialect hip`) throughput is reported at approximately
 RMS reaches **15.91 decode tokens/s** on the 512-input/33-output fixture and
 **14.28 decode tokens/s** on the 1,024-input/1,024-output fixture. Cooperative
 RMS is now the default after a fused-kernel buffer-lifetime fix resolved the
-long-request repeatability failure. The combined vector-prefill candidate passes
+long-request repeatability failure. The combined vector-prefill implementation passes
 the long fixture at **139.85 prompt tokens/s and 14.23 decode tokens/s**, with
-zero new compilations in the measured third request; final integration is pending.
+zero new compilations in the measured third request. It is now the automatic
+choice for the two qualified M256 projection shapes, using the shared HIP/Loom
+operand policy.
 These must not be presented as one backend's performance. The HIPC figure is
 recalled rather than recovered from a benchmark artifact; its exact checkpoint,
 quantization, context, MTP settings and platform need verification before a
@@ -1018,11 +1020,22 @@ All ten responses match exactly across both variants. Prompt throughput gains
 combined candidate also passed three full 1K-input/1K-output requests with
 identical text and clean shutdown. After two warmups the third request measured
 139.851 PP/s and 14.230 TPS, with exactly zero new JIT compilations. These are
-one warmed long-request measurement, not a multi-run median. Final source and
-native-code integration checks remain before promotion.
+one warmed long-request measurement, not a multi-run median. Final integration
+checks passed: all 13 compared native instruction/descriptor sections match the
+qualified implementation, with only the two accepted M256 cache identities
+changing. The other 11 complete code objects remain byte-identical.
 Evidence: `rms-vector-current-pp512-comparison.json` and the
 `qwen-rms-vector-current-{baseline,candidate}-pp512` and
 `qwen-rms-vector-current-1k1k` result directories.
+
+The rebuilt default server also passed three 512-input/129-output requests,
+with text matching the frozen qualified control, clean exit, and zero new
+compilations in the measured third request: 143.685 PP/s and 15.927 TPS.
+Source selection, vector loads, graph/view ownership, RMS and mock lifecycle
+tests passed before this GPU check. Evidence:
+`qwen-vector-production-pp512-tg128/result.json` and
+`build/vector-rms-integration/manifest.json` (server SHA256
+`06c03b0c36fc60192c5e238db1819ad32315a8fc7a1fc91104b82b48d44ea329`).
 
 The next isolated centered-affine Q6 candidate passed 32 guarded GPU cases,
 nine identical repeats each, against the original ordered FP32 reference and
@@ -1033,6 +1046,27 @@ products, with ordered FP32 fallback for exceptional and cancellation-sensitive
 outputs. This is numerical qualification only: full-shape throughput and model
 logits are still required. Evidence: `q6-centered-affine-numeric.log`; frozen
 fixture and source identities are in `build/perf-q6-centered-affine/gpu-manifest.json`.
+
+Full-size centered-affine projection checks subsequently passed all outputs and
+nine identical repeats. With negative centered biases and nonzero dyadic
+activations, M256 up-projection decreased from 5.567 to 4.714 ms and
+down-projection from 5.916 to 4.738 ms (host eval plus retirement, not GPU
+timestamps). Both implementations exactly match the original FP32 reference
+on these inputs. This distribution exercises the matrix path; it does not
+measure the fallback-heavy mixed-sign-bias case or model throughput. Full-model
+logit qualification remains pending. Evidence:
+`q6-centered-affine-{baseline,candidate}-{up256,down256}.log`.
+
+A separate four-column decode candidate shares activation loads across four
+output columns while preserving each output's FP32 operation order. With the
+same frozen cooperative-RMS/vector-prefill inputs, both variants completed five
+512-input/129-output requests (two warmups, three measured, KV1024, no MTP).
+All ten generated texts match exactly, and all measured requests have zero JIT
+compilations. Median decode improved from 15.958 to 16.700 TPS, about 4.65%,
+while prefill remained 143.39 versus 143.38 PP/s. This is a sequential comparison;
+the candidate still needs the long-generation gate before promotion. Evidence:
+`four-column-current-pp512-tg128-comparison.json` and the
+`qwen-four-column-current-{baseline,candidate}-pp512-tg128` result directories.
 
 ### FP32 subnormal descriptor correction
 
