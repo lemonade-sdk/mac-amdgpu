@@ -658,10 +658,10 @@ index 6d62302..a4ee4fa 100644
  target_include_directories(lse_backend_cpu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
  lse_apply_common_flags(lse_backend_cpu)
 diff --git a/src/backends/hrx/CMakeLists.txt b/src/backends/hrx/CMakeLists.txt
-index 2f05ce3..5c93fd5 100644
+index 2f05ce3..cb4b625 100644
 --- a/src/backends/hrx/CMakeLists.txt
 +++ b/src/backends/hrx/CMakeLists.txt
-@@ -23,6 +23,7 @@ add_library(lse_backend_hrx
+@@ -23,10 +23,11 @@ add_library(lse_backend_hrx
    hipc/hip_types.cpp
    kernels/dist_codec.cpp
    kernels/probe.cpp
@@ -669,7 +669,28 @@ index 2f05ce3..5c93fd5 100644
  )
  add_library(lse::backend_hrx ALIAS lse_backend_hrx)
  
-@@ -80,7 +81,11 @@ else()
+-target_link_libraries(lse_backend_hrx PUBLIC lse_core lse_backend_registry lse_graph lse_kernels lse_dist lse_probe lse_trace)
++target_link_libraries(lse_backend_hrx PUBLIC ${CMAKE_DL_LIBS} lse_core lse_backend_registry lse_graph lse_kernels lse_dist lse_probe lse_trace)
+ target_include_directories(lse_backend_hrx SYSTEM PUBLIC ${LSE_HRX_INCLUDE_DIR})
+ target_include_directories(lse_backend_hrx PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+ 
+@@ -59,12 +60,10 @@ if(LSE_HAVE_LOOMC)
+   target_include_directories(lse_backend_hrx SYSTEM PUBLIC ${LSE_LOOMC_INCLUDE_DIR})
+   target_link_libraries(lse_backend_hrx PUBLIC ${LSE_LOOMC_LIBRARY})
+   target_compile_definitions(lse_backend_hrx PUBLIC LOOMC_USING_SHARED_LIBRARY)
+-  # loomc publishes no version query and its .so carries no build-id note, so
+-  # identity() stats the resolved library to notice a rebuild at the same
+-  # version. Both are baked, not searched for, at runtime.
++  # Supplemental package version; runtime identity resolves the loaded image
++  # and hashes its contents once, including loader-selected overrides.
+   target_compile_definitions(lse_backend_hrx PRIVATE
+-    LSE_LOOMC_VERSION="${LSE_LOOMC_VERSION}"
+-    LSE_LOOMC_LIBRARY_PATH="${LSE_LOOMC_LIBRARY}")
++    LSE_LOOMC_VERSION="${LSE_LOOMC_VERSION}")
+ else()
+   target_compile_definitions(lse_backend_hrx PUBLIC LSE_HAVE_LOOMC=0)
+ endif()
+@@ -80,7 +79,11 @@ else()
  endif()
  
  # See the cpu backend: self-registration requires whole-archive linking.
@@ -5108,7 +5129,7 @@ index 9f17d38..35db5ad 100644
  }
  
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index a787603..72630cf 100644
+index a787603..cc028aa 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
 @@ -12,6 +12,56 @@ function(lse_add_test name)
@@ -5273,7 +5294,7 @@ index a787603..72630cf 100644
    lse_add_test(test_primitive lse_graph lse_backends)
  endif()
  
-@@ -86,3 +222,85 @@ if(LSE_ROCM_RUNTIME_DIR)
+@@ -86,3 +222,114 @@ if(LSE_ROCM_RUNTIME_DIR)
    set_tests_properties(${lse_tests} PROPERTIES
      ENVIRONMENT "LD_LIBRARY_PATH=${LSE_ROCM_RUNTIME_DIR}")
  endif()
@@ -5358,6 +5379,35 @@ index a787603..72630cf 100644
 +  target_link_libraries(test_quant_operand_cache PRIVATE lse_backend_hrx lse_graph lse_kernels lse_ir)
 +  lse_apply_common_flags(test_quant_operand_cache)
 +  add_test(NAME test_quant_operand_cache COMMAND test_quant_operand_cache)
++endif()
++
++# Loader overrides must change compiler identity even when CMake linked the
++# default image. Fixtures require no GPU or compiler runtime initialization.
++lse_add_test(test_compiler_identity)
++target_link_libraries(test_compiler_identity PRIVATE ${CMAKE_DL_LIBS})
++if(UNIX)
++  foreach(variant IN ITEMS default override)
++    add_library(lse_compiler_fixture_${variant} SHARED compiler_identity_fixture.cpp)
++    set_target_properties(lse_compiler_fixture_${variant} PROPERTIES
++      OUTPUT_NAME lse_compiler_identity_fixture
++      LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/compiler-${variant}")
++  endforeach()
++  target_compile_definitions(lse_compiler_fixture_override PRIVATE LSE_COMPILER_FIXTURE_VALUE=2)
++  add_executable(test_compiler_override test_compiler_override.cpp)
++  target_link_libraries(test_compiler_override PRIVATE lse_core lse_compiler_fixture_default ${CMAKE_DL_LIBS})
++  lse_apply_common_flags(test_compiler_override)
++  add_dependencies(test_compiler_override lse_compiler_fixture_override)
++  if(APPLE)
++    set(_lse_loader_path DYLD_LIBRARY_PATH)
++  else()
++    set(_lse_loader_path LD_LIBRARY_PATH)
++  endif()
++  add_test(NAME compiler_identity_default COMMAND ${CMAKE_COMMAND} -E env
++    "${_lse_loader_path}=$<TARGET_FILE_DIR:lse_compiler_fixture_default>"
++    $<TARGET_FILE:test_compiler_override> 1 $<TARGET_FILE:lse_compiler_fixture_default>)
++  add_test(NAME compiler_identity_override COMMAND ${CMAKE_COMMAND} -E env
++    "${_lse_loader_path}=$<TARGET_FILE_DIR:lse_compiler_fixture_override>"
++    $<TARGET_FILE:test_compiler_override> 2 $<TARGET_FILE:lse_compiler_fixture_override>)
 +endif()
 diff --git a/tests/test_ir.cpp b/tests/test_ir.cpp
 index 56fefa9..1a578b0 100644
@@ -12029,3 +12079,350 @@ index 0000000..622a821
 +      "\"stop_tokens_excluded\":true}\n");
 +}
 +LSE_TEST_MAIN()
+diff --git a/include/lse/backends/hrx/compiler_image_identity.hpp b/include/lse/backends/hrx/compiler_image_identity.hpp
+new file mode 100644
+index 0000000..978fbbc
+--- /dev/null
++++ b/include/lse/backends/hrx/compiler_image_identity.hpp
+@@ -0,0 +1,177 @@
++// Cache identity for the compiler image selected by the dynamic loader.
++#pragma once
++
++#include "lse/core/hash.hpp"
++#include <array>
++#include <cerrno>
++#include <chrono>
++#include <cstddef>
++#include <cstdint>
++#include <dlfcn.h>
++#include <fcntl.h>
++#include <filesystem>
++#include <optional>
++#include <string>
++#include <sys/stat.h>
++#include <unistd.h>
++#if defined(__APPLE__)
++#include <mach-o/loader.h>
++#endif
++
++namespace lse::backend::detail {
++inline std::string hex_identity(std::uint64_t value) {
++  constexpr char digits[] = "0123456789abcdef";
++  std::string text(16, '0');
++  for (std::size_t i = 0; i < 16; ++i) {
++    text[15 - i] = digits[value & 15];
++    value >>= 4;
++  }
++  return text;
++}
++
++inline auto file_mtime(const struct stat &st) {
++#if defined(__APPLE__)
++  return st.st_mtimespec;
++#else
++  return st.st_mtim;
++#endif
++}
++inline auto file_ctime(const struct stat &st) {
++#if defined(__APPLE__)
++  return st.st_ctimespec;
++#else
++  return st.st_ctim;
++#endif
++}
++inline bool same_compiler_file(const struct stat &a, const struct stat &b) {
++  const auto am = file_mtime(a), bm = file_mtime(b), ac = file_ctime(a),
++             bc = file_ctime(b);
++  return a.st_dev == b.st_dev && a.st_ino == b.st_ino &&
++         a.st_size == b.st_size && am.tv_sec == bm.tv_sec &&
++         am.tv_nsec == bm.tv_nsec && ac.tv_sec == bc.tv_sec &&
++         ac.tv_nsec == bc.tv_nsec;
++}
++
++// Content covers an equal-size rebuild with its original timestamp restored.
++// The descriptor and before/after stat checks reject concurrent replacement or
++// mutation during the read. Callers cache this result, never hash per kernel.
++inline std::optional<std::string> compiler_file_identity(const char *path) {
++  if (!path || !*path)
++    return std::nullopt;
++  const int fd = ::open(path, O_RDONLY | O_CLOEXEC);
++  if (fd < 0)
++    return std::nullopt;
++  struct Close {
++    int fd;
++    ~Close() { ::close(fd); }
++  } close{fd};
++  struct stat before{}, after{};
++  if (::fstat(fd, &before) != 0 || !S_ISREG(before.st_mode) ||
++      before.st_size <= 0)
++    return std::nullopt;
++  std::array<char, 64 * 1024> bytes{};
++  std::uint64_t digest = kHashSeed, total = 0;
++  while (total < static_cast<std::uint64_t>(before.st_size)) {
++    const auto remaining = static_cast<std::uint64_t>(before.st_size) - total;
++    const auto length = remaining < bytes.size()
++                            ? static_cast<std::size_t>(remaining)
++                            : bytes.size();
++    const auto n = ::read(fd, bytes.data(), length);
++    if (n < 0) {
++      if (errno == EINTR)
++        continue;
++      return std::nullopt;
++    }
++    if (n == 0)
++      break;
++    digest = hash_bytes(
++        std::string_view(bytes.data(), static_cast<std::size_t>(n)), digest);
++    total += static_cast<std::uint64_t>(n);
++  }
++  if (::fstat(fd, &after) != 0 || !same_compiler_file(before, after) ||
++      total != static_cast<std::uint64_t>(before.st_size))
++    return std::nullopt;
++  std::error_code ec;
++  const auto resolved = std::filesystem::canonical(path, ec);
++  if (ec)
++    return std::nullopt;
++  struct stat named{};
++  if (::stat(resolved.c_str(), &named) != 0 ||
++      !same_compiler_file(after, named))
++    return std::nullopt;
++  const auto modified = file_mtime(after);
++  return "file=" + resolved.string() + " bytes=" + std::to_string(total) +
++         " content=" + hex_identity(digest) +
++         " mtime=" + std::to_string(modified.tv_sec) + ":" +
++         std::to_string(modified.tv_nsec);
++}
++
++// Also identify the resident Mach-O image, so replacing the file after dyld
++// mapped it cannot label old code solely with the replacement's file digest.
++inline std::string resident_compiler_identity(const void *base) {
++#if defined(__APPLE__)
++  if (!base)
++    return {};
++  const auto *header = static_cast<const mach_header_64 *>(base);
++  if (header->magic != MH_MAGIC_64 || header->sizeofcmds > 16 * 1024 * 1024 ||
++      header->ncmds > header->sizeofcmds / sizeof(load_command))
++    return {};
++  const auto *current = reinterpret_cast<const std::byte *>(header + 1);
++  const auto *end = current + header->sizeofcmds;
++  for (std::uint32_t i = 0; i < header->ncmds; ++i) {
++    if (static_cast<std::size_t>(end - current) < sizeof(load_command))
++      return {};
++    const auto *cmd = reinterpret_cast<const load_command *>(current);
++    if (cmd->cmdsize < sizeof(load_command) ||
++        cmd->cmdsize > static_cast<std::size_t>(end - current))
++      return {};
++    if (cmd->cmd == LC_UUID) {
++      if (cmd->cmdsize < sizeof(uuid_command))
++        return {};
++      const auto *uuid = reinterpret_cast<const uuid_command *>(cmd);
++      constexpr char digits[] = "0123456789abcdef";
++      std::string text = "resident_uuid=";
++      for (auto byte : uuid->uuid) {
++        text += digits[byte >> 4];
++        text += digits[byte & 15];
++      }
++      return text;
++    }
++    current += cmd->cmdsize;
++  }
++#else
++  (void)base;
++#endif
++  return {};
++}
++
++inline const std::string &compiler_process_nonce() {
++  static const std::string value =
++      "process=" + std::to_string(::getpid()) + ":" +
++      std::to_string(std::chrono::high_resolution_clock::now()
++                         .time_since_epoch()
++                         .count()) +
++      ":" +
++      hex_identity(reinterpret_cast<std::uintptr_t>(&compiler_process_nonce));
++  return value;
++}
++
++// Use a function pointer from the actual call site, not a configure-time path
++// or a fresh dlopen. Unknown identity prevents cross-process disk-cache reuse.
++inline std::string compiler_image_identity(const void *symbol) {
++  Dl_info image{};
++  if (!symbol || ::dladdr(symbol, &image) == 0 || !image.dli_fname ||
++      !image.dli_fbase)
++    return "image=unresolved " + compiler_process_nonce();
++  const auto file = compiler_file_identity(image.dli_fname);
++  const auto resident = resident_compiler_identity(image.dli_fbase);
++  if (!file)
++    return "image=unreadable " + resident + " " + compiler_process_nonce();
++#if defined(__APPLE__)
++  // A nonstandard/no-UUID image has no independent resident-file correlation.
++  if (resident.empty())
++    return *file + " resident=unknown " + compiler_process_nonce();
++#endif
++  return *file + (resident.empty() ? "" : " " + resident);
++}
++} // namespace lse::backend::detail
+diff --git a/include/lse/backends/hrx/loomc/loomc_compiler.hpp b/include/lse/backends/hrx/loomc/loomc_compiler.hpp
+index df1b591..ffe67d4 100644
+--- a/include/lse/backends/hrx/loomc/loomc_compiler.hpp
++++ b/include/lse/backends/hrx/loomc/loomc_compiler.hpp
+@@ -39,7 +39,7 @@ class LoomcCompiler final : public graph::IKernelCompiler {
+ 
+   [[nodiscard]] bool available() const override;
+ 
+-  // The loomc install this was linked against plus the exact option set every
++  // The actual loaded loomc image plus the exact option set every
+   // invocation runs with.
+   [[nodiscard]] std::string identity() const override;
+ 
+diff --git a/src/backends/hrx/loomc/loomc_compiler.cpp b/src/backends/hrx/loomc/loomc_compiler.cpp
+index 4eac350..8c51510 100644
+--- a/src/backends/hrx/loomc/loomc_compiler.cpp
++++ b/src/backends/hrx/loomc/loomc_compiler.cpp
+@@ -8,7 +8,7 @@
+ #include <utility>
+ 
+ #if LSE_HAVE_LOOMC
+-#include <sys/stat.h>
++#include "lse/backends/hrx/compiler_image_identity.hpp"
+ 
+ #include "loomc/loomc.h"
+ #include "loomc/target/amdgpu.h"
+@@ -23,9 +23,6 @@ namespace {
+ #ifndef LSE_LOOMC_VERSION
+ #define LSE_LOOMC_VERSION "unknown"
+ #endif
+-#ifndef LSE_LOOMC_LIBRARY_PATH
+-#define LSE_LOOMC_LIBRARY_PATH ""
+-#endif
+ 
+ // Every knob an invocation runs with, in one place, so identity() reads the
+ // same values the calls do and a flag edit reaches the JIT cache key without
+@@ -67,20 +64,12 @@ const char* control_flow_name(loomc_target_control_flow_lowering_t cf) {
+                                                       : "structured_low";
+ }
+ 
+-// loomc publishes no version query and its shared object carries no build-id
+-// note, so the install's own file stamp is the only thing that moves when loomc
+-// is rebuilt at the same package version. It over-invalidates (a reinstall of
+-// identical bytes bumps mtime and costs one ~1 ms recompile per kernel) and
+-// never under-invalidates, which is the direction a cache key must err in.
++// Resolve the function this compiler actually calls. DYLD_LIBRARY_PATH and
++// loader interposition can select a different image than CMake discovered.
++// Content hashing is deliberately paid once per process, outside compilation.
+ const std::string& library_stamp() {
+-  static const std::string stamp = [] {
+-    const std::string path = LSE_LOOMC_LIBRARY_PATH;
+-    if (path.empty()) return std::string("lib=unstamped");
+-    struct ::stat st{};
+-    if (::stat(path.c_str(), &st) != 0) return "lib=" + path + " size=? mtime=?";
+-    return "lib=" + path + " size=" + std::to_string(st.st_size) +
+-           " mtime=" + std::to_string(st.st_mtime);
+-  }();
++  static const std::string stamp = detail::compiler_image_identity(
++      reinterpret_cast<const void*>(&loomc_compile_module));
+   return stamp;
+ }
+ 
+@@ -365,11 +354,8 @@ bool LoomcCompiler::available() const {
+ 
+ std::string LoomcCompiler::identity() const {
+ #if LSE_HAVE_LOOMC
+-  // loomc has no version entry point, so the package version comes from the
+-  // install that was discovered at configure time and the file stamp covers a
+-  // rebuild that leaves that version alone. Neither is a constant anyone here
+-  // maintains, which is the point: a hand-written revision number is one
+-  // forgotten increment away from serving an object a different compiler built.
++  // Package metadata is supplementary; the resident image and its contents
++  // identify the compiler actually selected by the dynamic loader.
+   std::string id = "loomc." LSE_LOOMC_VERSION " ";
+   id += library_stamp();
+   id += " pipeline=";
+diff --git a/tests/compiler_identity_fixture.cpp b/tests/compiler_identity_fixture.cpp
+new file mode 100644
+index 0000000..9225251
+--- /dev/null
++++ b/tests/compiler_identity_fixture.cpp
+@@ -0,0 +1,7 @@
++#ifndef LSE_COMPILER_FIXTURE_VALUE
++#define LSE_COMPILER_FIXTURE_VALUE 1
++#endif
++extern "C" __attribute__((visibility("default"))) int
++lse_compiler_identity_anchor() {
++  return LSE_COMPILER_FIXTURE_VALUE;
++}
+diff --git a/tests/test_compiler_identity.cpp b/tests/test_compiler_identity.cpp
+new file mode 100644
+index 0000000..ffd0d40
+--- /dev/null
++++ b/tests/test_compiler_identity.cpp
+@@ -0,0 +1,39 @@
++#include "harness.hpp"
++#include "lse/backends/hrx/compiler_image_identity.hpp"
++#include <fcntl.h>
++#include <fstream>
++namespace d = lse::backend::detail;
++LSE_TEST(compiler_identity_hashes_equal_size_equal_mtime_rebuilds) {
++  const auto path = std::filesystem::temp_directory_path() /
++                    ("lse-compiler-identity-" + std::to_string(getpid()));
++  {
++    std::ofstream out(path);
++    out << "compiler version A";
++  }
++  const timespec times[2] = {{123456789, 123456789}, {123456789, 123456789}};
++  LSE_EXPECT(utimensat(AT_FDCWD, path.c_str(), times, 0) == 0);
++  const auto first = d::compiler_file_identity(path.c_str());
++  LSE_EXPECT(first.has_value());
++  LSE_EXPECT(first == d::compiler_file_identity(path.c_str()));
++  {
++    std::ofstream out(path);
++    out << "compiler version B";
++  }
++  LSE_EXPECT(utimensat(AT_FDCWD, path.c_str(), times, 0) == 0);
++  const auto second = d::compiler_file_identity(path.c_str());
++  LSE_EXPECT(second.has_value());
++  LSE_EXPECT(first != second);
++  const timespec nanos[2] = {{123456789, 123456790}, {123456789, 123456790}};
++  LSE_EXPECT(utimensat(AT_FDCWD, path.c_str(), nanos, 0) == 0);
++  LSE_EXPECT(second != d::compiler_file_identity(path.c_str()));
++  std::filesystem::remove(path);
++  LSE_EXPECT(!d::compiler_file_identity(path.c_str()));
++}
++LSE_TEST(unknown_compiler_identity_is_process_scoped_and_stable) {
++  const auto first = d::compiler_image_identity(nullptr);
++  LSE_EXPECT(first.find("process=") != std::string::npos);
++  LSE_EXPECT(first == d::compiler_image_identity(nullptr));
++  LSE_EXPECT(!d::compiler_file_identity(nullptr));
++  LSE_EXPECT(!d::compiler_file_identity("/"));
++}
++int main() { return lse::test::run_all(); }
+diff --git a/tests/test_compiler_override.cpp b/tests/test_compiler_override.cpp
+new file mode 100644
+index 0000000..f558332
+--- /dev/null
++++ b/tests/test_compiler_override.cpp
+@@ -0,0 +1,24 @@
++#include "lse/backends/hrx/compiler_image_identity.hpp"
++#include <cstdlib>
++#include <iostream>
++extern "C" int lse_compiler_identity_anchor();
++int main(int argc, char **argv) {
++  if (argc != 3)
++    return 2;
++  if (lse_compiler_identity_anchor() != std::atoi(argv[1]))
++    return 3;
++  const auto id = lse::backend::detail::compiler_image_identity(
++      reinterpret_cast<const void *>(&lse_compiler_identity_anchor));
++  std::error_code ec;
++  const auto expected = std::filesystem::canonical(argv[2], ec);
++  if (ec || id.find("file=" + expected.string() + " bytes=") != 0)
++    return 4;
++  if (id.find("process=") != std::string::npos)
++    return 5;
++#if defined(__APPLE__)
++  if (id.find("resident_uuid=") == std::string::npos)
++    return 6;
++#endif
++  std::cout << id << '\n';
++  return 0;
++}

@@ -103,7 +103,7 @@ def main():
          'LSE_LOGIT_DIAGNOSTIC_DIR', 'HRX_MAC_SAME_QUEUE_PREFIX',
          'HRX_PROFILE_FILE', 'HRX_PROFILE_MODE', 'LSE_HIDDEN_DIAGNOSTIC_LAST',
          'LSE_HIDDEN_DIAGNOSTIC_DIR', 'LSE_PREFILL_DIAGNOSTIC_DIR',
-         'LSE_LAYER_DIAGNOSTIC_DIR') if key in env}
+         'LSE_LAYER_DIAGNOSTIC_DIR', 'LSE_SUBOP_DIAGNOSTIC_DIR') if key in env}
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def request(path, payload=None, timeout=args.request_timeout):
