@@ -64,8 +64,16 @@ and validation commands.
 
 ## Measured Qwen performance
 
+**Backend performance differs substantially:** HIPC (`--dialect hip`) has a
+reported result of approximately **34 decode tokens/s**, while the measured
+macOS Loom (`--dialect loom`) result below is **12.61 decode tokens/s**.
+The HIPC figure is a recalled earlier result; its benchmark log and exact
+model, quantization, context and MTP settings still need to be recovered for a
+matched comparison. It is not a macOS Loom result. Closing this decode
+performance gap is a current optimization priority.
+
 The local Qwen3.8-27B-MLX-6bit checkpoint runs entirely through the GPU kernel
-path, with MTP disabled and KV capacity 128. These resident-server results use
+path using **Loom**, with MTP disabled and KV capacity 128. These resident-server results use
 one warmup followed by three measured requests, each generating 33 tokens
 (32 subsequent decode steps), with explicit flush64/poll64 settings:
 

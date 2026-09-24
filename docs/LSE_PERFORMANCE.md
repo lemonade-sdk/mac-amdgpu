@@ -6,6 +6,15 @@ llama.cpp has not been demonstrated.** The current measurements establish a
 working baseline and identify work to profile; they are not a matched benchmark
 against another engine.
 
+The earlier **HIPC** (`--dialect hip`) throughput is reported at approximately
+**34 decode tokens/s**. The current qualified **macOS Loom** (`--dialect loom`)
+64-input/33-output resident-server median is **12.61 decode tokens/s**.
+These must not be presented as one backend's performance. The HIPC figure is
+recalled rather than recovered from a benchmark artifact; its exact checkpoint,
+quantization, context, MTP settings and platform need verification before a
+matched speedup ratio can be claimed. Improving Loom decode throughput remains
+a priority independently of that comparison.
+
 ## Recorded local baseline
 
 The driver 195 32-token run is preserved in:
