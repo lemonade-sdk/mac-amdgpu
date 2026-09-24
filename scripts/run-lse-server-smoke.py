@@ -86,7 +86,9 @@ def main():
          'LSE_FLUSH_INTERVAL', 'LSE_AUTO_BATCH', 'LSE_AUTO_BATCH_TRACE',
          'LSE_HRX_INT8', 'LSE_WMMA_MIN_M', 'LSE_Q6_WMMA',
          'LSE_SHARED_SCORE_SDPA', 'LSE_PROFILE_DISPATCH', 'MAC_HSA_SIGNAL_BACKEND',
-         'MAC_HSA_BLOCKED_POLL_US') if key in env}
+         'MAC_HSA_BLOCKED_POLL_US', 'LSE_KV_PREALLOC', 'LSE_NO_REPLAY',
+         'LSE_CACHE_DIR', 'LSE_LOGIT_DIAGNOSTIC_INDEX',
+         'LSE_LOGIT_DIAGNOSTIC_DIR') if key in env}
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def request(path, payload=None, timeout=args.request_timeout):
