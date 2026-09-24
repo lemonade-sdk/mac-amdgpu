@@ -65,6 +65,28 @@ Hardware GPU/UMC activity, when available, comes from the SMU metrics table.
 UMC activity measures memory-controller work; it is not allocated VRAM or a
 measured bandwidth value.
 
+The **SMU REPORTED GFX** history uses a fixed **0–100%** scale. Earlier versions
+scaled this percentage to the recent peak, making low activity appear full.
+Unavailable activity now leaves this same chart unavailable; it is never replaced
+by a submissions-rate chart. Driver-observed jobs/packets per second remain in
+the separate WORK panel. JSON retains `gfx_activity_percent` and declares its
+`gfx_activity_source` and `gfx_activity_scope`.
+
+The percentage is **not calibrated productive GPU utilization**. In the
+controlled driver 195 owned-idle diagnostic, all 11 observations over 10 seconds
+had GRBM_STATUS 0x382c (GUI/ANY/CP busy clear), CP_STAT 0, zero queues and no
+pending/new work; ten distinct fresh firmware sequences still reported97%
+initially and 100% afterward. No resident signal mailbox was started. Stop
+completed and stage0 was verified. See
+`build/tests/driver 195-hardware/initialized-idle-diagnostic.jsonl`.
+
+The IF 0x33 profile therefore displays **“idle can report 100%; workload utilization
+unverified”** and JSON adds `gfx_activity_accuracy`. Raw firmware percentages
+remain visible; the monitor does not invent zero or subtract a housekeeping
+estimate. Resident service work can contribute in other sessions, but it does
+not explain this controlled idle capture. The omitted Linux GFX clock-gating
+initialization path is under investigation; it is not a confirmed cause.
+
 The memory panel separates CPU-visible and GPU-only allocator capacity, used,
 free and largest contiguous free span. Used bytes include rounded client and
 driver allocations, including retained failed-work storage. “Outside pools”

@@ -114,7 +114,12 @@ if(BUILD_TESTING)
   target_compile_options(hsa-signal-test PRIVATE -Wall -Wextra -Werror -UNDEBUG
     -fsanitize=address,undefined -fno-sanitize-recover=all)
   target_link_options(hsa-signal-test PRIVATE -fsanitize=address,undefined)
-  add_test(NAME hsa-cpu-signals COMMAND hsa-signal-test)
+  add_test(NAME hsa-cpu-signals COMMAND hsa-signal-test 1000000)
+  set_tests_properties(hsa-cpu-signals PROPERTIES
+    ENVIRONMENT "MAC_HSA_BLOCKED_POLL_US=1000")
+  add_test(NAME hsa-cpu-signals-short-poll COMMAND hsa-signal-test 64000)
+  set_tests_properties(hsa-cpu-signals-short-poll PROPERTIES
+    ENVIRONMENT "MAC_HSA_BLOCKED_POLL_US=64")
   add_executable(hsa-memory-queue-test ../tests/hsa_memory_queue_test.cpp ${HSA_RUNTIME_SOURCES})
   target_include_directories(hsa-memory-queue-test PRIVATE include src third_party/hsa/include)
   target_compile_options(hsa-memory-queue-test PRIVATE -Wall -Wextra -Werror -UNDEBUG

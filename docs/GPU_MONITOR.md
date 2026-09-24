@@ -11,7 +11,7 @@ interfaces, sysfs and process fdinfo. The new backend enumerates every
 
 Build 193 adds software counters and graphs, current clocks and AC DPM ranges,
 and a bounded one-second sensor sampler for an already-initialized GPU. The first live collection and concurrent-workload check passed; independent
-sensor accuracy and an initialized idle/load comparison remain pending. Earlier build 176 rejected the
+sensor accuracy and the cause of the initialized-idle activity reading remain unresolved. Earlier build 176 rejected the
 installed **104.76.0 / interface 0x33** before sending a metrics command. Build
 193 supports an explicitly labeled Linux-compatible profile for that exact
 release; it does not claim to establish a new 0x33 firmware schema.
@@ -45,7 +45,7 @@ firmware reservation and may be less than the board's marketed capacity.
 
 ## Build 193 first hardware capture
 
-`build/tests/driver193-hardware/monitor-mailbox.jsonl` records 163 dashboard
+`build/tests/driver 193-hardware/monitor-mailbox.jsonl` records 163 dashboard
 samples, 156 fresh cached sensor reads and **16 distinct firmware captures**.
 Capture intervals were 1.025–1.058 seconds (median 1.041), independently of the
 100 ms UI refresh. Firmware version was 0x00684c00 and profile 0x33 throughout
@@ -91,6 +91,184 @@ readings rose. This **does not establish good idle/load correlation**. The cause
 remains unresolved: initialization could leave an engine busy, or the compatible
 profile's activity/power semantics could differ. Do not claim independently
 validated activity percentage or useful-compute utilization from these readings.
+
+### Activity display and resident service interpretation
+
+The monitor now renders **SMU GFX ACTIVE** against an absolute 0–100% scale.
+Previously the chart automatically used the recent maximum as its ceiling, so
+a 5% sample could occupy the full chart. Its replacement of missing GPU activity
+with submissions/s has also been removed: hardware gaps stay unavailable and
+software submission rates appear separately. A stale sample cannot retain the
+last numeric activity headline. Renderer tests cover low-percent graph height,
+fresh compatible-profile readings, stale values and absence of the fallback.
+
+The field itself still follows Linux
+`smu_v14_0_2_get_smu_metrics_data(METRICS_AVERAGE_GFXACTIVITY)`: the unscaled
+`uint16_t AverageGfxActivity` at offset 124 in the pinned table. Its units are
+percent; no evidence supports dividing it by 100 or substituting a moving-average
+field. Successful new table transfers and per-sample timestamps distinguish
+these readings from simply leaving a stale value on screen.
+
+`hsa/src/signal_mailbox_service.cl` runs one 32-thread wave with lane 0 executing
+a tight system-acquire polling loop; it currently has no shader sleep/backoff.
+`GPUSignalService` retires that kernel after 50 ms with no new CPU request, but
+repeated signal updates extend the lease. Such a resident kernel can contribute
+to engine-active time without occupying all CUs or doing inference work. The
+older idle capture did not log service lifetime, so that mechanism alone does
+not prove why it reported 100% activity or approximately 300 W. Correlate the
+`MAC_HSA_SIGNAL_TRACE=1` ready/retired events with initialized-idle/load/idle
+captures before assigning a cause. Keep the raw SMU value and its scope visible;
+do not manufacture a corrected percentage from software queue counters.
+
+The completed driver 195 bandwidth correlation is in
+`build/hrx-bandwidth/run.log` and `build/hrx-bandwidth/monitor.jsonl`.
+Phase markers include `CLOCK_UPTIME_RAW` timestamps, matching the sensor clock;
+`std::chrono::steady_clock` timestamps are a different domain on this system.
+Deduplicating by firmware sample generation/sequence gives:
+
+| Phase | Distinct samples | GFX activity | UMC activity | Socket power |
+| --- | ---: | ---: | ---: | ---: |
+| Initialized idle before work, 3 seconds | 3 | 100% | 0% | 296–297 W |
+| Verified H2D/D2H/D2D copy sweep, 1.037 seconds | 1 | 100% | 1% | 300 W |
+| Initialized idle after work, 3 seconds | 3 | 100% | 0% | 300 W |
+
+All seven phase samples were fresh transfers with new sequence numbers. A
+preceding initialization-transition sample reported 97% / 160 W. The copy sweep
+passed all payload/source/guard checks for 4 KiB through 16 MiB buffers and exited
+zero; the final monitor observation returned stage 0 with no participants or
+active queues. The brief sweep provides only one load sample, not a calibrated
+activity curve.
+
+The mailbox ready/first-request trace appeared **only after the post-load idle
+interval, during shutdown**; its two requests retired with confirmed completion.
+Consequently the resident mailbox does **not** explain the 100% initialized-idle
+reading in this capture. Possible initialization/engine-idle behavior versus
+firmware-field semantics remains unresolved. The display-scale correction is
+verified, but a truthful SMU percentage cannot yet be interpreted as useful
+workload utilization on this initialization path.
+
+The subsequent standalone owner test provides a stronger comparison:
+`build/tests/driver 195-hardware/initialized-idle-diagnostic.jsonl` records
+11 observations across 10 seconds and 10 distinct firmware sequences (one
+sequence was reused within the shared one-second cache). Every observation
+had GRBM_STATUS `0x382c`, with GUI_ACTIVE/ANY_ACTIVE/CP_BUSY clear, and CP_STAT
+zero. SDMA RPTR and WPTR both remained 16. There was one owner, no queues or
+pending work, and all cumulative submitted/completed/packet counters stayed
+unchanged. This tool has no signal service and submits no workload after
+normal initialization. Firmware GFX activity was 97% for the initial sequence
+and 100% for every later sequence; average GFX reached 3276 MHz and ended 3219 MHz,
+while reported socket power rose from 144 W to 297–300 W. Temperatures changed across the
+interval. All snapshots were within their freshness bounds; no scalar percentage
+correction follows from these observations. Stop returned status 0, phase 6 and
+verified stage 0.
+
+This directly shows that the reported percentage cannot independently represent
+productive workload utilization on the tested initialization path. The chart
+now says **SMU REPORTED GFX**, keeps its fixed 0–100 scale/raw values, and shows a
+profile-specific idle 100% warning. JSON adds `gfx_activity_accuracy` while
+retaining the numeric field. The monitor does not convert an instantaneous
+idle bit or software counter into a substitute hardware percentage.
+
+### Source audit and next idle diagnostic
+
+Linux explicitly maps both SMU 14.0.2 and **14.0.3** to
+`smu_v14_0_2_set_ppt_funcs` (`amdgpu_smu.c:799–801`). This is not an accidental
+use of a nearby chip's decoder. That implementation allocates table 5 as
+`sizeof(SmuMetricsExternal_t)` and returns `AverageGfxActivity` directly
+(`smu_v14_0_2_ppt.c:386,687–689`), with no division by 100 or conversion from
+fixed point. The local header puts that unsigned 16-bit field at byte 124,
+UMC activity at 126, `MovingAverageGfxActivity` at 90, and `MetricsCounter` at
+104. The 412-byte firmware table has no independent version header. These
+facts support the current Linux-compatible decoder; they do not establish
+that its reported engine activity tracks useful work. The pinned IF 0x33 /
+firmware 104.76.0 profile remains explicit.
+
+The collection path uses the reserved VRAM address programmed for the shared
+SMU driver table, sends `TransferTableSmu2Dram(5)`, waits for its successful
+mailbox response, and copies 412 bytes through BAR0 accessors before another
+serialized firmware request can use the slot. The current public snapshots
+retain decoded values, not the raw table. In the bandwidth capture the raw
+`MetricsCounter` values were 354, 995, 1005, 1001, 993, 998, 998, 998. This field
+is not treated as a monotonic sequence or as utilization; driver sequence and
+collection timestamps identify transfers. The changed UMC/power/temperature
+fields also rule out a wholly frozen host snapshot, without proving every
+firmware field's semantics.
+
+A separate initialization omission is concrete. Our `rlc_v12_0.cpp:361` defers
+clock gating to a later `set_clockgating_state`, but the port has no such
+implementation/call. Linux `soc24.c:398–405` enables the GFX CGCG, CGLS, MGCG,
+3D CGCG/CGLS, repeater FGCG, SRAM FGCG and performance-clock capabilities for
+GFX 12.0.1. `gfx_v12_0_update_gfx_clock_gating` then programs them inside RLC
+safe mode (`gfx_v12_0.c:4072–4304`). Missing this step is a candidate cause of
+excess idle activity/power, **not a demonstrated cause** of this capture.
+
+There is a useful external caution: AMD initially suspected disabled clock
+gating for a separate Navi 33 / SMU 13.0.7 idle-100% report, but subsequently
+withdrew that hypothesis after examining gating flags and said firmware's
+activity calculation needed investigation. That is different hardware and
+firmware and does not diagnose this device. See the
+[AMD developer's follow-up](https://mail-archive.com/amd-gfx@lists.freedesktop.org/msg151021.html).
+
+For the next bounded comparison, retain the existing owner and record cached
+47/61/62 snapshots alongside GRBM/CP state before, during and after known work.
+The owner's existing Live Status selector 30 supplies GRBM_STATUS, CP_STAT,
+RLC boot status and SDMA pointers/status. It also queries SMU running features.
+**It is not a general observer endpoint:** its admission may claim ownership
+or open PCI. Do not invoke it from a new supposedly passive monitor. Use the
+already-owning host, or first add a separately reviewed strict observer.
+No current RPC exposes arbitrary registers or the raw metrics table.
+
+A future strict diagnostic should copy the already collected raw table with
+its generation/sequence/profile, and read a fixed whitelist of GRBM_STATUS,
+GRBM_STATUS2, CP_STAT, CP_BUSY_STAT, CP_STALLED_STAT1/2/3, RLC_CNTL,
+RLC_SAFE_MODE, RLC_CGTT_MGCG_OVERRIDE, both RLC_CGCG_CGLS_CTRL registers,
+CP_RB_WPTR_POLL_CNTL and the existing queue pointers. It must run on the same
+lifecycle queue, reject non-ready/stopping/detached devices before MMIO, never
+open/claim PCI or send firmware commands, and avoid indexed registers needing
+selector writes. These register samples are instantaneous, not hardware
+utilization percentages. Correlate repeated samples rather than treating one
+idle bit as an interval measurement. No such RPC or clock-gating writes are
+included in the monitor display correction.
+
+### Standalone owned idle capture
+
+`scripts/build-hsa-idle-diagnostic.sh` builds a separate diagnostic and runs
+only offline validation. It is **not a passive observer**: the explicit command
+below acquires a stopped GPU, uses the normal HSA transport initializer, holds
+that owner throughout ten seconds of measurements, then explicitly stops it.
+It does not load the HSA signal runtime, create queues/shared buffers, dispatch
+compute or start the resident mailbox service. Normal driver initialization
+still performs its existing bringup checks.
+
+```sh
+scripts/build-hsa-idle-diagnostic.sh
+MAC_AMDGPU_FIRMWARE_DIR="$PWD/firmware"   build/hsa-idle-diagnostic/mac-hsa-idle-diagnostic --run --seconds 10   > build/tests/driver 195-hardware/idle-owned-diagnostic.jsonl   2> build/tests/driver 195-hardware/idle-owned-diagnostic.stderr
+```
+
+The command requires driver 193+, stage 0 and no existing participants or
+active queues; use `--registry HEX` if more than one device is present.
+Selectors 30/46/47/61 all use the retained owner connection. JSON lines include
+raw-uptime timestamps, GRBM/CP busy bits, all twelve Live Status words,
+firmware profile/sequence/counter, all sixteen metrics with validity, and
+software pending/completed/queue counts. Raw Live Status order follows selector
+30: GRBM_STATUS, CP_STAT, RLC_BOOTLOAD, SDMA0/1 status, SMU feature low/high,
+bringup-ready, SDMA0 RPTR/WPTR, RB_CNTL, MCU_CNTL. Metric-array order and units
+are `metrics::Field` in `amdgpu_metrics.h`; selected named fields are also
+printed for convenience. These instantaneous busy bits are not a percentage.
+
+Success requires Stop status 0, phase 6 and a subsequent stage-0 query before
+owner destruction. If retirement is unconfirmed, the process reports failure
+and deliberately remains alive holding its owner; it does not release the
+connection and trigger an implicit retry. No host/shared GPU buffers have
+been created by this tool. Resolve reset/detach before forcibly terminating
+that retained process. Samples stop on SIGINT/SIGTERM and attempt the same
+verified cleanup. The 8–12 second CLI bound covers the sampling schedule,
+not blocking initialization/firmware RPC time or failed-retirement retention.
+
+The tool's transport access is a compile-time friend enabled only by its
+standalone translation unit. The normal library exposes no new owner-port or
+initialization API. Offline validation checks cleanup acceptance, stale/error
+rejection and CLI opt-in; hardware acceptance is recorded separately.
 
 ### Further acceptance design
 

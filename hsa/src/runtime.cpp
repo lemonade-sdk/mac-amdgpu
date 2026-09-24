@@ -71,7 +71,7 @@ uint32_t waitSignals(bool all, uint32_t count, hsa_signal_t *handles,
             if (elapsed >= timeout) return UINT32_MAX;
             if (hint == HSA_WAIT_STATE_ACTIVE) std::this_thread::yield();
             else std::this_thread::sleep_for(std::chrono::nanoseconds(std::min<uint64_t>(
-                1000000, timeout - elapsed)));
+                mac_hsa::blockedSignalPollNs(), timeout - elapsed)));
         }
     } catch (const std::bad_alloc &) { return UINT32_MAX; }
 }

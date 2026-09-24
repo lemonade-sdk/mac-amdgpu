@@ -2155,3 +2155,31 @@ The repeated-request test exposed shared writable recurrent state: scheduler-int
 The rebuilt native server passed five interleaved requests on Qwen3.8-27B-MLX-6bit: The → France → The → Germany chat → The. All three identical greedy prompts returned the same four tokens; France returned Paris and chat answered Berlin. GPU execution was required, with KV128 and MTP disabled. The 23-token chat prompt took 7.089 seconds (3.244 prompt tokens/s); 28 subsequent decode tokens took 10.626 seconds (2.635 tokens/s). All five HTTP requests succeeded, timing/count checks passed, SIGINT completed with exit 0 and a separate HSA discovery probe verified driver 195 at stage 0. Results: build/tests/driver195-hardware/lse-server-owned-state/result.json. These short runs do not establish long-context performance or independent full-model accuracy.
 
 CLI/HTTP decode rates now exclude the first token produced by prefill. Server shutdown stops the listener once, drains in-flight work and joins the watchdog before normal destruction. The bounded grace-expiry path exits with failure without freeing potentially active GPU backing. Reproduction passed 17 selected host suites, 17 CLI-option cases, six runtime lifetime/strict-mode cases and Darwin socket/kqueue checks. The new scripts/run-lse-server-smoke.py reproduces session isolation, metrics and graceful shutdown; LOCAL_RUN.md has the user-facing server and chat commands.
+
+## Loom inference performance, accuracy and calibration
+
+The repeated resident benchmark now records binary/runtime hashes, exact request counts, warmup and measured samples. On Qwen3.8-27B-MLX-6bit, KV128, greedy decoding and no MTP, the five-token France prompt improved from a median 2.853677 decode tokens/s to 6.082109 with source caching, pointwise fusion and explicit flush64/poll64 settings. A same-runtime control confirmed that reducing blocked HSA polling from 1000 to 64 microseconds improved throughput; the runtime default remains 1000 microseconds. Disabling periodic flushes entirely was slower (5.593398 tokens/s). These are HTTP generation wall times including surrounding host work, not GPU timestamp or matched llama-bench results.
+
+Q6 activation panels now rotate their shared-memory indexing to avoid bank conflicts. The gfx1201 prefill schedule reuses decoded weights across two or four rows without narrowing FP32 accumulators; single-row decode rotates only privately staged panels. Other architecture, dtype, indexed and caller-staged configurations retain their existing path. All 49 multirow and eight single-row hardware correctness cases passed, with unchanged inputs and guards. Four large prefill projections retained exact whole-output hashes while improving about 2.9–8.7 times; the checked single-row K5120/N17408 projection improved from 0.577947 to 0.326997 ms. These host dispatch/retirement timings are kernel comparisons, not model-wide speedup claims.
+
+The combined Q6 changes then passed four full-model requests (one warmup and three measured), with identical output to the preceding implementation. Median decode reached 10.118556 tokens/s and warm PP5 reached 14.179178 tokens/s. A separate exact64-token prompt passed four repeated requests with median warm prefill 54.007206 tokens/s and 32 subsequent decode steps at 6.750825 tokens/s. The lower longer-context decode rate remains an optimization target. Normal exits and separate driver stage0 checks passed. Evidence is under build/tests/driver195-hardware/qwen-q6-combined-flush64-poll64 and qwen-q6-pp64-flush64-poll64.
+
+An independent Apple Metal MLX run of the same fully hashed checkpoint exactly matched all five prompt IDs and all 33 generated IDs from the R9700 CLI. This covers one greedy continuation, not broad model accuracy. The reference script records native precision, top-ten logits and token margins; Apple Metal timing is not an R9700 comparison. The CLI's optional --token-ids diagnostic emits existing vectors only after generation. See docs/LSE_PERFORMANCE.md for provenance and comparison limits.
+
+Native Loom calibration now executes validated stream and touch kernels when COMGR is unavailable. It checks every output and guard before publishing a rate and preserves backing if GPU retirement fails. Actual calibration measured a 512MiB streaming read at 416.829GB/s and host-observed amortized launch cost of 5.978 microseconds. Cache residency is unverified; matrix-rate measurements remain unknown. Profile identity includes compiler, batching and bounded polling policy. The calibration CLI subsequently produced the same33-token continuation with zero CPU fallback and clean shutdown.
+
+The isolated HSA wait-policy build passed all18 software suites, including default/short polling and unnotified DMA-like stores. The shared-memory test required normal macOS shared-memory access outside the sandbox. The combined Q6 adapter passed24 selected host suites, server CLI checks, six runtime-lifetime checks and Darwin socket/kqueue checks. Driver195 remains installed; these changes do not replace the dext.
+
+The 64-token continuation also now exactly matches 64 prompt IDs and 33 generated IDs from an independent float32 MLX reference. Native BF16 MLX diverged at an exact 18.375-logit tie between China and South; converting only floating parameters/scales/biases while preserving packed Q6 integer weight identity resolves this observed split. This remains two-prompt accuracy evidence, not broad model qualification.
+
+- Automatic single-device decode batching now qualifies ordinary warm decode
+  samples and selects stable improvements without repeating model work.
+  Verified median 10.127645 tokens/s with 64 µs polling and 6.967066 with the
+  default 1000 µs polling; all output text identical and clean shutdown.
+- Reproducible HRX compute-copy benchmark verifies payloads, guards and source
+  preservation. Repeated 16 MiB buffers measured H2D 6.79 GB/s, D2H 7.04 GB/s,
+  D2D 290.28 GB/s payload; cache residency is not established, so these are not
+  claims of raw link or physical DRAM bandwidth.
+- Monitor percentage graphs now retain a fixed 0–100 scale and clear stale
+  headlines. Owned-idle testing found SMU interface 0x33 reporting 100% despite
+  idle GRBM/CP and no queues; the monitor labels this raw counter explicitly.

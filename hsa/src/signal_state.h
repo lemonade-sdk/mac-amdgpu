@@ -1,4 +1,5 @@
 #pragma once
+#include "signal_wait_policy.h"
 #include <hsa/hsa.h>
 #include <hsa/amd_hsa_signal.h>
 #include <algorithm>
@@ -106,7 +107,7 @@ inline int64_t waitSignal(const std::shared_ptr<Signal> &signal,
         else {
             // Poll as well as notify: direct host atomic writes and silent stores
             // do not notify this condition variable. Never hold the runtime lock.
-            const auto interval = std::min<uint64_t>(1000000, timeout - elapsed);
+            const auto interval = std::min<uint64_t>(blockedSignalPollNs(), timeout - elapsed);
             std::unique_lock lock(signal->waitMutex);
             signal->changed.wait_for(lock, std::chrono::nanoseconds(interval));
         }

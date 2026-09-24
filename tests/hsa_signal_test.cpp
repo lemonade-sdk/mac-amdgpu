@@ -3,6 +3,7 @@
 #include <hsa/hsa_ext_amd.h>
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 
 static bool gpuPresent = true;
@@ -21,7 +22,15 @@ static void enumerate() {
     assert(hsa_iterate_agents([](hsa_agent_t a,void *) { agents.push_back(a); return HSA_STATUS_SUCCESS; },
                              nullptr)==HSA_STATUS_SUCCESS);
 }
-int main() {
+int main(int argc,char **argv) {
+    assert(argc==1 || argc==2);
+    if (argc==2) assert(mac_hsa::blockedSignalPollNs()==std::strtoull(argv[1],nullptr,10));
+    assert(mac_hsa::blockedSignalPollNs(nullptr)==1000000);
+    for (const char *bad : {"", "-1", "0", "9", "1001", "64us", " 64", "99999999999999999999"})
+        assert(mac_hsa::blockedSignalPollNs(bad)==1000000);
+    assert(mac_hsa::blockedSignalPollNs("10")==10000);
+    assert(mac_hsa::blockedSignalPollNs("64")==64000);
+    assert(mac_hsa::blockedSignalPollNs("1000")==1000000);
     hsa_signal_t signal{};
     assert(hsa_signal_create(0,0,nullptr,&signal)==HSA_STATUS_ERROR_NOT_INITIALIZED);
     assert(hsa_init()==HSA_STATUS_SUCCESS); enumerate();
@@ -100,6 +109,17 @@ int main() {
     assert(hsa_amd_signal_wait_all(4,group,conds,values,UINT64_MAX,HSA_WAIT_STATE_BLOCKED,observed)==0);
     complete.join();
     assert(observed[0]==0 && observed[1]==8 && observed[2]==0 && observed[3]==0);
+    // Direct DMA-like stores cannot signal the condition variable. Both the
+    // single and multi-signal blocked waits must observe them by polling.
+    hsa_signal_store_relaxed(other,1);
+    std::thread unnotified([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        auto *value=&reinterpret_cast<mac_hsa::SignalABI *>(other.handle)->value;
+        std::atomic_ref<int64_t>(*value).store(0,std::memory_order_release);
+    });
+    assert(hsa_amd_signal_wait_any(1,&other,&conds[2],&values[2],1000000000,
+        HSA_WAIT_STATE_BLOCKED,observed)==0 && observed[0]==0);
+    unnotified.join();
     assert(hsa_signal_destroy(other)==HSA_STATUS_SUCCESS);
     assert(hsa_amd_signal_wait_any(0,nullptr,nullptr,nullptr,UINT64_MAX,HSA_WAIT_STATE_BLOCKED,nullptr)==UINT32_MAX);
     assert(hsa_amd_signal_wait_all(0,nullptr,nullptr,nullptr,UINT64_MAX,HSA_WAIT_STATE_BLOCKED,nullptr)==0);

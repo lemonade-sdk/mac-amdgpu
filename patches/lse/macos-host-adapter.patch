@@ -105,10 +105,44 @@ index 8143b41..8d237af 100644
  
  # ---------------------------------------------------------------------------
 diff --git a/include/lse/backend/backend.hpp b/include/lse/backend/backend.hpp
-index 44a7e55..51287a1 100644
+index 44a7e55..f1fa692 100644
 --- a/include/lse/backend/backend.hpp
 +++ b/include/lse/backend/backend.hpp
-@@ -1337,10 +1337,16 @@ using StableRefResolver =
+@@ -1010,6 +1010,12 @@ class IBackend {
+                 const DispatchArgs& args) {
+     return launch(kernel, dims, args, DispatchTarget{});
+   }
++  // Optional online policy observation around one complete, ordinary decode
++  // step. begin/end may change submission batching only after a confirmed
++  // drain. The caller never repeats model work and excludes cold/JIT samples.
++  virtual Status begin_decode_sample(std::uint64_t) { return OkStatus(); }
++  virtual Status end_decode_sample(std::uint64_t, bool) { return OkStatus(); }
++  virtual void cancel_decode_sample() noexcept {}
+   virtual Status synchronize() = 0;
+ 
+   // What this device's streams can do, and how to order two of them. A caller
+@@ -1137,6 +1143,20 @@ class BackendAdapter final : public IBackend {
+     return impl_.launch(k, d, a, t);
+   }
+   using IBackend::launch;
++  Status begin_decode_sample(std::uint64_t key) override {
++    if constexpr (requires { impl_.begin_decode_sample_impl(key); })
++      return impl_.begin_decode_sample_impl(key);
++    return OkStatus();
++  }
++  Status end_decode_sample(std::uint64_t elapsed, bool eligible) override {
++    if constexpr (requires { impl_.end_decode_sample_impl(elapsed, eligible); })
++      return impl_.end_decode_sample_impl(elapsed, eligible);
++    return OkStatus();
++  }
++  void cancel_decode_sample() noexcept override {
++    if constexpr (requires { impl_.cancel_decode_sample_impl(); })
++      impl_.cancel_decode_sample_impl();
++  }
+   Status synchronize() override { return impl_.synchronize(); }
+   const StreamCapabilities& stream_capabilities() const noexcept override {
+     return impl_.stream_capabilities();
+@@ -1337,10 +1357,16 @@ using StableRefResolver =
  // Backends self-register from their own TU: linking one in is all that makes
  // it selectable by name.
  using BackendFactory = std::unique_ptr<IBackend> (*)();
@@ -126,7 +160,7 @@ index 44a7e55..51287a1 100644
  Result<std::unique_ptr<IBackend>> create_backend(std::string_view name);
  
  // What a stable reference names, before any of it is opened. nullopt when the
-@@ -1379,8 +1385,9 @@ std::vector<std::string> default_backend_order();
+@@ -1379,8 +1405,9 @@ std::vector<std::string> default_backend_order();
  struct BackendRegistrar {
    BackendRegistrar(std::string_view name, BackendFactory factory,
                     DeviceEnumerator enumerator,
@@ -138,7 +172,7 @@ index 44a7e55..51287a1 100644
    }
  };
  
-@@ -1410,6 +1417,15 @@ template <typename Derived>
+@@ -1410,6 +1437,15 @@ template <typename Derived>
    }
  }
  
@@ -154,7 +188,7 @@ index 44a7e55..51287a1 100644
  // No token pasting: Type may be a qualified name. One registration per TU.
  #define LSE_REGISTER_BACKEND(name, Type)                                  \
    namespace {                                                             \
-@@ -1418,7 +1434,8 @@ template <typename Derived>
+@@ -1418,7 +1454,8 @@ template <typename Derived>
          return std::make_unique<::lse::backend::BackendAdapter<Type>>();  \
        },                                                                  \
        ::lse::backend::device_enumerator_for<Type>(),                      \
@@ -165,10 +199,18 @@ index 44a7e55..51287a1 100644
  
  }  // namespace lse::backend
 diff --git a/include/lse/backends/hrx/hrx_backend.hpp b/include/lse/backends/hrx/hrx_backend.hpp
-index 660b044..cfd5be5 100644
+index 660b044..a0edf46 100644
 --- a/include/lse/backends/hrx/hrx_backend.hpp
 +++ b/include/lse/backends/hrx/hrx_backend.hpp
-@@ -30,6 +30,7 @@ namespace lse::backend {
+@@ -19,6 +19,7 @@
+ #include <vector>
+ 
+ #include "lse/backend/backend.hpp"
++#include "lse/backends/hrx/submission_tuner.hpp"
+ #include "lse/backends/hrx/device_info.hpp"
+ #include "lse/backends/hrx/hipc/comgr_compiler.hpp"
+ #include "lse/backends/hrx/hipc/hip_emitter.hpp"
+@@ -30,10 +31,14 @@ namespace lse::backend {
  class HrxBackend : public Backend<HrxBackend> {
   public:
    static constexpr std::string_view kName = "hrx";
@@ -176,6 +218,63 @@ index 660b044..cfd5be5 100644
  
    ~HrxBackend();
  
+   Status init_impl(int device_ordinal);
++  Status begin_decode_sample_impl(std::uint64_t key);
++  Status end_decode_sample_impl(std::uint64_t elapsed, bool eligible);
++  void cancel_decode_sample_impl() noexcept;
+   void shutdown_impl() noexcept;
+   const DeviceInfo& device_info_impl() const noexcept { return info_; }
+ 
+@@ -213,6 +218,12 @@ class HrxBackend : public Backend<HrxBackend> {
+   // per launch, 0 = only at sync/transfer boundaries). Counted per stream:
+   // batching is a property of one command buffer, not of the device.
+   std::uint32_t flush_interval_ = 0;
++  bool automatic_submission_ = false;
++  std::uint32_t baseline_flush_interval_ = 16;
++  SubmissionTuner submission_tuner_;
++  SubmissionTuner::State* submission_sample_ = nullptr;
++  std::uint64_t submission_signature_ = 0;
++  std::uint32_t submission_dispatches_ = 0;
+   std::vector<std::uint32_t> unflushed_launches_;
+ 
+   Result<void*> stream_at(std::uint32_t index);
+diff --git a/include/lse/backends/hrx/loomc/loom_emitter.hpp b/include/lse/backends/hrx/loomc/loom_emitter.hpp
+index f46f7d5..4524e03 100644
+--- a/include/lse/backends/hrx/loomc/loom_emitter.hpp
++++ b/include/lse/backends/hrx/loomc/loom_emitter.hpp
+@@ -14,6 +14,8 @@
+ #pragma once
+ 
+ #include <cstdint>
++#include <mutex>
++#include <unordered_map>
+ #include <string>
+ #include <string_view>
+ 
+@@ -28,6 +30,11 @@ namespace lse::backend {
+ 
+ class LoomEmitter final : public graph::IKernelEmitter {
+  public:
++  struct CacheStats {
++    std::size_t hits, misses, entries, source_bytes;
++  };
++  [[nodiscard]] CacheStats cache_stats() const;
++
+   Result<graph::EmittedKernel> emit(const graph::FusionGroup& group,
+                                     const DeviceInfo& device) const override;
+ 
+@@ -56,6 +63,11 @@ class LoomEmitter final : public graph::IKernelEmitter {
+   [[nodiscard]] const graph::IPhaseStaging* staging() const noexcept override {
+     return nullptr;
+   }
++
++ private:
++  mutable std::mutex cache_mutex_;
++  mutable std::unordered_map<std::string, graph::EmittedKernel> emit_cache_;
++  mutable std::size_t cache_hits_ = 0, cache_misses_ = 0, cache_bytes_ = 0;
+ };
+ 
+ }  // namespace lse::backend
 diff --git a/include/lse/communication/poller.hpp b/include/lse/communication/poller.hpp
 index e51c708..fdf066f 100644
 --- a/include/lse/communication/poller.hpp
@@ -189,6 +288,19 @@ index e51c708..fdf066f 100644
    std::map<int, IReady*> owners_;
    std::vector<unsigned char> scratch_;
  };
+diff --git a/include/lse/graph/graph.hpp b/include/lse/graph/graph.hpp
+index f5f3ce6..4ea06b0 100644
+--- a/include/lse/graph/graph.hpp
++++ b/include/lse/graph/graph.hpp
+@@ -362,6 +362,8 @@ class Scheduler {
+   struct Trace {
+     std::vector<std::string> group_descriptions;
+     std::uint32_t kernels_launched = 0;
++    // Actual partitioner invocations, independent of host timer resolution.
++    std::uint32_t partition_passes = 0;
+     std::uint32_t nodes_evaluated = 0;
+     std::uint32_t collectives_issued = 0;
+     // Nodes the device backend could not run, executed on the host instead.
 diff --git a/include/lse/ir/args.hpp b/include/lse/ir/args.hpp
 index 37e1df9..d3a715c 100644
 --- a/include/lse/ir/args.hpp
@@ -401,6 +513,59 @@ index a07a26a..d353906 100644
    std::int32_t position = 0;
  
    [[nodiscard]] bool empty() const noexcept {
+diff --git a/include/lse/probe/probe_kernels.hpp b/include/lse/probe/probe_kernels.hpp
+index 9a65b0c..f5d245d 100644
+--- a/include/lse/probe/probe_kernels.hpp
++++ b/include/lse/probe/probe_kernels.hpp
+@@ -46,7 +46,7 @@ struct StreamArgs {
+ //
+ // `elems` must be a whole number of `threads * width`, so every load lands
+ // inside the buffer and none of them needs a tail guard.
+-template <class E>
++template <class E, bool StoreThroughHook = false>
+ void stream_read(E& e, StreamArgs<E>& a, std::uint32_t elems,
+                  std::uint32_t threads, std::uint32_t load_bytes) {
+   const std::uint32_t width =
+@@ -60,7 +60,8 @@ void stream_read(E& e, StreamArgs<E>& a, std::uint32_t elems,
+       acc = lse::math::fma(v[j], e.f32(1.0f), acc);
+     }
+   }
+-  a.out[tid] = acc;
++  if constexpr (StoreThroughHook) e.store(tid, acc.read());
++  else a.out[tid] = acc;
+ }
+ 
+ template <class E>
+@@ -70,11 +71,12 @@ struct TouchArgs {
+ 
+ // The smallest dispatch that still has to be dispatched. What is left when its
+ // time is divided by the launch count is submission cost and nothing else.
+-template <class E>
++template <class E, bool StoreThroughHook = false>
+ void touch_one(E& e, TouchArgs<E>& a) {
+   const auto tid = e.thread_id();
+   if (auto only = e.when(tid < 1u)) {
+-    a.out[0] = e.f32(1.0f);
++    if constexpr (StoreThroughHook) e.store(e.u32(0), e.f32(1.0f));
++    else a.out[0] = e.f32(1.0f);
+   }
+ }
+ 
+diff --git a/include/lse/probe/profile.hpp b/include/lse/probe/profile.hpp
+index 65cf47e..f61d28e 100644
+--- a/include/lse/probe/profile.hpp
++++ b/include/lse/probe/profile.hpp
+@@ -139,7 +139,9 @@ struct DeviceProfile {
+   bool unified_memory = false;
+ 
+   // The roofline. Achieved streaming read rate out of device memory, which is
+-  // what decode is bound by; not the theoretical pin rate.
++  // what decode is bound by; not the theoretical pin rate. The historical
++  // field name does not promise cache bypass: unqueried last-level caches may
++  // contribute, so reports label it streaming bandwidth.
+   Measured dram_bytes_per_s;
+   // Wall time one dispatch costs when the kernel does nothing, on the
+   // submission path the engine actually uses.
 diff --git a/include/lse/runtime/generator.hpp b/include/lse/runtime/generator.hpp
 index 02f3249..505287f 100644
 --- a/include/lse/runtime/generator.hpp
@@ -456,10 +621,18 @@ index 6d62302..a4ee4fa 100644
  target_include_directories(lse_backend_cpu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
  lse_apply_common_flags(lse_backend_cpu)
 diff --git a/src/backends/hrx/CMakeLists.txt b/src/backends/hrx/CMakeLists.txt
-index 2f05ce3..49d3d0a 100644
+index 2f05ce3..5c93fd5 100644
 --- a/src/backends/hrx/CMakeLists.txt
 +++ b/src/backends/hrx/CMakeLists.txt
-@@ -80,7 +80,11 @@ else()
+@@ -23,6 +23,7 @@ add_library(lse_backend_hrx
+   hipc/hip_types.cpp
+   kernels/dist_codec.cpp
+   kernels/probe.cpp
++  kernels/probe_loom.cpp
+ )
+ add_library(lse::backend_hrx ALIAS lse_backend_hrx)
+ 
+@@ -80,7 +81,11 @@ else()
  endif()
  
  # See the cpu backend: self-registration requires whole-archive linking.
@@ -473,10 +646,26 @@ index 2f05ce3..49d3d0a 100644
  
  lse_apply_common_flags(lse_backend_hrx)
 diff --git a/src/backends/hrx/hrx_backend.cpp b/src/backends/hrx/hrx_backend.cpp
-index 76bb223..6631e02 100644
+index 76bb223..ea3f567 100644
 --- a/src/backends/hrx/hrx_backend.cpp
 +++ b/src/backends/hrx/hrx_backend.cpp
-@@ -154,9 +154,14 @@ class HsaRuntime {
+@@ -6,6 +6,7 @@
+ #include <atomic>
+ #include <cctype>
+ #include <charconv>
++#include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -17,6 +18,7 @@
+ 
+ #include "lse/backends/hrx/arch_database.hpp"
+ #include "lse/backends/hrx/code_object.hpp"
++#include "lse/core/hash.hpp"
+ 
+ extern "C" {
+ #include "hrx_runtime.h"
+@@ -154,9 +156,14 @@ class HsaRuntime {
    // preload_gpu_runtime already loaded rather than a second runtime. The hot
    // path keeps load_if_missing=false, so it behaves exactly as before.
    explicit HsaRuntime(bool load_if_missing = false) noexcept {
@@ -493,7 +682,7 @@ index 76bb223..6631e02 100644
      }
      if (lib_ == nullptr) return;
      init_ = reinterpret_cast<InitFn>(dlsym(lib_, "hsa_init"));
-@@ -287,10 +292,11 @@ class HsaRuntime {
+@@ -287,10 +294,11 @@ class HsaRuntime {
        // an interrupt round trip is the same order as the transfer.
        constexpr int kConditionLt = 2;
        constexpr int kWaitActive = 1;
@@ -508,7 +697,7 @@ index 76bb223..6631e02 100644
    }
  
    // Pins a host range so the copy engine can reach it, returning the address
-@@ -673,26 +679,26 @@ StreamCapabilities derive_stream_capabilities(const DeviceInfo& info,
+@@ -673,26 +681,26 @@ StreamCapabilities derive_stream_capabilities(const DeviceInfo& info,
  // exactly what enumerating devices before binding one would otherwise cause.
  std::atomic<bool> g_accelerator_up{false};
  
@@ -553,7 +742,7 @@ index 76bb223..6631e02 100644
    static std::mutex mu;
    const std::lock_guard lock(mu);
    if (g_accelerator_up.load(std::memory_order_relaxed)) return OkStatus();
-@@ -702,9 +708,17 @@ Status accelerator_up() {
+@@ -702,9 +710,17 @@ Status accelerator_up() {
    // for here because bringing the accelerator up is once per process and the
    // topology is fixed at that moment.
    const std::string group = backend::requested_device_group("hrx");
@@ -571,7 +760,7 @@ index 76bb223..6631e02 100644
    if (hrx_status_is_ok(status)) {
      g_accelerator_up.store(true, std::memory_order_release);
      return OkStatus();
-@@ -720,6 +734,12 @@ Status accelerator_up() {
+@@ -720,6 +736,12 @@ Status accelerator_up() {
  
  }  // namespace
  
@@ -584,19 +773,631 @@ index 76bb223..6631e02 100644
  bool HrxBackend::available() noexcept {
  #if LSE_HRX_LINKED
    return true;
+@@ -1138,6 +1160,15 @@ Status HrxBackend::init_impl(int device_ordinal) {
+     }
+   }
+ 
++  baseline_flush_interval_ = flush_interval_;
++#if defined(__APPLE__)
++  automatic_submission_ = physical_count_ == 1 && info_.arch == "gfx1201" &&
++      automatic_submission_policy(std::getenv("LSE_FLUSH_INTERVAL"),
++                                  std::getenv("LSE_AUTO_BATCH"));
++#endif
++  submission_tuner_ = {};
++  submission_sample_ = nullptr;
++
+   queue_count_ = probe_queue_count(device);
+   stream_caps_ = derive_stream_capabilities(info_, queue_count_);
+   if (physical_count_ > 1 && stream_caps_.stream_count < physical_count_) {
+@@ -1985,6 +2016,88 @@ Result<KernelHandle> HrxBackend::load_executable_impl(
+ #endif
+ }
+ 
++Status HrxBackend::begin_decode_sample_impl(std::uint64_t key) {
++  if (!automatic_submission_) return OkStatus();
++  if (submission_sample_ != nullptr) {
++    // Sampling must not turn an otherwise valid request into an error.
++    // Decline overlapping observations; their latency cannot isolate a policy.
++    cancel_decode_sample_impl();
++    return OkStatus();
++  }
++  auto* state = submission_tuner_.find(key);
++  if (state == nullptr) return OkStatus();
++  const auto interval = SubmissionTuner::next(*state);
++  if (interval != flush_interval_) {
++    LSE_RETURN_IF_ERROR(synchronize_impl());
++    flush_interval_ = interval;
++  }
++  submission_sample_ = state;
++  submission_signature_ = kHashSeed;
++  submission_dispatches_ = 0;
++  return OkStatus();
++}
++
++Status HrxBackend::end_decode_sample_impl(std::uint64_t elapsed, bool eligible) {
++  if (submission_sample_ == nullptr) return OkStatus();
++  const auto boundary_start = std::chrono::steady_clock::now();
++  auto* state = submission_sample_;
++  const bool was_done = state->done;
++  const auto prior_signature = state->signature;
++  const auto prior_attempts = state->attempts;
++  const auto prior_warm = state->warm;
++  const auto prior_samples = state->samples;
++  const auto sampled_interval = flush_interval_;
++  // The result readback already orders the inference dependency chain; drain
++  // every stream before changing a backend-global submission policy as well.
++  const Status retired = synchronize_impl();
++  submission_sample_ = nullptr;
++  flush_interval_ = baseline_flush_interval_;
++  if (!retired.ok()) {
++    automatic_submission_ = false;
++    return retired;
++  }
++  const auto boundary_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
++      std::chrono::steady_clock::now() - boundary_start).count();
++  SubmissionTuner::observe(*state, submission_signature_,
++                           static_cast<double>(elapsed) + static_cast<double>(boundary_ns),
++                           eligible && submission_dispatches_ >= 64);
++  static const bool tuning_trace = [] {
++    const char* value = std::getenv("LSE_AUTO_BATCH_TRACE");
++    return value != nullptr && std::strcmp(value, "1") == 0;
++  }();
++  static std::atomic<unsigned> trace_lines{0};
++  if (tuning_trace && trace_lines.fetch_add(1) < 256) {
++    std::fprintf(stderr, "[batch-tune-trace] workload=%llx prior-signature=%llx signature=%llx "
++                         "same=%d interval=%u eligible=%d dispatches=%u attempts=%u->%u "
++                         "warm=%u->%u samples=%u->%u done=%d boundary-ns=%llu\n",
++                 static_cast<unsigned long long>(state->key),
++                 static_cast<unsigned long long>(prior_signature),
++                 static_cast<unsigned long long>(submission_signature_),
++                 prior_signature == submission_signature_ ? 1 : 0, sampled_interval,
++                 eligible ? 1 : 0, submission_dispatches_, prior_attempts, state->attempts,
++                 prior_warm, state->warm, prior_samples, state->samples, state->done ? 1 : 0,
++                 static_cast<unsigned long long>(boundary_ns));
++  }
++  if (state->done && !was_done) {
++    std::fprintf(stderr, "[batch-tune] scope=resident-decode clock=host-steady "
++                         "workload=%llx signature=%llx interval=%u selected=%s "
++                         "samples=%u attempts=%u medians-ns=%.0f,%.0f,%.0f,%.0f\n",
++                 static_cast<unsigned long long>(state->key),
++                 static_cast<unsigned long long>(state->signature), state->interval,
++                 state->selected ? "yes" : "no", state->samples, state->attempts,
++                 state->medians[0], state->medians[1], state->medians[2], state->medians[3]);
++  }
++  return OkStatus();
++}
++
++void HrxBackend::cancel_decode_sample_impl() noexcept {
++  submission_sample_ = nullptr;
++  flush_interval_ = baseline_flush_interval_;
++  // An inference error is not a measurement. Do not schedule further tuning
++  // or claim retirement; the normal error path owns device recovery.
++  automatic_submission_ = false;
++}
++
+ Status HrxBackend::launch_impl(const KernelHandle& kernel, const LaunchDims& dims,
+                                const DispatchArgs& args,
+                                const DispatchTarget& target) {
+@@ -2024,6 +2137,30 @@ Status HrxBackend::launch_impl(const KernelHandle& kernel, const LaunchDims& dim
+     bindings.push_back(out);
+   }
+ 
++  if (submission_sample_ != nullptr) {
++    // Process-local executable handles identify exact loaded code objects.
++    // Allocation addresses and token values deliberately do not: ordinary
++    // ping-pong/rebinding must remain the same workload. Sizes, constants and
++    // launch geometry conservatively invalidate changed work.
++    submission_signature_ = hash_mix(submission_signature_, kernel.executable);
++    submission_signature_ = hash_mix(submission_signature_, kernel.export_ordinal);
++    for (unsigned i = 0; i < 3; ++i) {
++      submission_signature_ = hash_mix(submission_signature_, dims.workgroup_count[i]);
++      submission_signature_ = hash_mix(submission_signature_, dims.workgroup_size[i]);
++    }
++    submission_signature_ = hash_mix(submission_signature_, dims.subgroup_size);
++    submission_signature_ = hash_mix(submission_signature_, target.stream.index);
++    submission_signature_ = hash_mix(submission_signature_, args.flags);
++    submission_signature_ = hash_mix(submission_signature_, args.bindings.size());
++    submission_signature_ = hash_mix(submission_signature_, args.constants.size());
++    for (const auto& binding : args.bindings)
++      submission_signature_ = hash_mix(submission_signature_, binding.length != 0
++          ? binding.length : binding.buffer->size_bytes);
++    for (const auto byte : args.constants)
++      submission_signature_ = hash_mix(submission_signature_, std::to_integer<unsigned char>(byte));
++    ++submission_dispatches_;
++  }
++
+   const std::uint32_t index = target.stream.index;
+   auto* s = static_cast<hrx_stream_t>(*stream);
+ 
+diff --git a/src/backends/hrx/kernels/probe.cpp b/src/backends/hrx/kernels/probe.cpp
+index 8cadbf3..8c02a13 100644
+--- a/src/backends/hrx/kernels/probe.cpp
++++ b/src/backends/hrx/kernels/probe.cpp
+@@ -19,6 +19,8 @@
+ #include <array>
+ #include <chrono>
+ #include <cstring>
++#include <cstdio>
++#include <limits>
+ #include <memory>
+ #include <optional>
+ #include <span>
+@@ -26,6 +28,10 @@
+ #include <vector>
+ 
+ #include "lse/backends/hrx/hipc/comgr_compiler.hpp"
++#include "lse/backends/hrx/loomc/loomc_compiler.hpp"
++#include "lse/backends/hrx/probe_emit.hpp"
++#include "lse/backends/hrx/probe_measurement.hpp"
++#include "lse/backends/hrx/probe_retirement.hpp"
+ #include "lse/backends/hrx/device_info.hpp"
+ #include "lse/backends/hrx/hipc/hip_emitter.hpp"
+ #include "lse/backends/hrx/hipc/hip_sources.hpp"
+@@ -74,8 +80,7 @@ constexpr int kTileM = 16;
+ constexpr int kTileN = 16;
+ constexpr int kTileK = 16;
+ 
+-// 64 MB is far past this class of part's L2, so the streaming number is DRAM's.
+-constexpr std::size_t kStreamBytes = 64u << 20;
++// The allocation budget chooses the streaming working set at runtime.
+ constexpr int kStreamReps = 4;
+ constexpr std::uint32_t kBlock = 256;
+ constexpr int kLaunchReps = 512;
+@@ -262,9 +267,11 @@ std::string rate_source(std::string_view entry, const DeviceInfo& info,
+ class HrxDeviceProbe final : public probe::IDeviceProbe {
+  public:
+   explicit HrxDeviceProbe(IBackend& be)
+-      : be_(be), cache_(be, compiler_) {
++      : be_(be), use_loom_(!compiler_.available() && loom_compiler_.available()),
++        cache_(be, use_loom_ ? static_cast<const IKernelCompiler&>(loom_compiler_)
++                            : static_cast<const IKernelCompiler&>(compiler_)) {
+     const DeviceInfo& info = be_.device_info();
+-    if (!compiler_.available()) {
++    if (!compiler_.available() && !use_loom_) {
+       declined_ = "no JIT compiler in this build, so no probe kernel can be "
+                   "compiled and every device-side rate stays unknown";
+     } else if (device_extension<AmdDeviceInfo>(info) == nullptr) {
+@@ -287,13 +294,34 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
+     // A measurement that fails leaves its field unknown; it never falls back to
+     // a plausible number, and it does not stop the others from being taken.
+     if (const Status s = measure_stream(out); !s.ok()) note(s);
++    if (!retired_) return OkStatus();
+     if (const Status s = measure_launch(out); !s.ok()) note(s);
+-    if (const Status s = measure_matrix(out); !s.ok()) note(s);
++    if (!retired_) return OkStatus();
++    if (!use_loom_) {
++      if (const Status s = measure_matrix(out); !s.ok()) note(s);
++    } else {
++      note(LSE_ERROR(kUnimplemented, "Loom matrix-rate calibration is unavailable"));
++    }
+     fill_paths(out);
+     return OkStatus();
+   }
+ 
+  private:
++  bool retired_ = true;
++  Status finish_buffers(ProbeRetirement<DeviceBuffer>& buffers, Status operation) {
++    Status drain;
++    retired_ = buffers.finish([&] {
++      drain = be_.synchronize();
++      return drain.ok();
++    }, [&](DeviceBuffer& buffer) { be_.deallocate(buffer); });
++    if (!retired_) {
++      std::fprintf(stderr, "[probe] retirement unconfirmed; retaining allocations "
++                           "until process exit and stopping calibration\n");
++      return drain.ok() ? LSE_ERROR(kDeviceError, "probe retirement unavailable") : drain;
++    }
++    return operation;
++  }
++
+   void note(const Status& s) {
+     if (!declined_.empty()) declined_ += "; ";
+     declined_ += s.message();
+@@ -313,41 +341,82 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
+     return cache_.get_or_compile(0, hash_bytes(entry), emitted);
+   }
+ 
++  Result<KernelHandle> compiled_loom(Result<EmittedKernel> source) {
++    if (!source.ok()) return source.status();
++    const std::uint64_t key = hash_bytes(source->source);
++    return cache_.get_or_compile(0, key, *source);
++  }
++
++  Status poison_output(DeviceBuffer& dst, std::size_t payload) {
++    std::vector<float> values(payload + 16, -1234.0f);
++    std::fill_n(values.begin(), payload, std::numeric_limits<float>::quiet_NaN());
++    return be_.copy_h2d(values.data(), dst, values.size() * sizeof(float), 0);
++  }
++
++  Status validate_output(const DeviceBuffer& dst, std::size_t payload,
++                         float expected) {
++    std::vector<float> values(payload + 16);
++    LSE_RETURN_IF_ERROR(be_.copy_d2h(dst, values.data(), values.size() * sizeof(float), 0));
++    return check_probe_output(values, payload, expected);
++  }
++
+   // --- roofline ----------------------------------------------------------
+   Status measure_stream(probe::DeviceProfile& out) {
+     const DeviceInfo& info = be_.device_info();
+     const std::uint32_t load_bytes = device_load_bytes(&info);
+     const std::uint32_t width =
+         kir::pack_n(load_bytes, kir::pack_elem_bytes<kir::f32>());
+-    const std::uint32_t groups =
+-        (info.compute_units != 0 ? info.compute_units : 8u) * 8u;
++    if (info.compute_units == 0 || info.wavefront_size == 0 ||
++        info.max_threads_per_workgroup < kBlock) {
++      return LSE_ERROR(kUnimplemented, "stream probe needs known device geometry");
++    }
++    const auto free = be_.sample_free_memory();
++    const std::size_t stream_bytes = streaming_probe_bytes(
++        info.total_memory, free.ok() ? std::optional<std::size_t>(*free) : std::nullopt);
++    if (stream_bytes == 0) {
++      return LSE_ERROR(kUnimplemented, "no known memory budget for stream probe");
++    }
++    if (info.compute_units > std::numeric_limits<std::uint32_t>::max() / (8u * kBlock * width)) {
++      return LSE_ERROR(kInvalidArgument, "stream probe geometry overflows its index");
++    }
++    const std::uint32_t groups = info.compute_units * 8u;
+     const std::uint32_t threads = groups * kBlock;
+     const std::uint32_t span = threads * width;
+     // A whole number of strides, so the last pack of every thread lands inside
+     // the buffer and no load needs a tail guard.
+     std::uint32_t elems =
+-        static_cast<std::uint32_t>(kStreamBytes / sizeof(float));
++        static_cast<std::uint32_t>(stream_bytes / sizeof(float));
+     elems = (elems / span) * span;
+     if (elems == 0) {
+       return LSE_ERROR(kInvalidArgument, "stream probe has no work to do");
+     }
+ 
+-    LSE_ASSIGN_OR(const KernelHandle kernel,
+-                  compiled("lse_probe_stream",
+-                           stream_source("lse_probe_stream", elems, threads,
+-                                         load_bytes)));
+-
++    Result<KernelHandle> built = use_loom_
++        ? compiled_loom(emit_loom_stream_probe(info, elems, threads, load_bytes))
++        : compiled("lse_probe_stream", stream_source(
++              "lse_probe_stream", elems, threads, load_bytes));
++    if (!built.ok()) return built.status();
++    const KernelHandle kernel = built.release();
++    std::fprintf(stderr, "[probe] streaming dialect=%s working_set=%u "
++                         "bytes clock=host-steady cache-residency=unverified\n",
++                 use_loom_ ? "loom" : "hip", elems * 4u);
++
++    ProbeRetirement<DeviceBuffer> buffers;
++    if (!buffers.available()) {
++      return LSE_ERROR(kDeviceError, "probe retirement capacity unavailable");
++    }
+     auto in = be_.allocate(static_cast<std::size_t>(elems) * sizeof(float),
+                            MemoryClass::kDevice);
+     if (!in.ok()) return in.status();
+     DeviceBuffer src = in.release();
+-    auto sink = be_.allocate(static_cast<std::size_t>(threads) * sizeof(float),
++    buffers.track(src);
++    auto sink = be_.allocate((static_cast<std::size_t>(threads) + 16) * sizeof(float),
+                              MemoryClass::kDevice);
+     if (!sink.ok()) {
+-      be_.deallocate(src);
+-      return sink.status();
++      return finish_buffers(buffers, sink.status());
+     }
+     DeviceBuffer dst = sink.release();
++    buffers.track(dst);
+ 
+     // Written before it is read: an allocation nothing has touched is not
+     // backed by anything, and streaming it would time the page fault path
+@@ -358,9 +427,7 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
+                                     static_cast<std::size_t>(elems) *
+                                         sizeof(float), 0);
+       if (!s.ok()) {
+-        be_.deallocate(src);
+-        be_.deallocate(dst);
+-        return s;
++        return finish_buffers(buffers, s);
+       }
+     }
+ 
+@@ -369,12 +436,18 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
+     dims.workgroup_count[0] = groups;
+     dims.subgroup_size = wavefront();
+     const BufferRef refs[] = {{&src, 0, src.size_bytes},
+-                              {&dst, 0, dst.size_bytes}};
++                              {&dst, 0, static_cast<std::size_t>(threads) * sizeof(float)}};
+     DispatchArgs args;
+     args.bindings = refs;
++    const std::uint32_t count = threads;
++    if (use_loom_) args.constants = std::as_bytes(std::span(&count, 1));
+ 
+-    Status status = be_.launch(kernel, dims, args);
++    Status status = poison_output(dst, threads);
++    if (status.ok()) status = be_.launch(kernel, dims, args);
+     if (status.ok()) status = be_.synchronize();
++    const float expected = static_cast<float>(elems / threads);
++    if (status.ok()) status = validate_output(dst, threads, expected);
++    if (status.ok()) status = poison_output(dst, threads);
+     if (status.ok()) {
+       const auto t0 = Clock::now();
+       for (int r = 0; r < kStreamReps && status.ok(); ++r) {
+@@ -382,34 +455,51 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
+       }
+       if (status.ok()) status = be_.synchronize();
+       const double ns = ns_since(t0);
++      if (status.ok()) status = validate_output(dst, threads, expected);
+       if (status.ok() && ns > 0.0) {
+         out.dram_bytes_per_s = probe::Measured::measured(
+             static_cast<double>(elems) * sizeof(float) * kStreamReps * 1e9 / ns);
+       }
+     }
+-    be_.deallocate(src);
+-    be_.deallocate(dst);
++    status = finish_buffers(buffers, status);
++    if (!status.ok()) out.dram_bytes_per_s = {};
+     return status;
+   }
+ 
+   // --- dispatch cost -----------------------------------------------------
+   Status measure_launch(probe::DeviceProfile& out) {
+-    LSE_ASSIGN_OR(const KernelHandle kernel,
+-                  compiled("lse_probe_touch", touch_source("lse_probe_touch")));
+-    auto sink = be_.allocate(sizeof(float), MemoryClass::kDevice);
++    if (wavefront() == 0 || wavefront() > be_.device_info().max_threads_per_workgroup) {
++      return LSE_ERROR(kUnimplemented, "touch probe needs known device geometry");
++    }
++    Result<KernelHandle> built = use_loom_
++        ? compiled_loom(emit_loom_touch_probe(be_.device_info()))
++        : compiled("lse_probe_touch", touch_source("lse_probe_touch"));
++    if (!built.ok()) return built.status();
++    const KernelHandle kernel = built.release();
++    ProbeRetirement<DeviceBuffer> buffers;
++    if (!buffers.available()) {
++      return LSE_ERROR(kDeviceError, "probe retirement capacity unavailable");
++    }
++    auto sink = be_.allocate(17 * sizeof(float), MemoryClass::kDevice);
+     if (!sink.ok()) return sink.status();
+     DeviceBuffer dst = sink.release();
++    buffers.track(dst);
+ 
+     LaunchDims dims;
+     dims.workgroup_size[0] = wavefront() != 0 ? wavefront() : 32u;
+     dims.workgroup_count[0] = 1;
+     dims.subgroup_size = wavefront();
+-    const BufferRef refs[] = {{&dst, 0, dst.size_bytes}};
++    const BufferRef refs[] = {{&dst, 0, sizeof(float)}};
+     DispatchArgs args;
+     args.bindings = refs;
++    const std::uint32_t count = 1;
++    if (use_loom_) args.constants = std::as_bytes(std::span(&count, 1));
+ 
+-    Status status = be_.launch(kernel, dims, args);
++    Status status = poison_output(dst, 1);
++    if (status.ok()) status = be_.launch(kernel, dims, args);
+     if (status.ok()) status = be_.synchronize();
++    if (status.ok()) status = validate_output(dst, 1, 1.0f);
++    if (status.ok()) status = poison_output(dst, 1);
+     if (status.ok()) {
+       const auto t0 = Clock::now();
+       for (int r = 0; r < kLaunchReps && status.ok(); ++r) {
+@@ -417,6 +507,7 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
+       }
+       if (status.ok()) status = be_.synchronize();
+       const double ns = ns_since(t0);
++      if (status.ok()) status = validate_output(dst, 1, 1.0f);
+       if (status.ok() && ns > 0.0) {
+         // One workgroup of one wave writing one float: what is left after
+         // dividing is the submission path, which is what a placement decision
+@@ -425,7 +516,8 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
+             probe::Measured::measured(ns / static_cast<double>(kLaunchReps));
+       }
+     }
+-    be_.deallocate(dst);
++    status = finish_buffers(buffers, status);
++    if (!status.ok()) out.launch_overhead_ns = {};
+     return status;
+   }
+ 
+@@ -664,6 +756,8 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
+ 
+   IBackend& be_;
+   ComgrCompiler compiler_;
++  LoomcCompiler loom_compiler_;
++  bool use_loom_;
+   graph::JitCache cache_;
+   bool usable_ = false;
+   std::string declined_;
 diff --git a/src/backends/hrx/loomc/loom_emitter.cpp b/src/backends/hrx/loomc/loom_emitter.cpp
-index 7558527..40d61c1 100644
+index 7558527..712e95b 100644
 --- a/src/backends/hrx/loomc/loom_emitter.cpp
 +++ b/src/backends/hrx/loomc/loom_emitter.cpp
-@@ -1,6 +1,7 @@
+@@ -1,6 +1,9 @@
  #include "lse/backends/hrx/loomc/loom_emitter.hpp"
  
  #include <algorithm>
++#include <bit>
++#include <cstdlib>
 +#include <limits>
  #include <unordered_map>
  #include <unordered_set>
  #include <vector>
-@@ -453,6 +454,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -18,6 +21,116 @@ using namespace lse::graph;
+ 
+ namespace {
+ 
++// Full structural identity, independent of graph addresses. The graph's
++// display signature omits edges and aliasing; those change argument indices
++// and cannot identify reusable source or JIT objects.
++std::string emission_identity(const FusionGroup& group, const DeviceInfo& device) {
++  std::string key;
++  key.reserve(1024);
++  auto number = [&](std::uint64_t value) {
++    for (unsigned byte = 0; byte < 8; ++byte) {
++      key.push_back(static_cast<char>((value >> (byte * 8)) & 255u));
++    }
++  };
++  auto text = [&](std::string_view value) {
++    number(value.size());
++    key.append(value);
++  };
++  text("loom");
++  number(1);  // identity format
++  text(device.arch);
++  // Kernel selection overrides also distinguish persistent JIT identities.
++  // FLASH_SDPA and WMMA_MIN_M are latched by their kernels for the process.
++  for (const char* name : {"LSE_WMMA", "LSE_FLASH_SDPA", "LSE_WMMA_MIN_M"}) {
++    const char* value = std::getenv(name);
++    text(value != nullptr ? std::string_view(value) : std::string_view{});
++  }
++  number(device.lds_bytes_per_workgroup);
++  number(device.compute_units);
++  number(device.max_threads_per_workgroup);
++  number(device.wavefront_size);
++  number(device.max_waves_per_cu);
++  number(device.cus_per_lds_pool);
++  auto fact = [&](const auto& value) {
++    number(static_cast<std::uint64_t>(value.source));
++    number(value.value);
++  };
++  const auto& f = device.arch_facts;
++  fact(f.vector_registers_per_simd);
++  fact(f.vector_register_alloc_granule);
++  fact(f.vector_registers_addressable_per_wave);
++  fact(f.scalar_registers_per_simd);
++  fact(f.scalar_register_alloc_granule);
++  fact(f.scalar_registers_addressable_per_wave);
++  fact(f.lds_bytes_addressable_per_workgroup);
++  fact(f.lds_banks);
++  fact(f.max_flat_workgroup_size);
++  fact(f.wave_slots_per_simd);
++  fact(f.simds_per_lds_pool);
++  fact(f.lds_bytes_per_pool);
++  fact(f.lds_alloc_granule_bytes);
++  number(static_cast<std::uint64_t>(device.residency_bandwidth.source));
++  for (auto p : device.residency_bandwidth.percent) number(p);
++  text(device.extension_id);
++  const auto* amd = device_extension<AmdDeviceInfo>(device);
++  number(amd != nullptr);
++  if (amd != nullptr) {
++    number(amd->l2_cache_bytes);
++    number(amd->clock_khz);
++    number(static_cast<std::uint64_t>(amd->matrix_core));
++    number(amd->has_bf16_arith);
++    number(amd->matrix_core_bf16);
++    number(amd->has_dot4_i8);
++    number(amd->has_dot4_iu8);
++    number(amd->max_load_bytes);
++    number(amd->max_store_bytes);
++  }
++  number(static_cast<std::uint64_t>(group.anchor));
++  number(static_cast<std::uint64_t>(group.anchor_class));
++  number(group.is_phase);
++  std::unordered_map<const Node*, std::uint64_t> ids;
++  std::vector<const Node*> nodes;
++  auto identify = [&](const NodePtr& node) {
++    if (!node) return std::uint64_t{0};
++    const auto [it, inserted] = ids.emplace(node.get(), ids.size() + 1);
++    if (inserted) nodes.push_back(node.get());
++    return it->second;
++  };
++  auto sequence = [&](const auto& list) {
++    number(list.size());
++    for (const auto& node : list) number(identify(node));
++  };
++  sequence(group.inputs);
++  sequence(group.nodes);
++  sequence(group.outputs);
++  // Edges of computed nodes, including any boundary input absent from the
++  // caller's input list. Boundary nodes' own producers do not enter the kernel.
++  for (const auto& node : group.nodes) sequence(node->inputs);
++  number(nodes.size());
++  for (const Node* node : nodes) {
++    number(static_cast<std::uint64_t>(node->kind));
++    number(static_cast<std::uint64_t>(node->fclass));
++    number(static_cast<std::uint64_t>(node->dtype));
++    number(node->shape.rank());
++    for (std::size_t i = 0; i < node->shape.rank(); ++i) {
++      number(static_cast<std::uint64_t>(node->shape.dim(i)));
++    }
++    for (auto value : node->iattrs) number(static_cast<std::uint64_t>(value));
++    for (float value : node->attrs) number(std::bit_cast<std::uint32_t>(value));
++    text(node->prim ? node->prim->name() : std::string_view{});
++  }
++  return key;
++}
++
++std::uint64_t identity_hash(std::string_view key) {
++  std::uint64_t hash = 1469598103934665603ull;
++  for (unsigned char c : key) {
++    hash ^= c;
++    hash *= 1099511628211ull;
++  }
++  return hash;
++}
++
+ kir::Scalar elem_of(DType dt) {
+   switch (dt) {
+     case DType::kF16: return kir::Scalar::kF16;
+@@ -231,13 +344,7 @@ std::string kernel_header(const EmittedKernel& out,
+ 
+ std::uint64_t LoomEmitter::cache_key(const FusionGroup& group,
+                                      const DeviceInfo& device) const {
+-  // Same group, same device, different language: the emit cache and the JIT
+-  // cache both key on this, so the dialect has to be in it or the two
+-  // toolchains serve each other's objects.
+-  std::uint64_t h = IKernelEmitter::cache_key(group, device);
+-  h ^= static_cast<std::uint64_t>(Dialect::kLoom) + 0x9e3779b97f4a7c15ull;
+-  h *= 1099511628211ull;
+-  return h;
++  return identity_hash(emission_identity(group, device));
+ }
+ 
+ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -323,7 +430,8 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+ 
+   EmittedKernel out;
+   out.dialect = Dialect::kLoom;
+-  out.entry_name = "lse_loom_" + std::to_string(group.signature());
++  const std::string identity = emission_identity(group, device);
++  out.entry_name = "lse_loom_" + std::to_string(identity_hash(identity));
+ 
+   std::unordered_map<const Node*, std::size_t> binding_of;
+   auto bind = [&](const NodePtr& n) {
+@@ -348,6 +456,35 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+   }
+   out.constants.add("count", 4);
+ 
++  // Keep only source and launch metadata. The bindings above always come from
++  // this invocation, including a rebuilt graph after a request restart.
++  {
++    const std::lock_guard lock(cache_mutex_);
++    if (const auto it = emit_cache_.find(identity); it != emit_cache_.end()) {
++      auto bindings = std::move(out.binding_order);
++      out = it->second;
++      out.binding_order = std::move(bindings);
++      ++cache_hits_;
++      return out;
++    }
++    ++cache_misses_;
++  }
++  auto remember = [&] {
++    EmittedKernel saved = out;
++    saved.binding_order.clear();
++    const std::lock_guard lock(cache_mutex_);
++    constexpr std::size_t kSourceBudget = 64u * 1024u * 1024u;
++    if (saved.source.size() > kSourceBudget) return;
++    if (emit_cache_.size() >= 1024 ||
++        cache_bytes_ + saved.source.size() > kSourceBudget) {
++      emit_cache_.clear();
++      cache_bytes_ = 0;
++    }
++    if (emit_cache_.emplace(identity, std::move(saved)).second) {
++      cache_bytes_ += out.source.size();
++    }
++  };
++
+   // The launch parameters, and the views the body reads through. Parameter
+   // names follow the emitter convention the recorder already binds against:
+   // `in0..inN` and `out` for a self-indexed body, `b0..bN` for the per-element
+@@ -453,6 +590,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
        stored = true;
        std::string s;
        std::unordered_map<const Node*, std::string> value_of;
@@ -604,7 +1405,7 @@ index 7558527..40d61c1 100644
        value_of[anchor.get()] = std::string(value);
        const std::string idx(index);
  
-@@ -561,8 +563,19 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -561,8 +699,19 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
      si_shapes.types = type_table;
      si_shapes.intrinsics = &spellings;
  
@@ -625,7 +1426,15 @@ index 7558527..40d61c1 100644
      if (!epilogue_error.ok()) return epilogue_error;
      if (text.empty() || !cap.has()) {
        return LSE_ERROR(kUnimplemented, "primitive '",
-@@ -607,7 +620,8 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -595,6 +744,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+     }
+     out.source = kernel_header(out, params) + prologue + printed->text +
+                  "  kernel.return\n}\n";
++    remember();
+     return out;
+   }
+ 
+@@ -607,7 +757,8 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
  
    std::unordered_set<const Node*> pointer_inputs;
    for (const NodePtr& n : group.nodes) {
@@ -635,7 +1444,7 @@ index 7558527..40d61c1 100644
      for (const NodePtr& in : n->inputs) pointer_inputs.insert(in.get());
    }
  
-@@ -624,6 +638,8 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -624,6 +775,8 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
  
    std::string inner;
    std::unordered_map<const Node*, std::string> value_of;
@@ -644,7 +1453,7 @@ index 7558527..40d61c1 100644
    for (std::size_t i = 0; i < input_count; ++i) {
      const NodePtr& n = out.binding_order[i];
      if (pointer_inputs.count(n.get()) != 0) continue;
-@@ -716,6 +732,79 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -716,6 +869,79 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
        continue;
      }
  
@@ -724,7 +1533,7 @@ index 7558527..40d61c1 100644
      std::vector<std::string> args;
      args.reserve(n->inputs.size());
      for (const NodePtr& in : n->inputs) {
-@@ -785,7 +874,8 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -785,7 +1011,8 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
        inner += "  scf.if " + ok + " {\n";
        guard_close = "  }\n";
      }
@@ -734,6 +1543,20 @@ index 7558527..40d61c1 100644
          narrow_from_f32(it->second, n->dtype, mint, inner);
      const std::string dst = bounded("%i", n->element_count(), mint, inner);
      inner += "  view.store " + narrowed + ", %" + names[i] + "_view[" + dst +
+@@ -809,7 +1036,13 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+   out.lds_bytes = 0;
+   out.source =
+       kernel_header(out, params) + prologue + body + "  kernel.return\n}\n";
++  remember();
+   return out;
+ }
+ 
++LoomEmitter::CacheStats LoomEmitter::cache_stats() const {
++  const std::lock_guard lock(cache_mutex_);
++  return {cache_hits_, cache_misses_, emit_cache_.size(), cache_bytes_};
++}
++
+ }  // namespace lse::backend
 diff --git a/src/backends/hrx/loomc/loom_print.cpp b/src/backends/hrx/loomc/loom_print.cpp
 index 50b9aef..cc78f90 100644
 --- a/src/backends/hrx/loomc/loom_print.cpp
@@ -890,10 +1713,72 @@ index afeb740..ecf962d 100644
  
  namespace {
 diff --git a/src/cli/main.cpp b/src/cli/main.cpp
-index eee0565..08e97a6 100644
+index eee0565..113f59a 100644
 --- a/src/cli/main.cpp
 +++ b/src/cli/main.cpp
-@@ -703,8 +703,8 @@ int main(int argc, char** argv) {
+@@ -28,6 +28,7 @@
+ #include "lse/runtime/batch.hpp"
+ #include "lse/runtime/generator.hpp"
+ #include "lse/tokenizer/tokenizer.hpp"
++#include "token_ids.hpp"
+ 
+ namespace {
+ 
+@@ -52,6 +53,7 @@ struct Options {
+   // does not say gets.
+   std::string dialect;
+   bool show_stats = false;
++  bool token_ids = false;
+   bool list_devices = false;
+   bool list_cache = false;
+   bool debug = false;
+@@ -105,6 +107,8 @@ void usage() {
+       "                         below what the batch needs, sequences are\n"
+       "                         preempted and resume (default: no limit)\n"
+       "      --stats            print timings when done\n"
++      "      --token-ids        print exact prompt/generated IDs as JSON to stderr\n"
++      "                         after generation (single sequence only)\n"
+       "      --debug            print the HIP dump path and file count\n"
+       "      --devices          report every device this build can see, with\n"
+       "                         its identity and what it will not answer\n"
+@@ -151,6 +155,8 @@ bool parse(int argc, char** argv, Options* opt) {
+                      opt->dialect.c_str());
+         return false;
+       }
++    } else if (a == "--token-ids") {
++      opt->token_ids = true;
+     } else if (a == "--stats") {
+       opt->show_stats = true;
+     } else if (a == "--debug") {
+@@ -208,6 +214,11 @@ bool parse(int argc, char** argv, Options* opt) {
+     }
+   }
+ 
++  if (opt->token_ids && (opt->batch != 1 || !opt->prompts.empty())) {
++    std::fputs("lse: --token-ids requires a single sequence (no --batch or --prompt)\n", stderr);
++    return false;
++  }
++
+   if (!positional.empty()) {
+     opt->prompt.clear();
+     for (std::size_t i = 0; i < positional.size(); ++i) {
+@@ -699,12 +710,24 @@ int main(int argc, char** argv) {
+   auto out = gen.generate(*prompt, opt.limits, emit);
+   if (!out.ok()) return fail(out.status(), "generating");
+   std::putchar('\n');
++  // The generator already owns both vectors. No per-token hook or collection
++  // is added; diagnostic formatting happens after measured generation ends.
++  if (opt.token_ids) {
++    if (std::fflush(stdout) != 0) {
++      std::fputs("lse: flushing generated text failed\n", stderr);
++      return 1;
++    }
++    if (!cli::print_token_ids(stderr, *prompt, *out)) {
++      std::fputs("lse: writing token-ID diagnostic failed\n", stderr);
++      return 1;
++    }
++  }
+ 
    if (opt.show_stats) {
      const runtime::GenerationStats& s = gen.stats();
      std::fprintf(stderr,
@@ -904,7 +1789,7 @@ index eee0565..08e97a6 100644
                   "spec steps %u accepted %u (%.1f%%) | %u verify pass(es) "
                   "%.1f ms each | draft %.1f ms each\n"
                   "launches %u | phases %u (ideal %u launch%s) | groups "
-@@ -715,7 +715,9 @@ int main(int argc, char** argv) {
+@@ -715,7 +738,9 @@ int main(int argc, char** argv) {
                   "sched partition=%.3f s emit=%.3f s launch=%.3f s sync=%.3f s\n"
                   "jit mem=%llu disk=%llu compile=%llu (%.3f s)\n",
                   s.prompt_tokens, static_cast<double>(s.prefill_ns) / 1e9,
@@ -1221,10 +2106,172 @@ index 3ad7a35..0abc576 100644
        // Out of descriptors: the connection stays queued and the listening
        // socket stays readable, so waiting on it again would report ready
 diff --git a/src/graph/scheduler.cpp b/src/graph/scheduler.cpp
-index e5045ed..fdfc394 100644
+index e5045ed..318f792 100644
 --- a/src/graph/scheduler.cpp
 +++ b/src/graph/scheduler.cpp
-@@ -1677,8 +1677,18 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
+@@ -23,7 +23,9 @@
+ #include "lse/graph/program.hpp"
+ #include "lse/graph/stream_plan.hpp"
+ #include "lse/graph/kernel_primitive.hpp"
++#include "lse/graph/pointwise_fusion.hpp"
+ #include "lse/opt/fusion.hpp"
++#include "dispatch_profile.hpp"
+ 
+ namespace lse::graph {
+ namespace {
+@@ -656,7 +658,33 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
+   // ones a wrong-device launch would read.
+   LSE_RETURN_IF_ERROR(check_residency(bindings, member));
+ 
+-  const auto t_launch = bind_span.close();
++  // Submit mode preserves normal command-buffer batching. Serial mode is an
++  // intrusive diagnostic: drain prior work, submit one dispatch, then wait for
++  // completion. Its clock includes runtime/queue overhead, not just GPU work.
++  struct ProfileLifetime {
++    detail::DispatchProfileMode mode =
++        detail::dispatch_profile_mode(std::getenv("LSE_PROFILE_DISPATCH"));
++    detail::DispatchProfile profile;
++    ~ProfileLifetime() {
++      profile.print(stderr, mode == detail::DispatchProfileMode::kSerial);
++    }
++  };
++  static ProfileLifetime profiling;
++  if (profiling.mode == detail::DispatchProfileMode::kInvalid) {
++    return LSE_ERROR(kInvalidArgument,
++                     "LSE_PROFILE_DISPATCH must be off, submit, or serial");
++  }
++  const bool serial = profiling.mode == detail::DispatchProfileMode::kSerial;
++  auto t_launch = bind_span.close();
++  std::uint64_t predrain_ns = 0;
++  if (serial) {
++    const Status drained = be.synchronize();
++    const auto after_drain = SpanClock::now();
++    predrain_ns = elapsed_ns(t_launch, after_drain);
++    trace_.spans.host_wait.add(predrain_ns);
++    LSE_RETURN_IF_ERROR(drained);
++    t_launch = after_drain;
++  }
+   if (impl_->member_dirty.size() <= member) {
+     impl_->member_dirty.resize(member + 1, 0);
+   }
+@@ -664,8 +692,37 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
+   const Status submitted = be.launch(
+       launched, emitted->dims, args,
+       backend::DispatchTarget{stream, devices_.residency(member), {}});
+-  trace_.spans.submit.add(elapsed_ns(t_launch, SpanClock::now()));
+-  LSE_RETURN_IF_ERROR(submitted);
++  const auto after_submit = SpanClock::now();
++  const std::uint64_t submit_ns = elapsed_ns(t_launch, after_submit);
++  trace_.spans.submit.add(submit_ns);
++  Status completed = submitted;
++  std::uint64_t completion_ns = 0;
++  if (serial && submitted.ok()) {
++    completed = be.synchronize();
++    const auto after_completion = SpanClock::now();
++    completion_ns = elapsed_ns(t_launch, after_completion);
++    trace_.spans.host_wait.add(elapsed_ns(after_submit, after_completion));
++  }
++  if (profiling.mode != detail::DispatchProfileMode::kOff) {
++    std::string key = emitted->entry_name + " anchor=" +
++        std::string(to_string(group.anchor)) + " phase=" +
++        std::to_string(group.is_phase) + " member=" + std::to_string(member) +
++        " stream=" + std::to_string(stream.index) + " grid=";
++    for (std::size_t i = 0; i < 3; ++i) {
++      key += (i == 0 ? "" : "x") + std::to_string(emitted->dims.workgroup_count[i]);
++    }
++    key += " wg=";
++    for (std::size_t i = 0; i < 3; ++i) {
++      key += (i == 0 ? "" : "x") + std::to_string(emitted->dims.workgroup_size[i]);
++    }
++    for (const NodePtr& n : emitted->binding_order) {
++      key += " " + std::string(to_string(n->kind)) + n->shape.to_string() +
++             ":" + std::string(to_string(n->dtype));
++    }
++    profiling.profile.record(std::move(key), submit_ns, completion_ns,
++                              predrain_ns, completed.ok());
++  }
++  LSE_RETURN_IF_ERROR(completed);
+   // Diagnostic: LSE_DUMP_BUFFERS=<entry substring> drains the device after
+   // this dispatch and prints a checksum and the first values of every bound
+   // buffer, so a kernel's inputs and outputs can be compared across builds.
+@@ -827,6 +884,7 @@ std::uint64_t attributed_ns(const Scheduler::Trace::Spans& s) noexcept {
+ 
+ Status accumulate(Scheduler::Trace& acc, const Scheduler::Trace& step) {
+   acc.device_groups += step.device_groups;
++  acc.partition_passes += step.partition_passes;
+   acc.host_groups += step.host_groups;
+   acc.phase_groups += step.phase_groups;
+   acc.phase_ideal_launches += step.phase_ideal_launches;
+@@ -951,6 +1009,31 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
+   trace_.launch_ns = trace_.spans.submit.ns;
+   trace_.sync_ns = trace_.spans.host_wait.ns;
+ 
++  static const bool time_steps = std::getenv("LSE_TIME_STEPS") != nullptr;
++  if (time_steps) {
++    static std::atomic<std::uint64_t> step_sequence{0};
++    const auto& s = trace_.spans;
++    std::fprintf(stderr,
++        "[step-spans] step=%llu ok=%d replayed=%d device_groups=%u "
++        "host_groups=%u views=%u total_ms=%.3f partition_ms=%.3f "
++        "schedule_ms=%.3f emit_ms=%.3f jit_lookup_ms=%.3f "
++        "jit_compile_ms=%.3f bind_ms=%.3f submit_ms=%.3f "
++        "host_wait_ms=%.3f readback_ms=%.3f\n",
++        static_cast<unsigned long long>(step_sequence.fetch_add(1)),
++        static_cast<int>(ran.ok()), static_cast<int>(trace_.replayed),
++        trace_.device_groups, trace_.host_groups, trace_.views_aliased,
++        static_cast<double>(s.step.ns) / 1e6,
++        static_cast<double>(s.partition.ns) / 1e6,
++        static_cast<double>(s.schedule.ns) / 1e6,
++        static_cast<double>(s.emit.ns) / 1e6,
++        static_cast<double>(s.jit_lookup.ns) / 1e6,
++        static_cast<double>(s.jit_compile.ns) / 1e6,
++        static_cast<double>(s.bind.ns) / 1e6,
++        static_cast<double>(s.submit.ns) / 1e6,
++        static_cast<double>(s.host_wait.ns) / 1e6,
++        static_cast<double>(s.readback.ns) / 1e6);
++  }
++
+   const Status accumulated = accumulate(acc_, trace_);
+   if (!ran.ok()) return ran;
+   return accumulated;
+@@ -1004,6 +1087,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
+   // ones and pays none of it, which is why this and `schedule` are two spans
+   // and not one.
+   SpanTimer build_span(trace_.spans.partition, setup_span.close());
++  if (!replayed) ++trace_.partition_passes;
+   auto planned = replayed
+                      ? std::vector<Workgroup>{}
+                      : Partitioner::phases(roots, &backend().device_info());
+@@ -1019,6 +1103,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
+     // the same one-group path a node it refuses to stage already takes.
+     const IPhaseStaging* staging = emitter->staging();
+     for (Workgroup& wg : planned) {
++      const std::size_t phase_begin = phase_groups.size();
+       FusionGroup g = Partitioner::phase_group(wg, roots);
+       if (g.nodes.empty()) continue;
+       alias_ready_reshapes(g);
+@@ -1207,6 +1292,12 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
+         if (staging == nullptr || !staging->can_stage(*n)) {
+           flush_staged();
+           if (join_gdn_pair(n)) continue;
++          // No staged/grid barrier is needed for a single-consumer pointwise
++          // chain. Keep the ordinary emitter's existing fused SSA form.
++          if (staging == nullptr && phase_groups.size() > phase_begin &&
++              join_pointwise_chain(phase_groups.back(), n, roots, emitter->sources())) {
++            continue;
++          }
+           FusionGroup one;
+           one.nodes.push_back(n);
+           one.outputs.push_back(n);
+@@ -1599,6 +1690,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
+   // dispatch loop to the remainder rather than being folded in here — which is
+   // what the old partition_ns did, silently.
+   const auto t_repartition = place_span.close();
++  ++trace_.partition_passes;
+   std::vector<FusionGroup> groups =
+       Partitioner::partition(roots, &backend().device_info());
+   trace_.spans.partition.add(elapsed_ns(t_repartition, SpanClock::now()));
+@@ -1677,8 +1769,18 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
          ran.push_back(g);
          continue;
        }
@@ -1245,7 +2292,7 @@ index e5045ed..fdfc394 100644
        ++trace_.host_groups;
        trace_.host_group_reasons.push_back(dispatched.message());
      }
-@@ -1691,6 +1701,12 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
+@@ -1691,6 +1793,12 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
        launched = false;
      }
  
@@ -1258,7 +2305,7 @@ index e5045ed..fdfc394 100644
      // Host-only mode reaches here without passing the device-first arm above,
      // so nothing had counted this group. Leaving it uncounted printed
      // `groups device=0 host=0` beside a five-figure launch count, which reads
-@@ -1870,6 +1886,9 @@ ScopedMember::ScopedMember(std::size_t member) noexcept
+@@ -1870,6 +1978,9 @@ ScopedMember::ScopedMember(std::size_t member) noexcept
  ScopedMember::~ScopedMember() { g_preferred_member = previous_; }
  
  Scheduler* default_scheduler() {
@@ -1593,6 +2640,220 @@ index 8525a9b..43e66d9 100644
        const auto j = e.let(lane + ei * wave);
        if (auto in = e.when(j < D)) {
          const auto idx = ((b * heads + h) * D + row) * D + j;
+diff --git a/src/kernels/quant_linear.cpp b/src/kernels/quant_linear.cpp
+index bbfbcfc..9c649dc 100644
+--- a/src/kernels/quant_linear.cpp
++++ b/src/kernels/quant_linear.cpp
+@@ -19,12 +19,14 @@
+ // codes with v_dot4_i32_iu8, spending no per-weight instruction on the scale
+ // or the bias at all. quant/group_affine_codec.hpp carries the algebra, and
+ // `dot_ok` below carries what a device must have for it.
++#include <algorithm>
+ #include <array>
+ #include <span>
+ #include <string>
+ 
+ #include "lse/backends/hrx/device_info.hpp"
+ #include "lse/kernels/lds_linear.hpp"
++#include "lse/kernels/quant_panel.hpp"
+ #include "lse/kernels/vec_mem.hpp"
+ #include "lse/kernels/wmma.hpp"
+ #include "lse/graph/kernel_args.hpp"
+@@ -322,6 +324,22 @@ bool body_dot(const KernelShapes& s, const QuantDims& d) {
+   return quant_hoisted || budget == 0 || dot_lds_bytes(d) <= budget;
+ }
+ 
++// Exact-FP32 prefill schedule for the validated gfx1201 layout. Indexed rows may name different
++// matrices, and externally staged panels have a caller-owned layout, so neither
++// can participate in this reuse path.
++std::uint32_t q6_prefill_rows(const KernelShapes& s, const QuantDims& d,
++                              bool indexed) {
++  if (!d.valid || indexed || d.m < 2 || d.spec.bits != 6 ||
++      d.spec.group_size != 64 || s.device == nullptr ||
++      s.device->arch != "gfx1201" || wave_of(s.device) != 32 ||
++      s.input_dtypes[0] != DType::kF32 ||
++      s.input_dtypes[2] != DType::kBF16 || !s.staged.name.empty() ||
++      !s.staged_quant.codes.empty()) return 1;
++  const std::uint32_t rows = d.m >= 4 ? 4u : 2u;
++  const auto tile = std::min<std::uint32_t>(1024u, static_cast<std::uint32_t>(d.k));
++  return workgroup_lds_bytes(s.device) >= rows * tile * 4u ? rows : 1u;
++}
++
+ // Exactly the workgroup-shared arrays emit_body declares when it covers `rows`
+ // rows, under exactly the same conditions and in the same order of decision.
+ // The plan and the body cannot be allowed to disagree: this is the number a
+@@ -337,6 +355,9 @@ bool body_dot(const KernelShapes& s, const QuantDims& d) {
+ std::uint32_t body_lds_bytes_at(const KernelShapes& s, const QuantDims& d,
+                                 std::uint32_t rows) {
+   if (!d.valid || rows == 0) return 0;
++  if (rows > 1 && d.spec.bits == 6 && !body_dot(s, d)) {
++    return rows * std::min<std::uint32_t>(1024u, static_cast<std::uint32_t>(d.k)) * 4u;
++  }
+   const auto k = static_cast<std::uint32_t>(d.k);
+   const std::uint32_t budget = workgroup_lds_bytes(s.device);
+   const bool quant_hoisted =
+@@ -440,6 +461,8 @@ constexpr std::uint32_t kMaxRowsPerGroup = 8;
+ // available where the rows agree on the matrix.
+ std::uint32_t rows_per_group(const KernelShapes& s, const QuantDims& d,
+                              bool indexed) {
++  const auto exact_rows = q6_prefill_rows(s, d, indexed);
++  if (exact_rows > 1) return exact_rows;
+   if (!d.valid || indexed || d.m <= 1 || !body_dot(s, d)) return 1;
+   if (s.device == nullptr) return 1;
+   const auto m = static_cast<std::uint32_t>(d.m);
+@@ -747,7 +770,7 @@ void emit_chunk(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
+                 const kir::Val<kir::u32>& x_base,
+                 const kir::Val<kir::u32>& chunk,
+                 const kir::LValue<kir::f32>& acc,
+-                std::uint32_t chunks_per_group) {
++                std::uint32_t chunks_per_group, bool rotate_panel) {
+   const auto vals = static_cast<std::uint32_t>(spec.values_per_chunk());
+   const auto words = static_cast<std::uint32_t>(spec.words_per_chunk());
+   const auto group = e.let(chunk / chunks_per_group);
+@@ -758,13 +781,90 @@ void emit_chunk(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
+       e, a.packed, spec, e.let(row_base + chunk * words), scale, bias,
+       [&](int c, const kir::Val<kir::f32>& w) {
+         const auto idx = e.let(k_base + static_cast<std::uint32_t>(c));
+-        const auto xe = xs != nullptr ? (*xs)[idx].read() : a.x[x_base + idx];
++        const auto panel_idx = rotate_panel ? e.let(q6_panel_index(idx)) : idx;
++        const auto xe = xs != nullptr ? (*xs)[panel_idx].read() : a.x[x_base + idx];
+         acc = math::fma(xe, w, acc.read());
+       });
+ }
+ 
++// Every lane visits the same K indices, in the same order, as the one-row
++// kernel. Only the decoded weight's lifetime changes: it feeds several FP32
++// accumulators before being discarded. No activation or weight is narrowed.
++template <class A>
++std::string emit_q6_prefill(const KernelShapes& s, const QuantDims& d,
++                            std::uint32_t rows) {
++  const auto n = static_cast<std::uint32_t>(d.n);
++  const auto m = static_cast<std::uint32_t>(d.m);
++  const auto k = static_cast<std::uint32_t>(d.k);
++  const auto lanes = static_cast<std::uint32_t>(d.lanes);
++  const auto groups = static_cast<std::uint32_t>(d.groups);
++  const auto tile_k = std::min(1024u, k);
++  constexpr std::uint32_t wave = 32;
++  constexpr std::uint32_t values = 16;
++  constexpr std::uint32_t words = 3;
++  constexpr std::uint32_t chunks_per_group = 4;
++  kir::KernelBody kb(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
++  kb.set_store(s.store);
++  A a;
++  if (!env::bind(kb, a, s)) return {};
++  env::Emit e{&kb};
++  const auto lid = e.let(math::local_id());
++  const auto lane = e.let(lid % wave);
++  const auto col = e.let(math::workgroup_id_x() * (kBlock / wave) + lid / wave);
++  const auto row = e.let(math::workgroup_id_y() * rows);
++  const auto panel = e.lds<kir::f32>(rows * tile_k);
++  std::vector<kir::LValue<kir::f32>> acc;
++  for (std::uint32_t r = 0; r < rows; ++r) acc.push_back(e.var(0.0f));
++  for (auto base : e.range(0u, k, tile_k)) {
++    for (auto at : e.range(lid, e.u32(tile_k), kBlock)) {
++      for (std::uint32_t r = 0; r < rows; ++r) {
++        auto x = e.var(0.0f);
++        if (auto live = e.when(row + r < m && base + at < k)) {
++          x = a.x[(row + r) * k + base + at];
++        }
++        panel[r * tile_k + q6_panel_index(at)] = x.read();
++      }
++    }
++    e.barrier();
++    if (auto live_col = e.when(col < n)) {
++      for (auto chunk : e.range(lane, e.u32(tile_k / values), wave)) {
++        const auto logical_k = e.let(base + chunk * values);
++        if (auto live_k = e.when(logical_k < k)) {
++          const auto global_chunk = e.let(logical_k / values);
++          const auto group = e.let(global_chunk / chunks_per_group);
++          const auto scale = e.let(math::widen(a.scales[col * groups + group]));
++          const auto bias = e.let(math::widen(a.biases[col * groups + group]));
++          quant::dequant_chunk(e, a.packed, d.spec,
++              e.let(col * lanes + global_chunk * words), scale, bias,
++              [&](int c, const kir::Val<kir::f32>& weight) {
++                for (std::uint32_t r = 0; r < rows; ++r) {
++                  const auto at = e.let(r * tile_k + q6_panel_index(
++                      chunk * values + static_cast<std::uint32_t>(c)));
++                  acc[r] = math::fma(panel[at].read(), weight, acc[r].read());
++                }
++              });
++        }
++      }
++    }
++    // All readers retire before any wave refills the shared panel.
++    e.barrier();
++  }
++  for (std::uint32_t r = 0; r < rows; ++r) {
++    for (std::uint32_t bit = 1; bit < wave; bit <<= 1) {
++      acc[r] = acc[r].read() + math::shfl_xor(acc[r].read(), e.u32(bit));
++    }
++    if (auto writer = e.when(lane == 0 && col < n && row + r < m)) {
++      e.store((row + r) * n + col, acc[r].read());
++    }
++  }
++  return kb.lds().ok() ? kb.str() : std::string{};
++}
++
+ template <class A>
+ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
++  if (const auto rows = q6_prefill_rows(s, d, Indexed<A>); rows > 1) {
++    return emit_q6_prefill<A>(s, d, rows);
++  }
+   const auto n = static_cast<std::uint32_t>(d.n);
+   const auto k = static_cast<std::uint32_t>(d.k);
+   const auto m = static_cast<std::uint32_t>(d.m);
+@@ -831,6 +931,12 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
+     fill = true;
+   }
+   const bool stage = static_cast<bool>(xs);
++  // A caller-owned panel retains its declared linear layout. Decode can rotate
++  // only the panel this body fills, using the same map for stores and reads.
++  const bool rotate_panel = fill && d.spec.bits == 6 && d.m == 1 &&
++      d.spec.group_size == 64 && s.device != nullptr &&
++      s.device->arch == "gfx1201" && wave == 32 &&
++      s.input_dtypes[0] == DType::kF32 && s.input_dtypes[2] == DType::kBF16;
+ 
+   // A run whose stages all quantize this row the same way hoists the int8 form
+   // once, the way it already hoists the float row. Reading it costs this body
+@@ -875,7 +981,8 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
+   if (auto in_grid = e.when(tile < ntiles && row < m)) {
+     if (fill) {
+       for (auto t : e.range(lid, e.u32(k), kBlock)) {
+-        xs[t] = a.x[row * k + t];
++        const auto at = rotate_panel ? e.let(q6_panel_index(t)) : t;
++        xs[at] = a.x[row * k + t];
+       }
+       e.barrier();
+     }
+@@ -920,7 +1027,7 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
+           for (std::uint32_t u = 0; u < cpl; ++u) {
+             emit_chunk<A>(e, a, stage ? &xs : nullptr, d.spec, row_base,
+                           scale_base, x_base, e.let(chunk0 + u), acc[0],
+-                          chunks_per_group);
++                          chunks_per_group, rotate_panel);
+           }
+         }
+       }
+@@ -932,7 +1039,8 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
+                             chunks_per_group, cb);
+           } else {
+             emit_chunk<A>(e, a, stage ? &xs : nullptr, d.spec, row_base,
+-                          scale_base, x_base, chunk, acc[0], chunks_per_group);
++                          scale_base, x_base, chunk, acc[0], chunks_per_group,
++                          rotate_panel);
+           }
+         }
+       }
+@@ -1051,6 +1159,9 @@ struct QuantLinearKernel final : KernelPrimitive<QuantLinearKernel> {
+   StagedRow staged_row(const KernelShapes& s) const override {
+     const QuantDims d = dims_of(s, false);
+     if (!shape_ok(d) || !device_fits(s)) return {};
++    // This schedule owns several rows and stages K tiles itself; advertising a
++    // single-row hoisted panel would let fusion change its launch coverage.
++    if (q6_prefill_rows(s, d, false) > 1) return {};
+     return {0, static_cast<std::uint32_t>(d.k),
+             static_cast<std::uint32_t>(d.m)};
+   }
 diff --git a/src/kernels/sdpa.cpp b/src/kernels/sdpa.cpp
 index f1b0753..356fc24 100644
 --- a/src/kernels/sdpa.cpp
@@ -2060,11 +3321,126 @@ index 82f522d..c9926d2 100644
    DefaultSet& d = default_set();
    std::lock_guard lock(d.mu);
    if (d.built) {
+diff --git a/src/probe/pool.cpp b/src/probe/pool.cpp
+index 22ffa1b..937e999 100644
+--- a/src/probe/pool.cpp
++++ b/src/probe/pool.cpp
+@@ -1,6 +1,8 @@
+ #include "lse/probe/pool.hpp"
+ 
++#include <charconv>
+ #include <cstdio>
++#include <cstdlib>
+ #include <set>
+ 
+ #include "lse/core/hash.hpp"
+@@ -16,6 +18,18 @@ namespace {
+ constexpr int kTagFingerprint = 0x60;
+ constexpr int kTagProfile = 0x62;
+ 
++// Match the macOS HSA runtime's bounded wait setting. Invalid spellings select
++// the runtime default rather than creating distinct profiles for one policy.
++std::uint32_t mac_hsa_poll_us(const char* setting) {
++  if (setting == nullptr) return 1000;
++  const std::string_view text(setting);
++  std::uint32_t value = 0;
++  const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
++  if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
++      value < 10 || value > 1000) return 1000;
++  return value;
++}
++
+ std::string hex64(std::uint64_t v) {
+   char buf[17];
+   std::snprintf(buf, sizeof(buf), "%016llx",
+@@ -29,7 +43,7 @@ std::string hex64(std::uint64_t v) {
+ std::string local_identity(const PoolMember& member) {
+   if (member.backend == nullptr) return "absent";
+   const backend::DeviceInfo& info = member.backend->device_info();
+-  std::string s;
++  std::string s = "device-probe-v3-validated-stream-touch|";
+   s += member.backend->name();
+   s += '|';
+   s += info.arch;
+@@ -44,6 +58,22 @@ std::string local_identity(const PoolMember& member) {
+   s += '|';
+   const graph::IKernelCompiler* compiler = member.backend->compiler();
+   s += compiler != nullptr ? compiler->identity() : std::string("no-compiler");
++  // The HRX calibration can use Loom when COMGR is absent. Changes to that
++  // compiler or to submission batching change what the measured rates mean.
++  if (member.backend->name() == "hrx") {
++    if (const auto* loom = member.backend->toolchain_for(graph::Dialect::kLoom);
++        loom != nullptr && loom->compiler != nullptr) {
++      s += "|loom=" + loom->compiler->identity();
++      s += loom->compiler->available() ? "|available" : "|unavailable";
++    }
++    const char* flush = std::getenv("LSE_FLUSH_INTERVAL");
++    s += "|flush=";
++    s += flush != nullptr ? flush : "16";
++#if defined(__APPLE__)
++    s += "|mac-hsa-blocked-poll-us=";
++    s += std::to_string(mac_hsa_poll_us(std::getenv("MAC_HSA_BLOCKED_POLL_US")));
++#endif
++  }
+   return s;
+ }
+ 
+diff --git a/src/probe/profile.cpp b/src/probe/profile.cpp
+index 54cf21e..a78e077 100644
+--- a/src/probe/profile.cpp
++++ b/src/probe/profile.cpp
+@@ -244,7 +244,7 @@ std::string PoolProfile::describe() const {
+   char line[256];
+   for (const DeviceProfile& d : devices) {
+     std::snprintf(line, sizeof(line),
+-                  "  %-8s %-10s  dram %8.1f GB/s (%s)  launch %7.2f us (%s)"
++                  "  %-8s %-10s  stream %8.1f GB/s (%s)  launch %7.2f us (%s)"
+                   "  free %7.1f GB (%s)\n",
+                   d.id.str().c_str(), d.arch.c_str(),
+                   d.dram_bytes_per_s.value / 1e9,
 diff --git a/src/runtime/generator.cpp b/src/runtime/generator.cpp
-index 3530bd4..1fa9397 100644
+index 3530bd4..31b843f 100644
 --- a/src/runtime/generator.cpp
 +++ b/src/runtime/generator.cpp
-@@ -441,6 +441,7 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
+@@ -1,12 +1,17 @@
+ #include "lse/runtime/generator.hpp"
+ 
+ #include <algorithm>
++#include <atomic>
++#include <cstdio>
++#include <cstring>
+ #include <chrono>
+ #include <cstdlib>
+ 
+ #include "lse/graph/graph.hpp"
+ #include "lse/graph/interpreter.hpp"
+ #include "lse/graph/ops.hpp"
++#include "lse/core/hash.hpp"
++#include "lse/runtime/decode_sample.hpp"
+ 
+ namespace lse::runtime {
+ 
+@@ -23,6 +28,19 @@ std::uint64_t now_ns() {
+           .count());
+ }
+ 
++// Ensure every early return (and unwinding) abandons an active observation.
++// Cancellation changes policy bookkeeping only; it never claims GPU retirement.
++struct DecodeSampleScope {
++  backend::IBackend* backend = nullptr;
++  ~DecodeSampleScope() { if (backend != nullptr) backend->cancel_decode_sample(); }
++  Status finish(std::uint64_t elapsed, bool eligible) {
++    if (backend == nullptr) return OkStatus();
++    const Status status = backend->end_decode_sample(elapsed, eligible);
++    if (status.ok()) backend = nullptr;
++    return status;
++  }
++};
++
+ // Token ids ride the graph as f32, matching how every other index does.
+ Result<Array> token_array(const std::vector<std::uint32_t>& ids) {
+   Array a = Array::zeros(Shape{1, static_cast<std::int64_t>(ids.size())},
+@@ -441,6 +459,7 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
  
    std::uint32_t pending = sampler_.sample(prefill_logits, session.history());
    bool running = give(pending);
@@ -2072,7 +3448,7 @@ index 3530bd4..1fa9397 100644
  
    std::vector<std::uint32_t> row_in;   // the m tokens the next pass consumes
    std::size_t already = 0;             // leading answers already emitted
-@@ -545,6 +546,7 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
+@@ -545,6 +564,7 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
      if (!session.restart().ok()) session.clear();
      mtp_->reset();
    }
@@ -2080,7 +3456,7 @@ index 3530bd4..1fa9397 100644
    return generated;
  }
  
-@@ -620,10 +622,9 @@ Result<std::vector<std::uint32_t>> Generator::generate(
+@@ -620,10 +640,9 @@ Result<std::vector<std::uint32_t>> Generator::generate(
    const bool device_greedy =
        sp.temperature <= 0.0f && sp.repetition_penalty == 1.0f;
  
@@ -2092,18 +3468,78 @@ index 3530bd4..1fa9397 100644
      snapshot_trace(&stats_, &host_reasons_);
      return generated;
    }
-@@ -639,6 +640,9 @@ Result<std::vector<std::uint32_t>> Generator::generate(
+@@ -639,16 +658,72 @@ Result<std::vector<std::uint32_t>> Generator::generate(
      if (on_token && !on_token(next)) break;
      if (n + 1 == limits.max_tokens) break;
  
+-    // Only the new token goes in: every block's state already holds the rest.
+-    if (device_greedy) {
+-      LSE_ASSIGN_OR(next, greedy_step(session, next));
+-    } else {
 +    // The first token came from prefill. Start timing only when its successor
 +    // needs a model step, after the first token has been delivered.
 +    if (decode_start == 0) decode_start = now_ns();
-     // Only the new token goes in: every block's state already holds the rest.
-     if (device_greedy) {
-       LSE_ASSIGN_OR(next, greedy_step(session, next));
-@@ -648,7 +652,7 @@ Result<std::vector<std::uint32_t>> Generator::generate(
++    // Measure ordinary complete decode steps, never prefill or speculative
++    // verification. hidden() alone only submits work: logits/readback closes
++    // the interval and includes the actual host recording/GPU overlap.
++    graph::Scheduler* tuning_sched = graph::default_scheduler();
++    const auto* chain = tuning_sched != nullptr && tuning_sched->devices().size() == 1
++        ? tuning_sched->toolchain(0) : nullptr;
++    backend::IBackend* tuning_backend = chain != nullptr && chain->dialect == graph::Dialect::kLoom
++        ? &tuning_sched->backend() : nullptr;
++    DecodeSampleCounters before;
++    std::uint64_t partition_ns_before = 0, tuning_key = 0;
++    DecodeSampleScope observation{tuning_backend};
++    // Include any begin-boundary drain. The backend adds its final drain to
++    // this interval before accepting a sample; neither cost is hidden.
++    const auto step_start = now_ns();
++    if (tuning_backend != nullptr) {
++      // Cache only within this backend lifetime. Context buckets prevent a
++      // short-context choice from silently covering very different KV work.
++      tuning_key = hash_mix(kHashSeed, reinterpret_cast<std::uintptr_t>(&model_));
++      tuning_key = hash_mix(tuning_key, device_greedy);
++      tuning_key = hash_mix(tuning_key, static_cast<std::uint64_t>(session.position()) / 128);
++      LSE_RETURN_IF_ERROR(tuning_backend->begin_decode_sample(tuning_key));
++      const auto jit = tuning_sched->jit_stats();
++      const auto& trace = tuning_sched->accumulated_trace();
++      before = {jit.compiles, jit.disk_hits, trace.partition_passes, trace.host_groups};
++      partition_ns_before = trace.partition_ns;
++    }
++    const auto advanced = [&]() -> Result<std::uint32_t> {
++      // Only the new token goes in: each block already holds the prior state.
++      if (device_greedy) return greedy_step(session, next);
+       LSE_ASSIGN_OR(logits, step(session, {next}));
+-      next = sampler_.sample(logits, session.history());
++      return sampler_.sample(logits, session.history());
++    }();
++    if (!advanced.ok()) return advanced.status();
++    const auto step_ns = now_ns() - step_start;
++    if (tuning_backend != nullptr) {
++      const auto jit_after = tuning_sched->jit_stats();
++      const auto& trace = tuning_sched->accumulated_trace();
++      const DecodeSampleCounters after{jit_after.compiles, jit_after.disk_hits,
++                                       trace.partition_passes, trace.host_groups};
++      const bool warm = warm_decode_sample(before, after);
++      static const bool tuning_trace = [] {
++        const char* value = std::getenv("LSE_AUTO_BATCH_TRACE");
++        return value != nullptr && std::strcmp(value, "1") == 0;
++      }();
++      static std::atomic<unsigned> evidence_lines{0};
++      if (tuning_trace && evidence_lines.fetch_add(1) < 256) {
++        std::fprintf(stderr, "[batch-tune-evidence] workload=%llx position=%d eligible=%d "
++                             "compiles=%llu disk-loads=%llu partition-passes=%llu "
++                             "partition-ns=%llu host-groups=%llu elapsed-ns=%llu\n",
++                     static_cast<unsigned long long>(tuning_key), session.position(), warm ? 1 : 0,
++                     static_cast<unsigned long long>(after.compiles - before.compiles),
++                     static_cast<unsigned long long>(after.disk_loads - before.disk_loads),
++                     static_cast<unsigned long long>(after.partition_passes - before.partition_passes),
++                     static_cast<unsigned long long>(trace.partition_ns - partition_ns_before),
++                     static_cast<unsigned long long>(after.host_groups - before.host_groups),
++                     static_cast<unsigned long long>(step_ns));
++      }
++      LSE_RETURN_IF_ERROR(observation.finish(step_ns, warm));
      }
++    next = *advanced;
      session.advance(1);
    }
 -  stats_.decode_ns = now_ns() - decode_start;
@@ -2261,18 +3697,39 @@ index 9f17d38..35db5ad 100644
  }
  
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index a787603..e5cada6 100644
+index a787603..54b649d 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
-@@ -12,6 +12,7 @@ function(lse_add_test name)
+@@ -12,6 +12,28 @@ function(lse_add_test name)
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
  endfunction()
  
++lse_add_test(test_probe_measurement)
++lse_add_test(test_token_ids)
++lse_add_test(test_submission_tuner)
++lse_add_test(test_submission_constants lse_graph lse_kernels lse_ir)
++target_sources(test_submission_constants PRIVATE
++  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
++  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
++  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
++  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
++if(TARGET lse_backend_cpu)
++  lse_add_test(test_decode_sample lse_graph lse_kernels lse_backend_cpu)
++  lse_add_test(test_submission_decode lse_runtime lse_model lse_graph lse_backends lse_backend_cpu)
++endif()
 +lse_add_test(test_generation_stats)
++# Ordinary fused SSA chains need no device or model.
++lse_add_test(test_pointwise_fusion lse_graph lse_kernels lse_ir)
++target_sources(test_pointwise_fusion PRIVATE
++  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
++  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
++  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
++  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
++lse_add_test(test_dispatch_profile)
  lse_add_test(test_dtype)
  lse_add_test(test_reflect)
  # lse_backends is the set of backends this build ships. A test that runs a
-@@ -19,9 +20,63 @@ lse_add_test(test_reflect)
+@@ -19,9 +41,82 @@ lse_add_test(test_reflect)
  # deliberately does not link any of them, so nothing arrives transitively.
  lse_add_test(test_kernel_env lse_graph lse_backends)
  lse_add_test(test_ir lse_ir lse_graph lse_backends)
@@ -2320,7 +3777,26 @@ index a787603..e5cada6 100644
 +  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
 +  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
 +  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
++lse_add_test(test_loom_cache lse_graph lse_kernels lse_ir)
++target_sources(test_loom_cache PRIVATE
++  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
++  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
++  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
++  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
  lse_add_test(test_quant)
++# Compiler/layout contracts only; this test never opens a GPU.
++lse_add_test(test_quant_prefill lse_graph lse_kernels lse_backends lse_ir)
++if(NOT TARGET lse_backend_hrx)
++  target_sources(test_quant_prefill PRIVATE
++    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_emitter.cpp
++    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/phase_emit.cpp
++    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_sources.cpp
++    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_types.cpp
++    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
++    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
++    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
++    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
++endif()
  lse_add_test(test_shape)
  lse_add_test(test_server lse_server lse_tokenizer lse_model lse_backends)
 +# Socket lifecycle coverage never opens a model or device.
@@ -2336,7 +3812,7 @@ index a787603..e5cada6 100644
  lse_add_test(test_model lse_model lse_backends)
  
  if(LSE_ENABLE_CPU)
-@@ -35,7 +90,7 @@ endif()
+@@ -35,7 +130,7 @@ endif()
  
  if(LSE_ENABLE_CPU)
    lse_add_test(test_backend_cpu lse_backend_cpu)
@@ -2345,6 +3821,18 @@ index a787603..e5cada6 100644
    lse_add_test(test_primitive lse_graph lse_backends)
  endif()
  
+@@ -86,3 +181,11 @@ if(LSE_ROCM_RUNTIME_DIR)
+   set_tests_properties(${lse_tests} PROPERTIES
+     ENVIRONMENT "LD_LIBRARY_PATH=${LSE_ROCM_RUNTIME_DIR}")
+ endif()
++
++if(TARGET lse_backend_hrx AND LSE_HAVE_LOOMC)
++  lse_add_test(test_loom_probe lse_backend_hrx)
++endif()
++
++if(TARGET lse_backend_cpu)
++  lse_add_test(test_probe_policy lse_probe lse_backend_cpu)
++endif()
 diff --git a/tests/test_ir.cpp b/tests/test_ir.cpp
 index 56fefa9..1a578b0 100644
 --- a/tests/test_ir.cpp
@@ -2549,6 +4037,381 @@ index dd9e019..79de680 100644
 +    for (const auto& old : old_outputs) LSE_EXPECT(c.in.get() != old.get());
 +  }
 +}
+diff --git a/include/lse/backends/hrx/probe_emit.hpp b/include/lse/backends/hrx/probe_emit.hpp
+new file mode 100644
+index 0000000..05f4cea
+--- /dev/null
++++ b/include/lse/backends/hrx/probe_emit.hpp
+@@ -0,0 +1,13 @@
++#pragma once
++
++#include <cstdint>
++#include "lse/graph/codegen.hpp"
++
++namespace lse::backend::hrx_kernels {
++// Compile-only seam: records the shared calibration bodies, without allocating
++// device memory, creating queues, or dispatching work.
++Result<graph::EmittedKernel> emit_loom_stream_probe(
++    const DeviceInfo& device, std::uint32_t elements, std::uint32_t threads,
++    std::uint32_t load_bytes);
++Result<graph::EmittedKernel> emit_loom_touch_probe(const DeviceInfo& device);
++}  // namespace lse::backend::hrx_kernels
+diff --git a/include/lse/backends/hrx/probe_measurement.hpp b/include/lse/backends/hrx/probe_measurement.hpp
+new file mode 100644
+index 0000000..17b7901
+--- /dev/null
++++ b/include/lse/backends/hrx/probe_measurement.hpp
+@@ -0,0 +1,32 @@
++#pragma once
++#include <algorithm>
++#include <cstddef>
++#include <span>
++#include <optional>
++#include "lse/core/status.hpp"
++
++namespace lse::backend::hrx_kernels {
++// Bound the working set by an observed free budget when available, otherwise
++// by a conservative fraction of known device capacity. Neither is a claim
++// about the last-level cache; the reported rate is measured streaming traffic.
++inline std::size_t streaming_probe_bytes(std::size_t total, std::optional<std::size_t> free) {
++  constexpr std::size_t max_bytes = 512u << 20;
++  const std::size_t budget = free.has_value() ? *free / 4 : total / 16;
++  const std::size_t bytes = std::min(max_bytes, budget);
++  return bytes >= (8u << 20) ? bytes : 0;
++}
++inline Status check_probe_output(std::span<const float> values,
++                                 std::size_t payload, float expected) {
++  if (payload == 0 || values.size() <= payload) {
++    return LSE_ERROR(kInvalidArgument, "probe output has no payload or guard");
++  }
++  for (std::size_t i = 0; i < values.size(); ++i) {
++    const float want = i < payload ? expected : -1234.0f;
++    if (values[i] != want) {
++      return LSE_ERROR(kDeviceError, "probe output mismatch at element ",
++                       std::to_string(i));
++    }
++  }
++  return OkStatus();
++}
++}  // namespace lse::backend::hrx_kernels
+diff --git a/include/lse/backends/hrx/probe_retirement.hpp b/include/lse/backends/hrx/probe_retirement.hpp
+new file mode 100644
+index 0000000..3fc09d9
+--- /dev/null
++++ b/include/lse/backends/hrx/probe_retirement.hpp
+@@ -0,0 +1,82 @@
++#pragma once
++
++#include <array>
++#include <cstddef>
++#include <mutex>
++
++namespace lse::backend::hrx_kernels {
++
++// Reserve quarantine capacity before allocating or issuing work. A failed
++// drain does not prove that the GPU stopped referencing a buffer: retain its
++// owner until process exit and disable subsequent probes. The registry itself
++// intentionally has process lifetime, so static destruction cannot free an
++// allocation still in use by a failed device. Concurrent reservations are
++// bounded; callers must decline before allocating when no slot is available.
++template <class Buffer, std::size_t Capacity = 16>
++class ProbeRetirement {
++  struct Slot {
++    bool used = false;
++    std::array<Buffer, 2> buffers{};
++    std::size_t count = 0;
++  };
++  struct Registry {
++    std::mutex mutex;
++    bool failed = false;
++    std::array<Slot, Capacity> slots{};
++  };
++  static Registry& registry() {
++    static Registry* instance = new Registry;
++    return *instance;
++  }
++ public:
++  ProbeRetirement() {
++    auto& r = registry();
++    std::lock_guard lock(r.mutex);
++    if (r.failed) return;
++    for (auto& slot : r.slots) {
++      if (!slot.used) {
++        slot.used = true;
++        slot_ = &slot;
++        break;
++      }
++    }
++  }
++  ProbeRetirement(const ProbeRetirement&) = delete;
++  ProbeRetirement& operator=(const ProbeRetirement&) = delete;
++  ~ProbeRetirement() {
++    if (slot_ == nullptr) return;
++    auto& r = registry();
++    std::lock_guard lock(r.mutex);
++    if (slot_->count == 0) slot_->used = false;
++    else r.failed = true;  // Unwinding without a confirmed drain retains owners.
++  }
++  bool available() const { return slot_ != nullptr; }
++  bool track(const Buffer& buffer) {
++    if (slot_ == nullptr || slot_->count == slot_->buffers.size()) return false;
++    slot_->buffers[slot_->count++] = buffer;
++    return true;
++  }
++  template <class Drain, class Release>
++  bool finish(Drain&& drain, Release&& release) {
++    if (slot_ == nullptr) return false;
++    // Always drain, including after a failed later launch/copy. Its failure
++    // may have left earlier successful submissions in flight.
++    if (!drain()) {
++      auto& r = registry();
++      std::lock_guard lock(r.mutex);
++      r.failed = true;
++      slot_ = nullptr;  // Registry retains this occupied slot permanently.
++      return false;
++    }
++    for (std::size_t i = 0; i < slot_->count; ++i) release(slot_->buffers[i]);
++    auto& r = registry();
++    std::lock_guard lock(r.mutex);
++    *slot_ = {};
++    slot_ = nullptr;
++    return true;
++  }
++ private:
++  Slot* slot_ = nullptr;
++};
++
++}  // namespace lse::backend::hrx_kernels
+diff --git a/include/lse/backends/hrx/submission_tuner.hpp b/include/lse/backends/hrx/submission_tuner.hpp
+new file mode 100644
+index 0000000..f041067
+--- /dev/null
++++ b/include/lse/backends/hrx/submission_tuner.hpp
+@@ -0,0 +1,106 @@
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstdint>
++#include <limits>
++
++namespace lse::backend {
++
++// Measures natural, completed decode work. No extra model evaluation, token
++// replay, synthetic host pacing, GPU timestamp claim, or persistent pointer key.
++// Five interleaved observations per candidate reduce monotonic clock/context
++// drift. The baseline survives noise, insufficient evidence, and <5% wins.
++class SubmissionTuner {
++ public:
++  static constexpr std::array<std::uint32_t, 4> candidates{16, 64, 256, 0};
++  static constexpr unsigned samples_per_candidate = 5;
++  static constexpr unsigned max_attempts = 80;
++  struct State {
++    bool used = false, done = false, selected = false;
++    std::uint64_t key = 0, signature = 0;
++    unsigned attempts = 0, warm = 0, samples = 0;
++    std::uint32_t interval = 16;
++    std::array<std::array<double, samples_per_candidate>, 4> times{};
++    std::array<double, 4> medians{};
++  };
++  State* find(std::uint64_t key) {
++    for (auto& state : states_) if (state.used && state.key == key) return &state;
++    for (auto& state : states_) if (!state.used) {
++      state.used = true;
++      state.key = key;
++      return &state;
++    }
++    return nullptr;  // Bound model/shape residency rather than evict active work.
++  }
++  static unsigned candidate_index(unsigned sample) {
++    const unsigned round = sample / candidates.size();
++    const unsigned position = sample % candidates.size();
++    return round % 2 == 0 ? position : candidates.size() - position - 1;
++  }
++  static std::uint32_t next(const State& state) {
++    if (state.done) return state.interval;
++    if (state.warm < 2) return 16;
++    return candidates[candidate_index(state.samples)];
++  }
++  static void observe(State& state, std::uint64_t signature, double nanoseconds,
++                      bool eligible) {
++    if (state.done && signature == state.signature) return;
++    if (signature != state.signature) {
++      // A new actual launch shape invalidates both measurements and a cached
++      // choice. Retain the attempt budget so unstable graphs cannot tune forever.
++      const auto attempts = state.attempts;
++      const auto key = state.key;
++      state = {};
++      state.used = true; state.key = key; state.attempts = attempts;
++      state.signature = signature;
++      eligible = false;
++    }
++    if (++state.attempts >= max_attempts) { state.done = true; return; }
++    if (!eligible || !std::isfinite(nanoseconds) || nanoseconds <= 0) return;
++    if (state.warm < 2) { ++state.warm; return; }
++    const unsigned index = candidate_index(state.samples);
++    state.times[index][state.samples / candidates.size()] = nanoseconds;
++    if (++state.samples != candidates.size() * samples_per_candidate) return;
++    state.done = true;
++    std::array<bool, candidates.size()> stable{};
++    for (unsigned i = 0; i < candidates.size(); ++i) {
++      auto sorted = state.times[i];
++      std::sort(sorted.begin(), sorted.end());
++      const double median = sorted[samples_per_candidate / 2];
++      state.medians[i] = median;
++      for (auto& value : sorted) value = std::abs(value - median);
++      std::sort(sorted.begin(), sorted.end());
++      stable[i] = sorted[samples_per_candidate / 2] <= median * 0.05;
++    }
++    // Compare only measured stable policies. A noisy rejected candidate must
++    // not veto an independently stable improvement over a stable baseline.
++    if (!stable[0]) return;
++    double best = state.medians[0];
++    for (unsigned i = 1; i < candidates.size(); ++i)
++      if (stable[i]) best = std::min(best, state.medians[i]);
++    // Prefer the smallest bounded batch within 2% of the best. Deferred-only
++    // (0) is last, because equivalent throughput does not justify later start.
++    for (unsigned i = 0; i < candidates.size(); ++i) {
++      if (stable[i] && state.medians[i] <= best * 1.02 &&
++          state.medians[i] <= state.medians[0] * 0.95) {
++        state.interval = candidates[i];
++        state.selected = true;
++        break;
++      }
++    }
++  }
++ private:
++  std::array<State, 16> states_{};
++};
++
++inline bool automatic_submission_policy(const char* explicit_interval,
++                                         const char* automatic_setting) {
++  // Even an invalid explicit spelling opts out: the backend retains its
++  // existing parsing/default behavior, never replaces an operator's override.
++  return explicit_interval == nullptr &&
++         (automatic_setting == nullptr || automatic_setting[0] != '0');
++}
++
++}  // namespace lse::backend
+diff --git a/include/lse/graph/pointwise_fusion.hpp b/include/lse/graph/pointwise_fusion.hpp
+new file mode 100644
+index 0000000..2db3038
+--- /dev/null
++++ b/include/lse/graph/pointwise_fusion.hpp
+@@ -0,0 +1,67 @@
++#pragma once
++
++#include <algorithm>
++#include <span>
++
++#include "lse/graph/codegen.hpp"
++#include "lse/graph/graph.hpp"
++#include "lse/graph/kernel_primitive.hpp"
++
++namespace lse::graph {
++
++// Preserve ordinary per-element fusion when an emitter has no staged-phase
++// form. This never fuses a reduction, an indexed kernel, a view or a state
++// write. Call only for adjacent nodes within the same already ordered phase.
++inline bool join_pointwise_chain(FusionGroup &previous, const NodePtr &next,
++                                 std::span<const NodePtr> roots,
++                                 const DialectSourceTable &sources) {
++  const auto ordinary = [&](const NodePtr &n) {
++    return n && !n->materialized && n->fclass == FusionClass::kElementwise &&
++           n->dtype == DType::kF32 && n->prim != nullptr &&
++           dynamic_cast<const KernelPrimitiveBase *>(n->prim) == nullptr &&
++           !sources.find(n->prim->name()).empty();
++  };
++  if (!ordinary(next) || previous.is_phase || previous.nodes.empty() ||
++      previous.outputs.size() != 1)
++    return false;
++  const NodePtr &producer = previous.outputs.front();
++  if (!producer || producer != previous.nodes.back() ||
++      producer->consumer_count != 1 ||
++      std::find(roots.begin(), roots.end(), producer) != roots.end() ||
++      std::find(next->inputs.begin(), next->inputs.end(), producer) ==
++          next->inputs.end()) {
++    return false;
++  }
++  // Reuse the common HIP/Loom partition policy, narrowed to equal-shape FP32
++  // chains so eliminating an intermediate store cannot remove float narrowing
++  // or change the indexing of an aliased/broadcast value.
++  if (!Partitioner::can_fuse(*producer, *next))
++    return false;
++  for (const NodePtr &n : previous.nodes) {
++    if (!ordinary(n) || n->shape != next->shape || n->member != next->member) {
++      return false;
++    }
++  }
++
++  previous.nodes.push_back(next);
++  previous.outputs.assign(1, next);
++  previous.anchor = next->kind;
++  previous.anchor_class = next->fclass;
++  // Retain only outside bindings. Repeated operands share a binding, while
++  // every internal producer remains an SSA value in the generated body.
++  previous.inputs.clear();
++  for (const NodePtr &n : previous.nodes) {
++    for (const NodePtr &input : n->inputs) {
++      if (std::find(previous.nodes.begin(), previous.nodes.end(), input) !=
++          previous.nodes.end())
++        continue;
++      if (std::find(previous.inputs.begin(), previous.inputs.end(), input) ==
++          previous.inputs.end()) {
++        previous.inputs.push_back(input);
++      }
++    }
++  }
++  return true;
++}
++
++} // namespace lse::graph
+diff --git a/include/lse/kernels/quant_panel.hpp b/include/lse/kernels/quant_panel.hpp
+new file mode 100644
+index 0000000..11796ce
+--- /dev/null
++++ b/include/lse/kernels/quant_panel.hpp
+@@ -0,0 +1,15 @@
++#pragma once
++
++namespace lse::kernels {
++
++// Q6 lanes consume 16 consecutive floats. Rotate each 32-word block so the
++// lanes do not concentrate those reads on the same LDS banks. Staging and
++// contraction must use this identical permutation; it adds no padding.
++// Every supported group-affine row contains whole 32-word blocks.
++template <class Index>
++auto q6_panel_index(const Index& index) {
++  const auto block = index / 32u;
++  return block * 32u + (index + block) % 32u;
++}
++
++}  // namespace lse::kernels
+diff --git a/include/lse/runtime/decode_sample.hpp b/include/lse/runtime/decode_sample.hpp
+new file mode 100644
+index 0000000..1e0c3d6
+--- /dev/null
++++ b/include/lse/runtime/decode_sample.hpp
+@@ -0,0 +1,18 @@
++#pragma once
++#include <cstdint>
++
++namespace lse::runtime {
++struct DecodeSampleCounters {
++  std::uint64_t compiles = 0;
++  std::uint64_t disk_loads = 0;
++  std::uint64_t partition_passes = 0;
++  std::uint64_t host_groups = 0;
++};
++// Counter equality names actual work. A timer around the replay branch can
++// advance by a few nanoseconds even though the partitioner was never invoked.
++inline bool warm_decode_sample(const DecodeSampleCounters& before,
++                               const DecodeSampleCounters& after) {
++  return before.compiles == after.compiles && before.disk_loads == after.disk_loads &&
++         before.partition_passes == after.partition_passes && before.host_groups == after.host_groups;
++}
++}  // namespace lse::runtime
 diff --git a/include/lse/server/shutdown.hpp b/include/lse/server/shutdown.hpp
 new file mode 100644
 index 0000000..279a9c6
@@ -2613,6 +4476,161 @@ index 0000000..279a9c6
 +};
 +
 +}  // namespace lse::server::detail
+diff --git a/src/backends/hrx/kernels/probe_loom.cpp b/src/backends/hrx/kernels/probe_loom.cpp
+new file mode 100644
+index 0000000..7ae0491
+--- /dev/null
++++ b/src/backends/hrx/kernels/probe_loom.cpp
+@@ -0,0 +1,115 @@
++#include "lse/backends/hrx/probe_emit.hpp"
++
++#include "lse/backends/hrx/loomc/loom_emitter.hpp"
++#include "lse/graph/graph.hpp"
++#include "lse/graph/kernel_primitive.hpp"
++#include "lse/probe/probe_kernels.hpp"
++
++namespace lse::backend::hrx_kernels {
++namespace {
++using namespace graph;
++
++struct StreamProbe final : KernelPrimitive<StreamProbe> {
++  static constexpr std::string_view kName = "probe.stream";
++  static constexpr std::string_view kEntry = "lse_probe_stream";
++  static constexpr std::string_view kSource = {};
++  std::size_t arity() const noexcept override { return 1; }
++  bool owns_indexing() const noexcept override { return true; }
++  Result<Shape> infer_shape(std::span<const Shape> shapes) const override {
++    return shapes.empty() ? Shape{} : shapes[0];
++  }
++  DType infer_dtype(std::span<const DType>) const override { return DType::kF32; }
++  std::string emit_kernel(const KernelShapes& s) const override {
++    if (s.inputs.size() != 1 || s.iattrs.size() < 2 || !s.intrinsics) return {};
++    kir::KernelBody k(s.types, *s.intrinsics);
++    k.set_store(s.store);
++    probe::StreamArgs<env::Emit> args;
++    if (!env::bind(k, args, s)) return {};
++    env::Emit e{&k};
++    probe::stream_read<env::Emit, true>(e, args,
++        static_cast<std::uint32_t>(s.inputs[0].elem_count()),
++        static_cast<std::uint32_t>(s.output.elem_count()),
++        static_cast<std::uint32_t>(s.iattrs[1]));
++    return k.str();
++  }
++  static ThreadPlan plan_impl(const KernelShapes& s) {
++    ThreadPlan p;
++    p.workgroup_size[0] = static_cast<std::uint32_t>(s.iattrs[0]);
++    p.workgroup_count[0] = static_cast<std::uint32_t>(s.output.elem_count()) /
++                            p.workgroup_size[0];
++    return p;
++  }
++};
++
++struct TouchProbe final : KernelPrimitive<TouchProbe> {
++  static constexpr std::string_view kName = "probe.touch";
++  static constexpr std::string_view kEntry = "lse_probe_touch";
++  static constexpr std::string_view kSource = {};
++  std::size_t arity() const noexcept override { return 0; }
++  bool owns_indexing() const noexcept override { return true; }
++  Result<Shape> infer_shape(std::span<const Shape>) const override { return Shape{1}; }
++  DType infer_dtype(std::span<const DType>) const override { return DType::kF32; }
++  std::string emit_kernel(const KernelShapes& s) const override {
++    if (!s.intrinsics) return {};
++    kir::KernelBody k(s.types, *s.intrinsics);
++    k.set_store(s.store);
++    probe::TouchArgs<env::Emit> args;
++    if (!env::bind(k, args, s)) return {};
++    env::Emit e{&k};
++    probe::touch_one<env::Emit, true>(e, args);
++    return k.str();
++  }
++  static ThreadPlan plan_impl(const KernelShapes& s) {
++    ThreadPlan p;
++    p.workgroup_size[0] = s.device->wavefront_size;
++    p.workgroup_count[0] = 1;
++    return p;
++  }
++};
++
++NodePtr node(Shape shape, const Primitive* primitive = nullptr) {
++  auto n = std::make_shared<Node>();
++  n->set_kind(primitive ? OpKind::kCustom : OpKind::kBuffer);
++  n->shape = std::move(shape);
++  n->dtype = DType::kF32;
++  n->prim = primitive;
++  return n;
++}
++Result<EmittedKernel> emit(const NodePtr& output, const DeviceInfo& device) {
++  FusionGroup group;
++  group.nodes = {output};
++  group.inputs = output->inputs;
++  group.outputs = {output};
++  group.anchor = OpKind::kCustom;
++  group.anchor_class = FusionClass::kBarrier;
++  const LoomEmitter emitter;
++  return emitter.emit(group, device);
++}
++}  // namespace
++
++Result<graph::EmittedKernel> emit_loom_stream_probe(
++    const DeviceInfo& device, std::uint32_t elements, std::uint32_t threads,
++    std::uint32_t load_bytes) {
++  if (device.max_threads_per_workgroup < 256 || device.wavefront_size == 0 ||
++      elements == 0 || threads == 0 || threads % 256 != 0 ||
++      (load_bytes != 4 && load_bytes != 8 && load_bytes != 16) ||
++      static_cast<std::uint64_t>(threads) * (load_bytes / 4) > elements ||
++      elements % (static_cast<std::uint64_t>(threads) * (load_bytes / 4)) != 0) {
++    return LSE_ERROR(kInvalidArgument, "unsupported streaming-probe geometry");
++  }
++  static const StreamProbe primitive;
++  auto out = node(Shape{threads}, &primitive);
++  out->inputs = {node(Shape{elements})};
++  out->iattrs = {256, static_cast<std::int32_t>(load_bytes)};
++  return emit(out, device);
++}
++
++Result<graph::EmittedKernel> emit_loom_touch_probe(const DeviceInfo& device) {
++  if (device.wavefront_size == 0 ||
++      device.wavefront_size > device.max_threads_per_workgroup) {
++    return LSE_ERROR(kInvalidArgument, "unknown touch-probe wavefront geometry");
++  }
++  static const TouchProbe primitive;
++  return emit(node(Shape{1}, &primitive), device);
++}
++}  // namespace lse::backend::hrx_kernels
+diff --git a/src/cli/token_ids.hpp b/src/cli/token_ids.hpp
+new file mode 100644
+index 0000000..f2bad38
+--- /dev/null
++++ b/src/cli/token_ids.hpp
+@@ -0,0 +1,28 @@
++#pragma once
++
++#include <cinttypes>
++#include <cstdint>
++#include <cstdio>
++#include <span>
++
++namespace lse::cli {
++
++// Generator::generate returns emitted IDs; a sampled stop token is excluded.
++// Serialize existing vectors only after generation, leaving callbacks untouched.
++inline bool print_token_ids(FILE* file, std::span<const std::uint32_t> prompt,
++                            std::span<const std::uint32_t> generated) {
++  if (std::fputs("[token-ids] {\"prompt_ids\":[", file) < 0) return false;
++  const auto write = [file](std::span<const std::uint32_t> ids) {
++    for (std::size_t i = 0; i < ids.size(); ++i) {
++      if (std::fprintf(file, "%s%" PRIu32, i == 0 ? "" : ",", ids[i]) < 0)
++        return false;
++    }
++    return true;
++  };
++  return write(prompt) &&
++         std::fputs("],\"generated_ids\":[", file) >= 0 && write(generated) &&
++         std::fputs("],\"stop_tokens_excluded\":true}\n", file) >= 0 &&
++         std::fflush(file) == 0;
++}
++
++}  // namespace lse::cli
 diff --git a/src/communication/poller_kqueue.cpp b/src/communication/poller_kqueue.cpp
 new file mode 100644
 index 0000000..c492dcd
@@ -2737,6 +4755,300 @@ index 0000000..c492dcd
 +  ::kevent(epoll_fd_, &event, 1, nullptr, 0, nullptr);
 +}
 +} // namespace lse::comm
+diff --git a/src/graph/dispatch_profile.hpp b/src/graph/dispatch_profile.hpp
+new file mode 100644
+index 0000000..e03e6e2
+--- /dev/null
++++ b/src/graph/dispatch_profile.hpp
+@@ -0,0 +1,106 @@
++#pragma once
++
++#include <algorithm>
++#include <cstdint>
++#include <cstdio>
++#include <map>
++#include <mutex>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++namespace lse::graph::detail {
++
++enum class DispatchProfileMode { kOff, kSubmit, kSerial, kInvalid };
++
++inline DispatchProfileMode dispatch_profile_mode(const char* value) {
++  if (value == nullptr || std::string_view(value).empty() ||
++      std::string_view(value) == "off") return DispatchProfileMode::kOff;
++  if (std::string_view(value) == "submit") return DispatchProfileMode::kSubmit;
++  if (std::string_view(value) == "serial") return DispatchProfileMode::kSerial;
++  return DispatchProfileMode::kInvalid;
++}
++
++struct DispatchProfileSample {
++  std::uint64_t count = 0;
++  std::uint64_t failures = 0;
++  std::uint64_t submit_ns = 0;
++  std::uint64_t completion_ns = 0;
++  std::uint64_t predrain_ns = 0;
++  std::uint64_t max_submit_ns = 0;
++  std::uint64_t max_completion_ns = 0;
++};
++
++// Diagnostic-only aggregation. Bound both the number and length of keys, so a
++// long-running server with changing shapes cannot grow its profile indefinitely.
++class DispatchProfile {
++ public:
++  static constexpr std::size_t kMaxShapes = 512;
++  static constexpr std::size_t kMaxKeyBytes = 4096;
++  using Row = std::pair<std::string, DispatchProfileSample>;
++
++  void record(std::string key, std::uint64_t submit_ns,
++              std::uint64_t completion_ns, std::uint64_t predrain_ns,
++              bool succeeded) {
++    const std::lock_guard lock(mutex_);
++    const bool overflow = key.size() > kMaxKeyBytes ||
++        (!samples_.contains(key) && samples_.size() >= kMaxShapes);
++    // Do not move a shortened oversized string into the map: its capacity
++    // could retain the original allocation despite the bounded key length.
++    auto& s = overflow ? samples_["<other-shapes>"] : samples_[std::move(key)];
++    ++s.count;
++    if (!succeeded) ++s.failures;
++    s.submit_ns += submit_ns;
++    s.completion_ns += completion_ns;
++    s.predrain_ns += predrain_ns;
++    s.max_submit_ns = std::max(s.max_submit_ns, submit_ns);
++    s.max_completion_ns = std::max(s.max_completion_ns, completion_ns);
++  }
++
++  std::vector<Row> rows(bool serial) const {
++    const std::lock_guard lock(mutex_);
++    std::vector<Row> out(samples_.begin(), samples_.end());
++    std::sort(out.begin(), out.end(), [serial](const Row& a, const Row& b) {
++      const auto x = serial ? a.second.completion_ns : a.second.submit_ns;
++      const auto y = serial ? b.second.completion_ns : b.second.submit_ns;
++      return x != y ? x > y : a.first < b.first;
++    });
++    return out;
++  }
++
++  void print(FILE* file, bool serial) const {
++    const auto snapshot = rows(serial);
++    if (snapshot.empty()) return;
++    std::fprintf(file,
++        "[dispatch-profile] mode=%s clock=host-steady gpu-timestamps=no "
++        "forced-serialization=%s shapes=%zu max-shapes=%zu "
++        "completion-measured=%s "
++        "completion-includes-submit-flush-execution-and-wait=yes\n",
++        serial ? "serial" : "submit", serial ? "yes" : "no",
++        snapshot.size(), kMaxShapes, serial ? "yes" : "no");
++    for (const auto& [key, s] : snapshot) {
++      const double count = static_cast<double>(s.count);
++      std::fprintf(file,
++          "[dispatch-profile] n=%llu failed=%llu submit_ms=%.6f "
++          "submit_avg_us=%.3f submit_max_us=%.3f completion_ms=%.6f "
++          "completion_avg_us=%.3f completion_max_us=%.3f "
++          "excluded_predrain_ms=%.6f | %s\n",
++          static_cast<unsigned long long>(s.count),
++          static_cast<unsigned long long>(s.failures),
++          static_cast<double>(s.submit_ns) / 1e6,
++          static_cast<double>(s.submit_ns) / count / 1e3,
++          static_cast<double>(s.max_submit_ns) / 1e3,
++          static_cast<double>(s.completion_ns) / 1e6,
++          static_cast<double>(s.completion_ns) / count / 1e3,
++          static_cast<double>(s.max_completion_ns) / 1e3,
++          static_cast<double>(s.predrain_ns) / 1e6, key.c_str());
++    }
++  }
++
++ private:
++  mutable std::mutex mutex_;
++  std::map<std::string, DispatchProfileSample> samples_;
++};
++
++}  // namespace lse::graph::detail
+diff --git a/tests/test_decode_sample.cpp b/tests/test_decode_sample.cpp
+new file mode 100644
+index 0000000..7b2a8ed
+--- /dev/null
++++ b/tests/test_decode_sample.cpp
+@@ -0,0 +1,122 @@
++#include "harness.hpp"
++#include "lse/backends/cpu/cpu_backend.hpp"
++#include "lse/graph/codegen.hpp"
++#include "lse/graph/graph.hpp"
++#include "lse/graph/ops.hpp"
++#include "lse/graph/program.hpp"
++#include "lse/runtime/decode_sample.hpp"
++#include <cstring>
++
++namespace {
++using namespace lse;
++using namespace lse::graph;
++class AddEmitter final : public IKernelEmitter {
++ public:
++  Result<EmittedKernel> emit(const FusionGroup& group, const backend::DeviceInfo&) const override {
++    if (group.inputs.size() != 2 || group.outputs.size() != 1 || group.nodes.size() != 1)
++      return LSE_ERROR(kInvalidArgument, "host replay fixture expects one binary add");
++    EmittedKernel out;
++    out.dialect = Dialect::kLoom;
++    out.source = "host-only-replay-add";
++    out.entry_name = "host_add";
++    out.binding_order = group.inputs;
++    out.binding_order.push_back(group.outputs[0]);
++    out.constants.add("count", 4);
++    return out;
++  }
++  Dialect dialect() const noexcept override { return Dialect::kLoom; }
++  std::string_view prelude() const noexcept override { return {}; }
++  DialectSourceTable sources() const noexcept override { return {}; }
++};
++class HostCompiler final : public IKernelCompiler {
++ public:
++  Result<CompiledKernel> compile(std::string_view, std::string_view) const override {
++    CompiledKernel out;
++    out.code.push_back(std::byte{1});
++    return out;
++  }
++  bool available() const override { return true; }
++  std::string identity() const override { return "host-replay-test-v1"; }
++};
++struct HostDevice : backend::CpuBackend {
++  unsigned launches = 0;
++  std::span<const KernelToolchain> toolchains() const noexcept {
++    static const AddEmitter emitter;
++    static const HostCompiler compiler;
++    static const KernelToolchain chain{Dialect::kLoom, &emitter, &compiler};
++    return std::span(&chain, 1);
++  }
++  Result<backend::KernelHandle> load_executable(std::string_view name, std::span<const std::byte>) {
++    return backend::KernelHandle{1, 0, std::string(name)};
++  }
++  Status launch(const backend::KernelHandle&, const backend::LaunchDims&,
++                const backend::DispatchArgs& args, const backend::DispatchTarget&) {
++    if (args.bindings.size() != 3 || args.constants.size() != 4)
++      return LSE_ERROR(kInvalidArgument, "unexpected host add ABI");
++    std::uint32_t count;
++    std::memcpy(&count, args.constants.data(), sizeof(count));
++    auto data = [&](unsigned i) {
++      const auto& ref = args.bindings[i];
++      return reinterpret_cast<float*>(static_cast<std::byte*>(ref.buffer->ptr) +
++                                      ref.buffer->offset + ref.offset);
++    };
++    for (std::uint32_t i = 0; i < count; ++i) data(2)[i] = data(0)[i] + data(1)[i];
++    ++launches;
++    return OkStatus();
++  }
++};
++}
++
++LSE_TEST(decode_sample_rejects_actual_cold_or_host_work) {
++  using lse::runtime::DecodeSampleCounters;
++  using lse::runtime::warm_decode_sample;
++  DecodeSampleCounters before{3, 4, 5, 6};
++  LSE_EXPECT(warm_decode_sample(before, before));
++  for (unsigned field = 0; field < 4; ++field) {
++    auto after = before;
++    if (field == 0) ++after.compiles;
++    if (field == 1) ++after.disk_loads;
++    if (field == 2) ++after.partition_passes;
++    if (field == 3) ++after.host_groups;
++    LSE_EXPECT(!warm_decode_sample(before, after));
++  }
++}
++
++LSE_TEST(decode_sample_retained_replay_does_not_count_a_partition) {
++  backend::BackendAdapter<HostDevice> backend;
++  LSE_EXPECT_OK(backend.init(0));
++  Scheduler scheduler(backend);
++  scheduler.set_dialect(Dialect::kLoom);
++  auto make_leaf = [&](float value) {
++    auto buffer = backend.allocate(4 * sizeof(float), backend::MemoryClass::kDevice, backend::kDefaultStream);
++    LSE_EXPECT(buffer.ok());
++    float values[4]{value, value + 1, value + 2, value + 3};
++    LSE_EXPECT_OK(backend.copy_h2d(values, *buffer, sizeof(values), 0));
++    return Array::from_buffer(std::move(*buffer), Shape{4}, DType::kF32);
++  };
++  auto a = make_leaf(1), b = make_leaf(10);
++  auto output = a + b;
++  const NodePtr roots[]{output.node()};
++  Program program;
++  LSE_EXPECT_OK(scheduler.eval(roots, true, &program));
++  LSE_EXPECT(scheduler.last_trace().partition_passes > 0);
++  LSE_EXPECT_EQ(scheduler.last_trace().host_groups, 0u);
++  const auto partitions = scheduler.accumulated_trace().partition_passes;
++  LSE_EXPECT(program.holds(roots));
++  for (unsigned pass = 0; pass < 4; ++pass) {
++    float input[]{float(20 + pass), 2, 3, 4};
++    LSE_EXPECT_OK(backend.copy_h2d(input, a.node()->buffer, sizeof(input), 0));
++    program.reset_compute();
++    LSE_EXPECT_OK(scheduler.eval(roots, true, &program));
++    LSE_EXPECT(scheduler.last_trace().replayed);
++    LSE_EXPECT_EQ(scheduler.last_trace().partition_passes, 0u);
++    LSE_EXPECT_EQ(scheduler.accumulated_trace().partition_passes, partitions);
++    LSE_EXPECT_EQ(scheduler.last_trace().host_groups, 0u);
++    float result[4]{};
++    LSE_EXPECT_OK(backend.copy_d2h(output.node()->buffer, result, sizeof(result), 0));
++    LSE_EXPECT_EQ(result[0], float(30 + pass));
++    LSE_EXPECT_EQ(result[3], 17.0f);
++  }
++  LSE_EXPECT_EQ(backend.impl().launches, 5u);
++}
++LSE_TEST_MAIN()
+diff --git a/tests/test_dispatch_profile.cpp b/tests/test_dispatch_profile.cpp
+new file mode 100644
+index 0000000..51f11ce
+--- /dev/null
++++ b/tests/test_dispatch_profile.cpp
+@@ -0,0 +1,48 @@
++#include "harness.hpp"
++#include "../src/graph/dispatch_profile.hpp"
++
++using lse::graph::detail::DispatchProfile;
++using lse::graph::detail::DispatchProfileMode;
++using lse::graph::detail::dispatch_profile_mode;
++
++LSE_TEST(dispatch_profile_modes_are_explicit) {
++  LSE_EXPECT(dispatch_profile_mode(nullptr) == DispatchProfileMode::kOff);
++  LSE_EXPECT(dispatch_profile_mode("off") == DispatchProfileMode::kOff);
++  LSE_EXPECT(dispatch_profile_mode("submit") == DispatchProfileMode::kSubmit);
++  LSE_EXPECT(dispatch_profile_mode("serial") == DispatchProfileMode::kSerial);
++  LSE_EXPECT(dispatch_profile_mode("1") == DispatchProfileMode::kInvalid);
++}
++
++LSE_TEST(dispatch_profile_separates_shapes_failures_and_clock_domains) {
++  DispatchProfile p;
++  p.record("q6 M1", 10, 100, 7, true);
++  p.record("q6 M1", 30, 300, 3, false);
++  p.record("q6 M16", 80, 90, 5, true);
++  const auto submit = p.rows(false);
++  LSE_EXPECT_EQ(submit.size(), 2u);
++  LSE_EXPECT(submit[0].first == "q6 M16");
++  const auto serial = p.rows(true);
++  LSE_EXPECT(serial[0].first == "q6 M1");
++  const auto& s = serial[0].second;
++  LSE_EXPECT_EQ(s.count, 2u);
++  LSE_EXPECT_EQ(s.failures, 1u);
++  LSE_EXPECT_EQ(s.submit_ns, 40u);
++  LSE_EXPECT_EQ(s.completion_ns, 400u);
++  LSE_EXPECT_EQ(s.predrain_ns, 10u);
++  LSE_EXPECT_EQ(s.max_submit_ns, 30u);
++  LSE_EXPECT_EQ(s.max_completion_ns, 300u);
++}
++
++LSE_TEST(dispatch_profile_has_a_bounded_overflow_bucket) {
++  DispatchProfile p;
++  for (std::size_t i = 0; i < DispatchProfile::kMaxShapes + 9; ++i) {
++    p.record(std::to_string(i), 1, 0, 0, true);
++  }
++  p.record(std::string(DispatchProfile::kMaxKeyBytes + 1, 'x'), 2, 0, 0, true);
++  const auto rows = p.rows(false);
++  LSE_EXPECT_EQ(rows.size(), DispatchProfile::kMaxShapes + 1);
++  LSE_EXPECT(rows[0].first == "<other-shapes>");
++  LSE_EXPECT_EQ(rows[0].second.count, 10u);
++  LSE_EXPECT_EQ(rows[0].second.submit_ns, 11u);
++}
++LSE_TEST_MAIN()
 diff --git a/tests/test_generation_stats.cpp b/tests/test_generation_stats.cpp
 new file mode 100644
 index 0000000..839c867
@@ -2773,6 +5085,151 @@ index 0000000..839c867
 +  s.prompt_tokens = 0;
 +  LSE_EXPECT_EQ(s.prompt_tokens_per_second(), 0.0);
 +}
++LSE_TEST_MAIN()
+diff --git a/tests/test_loom_cache.cpp b/tests/test_loom_cache.cpp
+new file mode 100644
+index 0000000..fa321b9
+--- /dev/null
++++ b/tests/test_loom_cache.cpp
+@@ -0,0 +1,139 @@
++#include "harness.hpp"
++#include "lse/backends/hrx/arch_database.hpp"
++#include "lse/backends/hrx/loomc/loom_emitter.hpp"
++#include "lse/graph/graph.hpp"
++#include "lse/graph/ops.hpp"
++
++#include <chrono>
++
++namespace {
++using namespace lse;
++using namespace lse::graph;
++
++Array leaf(Shape shape, DType type = DType::kF32) {
++  auto node = std::make_shared<Node>();
++  node->shape = shape;
++  node->dtype = type;
++  node->materialized = true;
++  return Array(node);
++}
++
++FusionGroup subtraction(bool reverse = false, bool alias = false) {
++  auto a = leaf(Shape{128}), b = alias ? a : leaf(Shape{128});
++  auto out = reverse ? b - a : a - b;
++  FusionGroup group;
++  group.nodes = {out.node()};
++  group.inputs = alias ? std::vector<NodePtr>{a.node()}
++                       : std::vector<NodePtr>{a.node(), b.node()};
++  group.outputs = {out.node()};
++  group.anchor = out.node()->kind;
++  group.anchor_class = out.node()->fclass;
++  return group;
++}
++
++backend::DeviceInfo device() {
++  backend::DeviceInfo info;
++  info.arch = "gfx1201";
++  info.wavefront_size = 32;
++  info.max_threads_per_workgroup = 1024;
++  info.lds_bytes_per_workgroup = 65536;
++  return info;
++}
++}  // namespace
++
++LSE_TEST(loom_cache_rebinds_new_graphs_without_retaining_old_nodes) {
++  backend::LoomEmitter emitter;
++  auto info = device();
++  std::weak_ptr<Node> old_input;
++  std::string source;
++  {
++    auto group = subtraction();
++    old_input = group.inputs[0];
++    auto emitted = emitter.emit(group, info);
++    LSE_EXPECT(emitted.ok());
++    if (!emitted.ok()) return;
++    source = emitted->source;
++  }
++  LSE_EXPECT(old_input.expired());
++  auto rebuilt = subtraction();
++  auto cached = emitter.emit(rebuilt, info);
++  auto fresh = backend::LoomEmitter{}.emit(rebuilt, info);
++  LSE_EXPECT(cached.ok() && fresh.ok());
++  if (!cached.ok() || !fresh.ok()) return;
++  LSE_EXPECT(cached->source == source && cached->source == fresh->source);
++  LSE_EXPECT(cached->binding_order == fresh->binding_order);
++  LSE_EXPECT(cached->binding_order.front() == rebuilt.inputs.front());
++  LSE_EXPECT_EQ(emitter.cache_stats().hits, 1u);
++  LSE_EXPECT_EQ(emitter.cache_stats().entries, 1u);
++}
++
++LSE_TEST(loom_cache_identity_distinguishes_edges_aliases_constants_and_devices) {
++  backend::LoomEmitter emitter;
++  auto info = device();
++  auto normal = subtraction(), reversed = subtraction(true);
++  // The old display signature omits edges and collides for a-b and b-a.
++  LSE_EXPECT_EQ(normal.signature(), reversed.signature());
++  LSE_EXPECT(emitter.cache_key(normal, info) != emitter.cache_key(reversed, info));
++  auto aliased = subtraction(false, true);
++  LSE_EXPECT(emitter.cache_key(normal, info) != emitter.cache_key(aliased, info));
++  auto wider = info;
++  wider.wavefront_size = 64;
++  LSE_EXPECT(emitter.cache_key(normal, info) != emitter.cache_key(normal, wider));
++  wider = info;
++  wider.lds_bytes_per_workgroup /= 2;
++  LSE_EXPECT(emitter.cache_key(normal, info) != emitter.cache_key(normal, wider));
++  for (const auto* group : {&normal, &reversed, &aliased}) {
++    auto result = emitter.emit(*group, info);
++    LSE_EXPECT(result.ok());
++  }
++  LSE_EXPECT_EQ(emitter.cache_stats().misses, 3u);
++  LSE_EXPECT_EQ(emitter.cache_stats().hits, 0u);
++  auto constant = subtraction();
++  constant.inputs[0]->set_kind(OpKind::kConstant);
++  constant.inputs[0]->attrs[0] = 1.0f;
++  const auto one = emitter.cache_key(constant, info);
++  constant.inputs[0]->attrs[0] = 2.0f;
++  LSE_EXPECT(one != emitter.cache_key(constant, info));
++}
++
++LSE_TEST(loom_cache_reuses_q6_kernel_source_and_launch_metadata) {
++  auto info = device();
++  backend::AmdDeviceInfo amd;
++  backend::apply_arch_defaults(info, amd);
++  info.extension_id = backend::AmdDeviceInfo::kExtensionId;
++  info.extension = &amd;
++  auto out = quant_linear(leaf(Shape{1, 4096}),
++      leaf(Shape{17, 768}, DType::kU32),
++      leaf(Shape{17, 64}, DType::kBF16),
++      leaf(Shape{17, 64}, DType::kBF16), 6, 64);
++  const NodePtr roots[] = {out.node()};
++  const auto groups = Partitioner::partition(roots);
++  LSE_EXPECT_EQ(groups.size(), 1u);
++  if (groups.size() != 1) return;
++  backend::LoomEmitter emitter;
++  auto cold_start = std::chrono::steady_clock::now();
++  auto cold = emitter.emit(groups[0], info);
++  auto cold_end = std::chrono::steady_clock::now();
++  LSE_EXPECT(cold.ok());
++  if (!cold.ok()) return;
++  constexpr unsigned repeats = 100;
++  for (unsigned i = 0; i < repeats; ++i) {
++    auto hot = emitter.emit(groups[0], info);
++    LSE_EXPECT(hot.ok());
++    if (!hot.ok()) return;
++    LSE_EXPECT(hot->source == cold->source);
++    LSE_EXPECT(hot->binding_order == cold->binding_order);
++    LSE_EXPECT_EQ(hot->lds_bytes, cold->lds_bytes);
++    LSE_EXPECT_EQ(hot->dims.workgroup_count[0], cold->dims.workgroup_count[0]);
++    LSE_EXPECT_EQ(hot->constants.total_bytes, cold->constants.total_bytes);
++  }
++  const auto hot_end = std::chrono::steady_clock::now();
++  LSE_EXPECT_EQ(emitter.cache_stats().hits, repeats);
++  LSE_EXPECT_EQ(emitter.cache_stats().misses, 1u);
++  std::printf("    Q6 source emission: cold %.1f us, warm mean %.1f us (%u calls; host only)\n",
++      std::chrono::duration<double, std::micro>(cold_end - cold_start).count(),
++      std::chrono::duration<double, std::micro>(hot_end - cold_end).count() / repeats,
++      repeats);
++}
++
 +LSE_TEST_MAIN()
 diff --git a/tests/test_loom_conv.cpp b/tests/test_loom_conv.cpp
 new file mode 100644
@@ -3107,6 +5564,70 @@ index 0000000..adaa508
 +}
 +
 +LSE_TEST_MAIN()
+diff --git a/tests/test_loom_probe.cpp b/tests/test_loom_probe.cpp
+new file mode 100644
+index 0000000..92a561e
+--- /dev/null
++++ b/tests/test_loom_probe.cpp
+@@ -0,0 +1,58 @@
++#include "harness.hpp"
++#include "lse/backends/hrx/probe_emit.hpp"
++#include "lse/backends/hrx/loomc/loomc_compiler.hpp"
++
++using namespace lse;
++using namespace lse::backend;
++using namespace lse::backend::hrx_kernels;
++
++DeviceInfo probe_fixture() {
++  DeviceInfo d;
++  d.arch = "gfx1201";
++  d.compute_units = 64;
++  d.wavefront_size = 32;
++  d.max_threads_per_workgroup = 1024;
++  d.lds_bytes_per_workgroup = 65536;
++  return d;
++}
++LSE_TEST(loom_stream_and_touch_compile_through_native_compiler) {
++  const auto d = probe_fixture();
++  const LoomcCompiler compiler;
++  LSE_EXPECT(compiler.available());
++  if (!compiler.available()) return;
++  for (std::uint32_t load_bytes : {4u, 8u, 16u}) {
++    const std::uint32_t threads = d.compute_units * 8u * 256u;
++    const std::uint32_t span = threads * (load_bytes / 4u);
++    const std::uint32_t elems = ((512u << 20) / 4u / span) * span;
++    auto emitted = emit_loom_stream_probe(d, elems, threads, load_bytes);
++    LSE_EXPECT(emitted.ok());
++    if (!emitted.ok()) { std::fprintf(stderr, "%s\n", emitted.status().to_string().c_str()); return; }
++    LSE_EXPECT(emitted->dialect == graph::Dialect::kLoom);
++    LSE_EXPECT_EQ(emitted->binding_order.size(), 2u);
++    LSE_EXPECT_EQ(emitted->constants.total_bytes, 4u);
++    LSE_EXPECT_EQ(emitted->dims.workgroup_size[0], 256u);
++    LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], threads / 256u);
++    auto code = compiler.compile(emitted->source, "gfx1201");
++    LSE_EXPECT(code.ok());
++    if (!code.ok()) { std::fprintf(stderr, "%s\n", code.status().to_string().c_str()); return; }
++    LSE_EXPECT(!code->code.empty());
++  }
++  auto touch = emit_loom_touch_probe(d);
++  LSE_EXPECT(touch.ok());
++  if (!touch.ok()) return;
++  LSE_EXPECT_EQ(touch->binding_order.size(), 1u);
++  LSE_EXPECT_EQ(touch->constants.total_bytes, 4u);
++  LSE_EXPECT_EQ(touch->dims.workgroup_size[0], 32u);
++  auto code = compiler.compile(touch->source, "gfx1201");
++  LSE_EXPECT(code.ok());
++  if (!code.ok()) std::fprintf(stderr, "%s\n", code.status().to_string().c_str());
++}
++LSE_TEST(loom_probes_decline_unknown_geometry_and_partial_strides) {
++  auto d = probe_fixture();
++  LSE_EXPECT(!emit_loom_stream_probe(d, 1025, 256, 16).ok());
++  LSE_EXPECT(!emit_loom_stream_probe(d, 1024, 256, 3).ok());
++  d.wavefront_size = 0;
++  LSE_EXPECT(!emit_loom_touch_probe(d).ok());
++  LSE_EXPECT(!emit_loom_stream_probe(d, 1024, 256, 16).ok());
++}
++LSE_TEST_MAIN()
 diff --git a/tests/test_loom_repeat.cpp b/tests/test_loom_repeat.cpp
 new file mode 100644
 index 0000000..6d71ebc
@@ -3264,6 +5785,654 @@ index 0000000..4eba262
 +}
 +
 +LSE_TEST_MAIN()
+diff --git a/tests/test_pointwise_fusion.cpp b/tests/test_pointwise_fusion.cpp
+new file mode 100644
+index 0000000..36fa314
+--- /dev/null
++++ b/tests/test_pointwise_fusion.cpp
+@@ -0,0 +1,142 @@
++#include "harness.hpp"
++#include "lse/backends/hrx/arch_database.hpp"
++#include "lse/backends/hrx/loomc/loom_emitter.hpp"
++#include "lse/graph/ops.hpp"
++#include "lse/graph/pointwise_fusion.hpp"
++using namespace lse;
++using namespace lse::graph;
++namespace {
++Array leaf(Shape s = {1, 128}, DType dtype = DType::kF32) {
++  auto n = std::make_shared<Node>();
++  n->shape = s;
++  n->dtype = dtype;
++  n->materialized = true;
++  return Array(n);
++}
++FusionGroup solo(const Array &a) {
++  FusionGroup g;
++  g.nodes = {a.node()};
++  g.outputs = g.nodes;
++  g.inputs = a.node()->inputs;
++  g.anchor = a.node()->kind;
++  g.anchor_class = a.node()->fclass;
++  return g;
++}
++bool join(FusionGroup &g, const Array &next,
++          std::span<const NodePtr> roots = {}) {
++  return join_pointwise_chain(g, next.node(), roots, backend::loom_sources());
++}
++} // namespace
++LSE_TEST(gates_fuse_and_keep_external_bindings) {
++  auto x = leaf(), v = leaf();
++  auto sig = sigmoid(x), out = sig * v;
++  auto g = solo(sig);
++  const NodePtr roots[] = {out.node()};
++  LSE_EXPECT(Partitioner::can_fuse(*sig.node(), *out.node()));
++  LSE_EXPECT(join(g, out, roots));
++  LSE_EXPECT(g.nodes.size() == 2);
++  LSE_EXPECT(g.outputs.size() == 1 && g.outputs[0] == out.node());
++  LSE_EXPECT(g.inputs.size() == 2 && g.inputs[0] == x.node() &&
++             g.inputs[1] == v.node());
++  backend::DeviceInfo device;
++  device.arch = "gfx1201";
++  device.compute_units = 64;
++  device.max_threads_per_workgroup = 1024;
++  device.wavefront_size = 32;
++  device.lds_bytes_per_workgroup = 65536;
++  backend::AmdDeviceInfo amd;
++  backend::apply_arch_defaults(device, amd);
++  device.extension_id = backend::AmdDeviceInfo::kExtensionId;
++  device.extension = &amd;
++  backend::LoomEmitter emitter;
++  auto emitted = emitter.emit(g, device);
++  LSE_EXPECT(emitted.ok());
++  if (!emitted.ok())
++    return;
++  LSE_EXPECT(emitted->binding_order.size() == 3);
++  LSE_EXPECT(emitted->source.find("scalar.expf") != std::string::npos);
++  LSE_EXPECT(emitted->source.find("scalar.mulf") != std::string::npos);
++  LSE_EXPECT(emitted->source.find("kernel.barrier") == std::string::npos);
++}
++LSE_TEST(three_node_chain_and_duplicate_edges) {
++  auto x = leaf();
++  auto a = softplus(x), b = neg(a), c = exp(b);
++  auto g = solo(a);
++  LSE_EXPECT(join(g, b));
++  LSE_EXPECT(join(g, c));
++  LSE_EXPECT(g.nodes.size() == 3 && g.inputs.size() == 1 &&
++             g.outputs[0] == c.node());
++  auto d = sigmoid(x), e = d * d;
++  auto repeated = solo(d);
++  LSE_EXPECT(d.node()->consumer_count == 1);
++  LSE_EXPECT(join(repeated, e));
++  LSE_EXPECT(repeated.inputs.size() == 1);
++}
++LSE_TEST(escaping_roots_and_fanout_stay_materialized) {
++  auto x = leaf();
++  auto a = sigmoid(x), b = a * x;
++  auto g = solo(a);
++  const NodePtr roots[] = {a.node(), b.node()};
++  LSE_EXPECT(!join(g, b, roots));
++  LSE_EXPECT(g.nodes.size() == 1);
++  auto c = neg(a);
++  (void)c;
++  LSE_EXPECT(a.node()->consumer_count == 2);
++  LSE_EXPECT(!join(g, b));
++  LSE_EXPECT(g.outputs[0] == a.node());
++}
++LSE_TEST(reductions_and_indexed_kernels_cannot_join) {
++  auto x = leaf();
++  auto a = sigmoid(x);
++  auto r = sum(a, -1, true);
++  auto g = solo(a);
++  LSE_EXPECT(!join(g, r));
++  auto n = rms_norm(x, leaf(Shape{128}), 1e-6f, false);
++  auto out = n * x;
++  auto norm = solo(n);
++  LSE_EXPECT(!join(norm, out));
++}
++LSE_TEST(views_and_shape_changes_cannot_join) {
++  auto x = leaf();
++  auto a = sigmoid(x), v = reshape(a, Shape{128});
++  auto g = solo(a);
++  LSE_EXPECT(!join(g, v));
++  auto small = sigmoid(leaf(Shape{1}));
++  auto broad = small * x;
++  auto sg = solo(small);
++  LSE_EXPECT(!join(sg, broad));
++}
++LSE_TEST(placement_and_narrowing_boundaries_remain) {
++  auto x = leaf();
++  auto a = sigmoid(x), b = a * x;
++  auto g = solo(a);
++  a.node()->member = 0;
++  b.node()->member = 1;
++  LSE_EXPECT(!join(g, b));
++  b.node()->member = Node::kAnyMember;
++  LSE_EXPECT(!join(g, b));
++  auto narrow = leaf(Shape{1, 128}, DType::kBF16);
++  auto c = sigmoid(narrow), d = c * narrow;
++  auto ng = solo(c);
++  LSE_EXPECT(!join(ng, d));
++}
++LSE_TEST(no_cross_phase_or_unrelated_merge) {
++  auto x = leaf();
++  auto a = sigmoid(x), b = a * x;
++  auto g = solo(a);
++  g.is_phase = true;
++  LSE_EXPECT(!join(g, b));
++  g.is_phase = false;
++  auto unrelated = neg(x);
++  LSE_EXPECT(!join(g, unrelated));
++  a.node()->materialized = true;
++  LSE_EXPECT(!join(g, b));
++}
++LSE_TEST(missing_dialect_spelling_refuses_before_dispatch) {
++  auto x = leaf();
++  auto a = sigmoid(x), b = a * x;
++  auto g = solo(a);
++  DialectSourceTable empty(std::span<const PrimitiveSource>{});
++  LSE_EXPECT(!join_pointwise_chain(g, b.node(), {}, empty));
++}
++int main() { return lse::test::run_all(); }
+diff --git a/tests/test_probe_measurement.cpp b/tests/test_probe_measurement.cpp
+new file mode 100644
+index 0000000..f987048
+--- /dev/null
++++ b/tests/test_probe_measurement.cpp
+@@ -0,0 +1,95 @@
++#include "harness.hpp"
++#include "lse/backends/hrx/probe_measurement.hpp"
++#include <limits>
++#include <memory>
++#include "lse/backends/hrx/probe_retirement.hpp"
++#include <vector>
++
++using namespace lse::backend::hrx_kernels;
++LSE_TEST(probe_working_set_requires_and_respects_a_memory_budget) {
++  LSE_EXPECT_EQ(streaming_probe_bytes(0, std::nullopt), 0u);
++  LSE_EXPECT_EQ(streaming_probe_bytes(0, 16u << 20), 0u);
++  LSE_EXPECT_EQ(streaming_probe_bytes(std::size_t{32} << 30, 0), 0u);
++  LSE_EXPECT_EQ(streaming_probe_bytes(0, 128u << 20), 32u << 20);
++  LSE_EXPECT_EQ(streaming_probe_bytes(std::size_t{32} << 30, std::nullopt), 512u << 20);
++  LSE_EXPECT_EQ(streaming_probe_bytes(std::size_t{32} << 30, 64u << 20), 16u << 20);
++}
++LSE_TEST(probe_checks_every_result_and_every_guard) {
++  std::vector<float> values(1024 + 16, -1234.0f);
++  std::fill_n(values.begin(), 1024, 4096.0f);
++  LSE_EXPECT_OK(check_probe_output(values, 1024, 4096.0f));
++  for (std::size_t i : {std::size_t{0}, std::size_t{777}, std::size_t{1023},
++                         std::size_t{1024}, values.size() - 1}) {
++    const float old = values[i];
++    values[i] = std::numeric_limits<float>::quiet_NaN();
++    LSE_EXPECT(!check_probe_output(values, 1024, 4096.0f).ok());
++    values[i] = old;
++  }
++  LSE_EXPECT(!check_probe_output({}, 0, 1).ok());
++  LSE_EXPECT(!check_probe_output(std::span(values).first(1024), 1024, 4096).ok());
++}
++template <int Tag> struct OwnedProbeBuffer { std::shared_ptr<int> storage; };
++LSE_TEST(probe_partial_submission_always_drains_before_release) {
++  using Buffer = OwnedProbeBuffer<0>;
++  ProbeRetirement<Buffer, 2> pending;
++  LSE_EXPECT(pending.available());
++  Buffer a{std::make_shared<int>(1)}, b{std::make_shared<int>(2)};
++  std::weak_ptr<int> first = a.storage, second = b.storage;
++  LSE_EXPECT(pending.track(a));
++  LSE_EXPECT(pending.track(b));
++  a = {}; b = {};
++  bool drained = false;
++  int releases = 0;
++  // Simulates one accepted launch followed by a rejected launch: regardless
++  // of the operation's failure, finalization must drain the earlier work.
++  LSE_EXPECT(pending.finish([&] { drained = true; return true; }, [&](Buffer& buffer) {
++    LSE_EXPECT(drained);
++    ++releases;
++    buffer = {};
++  }));
++  LSE_EXPECT_EQ(releases, 2);
++  LSE_EXPECT(first.expired() && second.expired());
++  ProbeRetirement<Buffer, 2> next;
++  LSE_EXPECT(next.available());
++}
++LSE_TEST(probe_failed_drain_retains_storage_and_blocks_later_probes) {
++  using Buffer = OwnedProbeBuffer<1>;
++  std::weak_ptr<int> owner;
++  int releases = 0, drains = 0;
++  {
++    ProbeRetirement<Buffer, 2> pending;
++    Buffer buffer{std::make_shared<int>(7)};
++    owner = buffer.storage;
++    LSE_EXPECT(pending.track(buffer));
++    buffer = {};
++    LSE_EXPECT(!pending.finish([&] { ++drains; return false; }, [&](Buffer&) { ++releases; }));
++  }
++  LSE_EXPECT_EQ(drains, 1);
++  LSE_EXPECT_EQ(releases, 0);
++  LSE_EXPECT(!owner.expired());
++  ProbeRetirement<Buffer, 2> next;
++  LSE_EXPECT(!next.available());
++}
++LSE_TEST(probe_quarantine_capacity_is_reserved_before_allocation) {
++  using Buffer = OwnedProbeBuffer<2>;
++  ProbeRetirement<Buffer, 2> first, second, exhausted;
++  LSE_EXPECT(first.available() && second.available());
++  LSE_EXPECT(!exhausted.available());
++  LSE_EXPECT(first.finish([] { return true; }, [](Buffer&) {}));
++  ProbeRetirement<Buffer, 2> reused;
++  LSE_EXPECT(reused.available());
++}
++LSE_TEST(probe_unwinding_without_drain_preserves_buffer_owner) {
++  using Buffer = OwnedProbeBuffer<3>;
++  std::weak_ptr<int> owner;
++  {
++    ProbeRetirement<Buffer, 2> pending;
++    Buffer buffer{std::make_shared<int>(9)};
++    owner = buffer.storage;
++    LSE_EXPECT(pending.track(buffer));
++  }
++  LSE_EXPECT(!owner.expired());
++  ProbeRetirement<Buffer, 2> next;
++  LSE_EXPECT(!next.available());
++}
++LSE_TEST_MAIN()
+diff --git a/tests/test_probe_policy.cpp b/tests/test_probe_policy.cpp
+new file mode 100644
+index 0000000..987b3e9
+--- /dev/null
++++ b/tests/test_probe_policy.cpp
+@@ -0,0 +1,90 @@
++#include "harness.hpp"
++#include "lse/backends/cpu/cpu_backend.hpp"
++#include "lse/probe/pool.hpp"
++#include <cstdlib>
++#include <optional>
++#include <string>
++
++// Host storage with an HRX identity exercises profile selection without
++// loading a GPU runtime or issuing any device operation.
++struct ProfileCpu : lse::backend::CpuBackend {
++  static constexpr std::string_view kName = "hrx";
++};
++LSE_TEST(hrx_submission_policy_changes_the_calibration_fingerprint) {
++  const char* original = std::getenv("LSE_FLUSH_INTERVAL");
++  const std::optional<std::string> saved =
++      original ? std::optional<std::string>(original) : std::nullopt;
++  struct Restore {
++    const std::optional<std::string>& saved;
++    ~Restore() {
++      if (saved) setenv("LSE_FLUSH_INTERVAL", saved->c_str(), 1);
++      else unsetenv("LSE_FLUSH_INTERVAL");
++    }
++  } restore{saved};
++  lse::backend::BackendAdapter<ProfileCpu> backend;
++  LSE_EXPECT_OK(backend.init(0));
++  lse::probe::PoolMember member;
++  member.id = {"hrx", 0};
++  member.rank = 0;
++  member.host = "profile-test";
++  member.backend = &backend;
++  unsetenv("LSE_FLUSH_INTERVAL");
++  auto normal = lse::probe::pool_fingerprint(std::span(&member, 1), nullptr);
++  setenv("LSE_FLUSH_INTERVAL", "16", 1);
++  auto explicit_default = lse::probe::pool_fingerprint(std::span(&member, 1), nullptr);
++  setenv("LSE_FLUSH_INTERVAL", "64", 1);
++  auto larger_batch = lse::probe::pool_fingerprint(std::span(&member, 1), nullptr);
++  LSE_EXPECT(normal.ok() && explicit_default.ok() && larger_batch.ok());
++  if (normal.ok() && explicit_default.ok() && larger_batch.ok()) {
++    LSE_EXPECT(*normal == *explicit_default);
++    LSE_EXPECT(*normal != *larger_batch);
++  }
++  backend.shutdown();
++}
++#if defined(__APPLE__)
++LSE_TEST(mac_hsa_wait_policy_changes_the_calibration_fingerprint) {
++  const char* original = std::getenv("MAC_HSA_BLOCKED_POLL_US");
++  const std::optional<std::string> saved =
++      original ? std::optional<std::string>(original) : std::nullopt;
++  struct Restore {
++    const std::optional<std::string>& saved;
++    ~Restore() {
++      if (saved) setenv("MAC_HSA_BLOCKED_POLL_US", saved->c_str(), 1);
++      else unsetenv("MAC_HSA_BLOCKED_POLL_US");
++    }
++  } restore{saved};
++  lse::backend::BackendAdapter<ProfileCpu> backend;
++  LSE_EXPECT_OK(backend.init(0));
++  lse::probe::PoolMember member;
++  member.id = {"hrx", 0};
++  member.rank = 0;
++  member.host = "profile-test";
++  member.backend = &backend;
++  auto fingerprint = [&] {
++    return lse::probe::pool_fingerprint(std::span(&member, 1), nullptr);
++  };
++  unsetenv("MAC_HSA_BLOCKED_POLL_US");
++  const auto normal = fingerprint();
++  LSE_EXPECT(normal.ok());
++  for (const char* setting : {"1000", "", "9", "1001", "-1", "64junk", "4294967296"}) {
++    setenv("MAC_HSA_BLOCKED_POLL_US", setting, 1);
++    const auto value = fingerprint();
++    LSE_EXPECT(value.ok());
++    if (normal.ok() && value.ok()) LSE_EXPECT(*normal == *value);
++  }
++  setenv("MAC_HSA_BLOCKED_POLL_US", "64", 1);
++  const auto faster = fingerprint();
++  LSE_EXPECT(faster.ok());
++  if (normal.ok() && faster.ok()) LSE_EXPECT(*normal != *faster);
++  setenv("MAC_HSA_BLOCKED_POLL_US", "0064", 1);
++  const auto canonical = fingerprint();
++  LSE_EXPECT(canonical.ok());
++  if (faster.ok() && canonical.ok()) LSE_EXPECT(*faster == *canonical);
++  setenv("MAC_HSA_BLOCKED_POLL_US", "10", 1);
++  const auto lower_bound = fingerprint();
++  LSE_EXPECT(lower_bound.ok());
++  if (normal.ok() && lower_bound.ok()) LSE_EXPECT(*normal != *lower_bound);
++  backend.shutdown();
++}
++#endif
++LSE_TEST_MAIN()
+diff --git a/tests/test_quant_prefill.cpp b/tests/test_quant_prefill.cpp
+new file mode 100644
+index 0000000..012f8fd
+--- /dev/null
++++ b/tests/test_quant_prefill.cpp
+@@ -0,0 +1,297 @@
++// Host-only contracts for the shared HIP/Loom Q6 prefill schedule.
++#include "harness.hpp"
++#include "lse/backends/hrx/arch_database.hpp"
++#include "lse/backends/hrx/hipc/hip_emitter.hpp"
++#include "lse/backends/hrx/hipc/hip_sources.hpp"
++#include "lse/backends/hrx/hipc/hip_types.hpp"
++#include "lse/backends/hrx/loomc/loom_emitter.hpp"
++#include "lse/graph/graph.hpp"
++#include "lse/graph/kernel_primitive.hpp"
++#include "lse/graph/ops.hpp"
++#include "lse/kernels/quant_panel.hpp"
++
++#include <algorithm>
++#include <array>
++#include <bit>
++
++namespace {
++using namespace lse;
++using namespace lse::graph;
++
++struct Fixture {
++  backend::DeviceInfo device;
++  backend::AmdDeviceInfo amd;
++  std::array<Shape, 4> inputs;
++  std::array<DType, 4> dtypes{DType::kF32, DType::kU32,
++                            DType::kBF16, DType::kBF16};
++  DialectSourceTable intrinsics = backend::hip_sources();
++  KernelShapes shapes;
++  Fixture(int m, int k) {
++    device.arch = "gfx1201";
++    device.wavefront_size = 32;
++    device.max_threads_per_workgroup = 1024;
++    device.lds_bytes_per_workgroup = 65536;
++    backend::apply_arch_defaults(device, amd);
++    device.extension_id = backend::AmdDeviceInfo::kExtensionId;
++    device.extension = &amd;
++    inputs = {Shape{m, k}, Shape{17, k * 6 / 32},
++              Shape{17, k / 64}, Shape{17, k / 64}};
++    shapes.inputs = inputs;
++    shapes.input_dtypes = dtypes;
++    shapes.output = Shape{m, 17};
++    shapes.iattrs = {6, 64, 0, 0};
++    shapes.device = &device;
++    shapes.types = backend::hip_types();
++    shapes.intrinsics = &intrinsics;
++  }
++};
++const KernelPrimitiveBase* primitive() {
++  return dynamic_cast<const KernelPrimitiveBase*>(find_primitive("quant_linear"));
++}
++Array input(const Shape& shape, DType dtype) {
++  auto node = std::make_shared<Node>();
++  node->shape = shape;
++  node->dtype = dtype;
++  node->materialized = true;
++  return Array(node);
++}
++}  // namespace
++
++LSE_TEST(q6_prefill_plan_declares_multirow_resources_and_no_single_row_panel) {
++  const auto* p = primitive();
++  LSE_EXPECT(p != nullptr);
++  if (!p) return;
++  for (int m : {1, 2, 3, 4, 5, 17, 128, 256}) {
++    for (int k : {64, 576, 1024, 1088, 4096, 5120, 17408}) {
++      Fixture f(m, k);
++      const unsigned rows = m >= 4 ? 4u : (m >= 2 ? 2u : 1u);
++      const auto plan = p->plan(f.shapes);
++      LSE_EXPECT_EQ(plan.workgroup_count[0], 3u);
++      LSE_EXPECT_EQ(plan.workgroup_count[1], (unsigned(m) + rows - 1) / rows);
++      LSE_EXPECT_EQ(plan.lds_bytes, m > 1 ? rows * unsigned(std::min(k, 1024)) * 4u
++                                       : (k <= 16384 ? unsigned(k) * 4u : 0u));
++      if (m > 1) LSE_EXPECT_EQ(p->staged_row(f.shapes).count, 0u);
++    }
++  }
++}
++
++LSE_TEST(q6_prefill_fallback_preserves_architecture_and_staging_contracts) {
++  const auto* p = primitive();
++  LSE_EXPECT(p != nullptr);
++  if (!p) return;
++  for (int reason = 0; reason < 8; ++reason) {
++    Fixture f(5, 4096);
++    if (reason == 0) f.device.arch = "gfx1200";
++    if (reason == 1) f.device.wavefront_size = 64;
++    if (reason == 2) f.device.lds_bytes_per_workgroup = 8192;
++    if (reason == 3) f.dtypes[2] = f.dtypes[3] = DType::kF32;
++    if (reason == 4) f.shapes.staged = {"caller_panel", 4096};
++    if (reason == 5) f.shapes.staged_quant.codes = "caller_codes";
++    if (reason == 6) {
++      f.shapes.iattrs[1] = 128;
++      f.inputs[2] = f.inputs[3] = Shape{17, 32};
++    }
++    if (reason == 7) f.device.lds_bytes_per_workgroup = 0;
++    LSE_EXPECT_EQ(p->plan(f.shapes).workgroup_count[1], 5u);
++  }
++  // Indexed rows can select different matrices, so they cannot share weights.
++  const auto* indexed = dynamic_cast<const KernelPrimitiveBase*>(
++      find_primitive("quant_linear_indexed"));
++  LSE_EXPECT(indexed != nullptr);
++  if (!indexed) return;
++  Fixture f(5, 4096);
++  const Shape shapes[] = {Shape{5, 4096}, Shape{2, 17, 768},
++                         Shape{2, 17, 64}, Shape{2, 17, 64}, Shape{5, 1}};
++  const DType dtypes[] = {DType::kF32, DType::kU32, DType::kBF16,
++                         DType::kBF16, DType::kF32};
++  f.shapes.inputs = shapes;
++  f.shapes.input_dtypes = dtypes;
++  f.shapes.iattrs = {0, 6, 64, 0};
++  LSE_EXPECT_EQ(indexed->plan(f.shapes).workgroup_count[1], 5u);
++}
++
++LSE_TEST(q6_prefill_hip_and_loom_emit_matching_launch_and_lds_requirements) {
++  for (int m : {3, 5, 17}) {
++    Fixture f(m, 1088);
++    auto y = quant_linear(input(f.inputs[0], f.dtypes[0]),
++                          input(f.inputs[1], f.dtypes[1]),
++                          input(f.inputs[2], f.dtypes[2]),
++                          input(f.inputs[3], f.dtypes[3]), 6, 64);
++    const NodePtr roots[] = {y.node()};
++    const auto groups = Partitioner::partition(roots);
++    LSE_EXPECT_EQ(groups.size(), 1u);
++    if (groups.size() != 1) continue;
++    auto hip = backend::HipEmitter{}.emit(groups.front(), f.device);
++    auto loom = backend::LoomEmitter{}.emit(groups.front(), f.device);
++    LSE_EXPECT(hip.ok() && loom.ok());
++    if (!hip.ok() || !loom.ok()) continue;
++    const unsigned rows = m >= 4 ? 4u : 2u;
++    LSE_EXPECT_EQ(hip->dims.workgroup_count[1], (unsigned(m) + rows - 1) / rows);
++    LSE_EXPECT_EQ(hip->lds_bytes, rows * 4096u);
++    LSE_EXPECT_EQ(loom->lds_bytes, hip->lds_bytes);
++    LSE_EXPECT_EQ(loom->dims.workgroup_count[1], hip->dims.workgroup_count[1]);
++    auto actual_shared = backend::HipEmitter::shared_bytes(hip->source);
++    LSE_EXPECT(actual_shared.ok());
++    if (actual_shared.ok()) LSE_EXPECT_EQ(*actual_shared, hip->lds_bytes);
++  }
++}
++
++LSE_TEST(q6_panel_layout_is_bijective_and_spreads_strided_lane_reads) {
++  for (unsigned count : {64u, 576u, 1024u, 4096u, 16384u}) {
++    std::vector<unsigned> panel(count, count);
++    for (unsigned i = 0; i < count; ++i) {
++      const auto at = kernels::q6_panel_index(i);
++      LSE_EXPECT(at < count);
++      if (at >= count) continue;
++      LSE_EXPECT_EQ(panel[at], count);
++      panel[at] = i;
++    }
++    for (unsigned i = 0; i < count; ++i)
++      LSE_EXPECT_EQ(panel[kernels::q6_panel_index(i)], i);
++  }
++  // This verifies address distribution, not a claim about measured stall count.
++  for (unsigned banks : {32u, 64u}) {
++    for (unsigned c = 0; c < 16; ++c) {
++      std::array<unsigned, 64> hits{};
++      for (unsigned lane = 0; lane < 32; ++lane)
++        ++hits[kernels::q6_panel_index(lane * 16 + c) % banks];
++      LSE_EXPECT_EQ(*std::max_element(hits.begin(), hits.end()), 1u);
++    }
++  }
++}
++
++namespace {
++static float activation(unsigned row, unsigned k) {
++  return std::sin(float(row * 17 + k * 3) * 0.03f) * 0.7f;
++}
++static float weight(unsigned col, unsigned k) {
++  // BF16-representable scale/bias and all Q6 code values, including straddles.
++  const float scale = float((col + k / 64) % 7 + 1) / 64.0f;
++  const float bias = float(int((col * 3 + k / 64) % 9) - 4) / 8.0f;
++  const auto code = (col * 17 + k * 13 + 7) % 64;
++  return std::fma(float(code), scale, bias);
++}
++static float reduce(std::array<float, 32> values) {
++  for (unsigned bit = 1; bit < 32; bit <<= 1) {
++    const auto prior = values;
++    for (unsigned lane = 0; lane < 32; ++lane)
++      values[lane] = prior[lane] + prior[lane ^ bit];
++  }
++  return values[0];
++}
++int check_schedule() {
++  for (unsigned tile : {64u, 128u, 576u, 1024u}) {
++    std::vector<bool> seen(tile);
++    for (unsigned at = 0; at < tile; ++at) {
++      const auto mapped = lse::kernels::q6_panel_index(at);
++      if (mapped >= tile || seen[mapped]) return 2;
++      seen[mapped] = true;
++    }
++  }
++  for (unsigned banks : {32u, 64u}) {
++    for (unsigned c = 0; c < 16; ++c) {
++      std::array<unsigned, 64> original{}, rotated{};
++      for (unsigned lane = 0; lane < 32; ++lane) {
++        ++original[(lane * 16 + c) % banks];
++        ++rotated[lse::kernels::q6_panel_index(lane * 16 + c) % banks];
++      }
++      unsigned before = 0, after = 0;
++      for (unsigned b = 0; b < banks; ++b) {
++        before = std::max(before, original[b]);
++        after = std::max(after, rotated[b]);
++      }
++      if (after != 1 || after >= before) return 3;
++    }
++  }
++  std::puts("PASS physical panel bounds/permutation and per-instruction bank distribution (not measured stalls)");
++  unsigned checked = 0;
++  for (unsigned m : {2u, 3u, 4u, 5u, 17u, 128u}) {
++    for (unsigned k : {64u, 576u, 1088u, 4096u, 17408u}) {
++      constexpr unsigned n = 17;
++      const unsigned rows = m >= 4 ? 4 : 2, tile = k < 1024 ? k : 1024;
++      std::vector<float> expected(m * n), actual(m * n, NAN);
++      std::uint64_t baseline_weights = 0, reused_weights = 0;
++      for (unsigned row = 0; row < m; ++row) for (unsigned col = 0; col < n; ++col) {
++        std::array<float, 32> sums{};
++        for (unsigned lane = 0; lane < 32; ++lane)
++          for (unsigned chunk = lane; chunk < k / 16; chunk += 32)
++            for (unsigned c = 0; c < 16; ++c) {
++              const auto at = chunk * 16 + c;
++              sums[lane] = std::fma(activation(row, at), weight(col, at), sums[lane]);
++              ++baseline_weights;
++            }
++        expected[row * n + col] = reduce(sums);
++      }
++      for (unsigned row = 0; row < m; row += rows) for (unsigned col = 0; col < n; ++col) {
++        std::array<std::array<float, 32>, 4> sums{};
++        for (unsigned base = 0; base < k; base += tile) {
++          std::vector<float> panel(rows * tile);
++          for (unsigned r = 0; r < rows; ++r)
++            for (unsigned at = 0; at < tile; ++at)
++              panel[r * tile + lse::kernels::q6_panel_index(at)] = row + r < m && base + at < k
++                  ? activation(row + r, base + at) : 0.0f;
++          for (unsigned lane = 0; lane < 32; ++lane)
++            for (unsigned chunk = lane; chunk < tile / 16; chunk += 32) {
++              if (base + chunk * 16 >= k) continue;
++              for (unsigned c = 0; c < 16; ++c) {
++                const auto at = base + chunk * 16 + c;
++                const float w = weight(col, at);
++                ++reused_weights;
++                for (unsigned r = 0; r < rows; ++r) {
++                  const float x = panel[r * tile + lse::kernels::q6_panel_index(chunk * 16 + c)];
++                  sums[r][lane] = std::fma(x, w, sums[r][lane]);
++                }
++              }
++            }
++        }
++        for (unsigned r = 0; r < rows && row + r < m; ++r)
++          actual[(row + r) * n + col] = reduce(sums[r]);
++      }
++      for (unsigned i = 0; i < actual.size(); ++i) {
++        if (std::bit_cast<std::uint32_t>(actual[i]) != std::bit_cast<std::uint32_t>(expected[i])) {
++          std::fprintf(stderr, "FAIL M%u K%u output%u expected=%g actual=%g\n", m, k, i, expected[i], actual[i]);
++          return 1;
++        }
++      }
++      const auto expected_reads = std::uint64_t((m + rows - 1) / rows) * n * k;
++      if (reused_weights != expected_reads || reused_weights >= baseline_weights) return 1;
++      checked += actual.size();
++      std::printf("PASS M%u K%u N17: %zu bit-exact FP32 results, weight-decodes %llu -> %llu\n",m,k,actual.size(),(unsigned long long)baseline_weights,(unsigned long long)reused_weights);
++    }
++  }
++  std::printf("PASS %u FP32 schedule outputs; no GPU execution\n", checked);
++  return 0;
++}
++
++}
++
++LSE_TEST(q6_prefill_preserves_fp32_accumulation_order_with_ragged_tiles) {
++  LSE_EXPECT_EQ(check_schedule(), 0);
++}
++
++LSE_TEST(q6_decode_rotation_preserves_resources_and_caller_panel_layout) {
++  const auto* p = primitive();
++  LSE_EXPECT(p != nullptr);
++  if (!p) return;
++  for (int k : {64, 576, 1024, 1088, 4096, 5120, 16384, 17408}) {
++    Fixture f(1, k);
++    const auto expected_lds = k <= 16384 ? unsigned(k) * 4u : 0u;
++    LSE_EXPECT_EQ(p->plan(f.shapes).lds_bytes, expected_lds);
++    LSE_EXPECT_EQ(p->plan(f.shapes).workgroup_count[1], 1u);
++    LSE_EXPECT_EQ(p->staged_row(f.shapes).count, unsigned(k));
++    // A prefilled caller panel must not be rotated or redeclared privately.
++    f.shapes.staged = {"caller_panel", unsigned(k)};
++    LSE_EXPECT_EQ(p->plan(f.shapes).lds_bytes, 0u);
++    f.shapes.store = [](std::string_view i, std::string_view v) {
++      return "out[" + std::string(i) + "] = " + std::string(v) + ";";
++    };
++    const auto body = p->emit_kernel(f.shapes);
++    LSE_EXPECT(!body.empty());
++    LSE_EXPECT(body.find("caller_panel") != std::string::npos);
++    auto declared = backend::HipEmitter::shared_bytes(body);
++    LSE_EXPECT(declared.ok());
++    if (declared.ok()) LSE_EXPECT_EQ(*declared, 0u);
++  }
++}
++
++LSE_TEST_MAIN()
 diff --git a/tests/test_server_shutdown.cpp b/tests/test_server_shutdown.cpp
 new file mode 100644
 index 0000000..944dfba
@@ -3364,3 +6533,344 @@ index 0000000..944dfba
 +  }
 +  std::puts("server shutdown: timeout, normal return, startup race, socket worker drain PASS");
 +}
+diff --git a/tests/test_submission_constants.cpp b/tests/test_submission_constants.cpp
+new file mode 100644
+index 0000000..9452333
+--- /dev/null
++++ b/tests/test_submission_constants.cpp
+@@ -0,0 +1,81 @@
++#include "harness.hpp"
++#include "lse/backends/hrx/arch_database.hpp"
++#include "lse/backends/hrx/loomc/loom_emitter.hpp"
++#include "lse/graph/graph.hpp"
++#include "lse/graph/ops.hpp"
++#include "lse/kv/block.hpp"
++#include <cstring>
++
++namespace {
++using namespace lse;
++using namespace lse::graph;
++Array leaf(Shape shape, DType dtype = DType::kF32) {
++  auto node = std::make_shared<Node>();
++  node->set_kind(OpKind::kBuffer);
++  node->shape = shape; node->dtype = dtype; node->materialized = true;
++  return Array(node);
++}
++void payload(Array& array, std::initializer_list<float> values) {
++  array.node()->host_mirror.resize(values.size() * sizeof(float));
++  std::memcpy(array.node()->host_mirror.data(), values.begin(), values.size() * sizeof(float));
++}
++}
++
++LSE_TEST(loom_decode_push_constants_exclude_token_and_position_payloads) {
++  using namespace lse;
++  using namespace lse::graph;
++  backend::DeviceInfo info;
++  info.arch = "gfx1201"; info.compute_units = 64; info.wavefront_size = 32;
++  info.max_threads_per_workgroup = 1024; info.lds_bytes_per_workgroup = 65536;
++  backend::AmdDeviceInfo amd;
++  backend::apply_arch_defaults(info, amd);
++  info.extension_id = backend::AmdDeviceInfo::kExtensionId; info.extension = &amd;
++  auto ids = leaf(Shape{1, 1}), position = leaf(Shape{1});
++  auto meta = leaf(Shape{kv::step_meta_elems(1)}), table = leaf(Shape{1, 8});
++  auto q = leaf(Shape{1, 24, 1, 256}), pool = leaf(Shape{8, 4, 16, 256});
++  auto gq = leaf(Shape{1, 1, 48, 128});
++  Array next_state;
++  std::vector<Array> outputs{
++      quant_embedding(leaf(Shape{248320, 960}, DType::kU32),
++          leaf(Shape{248320, 80}, DType::kBF16), leaf(Shape{248320, 80}, DType::kBF16), ids, 6, 64),
++      rope(q, leaf(Shape{128, 256}), leaf(Shape{128, 256}), position),
++      sdpa_paged(q, pool, pool, 0.0625f, MaskKind::kCausal, 0, meta, table, 16),
++      kv_page_write(pool, leaf(Shape{1, 4, 1, 256}), meta, table, 16),
++      gated_delta_step(gq, leaf(gq.shape()), leaf(gq.shape()), leaf(Shape{1, 1, 48}),
++          leaf(Shape{1, 1, 48}), leaf(Shape{1, 48, 128, 128}), &next_state)};
++  outputs.push_back(next_state);
++  backend::LoomEmitter emitter;
++  for (auto& output : outputs) {
++    const NodePtr roots[]{output.node()};
++    auto groups = Partitioner::partition(roots, &info);
++    LSE_EXPECT(!groups.empty());
++    for (const auto& group : groups) {
++      std::string initial_source;
++      std::size_t initial_count = 0;
++      for (unsigned step = 0; step < 3; ++step) {
++        payload(ids, {static_cast<float>(100 + step)});
++        payload(position, {static_cast<float>(5 + step)});
++        payload(meta, {static_cast<float>(5 + step), static_cast<float>(6 + step), 1.0f, 1.0f});
++        auto emitted = emitter.emit(group, info);
++        LSE_EXPECT(emitted.ok());
++        if (!emitted.ok()) {
++          std::fprintf(stderr, "%s\n", emitted.status().to_string().c_str());
++          return;
++        }
++        LSE_EXPECT_EQ(emitted->constants.fields.size(), 1u);
++        LSE_EXPECT_EQ(emitted->constants.total_bytes, 4u);
++        if (emitted->constants.fields.size() != 1) return;
++        LSE_EXPECT(emitted->constants.fields[0].name == "count");
++        LSE_EXPECT_EQ(emitted->constants.fields[0].offset, 0u);
++        LSE_EXPECT_EQ(emitted->constants.fields[0].size, 4u);
++        const auto count = group.nodes.back()->element_count();
++        if (step == 0) { initial_source = emitted->source; initial_count = count; }
++        else {
++          LSE_EXPECT(emitted->source == initial_source);
++          LSE_EXPECT_EQ(count, initial_count);
++        }
++      }
++    }
++  }
++}
++LSE_TEST_MAIN()
+diff --git a/tests/test_submission_decode.cpp b/tests/test_submission_decode.cpp
+new file mode 100644
+index 0000000..950cd05
+--- /dev/null
++++ b/tests/test_submission_decode.cpp
+@@ -0,0 +1,109 @@
++// Reuse the synthetic tiny model and state fixtures; select only the cases
++// below, and bind an explicit host-only backend before any graph exists.
++#define main runtime_fixture_unused_main
++#include "test_runtime.cpp"
++#undef main
++#include "lse/backends/cpu/cpu_backend.hpp"
++
++namespace {
++struct ObservedCpu : lse::backend::CpuBackend {
++  bool advertise = false, active = false, fail_begin = false, fail_end = false;
++  unsigned begins = 0, ends = 0, cancelled = 0;
++  std::span<const lse::graph::KernelToolchain> toolchains() const noexcept {
++    static const lse::graph::KernelToolchain loom{lse::graph::Dialect::kLoom, nullptr, nullptr};
++    return advertise ? std::span(&loom, 1) : std::span<const lse::graph::KernelToolchain>{};
++  }
++  lse::Status begin_decode_sample_impl(std::uint64_t) {
++    LSE_EXPECT(!active);
++    active = true;
++    ++begins;
++    if (fail_begin) return LSE_ERROR(kDeviceError, "injected begin drain failure");
++    return lse::OkStatus();
++  }
++  lse::Status end_decode_sample_impl(std::uint64_t elapsed, bool eligible) {
++    LSE_EXPECT(active && elapsed > 0);
++    // The interpreter is deliberately ineligible for device policy evidence.
++    LSE_EXPECT(!eligible);
++    ++ends;
++    if (fail_end) return LSE_ERROR(kDeviceError, "injected end drain failure");
++    active = false;
++    return lse::OkStatus();
++  }
++  void cancel_decode_sample_impl() noexcept { active = false; ++cancelled; }
++};
++lse::backend::BackendAdapter<ObservedCpu> observed_backend;
++lse::backend::SingleDevice observed_device(observed_backend);
++lse::backend::IDeviceSet* host_set() { return &observed_device; }
++}
++
++LSE_TEST(submission_decode_observation_preserves_tokens_and_state) {
++  auto& backend = observed_backend.impl();
++  MtpFixture fx = build_mtp_fixture();
++  LSE_EXPECT(fx.ok);
++  if (!fx.ok) return;
++  GenerationLimits limits;
++  limits.max_tokens = 5;
++  const std::vector<std::uint32_t> prompt{2, 11, 33};
++  Generator reference(*fx.lm, greedy_params());
++  Session reference_session("batch-reference", fx.lm->state_slots());
++  auto expected = reference.generate(reference_session, prompt, limits);
++  LSE_EXPECT(expected.ok());
++  if (!expected.ok()) return;
++  LSE_EXPECT_EQ(backend.begins, 0u);
++  backend.advertise = true;
++  Generator observed(*fx.lm, greedy_params());
++  Session observed_session("batch-observed", fx.lm->state_slots());
++  auto actual = observed.generate(observed_session, prompt, limits);
++  LSE_EXPECT(actual.ok());
++  if (!actual.ok()) return;
++  LSE_EXPECT(*actual == *expected);
++  LSE_EXPECT(observed_session.history() == reference_session.history());
++  LSE_EXPECT_EQ(observed_session.position(), reference_session.position());
++  LSE_EXPECT_EQ(backend.begins, 4u);
++  LSE_EXPECT_EQ(backend.ends, 4u);
++  LSE_EXPECT(!backend.active);
++  // Prefill-only and cancellation after its token must never create a decode
++  // observation or run an extra token for calibration.
++  limits.max_tokens = 0;
++  LSE_EXPECT(observed.generate(prompt, limits).ok());
++  limits.max_tokens = 5;
++  auto cancelled = observed.generate(prompt, limits, [](std::uint32_t) { return false; });
++  LSE_EXPECT(cancelled.ok() && cancelled->size() == 1);
++  LSE_EXPECT_EQ(backend.begins, 4u);
++  LSE_EXPECT_EQ(backend.ends, 4u);
++  LSE_EXPECT_EQ(backend.cancelled, 0u);
++}
++
++LSE_TEST(submission_decode_boundary_failure_cancels_the_observation) {
++  auto& backend = observed_backend.impl();
++  for (bool fail_at_begin : {true, false}) {
++    backend.advertise = true;
++    backend.begins = backend.ends = backend.cancelled = 0;
++    backend.fail_begin = fail_at_begin;
++    backend.fail_end = !fail_at_begin;
++    MtpFixture fx = build_mtp_fixture();
++    LSE_EXPECT(fx.ok);
++    if (!fx.ok) return;
++    Generator gen(*fx.lm, greedy_params());
++    GenerationLimits limits;
++    limits.max_tokens = 3;
++    auto result = gen.generate({2, 11, 33}, limits);
++    LSE_EXPECT(!result.ok());
++    LSE_EXPECT_EQ(backend.begins, 1u);
++    LSE_EXPECT_EQ(backend.ends, fail_at_begin ? 0u : 1u);
++    LSE_EXPECT_EQ(backend.cancelled, 1u);
++    LSE_EXPECT(!backend.active);
++    backend.fail_begin = backend.fail_end = false;
++  }
++}
++
++int main() {
++  if (!observed_backend.init(0).ok()) return 1;
++  lse::graph::register_device_set_factory(host_set);
++  auto* scheduler = lse::graph::default_scheduler();
++  if (scheduler == nullptr || &scheduler->backend() != &observed_backend) return 2;
++  scheduler->set_mode(lse::graph::Scheduler::Mode::kHostOnly);
++  auto& cases = lse::test::Registry::get().cases;
++  std::erase_if(cases, [](const auto& test) { return !test.name.starts_with("submission_decode_"); });
++  return lse::test::run_all();
++}
+diff --git a/tests/test_submission_tuner.cpp b/tests/test_submission_tuner.cpp
+new file mode 100644
+index 0000000..02d6dac
+--- /dev/null
++++ b/tests/test_submission_tuner.cpp
+@@ -0,0 +1,88 @@
++#include "harness.hpp"
++#include "lse/backends/hrx/submission_tuner.hpp"
++#include <limits>
++using lse::backend::SubmissionTuner;
++
++static void train(SubmissionTuner::State& s, const std::array<double, 4>& times) {
++  for (unsigned attempt = 0; attempt < 40 && !s.done; ++attempt) {
++    const auto interval = SubmissionTuner::next(s);
++    const auto it = std::find(SubmissionTuner::candidates.begin(), SubmissionTuner::candidates.end(), interval);
++    SubmissionTuner::observe(s, 123, times[static_cast<std::size_t>(it - SubmissionTuner::candidates.begin())], true);
++  }
++}
++LSE_TEST(submission_tuner_selects_measured_win_and_caches_it) {
++  SubmissionTuner tuner;
++  auto* s = tuner.find(42);
++  train(*s, {200, 140, 139, 180});
++  LSE_EXPECT(s->done && s->selected);
++  LSE_EXPECT_EQ(SubmissionTuner::next(*s), 64u);
++  LSE_EXPECT_EQ(s->samples, 20u);
++  const auto attempts = s->attempts;
++  SubmissionTuner::observe(*s, 123, 9000, true);
++  LSE_EXPECT_EQ(s->attempts, attempts);
++  LSE_EXPECT(tuner.find(42) == s);
++}
++LSE_TEST(submission_tuner_preserves_baseline_without_five_percent_win) {
++  SubmissionTuner tuner;
++  auto* s = tuner.find(1);
++  train(*s, {200, 194, 197, 199});
++  LSE_EXPECT(s->done && !s->selected);
++  LSE_EXPECT_EQ(SubmissionTuner::next(*s), 16u);
++}
++LSE_TEST(submission_tuner_can_select_deferred_only_when_measurably_best) {
++  SubmissionTuner tuner;
++  auto* s = tuner.find(1);
++  train(*s, {200, 150, 140, 100});
++  LSE_EXPECT(s->done && s->selected);
++  LSE_EXPECT_EQ(SubmissionTuner::next(*s), 0u);
++}
++LSE_TEST(submission_tuner_excludes_jit_and_warmup_and_bounds_attempts) {
++  SubmissionTuner tuner;
++  auto* s = tuner.find(1);
++  for (unsigned i = 0; i < 5; ++i) SubmissionTuner::observe(*s, 123, 100, false);
++  LSE_EXPECT_EQ(s->samples, 0u);
++  for (unsigned i = 0; i < 80; ++i) SubmissionTuner::observe(*s, 123, 100, false);
++  LSE_EXPECT(s->done && !s->selected);
++  LSE_EXPECT_EQ(SubmissionTuner::next(*s), 16u);
++}
++LSE_TEST(submission_tuner_invalidates_changed_workload_shape) {
++  SubmissionTuner tuner;
++  auto* s = tuner.find(1);
++  train(*s, {200, 140, 139, 180});
++  SubmissionTuner::observe(*s, 456, 100, true);
++  LSE_EXPECT(!s->done && !s->selected);
++  LSE_EXPECT_EQ(s->samples, 0u);
++  LSE_EXPECT_EQ(SubmissionTuner::next(*s), 16u);
++}
++LSE_TEST(submission_tuner_rejects_noisy_evidence) {
++  SubmissionTuner tuner;
++  auto* s = tuner.find(1);
++  for (unsigned i = 0; i < 40 && !s->done; ++i) {
++    const auto round = s->samples / 4;
++    SubmissionTuner::observe(*s, 123, (round % 3 == 0 ? 100 : (round % 3 == 1 ? 200 : 300)), true);
++  }
++  LSE_EXPECT(s->done && !s->selected);
++}
++LSE_TEST(submission_tuner_bounds_workload_cache_and_preserves_override) {
++  SubmissionTuner tuner;
++  for (unsigned i = 0; i < 16; ++i) LSE_EXPECT(tuner.find(i) != nullptr);
++  LSE_EXPECT(tuner.find(17) == nullptr);
++  using lse::backend::automatic_submission_policy;
++  LSE_EXPECT(automatic_submission_policy(nullptr, nullptr));
++  LSE_EXPECT(!automatic_submission_policy(nullptr, "0"));
++  for (auto value : {"", "0", "64", "invalid"}) LSE_EXPECT(!automatic_submission_policy(value, nullptr));
++}
++LSE_TEST(submission_tuner_noisy_alternative_does_not_veto_stable_improvement) {
++  SubmissionTuner tuner;
++  auto* s = tuner.find(1);
++  for (unsigned attempt = 0; attempt < 40 && !s->done; ++attempt) {
++    const auto interval = SubmissionTuner::next(*s);
++    const double elapsed = interval == 16 ? 200 : interval == 64 ? 140 :
++        interval == 256 ? 139 : (s->samples / 4 % 3 == 0 ? 100 :
++                                s->samples / 4 % 3 == 1 ? 200 : 300);
++    SubmissionTuner::observe(*s, 123, elapsed, true);
++  }
++  LSE_EXPECT(s->done && s->selected);
++  LSE_EXPECT_EQ(SubmissionTuner::next(*s), 64u);
++}
++LSE_TEST_MAIN()
+diff --git a/tests/test_token_ids.cpp b/tests/test_token_ids.cpp
+new file mode 100644
+index 0000000..622a821
+--- /dev/null
++++ b/tests/test_token_ids.cpp
+@@ -0,0 +1,39 @@
++#include "harness.hpp"
++#include "../src/cli/token_ids.hpp"
++
++#include <stdexcept>
++#include <string>
++
++namespace {
++std::string capture(std::span<const std::uint32_t> prompt,
++                    std::span<const std::uint32_t> generated) {
++  FILE* file = std::tmpfile();
++  if (!file) throw std::runtime_error("tmpfile failed");
++  const bool written = lse::cli::print_token_ids(file, prompt, generated);
++  if (!written) {
++    std::fclose(file);
++    throw std::runtime_error("writing diagnostic failed");
++  }
++  std::rewind(file);
++  std::string text;
++  char buffer[64];
++  while (std::fgets(buffer, sizeof(buffer), file)) text += buffer;
++  std::fclose(file);
++  return text;
++}
++}
++
++LSE_TEST(token_ids_preserve_order_repeats_and_unsigned_range) {
++  const std::uint32_t prompt[] = {760, 6511, 314, 9338, 369};
++  const std::uint32_t generated[] = {0, UINT32_MAX, 0, 17};
++  LSE_EXPECT(capture(prompt, generated) ==
++      "[token-ids] {\"prompt_ids\":[760,6511,314,9338,369],"
++      "\"generated_ids\":[0,4294967295,0,17],\"stop_tokens_excluded\":true}\n");
++}
++
++LSE_TEST(token_ids_empty_arrays_remain_valid_json) {
++  LSE_EXPECT(capture({}, {}) ==
++      "[token-ids] {\"prompt_ids\":[],\"generated_ids\":[],"
++      "\"stop_tokens_excluded\":true}\n");
++}
++LSE_TEST_MAIN()

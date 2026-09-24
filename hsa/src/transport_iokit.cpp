@@ -84,6 +84,9 @@ OriginalAtomicCaps captureOriginalAtomicCaps(io_service_t service) {
 }
 
 class IOKitConnection final : public Connection, private InitializationRPC {
+#if defined(MAC_HSA_IDLE_DIAGNOSTIC)
+    friend struct IdleDiagnosticAccess;
+#endif
 public:
     explicit IOKitConnection(OriginalAtomicCaps audit):originalAtomicCaps(std::move(audit)) {}
     io_service_t service = IO_OBJECT_NULL;

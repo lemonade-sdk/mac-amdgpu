@@ -75,6 +75,48 @@ int main() {
     assert(output.find("\"gfx\":{\"raw_current_mhz\":1000,\"dpm_min_mhz\":500,\"ac_dpm_max_mhz\":2900}")!=std::string::npos);
     assert(output.find("\"retired_packets\":0")!=std::string::npos);
     assert(output.find("[h] fast/slow")!=std::string::npos && output.find("FAST 0.1 s")!=std::string::npos);
+    assert(output.find("SMU REPORTED GFX  -- %  [scale 0..100]")!=std::string::npos);
+    assert(output.find("SUBMISSIONS  ")==std::string::npos);
+    assert(output.find("WORK  submissions")!=std::string::npos);
+    // A low absolute hardware percentage must not fill the chart by being
+    // normalized to its own peak. Compatible firmware retains its raw reading.
+    d.telemetrySupported=true;
+    d.metrics.version=kSMUMetricsSnapshotVersion;d.metrics.size=sizeof(d.metrics);
+    d.metrics.driverInterface=metrics::kCompatibleInterface;
+    d.metrics.flags=kSMUMetricsValid|kSMUMetricsLinuxCompatible;
+    d.metrics.collectedAtNs=now;
+    d.metrics.validFields=uint64_t(1)<<metrics::GfxActivityPercent;
+    d.metrics.values[metrics::GfxActivityPercent]=5;
+    histories[d.registry].add(now,{}, {},5.0);
+    captured.str("");captured.clear();previous=std::cout.rdbuf(captured.rdbuf());
+    dashboard({d},selected,{},false,false,&histories,{},80,40,now);
+    json({d},selected,{});
+    std::cout.rdbuf(previous);output=captured.str();
+    assert(output.find("SMU REPORTED GFX  5.0 %  [scale 0..100]")!=std::string::npos);
+    assert(output.find("\"gfx_activity_percent\":5")!=std::string::npos);
+    assert(output.find("idle can report 100%; workload utilization unverified")!=std::string::npos);
+    assert(output.find("\"gfx_activity_accuracy\":\"idle_100_percent_observed; workload_utilization_unverified\"")!=std::string::npos);
+    assert(output.find("firmware-reported activity; not CU occupancy or productive workload utilization")!=std::string::npos);
+    const auto gfx=output.find("SMU REPORTED GFX");
+    const auto end=output.find("SMU activity:",gfx);
+    const auto plot=output.substr(gfx,end-gfx);
+    // Four-row graph:5% occupies only the bottom row, not all four.
+    assert(std::count(plot.begin(),plot.end(),'#')==1);
+    captured.str("");captured.clear();previous=std::cout.rdbuf(captured.rdbuf());
+    dashboard({d},selected,{},false,false,&histories,{},80,40,now+kSMUMetricsStaleAfterNs+1);
+    std::cout.rdbuf(previous);output=captured.str();
+    assert(output.find("SMU REPORTED GFX  -- %  [scale 0..100]")!=std::string::npos);
+    assert(output.find("SUBMISSIONS  ")==std::string::npos);
+    // Keep the raw100% reading alongside the warning; do not replace it with
+    // a software-derived zero even when driver counters show no pending work.
+    d.metrics.values[metrics::GfxActivityPercent]=100;
+    captured.str("");captured.clear();previous=std::cout.rdbuf(captured.rdbuf());
+    dashboard({d},selected,{},false,false,&histories,{},80,40,now);
+    json({d},selected,{});
+    std::cout.rdbuf(previous);output=captured.str();
+    assert(output.find("SMU REPORTED GFX  100.0 %  [scale 0..100]")!=std::string::npos);
+    assert(output.find("\"gfx_activity_percent\":100")!=std::string::npos);
+    assert(output.find("idle can report 100%; workload utilization unverified")!=std::string::npos);
     // A narrow terminal is clipped by columns and reserves its final row for controls.
     captured.str("");captured.clear();previous=std::cout.rdbuf(captured.rdbuf());
     dashboard({d},selected,{},true,false,&histories,{},40,12,now);

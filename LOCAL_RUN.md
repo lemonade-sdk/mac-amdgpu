@@ -2,7 +2,7 @@
 
 Open with `open -a TextEdit LOCAL_RUN.md` or `less LOCAL_RUN.md` (`q` exits). Dependency pins and signing requirements: [full setup guide](docs/LSE_QUICKSTART.md). Projects: [mac_amdgpu](https://github.com/lemonade-sdk/mac-amdgpu), [Lemon Seed Engine](https://github.com/Geramy/LSE).
 
-**Current boundary:** Qwen 27B Q6 CLI generation and five interleaved HTTP completion/chat requests passed through LSE/Loom/HRX with GPU execution required, repeatable output and clean shutdown. The chat measured 3.24 prompt tokens/s and 2.63 decode tokens/s. These are short runs with KV128 and MTP disabled; longer contexts and broad accuracy remain unqualified.
+**Current boundary:** Qwen 27B Q6 CLI generation and repeated HTTP completion/chat requests pass through LSE/Loom/HRX with GPU execution required and clean shutdown. All five prompt IDs and 33 generated IDs from the France fixture exactly match independent MLX on the same checkpoint. The optimized Q6 kernels reached median 10.12 decode tokens/s with flush64/poll64; automatic batching reached 10.13 with poll64 and 6.97 with the default poll1000. These are short runs with KV128 and MTP disabled; longer contexts and broad accuracy remain unqualified. [Exact conditions and evidence](docs/LSE_PERFORMANCE.md).
 
 ## Build locally
 
@@ -58,6 +58,48 @@ python3 scripts/run-lse-qwen-smoke.py --run --timeout-seconds 1200
 ```
 
 Default model: `~/.lmstudio/models/lmstudio-community/Qwen3.8-27B-MLX-6bit`; override with `--model PATH`. The runner uses HRX/Loom, strict GPU execution, KV128, no MTP, greedy generation and statistics. One token is the default; add `--tokens 16` to exercise decoding. Run one GPU workload at a time.
+
+## Experimental resident benchmark
+
+Eligible macOS gfx1201 single-device decode automatically measures intervals
+16/64/256/0; other work retains the 16-dispatch baseline. Blocked polling defaults
+to **1000 µs**. The measured 64/64 settings below are explicit overrides,
+using an isolated HSA build. They do not require reinstalling the driver.
+Build LSE/HRX as above first, then configure the experiment and run its CPU-only
+signal checks:
+
+```sh
+cmake -S hsa -B build/hsa-wait-perf -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+cmake --build build/hsa-wait-perf --target hsa-runtime64 hsa-signal-test mac-hsa-info --parallel 4
+ctest --test-dir build/hsa-wait-perf -R '^hsa-cpu-signals(-short-poll)?$' --output-on-failure
+```
+
+With other GPU workloads stopped, explicitly run one warmup and three measured
+requests against the resident model:
+
+```sh
+env -u LSE_TIME_STEPS -u LSE_PROFILE_DISPATCH -u MAC_HSA_SIGNAL_BACKEND \
+  LSE_TIME_SPANS=1 LSE_FLUSH_INTERVAL=64 MAC_HSA_BLOCKED_POLL_US=64 \
+  python3 scripts/run-lse-server-smoke.py --run \
+  --hsa-library-dir build/hsa-wait-perf \
+  --benchmark-repeats 3 --generated-tokens 33 --kv-len 128 \
+  --log-dir build/tests/qwen-resident-experiment-64-64
+build/hsa-wait-perf/mac-hsa-info
+```
+
+The runner uses the raw five-token France prompt and records binary/runtime
+hashes, settings, each response and median rates. Require all 33 generated tokens
+(32 subsequent decode steps), identical output, normal server exit and driver
+stage 0 afterward. Median 10.118556 decode tokens/s was measured with the
+optimized Q6 kernels. Results depend on the recorded build and context.
+To exercise automatic batching, omit `LSE_FLUSH_INTERVAL`; `LSE_AUTO_BATCH=0`
+disables it. Explicit flush overrides always take precedence. None of these five-token prefill measurements is a PP512 benchmark.
+
+To repeat the polling control, keep the same binaries and flush interval, change
+`MAC_HSA_BLOCKED_POLL_US` to `1000`, and use a distinct log directory. To measure
+the fixed baseline, use `LSE_FLUSH_INTERVAL=16` and
+`MAC_HSA_BLOCKED_POLL_US=1000`. Command-scoped overrides above do not persist in
+the shell or change the interactive server defaults below.
 
 ## HTTP chat
 

@@ -147,6 +147,11 @@ void json(const std::vector<mtop::Device> &devices, const mtop::Selection &selec
                       << ",\"sample_uptime_ns\":" << d.metrics.collectedAtNs
                       << ",\"firmware_metrics_counter\":" << d.metrics.firmwareCounter;
         std::cout << ",\"gfx_activity_percent\":" << metric(d, GfxActivityPercent, 1, "", true)
+                  << ",\"gfx_activity_source\":\"SMU AverageGfxActivity\""
+                  << ",\"gfx_activity_scope\":\"firmware-reported activity; not CU occupancy or productive workload utilization\""
+                  << ",\"gfx_activity_accuracy\":" << quote(d.metrics.driverInterface==amdgpu::metrics::kCompatibleInterface &&
+                      (d.metrics.flags&amdgpu::kSMUMetricsLinuxCompatible) ?
+                      "idle_100_percent_observed; workload_utilization_unverified" : "not_independently_calibrated")
                   << ",\"umc_activity_percent\":" << metric(d, UmcActivityPercent, 1, "", true)
                   << ",\"media_activity_percent\":" << metric(d, MediaActivityPercent, 1, "", true)
                   << ",\"vram_used_bytes\":null,\"gtt_used_bytes\":null"
@@ -281,22 +286,35 @@ void dashboard(const std::vector<mtop::Device> &devices, const mtop::Selection &
                 uint64_t pending=0,failed=0,completed=0;
                 for (const auto &e:d->software.engines) {pending+=e.pending;failed+=e.failed;completed+=e.completed;}
                 line("WORK  pending "+std::to_string(pending)+"  completed "+std::to_string(completed)+"  failed "+std::to_string(failed));
+                line("WORK  submissions "+decimal(history.points.empty() ? std::optional<double>{} : history.points.back().submissionsPerSecond)+
+                    " jobs + packets/s (driver-observed)");
                 line("AQL   queues "+std::to_string(d->software.activeQueues)+"  queued packets "+std::to_string(d->software.queuedPackets)+
                     "  consumed "+std::to_string(d->software.consumedPackets)+"  clients "+std::to_string(d->software.participants));
                 if (d->software.flags&amdgpu::software_stats::QueueSampleIncomplete) line("AQL queue snapshot incomplete; rates may omit unobserved packets.");
             } else line("Software counters: "+(d->softwareError.empty() ? std::string("requires driver 193+") : d->softwareError));
             const unsigned height=rows>=32 ? 4 : 2;
-            auto chart=[&](const std::string &title,const std::string &unit,std::optional<double> mtop::ActivityPoint::*field) {
+            auto chart=[&](const std::string &title,const std::string &unit,std::optional<double> mtop::ActivityPoint::*field,
+                           std::optional<double> fixedScale={}) {
                 const auto values=history.buckets(columns-2,now,field);
                 double maximum=1;for (auto value:values) if(value) maximum=std::max(maximum,*value);
-                const auto current=history.points.empty() ? std::optional<double>{} : history.points.back().*field;
-                line(title+"  "+decimal(current)+" "+unit+"  [peak scale "+decimal(maximum)+"]");
+                if (fixedScale) maximum=*fixedScale;
+                auto current=history.points.empty() ? std::optional<double>{} : history.points.back().*field;
+                // A stale or failed firmware read must not retain a previous
+                // numeric headline, even while historical samples remain visible.
+                if (field==&mtop::ActivityPoint::gfxPercent)
+                    current=hardwareValue(*d,amdgpu::metrics::GfxActivityPercent,now);
+                line(title+"  "+decimal(current)+" "+unit+
+                    (fixedScale ? "  [scale 0.."+decimal(maximum,0)+"]" : "  [peak scale "+decimal(maximum)+"]"));
                 for (const auto &row:mtop::graph(values,height,maximum)) line("|"+row+"|");
                 line("+"+std::string(columns-2,'-')+"+");
             };
-            if (hardwareValue(*d,amdgpu::metrics::GfxActivityPercent,now))
-                chart("GPU ACTIVITY","%",&mtop::ActivityPoint::gfxPercent);
-            else chart("SUBMISSIONS","jobs + packets/s",&mtop::ActivityPoint::submissionsPerSecond);
+            // Activity is an absolute percentage, never normalized to the
+            // recent peak and never replaced with a software submission rate.
+            chart("SMU REPORTED GFX","%",&mtop::ActivityPoint::gfxPercent,100.0);
+            if (d->metrics.driverInterface==amdgpu::metrics::kCompatibleInterface &&
+                (d->metrics.flags&amdgpu::kSMUMetricsLinuxCompatible))
+                line("SMU activity: idle can report 100%; workload utilization unverified.");
+            else line("SMU activity is firmware-reported; not CU occupancy or useful work.");
             chart("COMPLETED COPIES","MiB/s",&mtop::ActivityPoint::transferMiBPerSecond);
             line("History: last 60 s; peak per column; dots = no sample. Rates are driver-observed.");
             if (mtop::hasAccounting(*d)) {
