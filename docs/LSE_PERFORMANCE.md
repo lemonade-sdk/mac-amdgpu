@@ -6,17 +6,58 @@ llama.cpp has not been demonstrated.** The current measurements establish a
 working baseline and identify work to profile; they are not a matched benchmark
 against another engine.
 
+**Current qualification correction:** the M256 residual-two-product vector
+BF16 profile is withdrawn from automatic selection. A newly matched reference
+changes only those two Q6 projections back to their original FP32 contraction,
+preserving cooperative RMS and every other model/runtime input. Its comparison
+measures vector logit relative L2 **0.00503022829645**, exceeding the unchanged
+**0.005** limit. Earlier **0.00408522** evidence came from a different RMS
+context and does not establish the current profile's accuracy. The source
+profile is now Candidate with failed model quality and a conservative 5031-ppm
+record; the ordinary selector uses FP32 for those shapes.
+
+The centered M256 candidate measures **0.00406726276905** against that same
+matched reference and passes. All three implementations repeat bit-exactly,
+have finite logits and the same argmax. Its **0.00661439** difference against
+the vector implementation alone was not a valid substitute for comparison
+with the original FP32 projection. Performance and long-generation gates for
+the centered replacement remain pending. Evidence:
+`centered-m256-scalar-vs-{baseline,candidate}.json` and
+`build/perf-q6-m256-scalar-reference/identity-proof.json`.
+
+The historical vector-prefill throughput and promotion records below are
+retained for reproducibility, but do not describe the current default selector
+or an accepted accuracy result. This also applies to the four-column performance
+runs that used that prefill profile; the decode arithmetic itself is unchanged.
+
+The matched nondiagnostic centered candidate completed five 512-input/129-output
+requests, with text identical across all ten candidate/control responses and
+zero new compilations in the three measured requests. It measured median
+**119.215 PP/s and 16.648 TPS**, versus **143.262 PP/s and 16.691 TPS** for the
+withdrawn vector performance control. Thus the centered change is not a speedup
+over that approximation. A matched nondiagnostic FP32 fallback comparison,
+additional prompt contexts and long-generation qualification are still required
+before selecting it automatically. Evidence:
+`centered-current-pp512-tg128-comparison.json`.
+
+An isolated, explicitly enabled Q6 INT8 residual-correction implementation
+passed 60 normal and 11 exceptional GPU cases, nine identical repeats each,
+including independent arithmetic/FP32 quality checks, all outputs and guards.
+Single-product alternatives failed host accuracy and were not used. Hardware
+accuracy does not establish model quality or speed; retained-graph full-shape
+timing and full-model acceptance remain pending. The default path is unchanged.
+Evidence: `q6-int8-residual2-numeric.log` and `build/perf-q6-int8/README.md`.
+
 The earlier **HIPC** (`--dialect hip`) throughput is reported at approximately
-**34 decode tokens/s**. Current **macOS Loom** (`--dialect loom`) with cooperative
+**34 decode tokens/s**. Recorded **macOS Loom** (`--dialect loom`) with cooperative
 RMS and four-column Q6 reaches **16.70 decode tokens/s** on the
 512-input/129-output fixture and **14.83 decode tokens/s** on the
 1,024-input/1,024-output fixture. Cooperative
 RMS is now the default after a fused-kernel buffer-lifetime fix resolved the
 long-request repeatability failure. The combined vector-prefill implementation passes
 the long fixture at **139.85 prompt tokens/s and 14.23 decode tokens/s**, with
-zero new compilations in the measured third request. It is now the automatic
-choice for the two qualified M256 projection shapes, using the shared HIP/Loom
-operand policy.
+zero new compilations in the measured third request. Its former automatic
+selection has been withdrawn by the qualification correction above.
 These must not be presented as one backend's performance. The HIPC figure is
 recalled rather than recovered from a benchmark artifact; its exact checkpoint,
 quantization, context, MTP settings and platform need verification before a

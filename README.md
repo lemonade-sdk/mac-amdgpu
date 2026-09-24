@@ -70,12 +70,17 @@ its log, model, quantization, context and MTP settings still need to be recovere
 for a matched comparison. It is not a measured macOS Loom result.
 
 The local Qwen3.8-27B-MLX-6bit checkpoint runs through GPU kernels using **Loom**.
-Cooperative RMS normalization, qualified vector BF16 prefill and four-column Q6
-decode are selected automatically for supported shapes through shared HIP/Loom
-code and policy.
-The rebuilt default server passes GPU inference with identical repeated text
-and clean shutdown. The combined implementation also passed three full
-**1,024-input/1,024-output** requests.
+Cooperative RMS normalization and four-column Q6 decode use shared HIP/Loom code
+and policy. GPU inference passes repeated-text and clean-shutdown checks,
+including full **1,024-input/1,024-output** requests.
+
+The M256 residual-two-product BF16 prefill profile is currently withheld from
+automatic selection: a new matched FP32 reference measured **0.005030228**
+logit relative error, above the unchanged **0.005** limit. Those shapes use
+the FP32 fallback in current source. The centered replacement passes the initial
+matched accuracy check and is undergoing performance and long-generation tests.
+The following rates were measured with the withdrawn prefill profile and are
+preserved as experimental results, not current-default throughput claims.
 
 | Workload | Prompt processing | Decode |
 | --- | ---: | ---: |
@@ -88,8 +93,9 @@ request after two warmups. Compiler counters confirm zero new compilations in
 every measured request. Output token counts include the first token from
 prefill, so the rows contain 128 or 1,023 decode steps respectively.
 
-The rebuilt default server separately confirmed **143.29 PP/s and 16.70 TPS**
-on the same short workload, with text matching the frozen qualified candidate.
+Before the profile was withdrawn, the rebuilt server separately confirmed
+**143.29 PP/s and 16.70 TPS** on the same short workload, with text matching the
+frozen candidate.
 Vector prefill previously improved the matched 512-input/33-output fixture
 by **61%**. Four-column decode improves the matched short workload by **4.65%**
 and the separate long comparison by about **4.2%**, with unchanged generated text.
