@@ -2863,10 +2863,19 @@ index bbfbcfc..733b506 100644
              static_cast<std::uint32_t>(d.m)};
    }
 diff --git a/src/kernels/sdpa.cpp b/src/kernels/sdpa.cpp
-index f1b0753..356fc24 100644
+index f1b0753..e7098f4 100644
 --- a/src/kernels/sdpa.cpp
 +++ b/src/kernels/sdpa.cpp
-@@ -14,20 +14,6 @@ namespace math = lse::math;
+@@ -4,6 +4,8 @@
+ #include "lse/kv/block.hpp"
+ #include "lse/kernels/sdpa.hpp"
+ #include "lse/math.hpp"
++#include "lse/backends/hrx/device_info.hpp"
++#include <cstdlib>
+ 
+ #include <string>
+ 
+@@ -14,20 +16,6 @@ namespace math = lse::math;
  
  namespace {
  
@@ -2887,7 +2896,181 @@ index f1b0753..356fc24 100644
  constexpr bool is_pow2(std::uint32_t v) noexcept {
    return v >= 2 && (v & (v - 1)) == 0;
  }
-@@ -217,88 +203,90 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
+@@ -48,6 +36,161 @@ struct SdpaArgs {
+   env::Out<kir::f32, E> out;
+ };
+ 
++// Decode keeps the baseline arithmetic order: one sequential Q.K FMA chain per
++// key, then each output channel walks the same keys for max, denominator, and
++// value accumulation. Sharing only the completed scores removes 2*Dv repeated
++// dots without narrowing operands or reassociating a reduction.
++struct DecodeSdpaKernel final : KernelPrimitive<DecodeSdpaKernel> {
++  static constexpr std::string_view kName = "attention.decode_shared";
++  static constexpr std::string_view kEntry = "lse_sdpa_decode_shared";
++  static constexpr std::string_view kSource = {};
++  static constexpr std::uint32_t kThreads = 256;
++  std::size_t arity() const noexcept override { return 5; }
++  bool owns_indexing() const noexcept override { return true; }
++
++  static bool supported(const KernelShapes &s) {
++    if (s.inputs.size() != 5 || !s.device || s.device->arch != "gfx1201" ||
++        s.device->max_threads_per_workgroup < kThreads ||
++        s.inputs[0].rank() != 4 || s.inputs[1].rank() != 4 ||
++        s.inputs[2].rank() != 4 || s.inputs[4].rank() != 2)
++      return false;
++    if (s.input_dtypes.size() != 5 ||
++        (s.iattrs[0] != 0 && s.iattrs[0] != 1 && s.iattrs[1] < 0))
++      return false;
++    for (auto dtype : s.input_dtypes)
++      if (dtype != DType::kF32)
++        return false;
++    const auto &q = s.inputs[0];
++    const auto &keys = s.inputs[1];
++    const auto &values = s.inputs[2];
++    const auto &table = s.inputs[4];
++    const auto block = keys.dim(2), stride = table.dim(1);
++    if (q.dim(0) <= 0 || q.dim(1) <= 0 || q.dim(2) != 1 || q.dim(3) != 256 ||
++        keys.dim(0) <= 0 || keys.dim(1) <= 0 || keys.dim(3) != 256 ||
++        values != keys || q.dim(1) % keys.dim(1) || table.dim(0) < q.dim(0) ||
++        block < 2 || block > 256 ||
++        !is_pow2(static_cast<std::uint32_t>(block)) || stride <= 0 ||
++        stride > 8192 / block || s.iattrs[3] != block ||
++        s.inputs[3].elem_count() < static_cast<std::size_t>(kv::step_meta_elems(
++                                       static_cast<std::int32_t>(q.dim(0)))))
++      return false;
++    return static_cast<std::uint64_t>(stride * block) * sizeof(float) <=
++           workgroup_lds_bytes(s.device);
++  }
++
++  std::string emit_kernel(const KernelShapes &s) const override {
++    if (!supported(s) || !s.types.scalar || !s.intrinsics || !s.store)
++      return {};
++    const auto heads = static_cast<std::uint32_t>(s.inputs[0].dim(1));
++    const auto kvheads = static_cast<std::uint32_t>(s.inputs[1].dim(1));
++    const auto block = static_cast<std::uint32_t>(s.inputs[1].dim(2));
++    const auto stride = static_cast<std::uint32_t>(s.inputs[4].dim(1));
++    const auto capacity = stride * block;
++    kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
++    k.set_store(s.store);
++    SdpaArgs<env::Emit> a;
++    if (!env::bind(k, a, s))
++      return {};
++    env::Emit e{&k};
++    const auto scores = e.lds<kir::f32>(capacity);
++    const auto lane = e.let(math::local_id());
++    const auto wg = e.let(math::workgroup_id_x());
++    const auto h = e.let(wg % heads), b = e.let(wg / heads);
++    const auto kh = e.let(h / (heads / kvheads));
++    const auto output = e.let((b * heads + h) * 256u + lane);
++    const auto rows = e.runtime_extent("rows", kir::cast<kir::u32>(a.meta[2u]));
++    if (auto pad = e.when(b >= rows))
++      e.store(output, e.f32(0.0f));
++    (void)e.ret_if(b >= rows); // Uniform across the whole workgroup.
++    const auto mb =
++        e.let(e.u32(kv::kStepMetaHeader) + b * e.u32(kv::kStepMetaPerRow));
++    const auto offset = e.let(kir::cast<kir::u32>(a.meta[mb]));
++    const auto loaded_len = e.let(kir::cast<kir::u32>(a.meta[mb + 1u]));
++    const auto row_len =
++        e.let(select(loaded_len < capacity, loaded_len, e.u32(capacity)));
++    const auto loaded_max = e.let(kir::cast<kir::u32>(a.meta[1u]));
++    const auto kv_len = e.runtime_extent(
++        "kv_len", select(loaded_max < capacity, loaded_max, e.u32(capacity)));
++    const auto tb = e.let(b * stride), qb = e.let((b * heads + h) * 256u);
++    // All lanes reach the barrier, including those beyond the last live key.
++    for (auto j : e.range(lane, kv_len, kThreads)) {
++      scores[j] = math::neg_inf();
++      if (auto live = e.when(j < row_len)) {
++        const auto blk = e.let(kir::cast<kir::u32>(a.table[tb + j / block]));
++        const auto kb =
++            e.let(((blk * kvheads + kh) * block + j % block) * 256u);
++        auto score = e.var(0.0f);
++        for (auto dd : e.range(256u))
++          score = math::fma(a.q[qb + dd], a.k[kb + dd], score.read());
++        scores[j] = score.read() * s.attrs[0];
++      }
++    }
++    e.barrier();
++    const auto nblk = e.let((kv_len + e.u32(block - 1)) / e.u32(block));
++    const auto row_blk = e.let((row_len + e.u32(block - 1)) / e.u32(block));
++    const auto maximum = e.var(math::neg_inf());
++    auto allowed = [&](auto j) {
++      if (s.iattrs[0] == 0)
++        return e.u32(1) == e.u32(1);
++      if (s.iattrs[0] == 1)
++        return j <= offset;
++      // j < capacity <= 8192, and supported() requires a nonnegative i32
++      // window, so this equivalent addition cannot overflow u32. Subtracting
++      // indices instead exposes wrap to Loom despite the causal guard.
++      return j <= offset &&
++             j + static_cast<std::uint32_t>(s.iattrs[1]) > offset;
++    };
++    for (auto bi : e.range(nblk))
++      if (auto mine = e.when(bi < row_blk)) {
++        for (auto jj : e.range(block)) {
++          const auto j = e.let(bi * block + jj);
++          if (auto live = e.when(j < row_len && j < kv_len))
++            if (auto mask = e.when(allowed(j)))
++              maximum = math::max(maximum.read(), scores[j].read());
++        }
++      }
++    auto denom = e.var(0.0f), acc = e.var(0.0f);
++    for (auto bi : e.range(nblk))
++      if (auto mine = e.when(bi < row_blk)) {
++        const auto blk = e.let(kir::cast<kir::u32>(a.table[tb + bi]));
++        const auto vb = e.let(((blk * kvheads + kh) * block) * 256u + lane);
++        for (auto jj : e.range(block)) {
++          const auto j = e.let(bi * block + jj);
++          if (auto live = e.when(j < row_len && j < kv_len)) {
++            auto weight = e.var(0.0f);
++            if (auto mask = e.when(allowed(j)))
++              weight = math::exp(scores[j].read() - maximum.read());
++            denom = denom.read() + weight.read();
++            acc = math::fma(weight.read(), a.v[vb + jj * 256u], acc.read());
++          }
++        }
++      }
++    e.store(output, acc.read() / select(denom.read() == 0.0f, e.f32(1.0f),
++                                        denom.read()));
++    return k.lds().ok() ? k.str() : std::string{};
++  }
++  Result<Shape> infer_shape(std::span<const Shape> in) const override {
++    if (in.size() != 5)
++      return LSE_ERROR(kInvalidArgument, "decode attention takes five inputs");
++    return Shape{in[0].dim(0), in[0].dim(1), 1, in[2].dim(3)};
++  }
++  DType infer_dtype(std::span<const DType> in) const override {
++    return in.empty() ? DType::kF32 : in[0];
++  }
++  static ThreadPlan plan_impl(const KernelShapes &s) {
++    ThreadPlan tp;
++    tp.workgroup_size[0] = kThreads;
++    tp.lds_bytes =
++        static_cast<std::uint32_t>(s.inputs[4].dim(1) * s.inputs[1].dim(2)) *
++        sizeof(float);
++    tp.workgroup_count[0] =
++        static_cast<std::uint32_t>(s.inputs[0].dim(0) * s.inputs[0].dim(1));
++    return tp;
++  }
++};
++LSE_REGISTER_PRIMITIVE(DecodeSdpaKernel);
++const DecodeSdpaKernel kDecodeShared{};
++
+ // One thread per output [B, Hq, Tq, Dv]. Recomputes the key dots for softmax;
+ // S is small on the generate path (prefill tokens or cached length).
+ //
+@@ -73,6 +216,11 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
+   // A prefill pass has query rows to share a key across; this one does not,
+   // and recomputing the score per output channel is what it costs.
+   const KernelPrimitiveBase* specialize(const KernelShapes& s) const override {
++    static const bool shared = [] {
++      const char* value = std::getenv("LSE_SHARED_SCORE_SDPA");
++      return value == nullptr || std::string_view(value) != "0";
++    }();
++    if (shared && DecodeSdpaKernel::supported(s)) return &kDecodeShared;
+     if (const KernelPrimitiveBase* f = flash_sdpa_for(s)) return f;
+     return this;
+   }
+@@ -217,88 +365,90 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
      // real blocks through their own table row and answer zero. Returning here
      // rather than masking inside the address arithmetic is the width-invariance
      // rule: no real row's result may depend on how many rows shared the pass.
@@ -2906,22 +3089,7 @@ index f1b0753..356fc24 100644
 -    // it would have seen decoding alone.
 -    const auto row_blk = e.let((row_len + e.u32(ts - 1)) / e.u32(ts));
 -    const auto tb = e.let(b * stride);
-+    const auto rows = e.runtime_extent("rows", kir::cast<kir::u32>(a.meta[2u]));
-+    auto result = e.var(0.0f);
-+    if (auto live_row = e.when(b < rows)) {
-+      // The longest live KV in the pass. One code object serves every sequence
-+      // length: this is the block loop's trip count and nothing else, and an
-+      // outermost trip count is exactly where ExtentBinding::kRuntime is legal.
-+      // Raggedness rides underneath it in `row_len`, which is a guard.
-+      const auto kv_len = e.runtime_extent("kv_len", kir::cast<kir::u32>(a.meta[1u]));
-+      const auto nblk = e.let((kv_len + e.u32(ts - 1)) / e.u32(ts));
-+      // Blocks this row actually holds. A row shorter than the longest one spends
-+      // the remaining iterations on one compare — it loads no table entry and
-+      // touches no key — so its accumulator sees the same terms in the same order
-+      // it would have seen decoding alone.
-+      const auto row_blk = e.let((row_len + e.u32(ts - 1)) / e.u32(ts));
-+      const auto tb = e.let(b * stride);
- 
+-
 -    const auto m = e.var(math::neg_inf());
 -    for (auto bi : e.range(nblk)) {
 -      if (auto mine = e.when(bi < row_blk)) {
@@ -2946,6 +3114,22 @@ index f1b0753..356fc24 100644
 -              if (auto g = e.when(j <= abs_i)) take();
 -            } else {
 -              if (auto g = e.when(j <= abs_i && (abs_i - j) < window)) take();
++    const auto rows = e.runtime_extent("rows", kir::cast<kir::u32>(a.meta[2u]));
++    auto result = e.var(0.0f);
++    if (auto live_row = e.when(b < rows)) {
++      // The longest live KV in the pass. One code object serves every sequence
++      // length: this is the block loop's trip count and nothing else, and an
++      // outermost trip count is exactly where ExtentBinding::kRuntime is legal.
++      // Raggedness rides underneath it in `row_len`, which is a guard.
++      const auto kv_len = e.runtime_extent("kv_len", kir::cast<kir::u32>(a.meta[1u]));
++      const auto nblk = e.let((kv_len + e.u32(ts - 1)) / e.u32(ts));
++      // Blocks this row actually holds. A row shorter than the longest one spends
++      // the remaining iterations on one compare — it loads no table entry and
++      // touches no key — so its accumulator sees the same terms in the same order
++      // it would have seen decoding alone.
++      const auto row_blk = e.let((row_len + e.u32(ts - 1)) / e.u32(ts));
++      const auto tb = e.let(b * stride);
++
 +      const auto m = e.var(math::neg_inf());
 +      for (auto bi : e.range(nblk)) {
 +        if (auto mine = e.when(bi < row_blk)) {
@@ -3049,7 +3233,7 @@ index f1b0753..356fc24 100644
      return k.str();
    }
  
-@@ -393,7 +381,7 @@ struct KvPageWriteKernel final : KernelPrimitive<KvPageWriteKernel> {
+@@ -393,7 +543,7 @@ struct KvPageWriteKernel final : KernelPrimitive<KvPageWriteKernel> {
      // The same padded-bucket rule the attention kernel follows: pad rows do no
      // work rather than writing somewhere harmless, so a real row's blocks
      // cannot be reached by a row that is not in the batch.
@@ -3705,15 +3889,21 @@ index 9f17d38..35db5ad 100644
  }
  
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index a787603..54b649d 100644
+index a787603..c1f700e 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
-@@ -12,6 +12,28 @@ function(lse_add_test name)
+@@ -12,6 +12,34 @@ function(lse_add_test name)
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
  endfunction()
  
 +lse_add_test(test_probe_measurement)
 +lse_add_test(test_token_ids)
++lse_add_test(test_attention_decode lse_graph lse_kernels lse_ir)
++target_sources(test_attention_decode PRIVATE
++  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
++  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
++  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
++  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
 +lse_add_test(test_submission_tuner)
 +lse_add_test(test_submission_constants lse_graph lse_kernels lse_ir)
 +target_sources(test_submission_constants PRIVATE
@@ -3737,7 +3927,7 @@ index a787603..54b649d 100644
  lse_add_test(test_dtype)
  lse_add_test(test_reflect)
  # lse_backends is the set of backends this build ships. A test that runs a
-@@ -19,9 +41,82 @@ lse_add_test(test_reflect)
+@@ -19,9 +47,82 @@ lse_add_test(test_reflect)
  # deliberately does not link any of them, so nothing arrives transitively.
  lse_add_test(test_kernel_env lse_graph lse_backends)
  lse_add_test(test_ir lse_ir lse_graph lse_backends)
@@ -3820,7 +4010,7 @@ index a787603..54b649d 100644
  lse_add_test(test_model lse_model lse_backends)
  
  if(LSE_ENABLE_CPU)
-@@ -35,7 +130,7 @@ endif()
+@@ -35,7 +136,7 @@ endif()
  
  if(LSE_ENABLE_CPU)
    lse_add_test(test_backend_cpu lse_backend_cpu)
@@ -3829,7 +4019,7 @@ index a787603..54b649d 100644
    lse_add_test(test_primitive lse_graph lse_backends)
  endif()
  
-@@ -86,3 +181,11 @@ if(LSE_ROCM_RUNTIME_DIR)
+@@ -86,3 +187,11 @@ if(LSE_ROCM_RUNTIME_DIR)
    set_tests_properties(${lse_tests} PROPERTIES
      ENVIRONMENT "LD_LIBRARY_PATH=${LSE_ROCM_RUNTIME_DIR}")
  endif()
@@ -4875,6 +5065,169 @@ index 0000000..e03e6e2
 +};
 +
 +}  // namespace lse::graph::detail
+diff --git a/tests/test_attention_decode.cpp b/tests/test_attention_decode.cpp
+new file mode 100644
+index 0000000..c66a23a
+--- /dev/null
++++ b/tests/test_attention_decode.cpp
+@@ -0,0 +1,157 @@
++#include "harness.hpp"
++#include "lse/backends/hrx/loomc/loom_emitter.hpp"
++#include "lse/graph/kernel_primitive.hpp"
++#include "lse/graph/ops.hpp"
++#include "lse/kv/block.hpp"
++#include <cstdint>
++#include <limits>
++
++namespace {
++using namespace lse;
++using namespace lse::graph;
++backend::DeviceInfo device() {
++  backend::DeviceInfo out;
++  out.arch = "gfx1201";
++  out.wavefront_size = 32;
++  out.max_threads_per_workgroup = 1024;
++  out.lds_bytes_per_workgroup = 65536;
++  return out;
++}
++Array leaf(Shape shape) {
++  auto node = std::make_shared<Node>();
++  node->set_kind(OpKind::kBuffer);
++  node->shape = shape;
++  node->dtype = DType::kF32;
++  node->materialized = true;
++  return Array(node);
++}
++struct Fixture {
++  backend::DeviceInfo gpu = device();
++  std::vector<Shape> shapes;
++  std::vector<DType> dtypes = std::vector<DType>(5, DType::kF32);
++  Array out;
++  explicit Fixture(int capacity = 128, int batch = 2) {
++    shapes = {Shape{batch, 24, 1, 256}, Shape{capacity / 16 + 1, 4, 16, 256},
++              Shape{capacity / 16 + 1, 4, 16, 256},
++              Shape{kv::step_meta_elems(batch)}, Shape{batch, capacity / 16}};
++    out =
++        sdpa_paged(leaf(shapes[0]), leaf(shapes[1]), leaf(shapes[2]), 0.0625f,
++                   MaskKind::kCausal, 0, leaf(shapes[3]), leaf(shapes[4]), 16);
++  }
++  KernelShapes request() const {
++    KernelShapes s;
++    s.inputs = shapes;
++    s.input_dtypes = dtypes;
++    s.output = out.shape();
++    s.device = &gpu;
++    s.attrs = out.node()->attrs;
++    s.iattrs = out.node()->iattrs;
++    return s;
++  }
++  const KernelPrimitiveBase *primitive() const {
++    return dynamic_cast<const KernelPrimitiveBase *>(out.node()->prim);
++  }
++};
++} // namespace
++
++LSE_TEST(decode_attention_specialization_reports_exact_resources) {
++  for (int capacity : {128, 512, 8192}) {
++    Fixture fx(capacity);
++    auto shapes = fx.request();
++    auto *base = fx.primitive();
++    LSE_EXPECT(base != nullptr);
++    if (!base)
++      return;
++    auto *selected = base->specialize(shapes);
++    LSE_EXPECT(selected != nullptr && selected != base);
++    if (!selected)
++      return;
++    LSE_EXPECT(selected->owns_indexing());
++    const auto plan = selected->plan(shapes);
++    LSE_EXPECT_EQ(plan.workgroup_size[0], 256u);
++    LSE_EXPECT_EQ(plan.workgroup_count[0], 48u);
++    LSE_EXPECT_EQ(plan.lds_bytes, static_cast<unsigned>(capacity) * 4u);
++  }
++}
++
++LSE_TEST(decode_attention_declines_unqualified_contracts) {
++  for (int variant = 0; variant < 9; ++variant) {
++    Fixture fx;
++    if (variant == 0)
++      fx.gpu.arch = "gfx1100";
++    if (variant == 1)
++      fx.gpu.lds_bytes_per_workgroup = 0;
++    if (variant == 2)
++      fx.gpu.lds_bytes_per_workgroup = 511;
++    if (variant == 3)
++      fx.gpu.max_threads_per_workgroup = 128;
++    if (variant == 4)
++      fx.shapes[0] = Shape{2, 24, 2, 256};
++    if (variant == 5)
++      fx.shapes[0] = Shape{2, 25, 1, 256};
++    if (variant == 6)
++      fx.dtypes[0] = DType::kBF16;
++    if (variant == 7)
++      fx.shapes[4] = Shape{2, 1024};
++    auto shapes = fx.request();
++    if (variant == 8) {
++      shapes.iattrs[0] = 2;
++      shapes.iattrs[1] = -1;
++    }
++    const auto *base = fx.primitive();
++    LSE_EXPECT(base != nullptr);
++    if (base)
++      LSE_EXPECT(base->specialize(shapes) == base);
++  }
++}
++
++LSE_TEST(decode_attention_masks_keep_binding_and_launch_abi) {
++  backend::LoomEmitter emitter;
++  for (int mode : {0, 1, 2})
++    for (int window : {0, 7, std::numeric_limits<int>::max()}) {
++      Fixture fx;
++      fx.out.node()->iattrs[0] = mode;
++      fx.out.node()->iattrs[1] = window;
++      const NodePtr roots[]{fx.out.node()};
++      const auto groups = Partitioner::partition(roots, &fx.gpu);
++      LSE_EXPECT_EQ(groups.size(), 1u);
++      if (groups.size() != 1)
++        return;
++      auto emitted = emitter.emit(groups[0], fx.gpu);
++      LSE_EXPECT(emitted.ok());
++      if (!emitted.ok())
++        return;
++      LSE_EXPECT_EQ(emitted->binding_order.size(), 6u);
++      for (std::size_t i = 0; i < 5; ++i)
++        LSE_EXPECT(emitted->binding_order[i] == fx.out.node()->inputs[i]);
++      LSE_EXPECT(emitted->binding_order[5] == fx.out.node());
++      LSE_EXPECT_EQ(emitted->constants.fields.size(), 1u);
++      LSE_EXPECT_EQ(emitted->constants.total_bytes, 4u);
++      LSE_EXPECT(emitted->constants.fields[0].name == "count");
++      LSE_EXPECT_EQ(emitted->constants.fields[0].offset, 0u);
++      LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], 48u);
++      LSE_EXPECT_EQ(emitted->dims.workgroup_size[0], 256u);
++      LSE_EXPECT_EQ(emitted->lds_bytes, 512u);
++      LSE_EXPECT(emitted->source.find("kernel.barrier<workgroup>") !=
++                 std::string::npos);
++      LSE_EXPECT(emitted->source.find("scalar.fmaf") != std::string::npos);
++      LSE_EXPECT(emitted->source.find("index.sub") == std::string::npos);
++    }
++}
++
++LSE_TEST(decode_attention_sliding_mask_equivalence_at_integer_boundaries) {
++  constexpr std::uint32_t keys[]{0, 1, 7, 127, 255, 256, 511, 512, 8191};
++  constexpr std::uint32_t offsets[]{
++      0, 1, 7, 128, 512, 8191, 0x7fffffffu, 0x80000000u, 0xffffffffu};
++  constexpr std::uint32_t windows[]{0, 1, 7, 128, 512, 8192, 0x7fffffffu};
++  for (auto key : keys)
++    for (auto offset : offsets)
++      for (auto window : windows) {
++        LSE_EXPECT(std::uint64_t(key) + window <=
++                   std::numeric_limits<std::uint32_t>::max());
++        const bool original = key <= offset && offset - key < window;
++        const bool shared = key <= offset && key + window > offset;
++        LSE_EXPECT(original == shared);
++      }
++}
++LSE_TEST_MAIN()
 diff --git a/tests/test_decode_sample.cpp b/tests/test_decode_sample.cpp
 new file mode 100644
 index 0000000..7b2a8ed

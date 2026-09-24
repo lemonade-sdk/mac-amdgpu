@@ -70,7 +70,8 @@ def main():
     result['model_config_sha256'] = hashlib.sha256((args.model / 'config.json').read_bytes()).hexdigest()
     result['measurement_environment'] = {key: env[key] for key in
         ('LSE_REQUIRE_DEVICE_KERNELS', 'LSE_TIME_SPANS', 'LSE_TIME_STEPS',
-         'LSE_FLUSH_INTERVAL', 'LSE_AUTO_BATCH', 'LSE_AUTO_BATCH_TRACE', 'LSE_PROFILE_DISPATCH', 'MAC_HSA_SIGNAL_BACKEND',
+         'LSE_FLUSH_INTERVAL', 'LSE_AUTO_BATCH', 'LSE_AUTO_BATCH_TRACE',
+         'LSE_SHARED_SCORE_SDPA', 'LSE_PROFILE_DISPATCH', 'MAC_HSA_SIGNAL_BACKEND',
          'MAC_HSA_BLOCKED_POLL_US') if key in env}
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 

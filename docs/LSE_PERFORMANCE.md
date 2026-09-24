@@ -412,3 +412,38 @@ Median decode was 6.764287 tokens/s (expected to remain unchanged by this
 prefill-only change). All four requests returned identical text and the server
 exited normally; the driver was independently checked at stage0. Evidence:
 `build/tests/driver195-hardware/qwen-rows8-pp64/` and `q6-rows8-*` logs.
+
+### Shared-score FP32 decode attention
+
+The gfx1201 Tq1/Dh256/Dv256 specialization computes each sequential FP32 Q·K
+score once, publishes it through workgroup shared memory, then keeps the
+original ascending-key softmax/value accumulation order. Unsupported shapes
+retain the previous implementation. `LSE_SHARED_SCORE_SDPA=0` selects that
+implementation for comparison.
+
+Qualification covered 60 guarded full-output GPU cases across capacities 128/512,
+GQA 24/4, padded and live-empty rows, context tails and four mask variants. The
+30 causal/unmasked fixtures have identical whole-output hashes to the previous
+kernel. All 24 production code objects match the qualified candidate byte for
+byte; four host tests verify admission, resources, ABI and mask boundaries.
+
+Grouped 64-dispatch host measurements fell from 2089.561 to 122.666 µs per
+dispatch at 64 live keys and 4095.384 to 142.493 µs at 128 keys. These include host
+recording and retirement and are not GPU timestamps.
+
+Full-model resident results with fixed flush64/poll64, KV128, no MTP, one warmup
+and three measured 33-token requests:
+
+| Prompt tokens | Median prompt tokens/s | Median decode tokens/s | Evidence suffix |
+|---|---:|---:|---|
+| 5 |14.115606|12.106801|`qwen-shared-attention-pp5`|
+|64|63.228934|12.115379|`qwen-shared-attention-pp64`|
+
+All requests returned identical text and exited cleanly. A separate CLI run
+confirmed the exact 64 prompt and 33 generated IDs still match the earlier
+float32 MLX reference. Its submission profile is diagnostic, not the resident
+throughput measurement. Logs are under `build/tests/driver195-hardware/`.
+
+A 512-token prompt at KV1024 currently fails with `no DMA entry points` during
+KV-pool growth. It exits normally and returns the driver to stage0; longer
+context inference remains unqualified until that copy path is corrected.

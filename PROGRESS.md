@@ -2188,3 +2188,10 @@ The 64-token continuation also now exactly matches 64 prompt IDs and 33 generate
   and reduces large matrix dispatch times by 19–21%. Full-model PP64 improved
   from 54.01 to 63.12 prompt tokens/s with identical response text and clean
   shutdown; decode remained approximately 6.76 tokens/s before attention changes.
+
+- Shared-score FP32 decode attention passes 60 guarded GPU cases; 30 baseline
+  comparisons have exact full-output hashes. Full-model PP64 decode improves
+  6.76→12.12 tokens/s with identical text; exact 64 prompt/33 generated IDs
+  remain equal to the float32 MLX reference. PP5 now reaches 12.11 tokens/s.
+- PP512/KV1024 exposed a loaded-HSA symbol lookup failure during KV-pool copy;
+  clean failure and stopped driver verified. Longer contexts remain unqualified.
