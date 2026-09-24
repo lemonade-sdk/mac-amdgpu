@@ -6,7 +6,16 @@ llama.cpp has not been demonstrated.** The current measurements establish a
 working baseline and identify work to profile; they are not a matched benchmark
 against another engine.
 
-**Current accurate-default benchmark:** rebuilt server `77e4047b` measured
+**Current default:** the ordinary Mac same-queue policy, with no experimental
+switch, measures **88.9301 PP/s and 17.5059 TPS** on 512 input / 129 output,
+KV1024, MTP disabled, flush64/poll64. These are medians of three measured requests
+after two warmups. All five responses match the control, all measured requests
+have zero compilation or disk-cache misses, and shutdown succeeds. Final default
+runtime `4fe069d5` also passes ring-wrap, cross-queue, transitive host-action and
+ABORTED-propagation checks with validated traces. Evidence:
+`build/hrx-prefix-default/final-qualification.json` and `prefix-default-model/result.json`.
+
+**Accurate baseline before the queue optimization:** rebuilt server `77e4047b` measured
 **88.8185 PP/s and 16.6747 TPS** on 512 input / 129 output tokens, KV1024,
 MTP disabled, flush64 and 64 µs polling. This is one measured request after two
 warmups, with zero measured compilations, three identical responses and clean
@@ -90,6 +99,51 @@ This is no consistent speedup; these are wall intervals, not GPU timestamps.
 GPU-duration profiling and full-model acceptance remain pending. The default
 path is unchanged. Timing evidence: `q6-int8-retained-perf-comparison.json`.
 Evidence: `q6-int8-residual2-numeric.log` and `build/perf-q6-int8/README.md`.
+
+## Current optimization experiments
+
+These candidates remain separate from the accurate default above.
+
+The revised centered M256 implementation uses two BF16 activation terms and
+ordered FP32 repair for exceptional or cancellation-sensitive outputs. It now
+passes all three fixed 512-token model contexts against the matched FP32
+reference: relative logit L2 is **0.0000495955** for code, **0.00000208275**
+for math, and **0.00000649414** for story, below the unchanged 0.005 limit.
+All 248,320 logits are finite, repetitions are bit-exact, and argmax agrees.
+This supersedes the earlier candidate's accuracy failure, not its performance
+qualification: the revised story diagnostic achieves only **21.68 PP/s** with
+zero new compilations, so this implementation is not promoted.
+
+A separate two-pass prototype moves repair out of the matrix kernel. The first
+pass writes values and repair flags; a second ordinary GPU kernel copies valid
+values or recomputes flagged outputs in the original FP32 order. It uses a
+distinct output allocation and requires no CPU readback or shared atomic RMW.
+All **37 numerical cases with nine repeats each** pass, with output hashes
+identical to the revised single-pass implementation. Automatic HIP/Loom model selection also passes the code context at relative L2
+0.0000495955, with bit-exact repeats and matching argmax. Math/story model gates
+and compilation-free throughput remain pending; the branch is not promoted. Evidence:
+`centered-v3-quality-{code,math,story}.json`,
+`q6-centered-repair-phase-numeric.log`, and
+`build/perf-q6-centered-repair-phase/gpu-manifest.json`.
+
+The four-column INT8 residual candidate passes **71 numerical cases with nine
+repeats each**, but GPU timestamps expose a large-shape regression. A diagnostic
+reports zero scalar fallbacks for all three measured shapes. Fetching scale data
+earlier does not resolve it; a quiet matched repeat measures:
+
+| Projection | FP32 control median | INT8 early-metadata median |
+| --- | ---: | ---: |
+| K5120 to N17408 | 126.18 us | 841.02 us |
+| K17408 to N5120 | 90.96 us | 724.20 us |
+| K6144 to N5120 | 44.02 us | 37.62 us |
+
+Each row contains sixteen measured dispatches after three warmups, with matching
+inputs and passing output/guard checks. These are CP device durations, not host
+submission times or full-model results. Larger weight working sets and memory
+scheduling remain hypotheses; cache counters have not established the cause.
+INT8 remains experimental. Evidence:
+`q6-int8-quad-fallback-r2.log`, `q6-int8-quad-prefetch-numeric.log`, and
+`build/perf-q6-int8-quad-prefetch/cp-performance-comparison-r2.json`.
 
 The earlier **HIPC** (`--dialect hip`) throughput is reported at approximately
 **34 decode tokens/s**. Recorded **macOS Loom** (`--dialect loom`) with cooperative
@@ -869,10 +923,53 @@ kernel sequences. Evidence: `hidden-baseline-series/comparison.json` under
 
 The isolated HRX experiment admits a standard AQL prefix barrier only for a
 published same-physical-queue device epoch with no undrained earlier host action.
-Cross-queue and unproven dependencies retain software deferral. It is not enabled
-in the normal runtime.
+Cross-queue and unproven dependencies retain software deferral. Following the
+qualification below, this is now ordinary Mac runtime behavior; the experimental
+environment switch has been removed.
 
-Hardware tests verified all outputs/guards and clean retirement for 257 dependent
+The current-runtime rebase (`fff73794` library) passes the default-capacity
+checks with the option both off and on. The enabled 8,193-step run records
+1,930 actual device barriers and 6,262 software deferrals. All 512 cross-queue
+consumer edges remain deferred and begin after their producer ends on the same
+physical GPU clock. An undrained host callback A keeps consumer C deferred even
+after intervening device-only submission B; intentional callback failure retains
+`ABORTED` and clean shutdown. All payloads, immutable inputs and guards match.
+
+Separate instrumented runs also establish physical backpressure, rather than
+only ring wrap. Each runs 257 dependent operations behind an automatically
+terminating GPU dispatch, with exact final data and successful retirement:
+
+| Exhausted resource | Actual AQL / notification / kernarg capacities | Observed rejection |
+| --- | --- | --- |
+| AQL packets | 64 / 4096 / 8192 | AQL reservation |
+| Notifications | 64 / 4 / 8192 | Notification reservation |
+| Kernargs | 256 / 4096 / 512 | Kernarg reservation |
+
+Failed admission leaves the write position unchanged in every case. A first
+kernarg fixture was too small for its setup upload and was corrected before
+qualification; no production allocation policy changed. These tests do not
+cover arbitrary device loss. The production library contains none of the test
+factory or capacity counters. Current evidence is in `prefix-current-*` logs
+and captures, with strict trace checks in
+`build/hrx-prefix-current-source/qualification/current-extended-results.json`.
+The matched accurate-FP32 model comparison ran off/on/on/off, with two warmups
+and three measured 512-input/129-output requests per process. All twenty
+responses match, all twelve measured requests have zero compilation and disk
+cache misses, and all processes shut down cleanly. Server, HSA, HRX, compiler,
+model and measurement settings match except for the prefix option:
+
+| Queue policy | Median prompt rate | Median decode rate |
+| --- | ---: | ---: |
+| Software deferral | 88.4045 PP/s | 16.6678 TPS |
+| Qualified same-queue barriers | 88.1397 PP/s | 17.4067 TPS |
+
+This is **+4.43% decode / -0.30% prefill** across the six measured requests per
+policy. Both enabled process medians exceed both controls. The effect is useful
+but does not establish parity with another inference engine. Promotion was followed by the final ordinary-default build checks reported at
+the top of this document. Evidence: `build/hrx-prefix-current/model-comparison.json` and
+`prefix-current-model-{off-1,on-1,on-2,off-2}/result.json`.
+
+Earlier hardware tests verified all outputs/guards and clean retirement for 257 dependent
 submissions, 513 alternating submissions on two physical queues, and 8,193
 submissions across ring wrap. Captures prove 256 device barriers replaced 256
 software deferrals in the short same-queue chain. Cross-queue submissions retained

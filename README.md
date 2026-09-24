@@ -2,6 +2,8 @@
 
 **Working AMD GPU compute and AI inference on Apple Silicon macOS.**
 
+Current release: **[0.1.96 (build 196)](https://github.com/lemonade-sdk/mac-amdgpu/releases/tag/v0.1.96)**.
+
 mac_amdgpu is a native PCIDriverKit driver and userspace HSA runtime. It runs
 real workloads on the **AMD Radeon AI PRO R9700** (`gfx1201`) connected to an
 Apple Silicon Mac over Thunderbolt 5. The driver initializes the GPU, loads
@@ -79,23 +81,24 @@ profile failed accuracy qualification, measured:
 
 | Workload | Prompt processing | Decode |
 | --- | ---: | ---: |
-| 512 input / 129 output, KV1024 | **88.82 tokens/s** | **16.67 tokens/s** |
+| 512 input / 129 output, KV1024 | **88.93 tokens/s** | **17.51 tokens/s** |
 
-This is one measured request after two warmups, with MTP disabled, flush64 and
-64 µs polling. All three responses matched, the measured request compiled no new
-shaders, and the server shut down cleanly. Output count includes the first token
-from prefill, leaving 128 timed decode steps. A separate run using the prior HSA
-library measured 88.68 PP/s and 16.68 TPS on the same rebuilt server.
+These are medians of three measured requests after two warmups, with MTP disabled,
+flush64 and 64 µs polling. All five responses matched, measured requests had no
+compilation or disk-cache misses, and the server shut down cleanly. Output count
+includes the first token from prefill, leaving 128 timed decode steps. Qualified
+same-queue GPU barriers are now automatic on Mac; a separate off/on/on/off
+comparison measured a **4.43% decode improvement** over software deferral.
 
 **rocprofmac works on this model.** A matched GPU timestamp capture preserved
 all generated text and added about 1.0% prefill time and 3.7% decode time in this
 comparison. The two feed-forward projection shapes account for 67.3% of summed
 prefill kernel time, making matrix-kernel optimization the main prefill priority.
 
-Experimental prefill kernels reached higher throughput but failed the unchanged
-accuracy limit; they are withheld from automatic selection. The four-column
-INT8 decode candidate passes its GPU numerical suite and remains experimental
-pending full-model quality and performance checks. Historical measurements,
+Further prefill and INT8 improvements are being qualified on testing branches.
+The two-pass prefill prototype passes its numerical suite and first full-model
+accuracy context; remaining quality and speed checks precede promotion. INT8
+passes numerical tests but its large-shape performance investigation is ongoing. Historical measurements,
 profiling conditions, and [current evidence](docs/LSE_PERFORMANCE.md) are kept
 separately. Matched llama.cpp performance parity remains an active goal.
 See the [reproduction command](LOCAL_RUN.md#experimental-resident-benchmark).

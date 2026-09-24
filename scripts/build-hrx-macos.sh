@@ -50,6 +50,8 @@ fi
 hrx_lib="$hrx_build/libhrx/src/libhrx"
 bash scripts/build-hrx-compute-fixture.sh
 bash scripts/test-hrx-access-policy.sh
+bash scripts/test-hrx-prefix.sh "$hrx_copy"
+bash scripts/build-hrx-dependency-test.sh "$hrx_copy" "$hrx_build"
 "$llvm_bin/clang" -std=c11 -Wall -Wextra -Werror \
   -I"$hrx_copy/libhrx/include" -I"$repo_root/build/tests" hsa/tools/mac_hrx_smoke.c \
   -L"$hrx_lib" -lhrx -Wl,-rpath,"$hrx_lib" \
