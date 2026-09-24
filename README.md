@@ -7,7 +7,7 @@ real workloads on the **AMD Radeon AI PRO R9700** (`gfx1201`) connected to an
 Apple Silicon Mac over Thunderbolt 5. The driver initializes the GPU, loads
 firmware, manages memory and compute queues, and executes GPU kernels.
 
-With [Lemon Seed Engine (LSE)](https://github.com/Geramy/LSE/tree/main),
+With [Lemon Seed Engine (LSE)](https://github.com/Geramy/LSE),
 **Loom → HRX → HSA → mac_amdgpu now runs Qwen3.8-27B-MLX-6bit text generation
 and HTTP chat on the R9700**. The validated inference runs require GPU execution
 and complete with clean runtime shutdown. This is a working compute stack with
@@ -54,6 +54,12 @@ and validation commands.
 - **Controlled lifecycle:** Stop/Restart GPU drains work and uses a verified
   reset before releasing session resources. Other processes can continue using
   their existing queues when a participating process exits.
+- **GPU dispatch timing:** [rocprofmac](tools/rocprofmac/README.md) reads
+  hardware start/end timestamps from completion signals. Its R9700 qualification
+  passed 64 profiled dispatches with exact outputs and intact guards, without
+  marker kernels. The tool also includes a macOS CPU sampling helper. Full LSE
+  trace collection, CPU capture validation and profiling overhead measurements
+  are still in progress.
 
 ## Measured Qwen performance
 
@@ -91,7 +97,7 @@ Metal/display integration and Mesa/Vulkan support are separate future work.
   models/quantizations are being qualified. Qwen Q6 has completed an exact
   1,024-input / 1,024-output run with KV capacity 2,048; throughput optimization continues.
 - **HSA support targets real application needs:** the pinned HRX interface works,
-  while full HSA conformance, general executable linking and hardware profiling
+  while full HSA conformance, general executable linking and full hardware profiling
   remain incomplete. Unsupported APIs report errors rather than simulated success.
 - **Shared signals work through the mediated path:** native simultaneous CPU/GPU
   atomic read-modify-write is not supported on the tested connection. The driver
@@ -113,7 +119,8 @@ Metal/display integration and Mesa/Vulkan support are separate future work.
   1,024-input / 1,024-output workload.
 - Improve throughput using measured tile, register, LDS and workgroup choices.
 - Expand model accuracy checks, multi-client coverage and hardware compatibility.
-- Improve activity measurement and validate GPU timestamps and IRQ-assisted wakeups.
+- Connect verified GPU timestamps to LSE traces, measure profiler overhead,
+  improve activity measurement and validate IRQ-assisted wakeups.
 
 Detailed engineering results live in [PROGRESS.md](PROGRESS.md). The README
 summarizes current capabilities; it is not a running release log.
