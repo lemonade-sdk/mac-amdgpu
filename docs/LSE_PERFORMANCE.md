@@ -854,3 +854,117 @@ The rebuilt normal runtime also passed the same six-request check: identical
 text, clean shutdown, median 108.920 PP/s and 11.888 TPS after three warmups.
 Evidence: `qwen-prefill512-tlsf-canonical/result.json`. The runtime SHA-256 was
 `2b39fe18a74b4d42c67df5ac930e0bf796b65760f86aeeb56e9a54f0c3803cff`.
+
+### Corrected BF16 operands for M256
+
+An isolated correction splits each FP32-dequantized Q6 weight into a BF16 high
+part and a BF16 residual, then accumulates two native matrix products in FP32.
+Packed model storage is unchanged. This addresses compounded activation/weight
+rounding without relaxing the existing 0.5% quality limits. Exceptional blocks
+use uniform FP32 computation on the GPU.
+
+The R9700 passed all 16 cases, each evaluated nine times with output/input
+guards: the K64 adversarial case, five exceptional-value cases, and ten M256
+cases. Maximum relative L2 error among these fixtures was 0.003062. The scalar
+control subsequently passed 15/16 cases with explicit repeated-output hash
+checks. It failed only the subnormal case: a reference value of 3.48975e-39
+became zero (relative L2 error 1). The corrected candidate passed that case. This records an existing scalar limitation rather
+than excluding subnormals or loosening the criterion.
+
+Full-size projection measurements used one warm execution followed by eight
+measured executions. Every output matched an independent dyadic-value oracle;
+these fixture values do not establish full-model quality. Heavy CPU builds were
+paused during the measurements.
+
+| M256 projection | Scalar elapsed ms | Corrected BF16 elapsed ms |
+| --- | ---: | ---: |
+| N17408, K5120 | 9.381594 | 6.566844 |
+| N5120, K17408 | 8.621917 | 6.379839 |
+
+These are host evaluation-plus-retirement means, not GPU timestamps or model
+throughput. The candidate uses 24,592 bytes LDS, 141 VGPRs and no scratch; it is
+not yet a production selection. Evidence and binary/runtime hashes:
+`build/tests/driver195-hardware/q6-bf16-residual2-results.json` and associated
+logs; source/build manifest: `build/perf-q6-bf16-two-product`.
+
+A private model candidate selects this correction only for the two measured
+M256 shapes. Their native code objects match the numerical qualification
+objects byte-for-byte; all 11 other shape controls retain identical HIP source,
+Loom source and native code. The generator still uses 256-token chunks.
+
+Matched 512-input/33-output resident-server runs used three warmups followed by
+three measured requests, KV1024, flush64/poll64 and the corrected normal HRX
+allocator. All twelve request texts matched and both servers exited cleanly.
+
+| Implementation | Median prompt tokens/s | Median decode tokens/s |
+| --- | ---: | ---: |
+| M256 corrected BF16 candidate | 88.4914 | 11.8981 |
+| Unchanged server, measured immediately afterward | 70.0889 | 11.8892 |
+
+This pair shows 26.26% higher prefill throughput with unchanged decode speed.
+It is separate from the 512-token generator experiment; the optimizations have
+not been combined. The candidate remains experimental pending the repeatability
+investigation below. Evidence: `qwen-bf16-residual2-m256/result.json` and
+`qwen-bf16-residual2-m256-control/result.json` under
+`build/tests/driver195-hardware`; frozen source and build manifest:
+`build/perf-q6-bf16-m256-model`.
+
+The subsequent quality diagnostic captured the existing host prefill logits,
+before sampling, without adding device allocations or readbacks. Two baseline
+and two candidate requests had exactly matching prompt token bytes and 248,320
+finite logits each. All four cross-comparisons retained the same argmax and
+relative L2 error 0.003241–0.004721, below the existing 0.005 limit. However,
+candidate-to-candidate error was 0.005177 versus baseline repeat error 0.0001367.
+The larger repeat variation is unresolved; matching text and passing cross-pair
+checks alone do not establish production acceptance. Evidence:
+`build/tests/driver195-hardware/bf16-m256-logit-comparison.json`.
+
+An isolated shared HIP/Loom `Tile::load` extension replaces eight scalar BF16
+fragment loads with one aligned 128-bit LDS load. Native inspection shows 192
+scalar LDS loads replaced by 24 vector loads, with unchanged matrix operations,
+barriers, register allocation and scratch usage. All 16 GPU numerical cases
+passed nine exact repeated-output hashes, and each case's final hash matched
+the original corrected implementation. Performance has not yet been measured.
+Evidence: `q6-bf16-residual2-vector-lds-numeric.log` and
+`build/perf-q6-bf16-two-product-vector-lds`.
+
+### First differing prefill layer
+
+The baseline layer diagnostic, using the preserved pre-allocator-fix HRX
+runtime, captured 264 boundaries across four 256-token chunks in each request.
+Embedding outputs matched. The first difference was already at layer 0 of the
+first chunk: 86/256 rows differed, including row 0, while the final row still
+matched exactly. All 25 kernel identities/source hashes and launch geometries
+through that boundary matched. Both requests constructed fresh graphs.
+
+Later kernel sequences differed, first at dispatch 90, but that cannot explain
+the earlier layer 0 difference. The next diagnostic must inspect layer 0's
+intermediate operations and their inputs. Layer readbacks serialize execution;
+the captured timings are not performance measurements. Evidence:
+`build/tests/driver195-hardware/layer-baseline-comparison.json` and
+`layer-baseline-series`.
+
+### FP32 subnormal descriptor correction
+
+The scalar exceptional-value failure exposed a Loom compiler bug. Its assembly
+metadata requests FP32 denorm mode 3, but the direct binary descriptor writer
+omitted those bits, producing mode 0. The adapter now sets the missing field to
+match the assembly policy. Host tests call both actual emitters and verify
+floating-mode parity for all 23 supported processor profiles.
+
+With the isolated corrected compiler, the failing scalar subnormal case matches
+its reference exactly across nine identical output hashes. The complete scalar
+suite passes 16/16; all 15 previously passing case hashes are unchanged. The old
+and corrected scalar code objects differ in exactly one descriptor byte; their
+instructions are identical. This establishes the cause of that specific
+subnormal failure, not the separate model repeatability issue.
+
+The correction is applied to the normal compiler. A private server with robust
+loaded-compiler cache identity also completed two 64-input/33-output model
+requests with matching text and clean shutdown against it. The cache identity
+fix distinguishes the actual loaded library and its content, including loader
+overrides, so rebuilt compilers cannot silently inherit the old cache identity.
+Evidence: `loom-denorm32-scalar-subnormal.log`, `loom-denorm32-scalar-full.log`,
+and `qwen-loaded-compiler-identity/result.json` under
+`build/tests/driver195-hardware`. Canonical compiler SHA-256:
+`ebbb7cc3da1db6b7204b003b41afc6f01c5a355ff945553f34c89e2f41ee7a15`.

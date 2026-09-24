@@ -489,3 +489,25 @@ index bec35042..d25e51a5 100644
    if (iree_status_is_ok(status) && !has_selected_allocation) {
      if (iree_all_bits_set(flags, IREE_HAL_POOL_RESERVE_FLAG_DISALLOW_GROWTH)) {
        growth_required = true;
+diff --git a/loom/src/loom/target/emit/native/amdgpu/descriptor.c b/loom/src/loom/target/emit/native/amdgpu/descriptor.c
+index f308f74d..37ebb533 100644
+--- a/loom/src/loom/target/emit/native/amdgpu/descriptor.c
++++ b/loom/src/loom/target/emit/native/amdgpu/descriptor.c
+@@ -19,6 +19,7 @@
+ #define LOOM_AMDGPU_COMPUTE_PGM_RSRC1_VGPR_COUNT_WIDTH 6u
+ #define LOOM_AMDGPU_COMPUTE_PGM_RSRC1_SGPR_COUNT_SHIFT 6u
+ #define LOOM_AMDGPU_COMPUTE_PGM_RSRC1_SGPR_COUNT_WIDTH 4u
++#define LOOM_AMDGPU_COMPUTE_PGM_RSRC1_DENORM_32_SHIFT 16u
+ #define LOOM_AMDGPU_COMPUTE_PGM_RSRC1_DENORM_16_64_SHIFT 18u
+ #define LOOM_AMDGPU_COMPUTE_PGM_RSRC1_DX10_CLAMP_SHIFT 21u
+ #define LOOM_AMDGPU_COMPUTE_PGM_RSRC1_IEEE_MODE_SHIFT 23u
+@@ -543,6 +544,9 @@ iree_status_t loom_amdgpu_kernel_descriptor_write(
+   loom_amdgpu_kernel_descriptor_set_bits_u32(
+       &compute_pgm_rsrc1, LOOM_AMDGPU_COMPUTE_PGM_RSRC1_SGPR_COUNT_SHIFT,
+       LOOM_AMDGPU_COMPUTE_PGM_RSRC1_SGPR_COUNT_WIDTH, sgpr_block_count);
++  // Match the assembly envelope: all floating types preserve denormals.
++  loom_amdgpu_kernel_descriptor_set_bits_u32(
++      &compute_pgm_rsrc1, LOOM_AMDGPU_COMPUTE_PGM_RSRC1_DENORM_32_SHIFT, 2, 3);
+   loom_amdgpu_kernel_descriptor_set_bits_u32(
+       &compute_pgm_rsrc1, LOOM_AMDGPU_COMPUTE_PGM_RSRC1_DENORM_16_64_SHIFT, 2,
+       3);

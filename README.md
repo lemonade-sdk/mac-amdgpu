@@ -370,6 +370,21 @@ dependency ordering, fragmentation, and concurrent allocation with trimming.
 The adapter searches all existing slabs before growing the pool, avoiding
 premature exhaustion when reusable memory remains in older slabs.
 
+The Loom floating-mode regression is also host-only. It calls the actual binary
+descriptor writer and assembly metadata printer for every supported processor
+profile, checking that both preserve FP32 and FP16/64 subnormals and use the
+same rounding modes:
+
+```sh
+source scripts/amdgpu-llvm-env.sh
+python3 scripts/test-loom-denorm-descriptor.py \
+  --hrx-source build/hrx-macos-source \
+  --hrx-build build/hrx-macos-adapter
+```
+
+Use matching patched source and built HRX dependencies. This check writes only
+its own test outputs; it neither changes the compiler libraries nor opens HSA.
+
 ## Entitlement reference
 
 | Entitlement | Bundle | What it does |

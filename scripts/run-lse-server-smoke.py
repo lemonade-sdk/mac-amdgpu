@@ -89,7 +89,8 @@ def main():
     result['runtime_overrides'] = {
         name: {'path': str(path.resolve()),
                'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
-        for name in ('libhrx.0.dylib', 'libhrx.dylib')
+        for name in ('libhrx.0.dylib', 'libhrx.dylib',
+                     'libloomc.0.dylib', 'libloomc.dylib')
         if (path := args.hsa_library_dir.resolve() / name).is_file()}
     result['model_config_sha256'] = hashlib.sha256((args.model / 'config.json').read_bytes()).hexdigest()
     result['measurement_environment'] = {key: env[key] for key in
@@ -101,7 +102,8 @@ def main():
          'LSE_CACHE_DIR', 'LSE_LOGIT_DIAGNOSTIC_INDEX',
          'LSE_LOGIT_DIAGNOSTIC_DIR', 'HRX_MAC_SAME_QUEUE_PREFIX',
          'HRX_PROFILE_FILE', 'HRX_PROFILE_MODE', 'LSE_HIDDEN_DIAGNOSTIC_LAST',
-         'LSE_HIDDEN_DIAGNOSTIC_DIR') if key in env}
+         'LSE_HIDDEN_DIAGNOSTIC_DIR', 'LSE_PREFILL_DIAGNOSTIC_DIR',
+         'LSE_LAYER_DIAGNOSTIC_DIR') if key in env}
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def request(path, payload=None, timeout=args.request_timeout):
