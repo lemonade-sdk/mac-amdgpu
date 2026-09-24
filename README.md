@@ -97,8 +97,9 @@ and the [reproduction command](LOCAL_RUN.md#experimental-resident-benchmark).
 The [cooperative RMS testing branch](https://github.com/Geramy/LSE/tree/testing/r9700-cooperative-rms)
 measured 16.75–16.82 TPS and about 116 PP/s on the short fixture, but failed
 repeated 1K-input/1K-output greedy text equality. It is **not the stable default**;
-the unchanged baseline passed that repeatability check. Investigation continues
-before the faster implementation can be promoted.
+the unchanged baseline passed that repeatability check, but also showed near-tied
+token variation in a later logit diagnostic. The cause is not isolated to RMS;
+investigation continues before the faster implementation can be promoted.
 
 ## Current scope
 

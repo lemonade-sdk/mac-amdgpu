@@ -677,3 +677,42 @@ preallocation does not establish a numerical fix and is not promoted as one.
 Artifacts: `qwen-rms-logit-diagnostic`, `rms-logits-337/comparison.json`,
 `qwen-rms-logit-prealloc`, and `rms-logits-prealloc/comparison.json` under
 `build/tests/driver195-hardware`. Stable source/default binaries remain restored.
+
+The same diagnostic was then linked against the unchanged baseline kernel and
+emitter archives. It also produced different continuations at the same token,
+with identical 1,361-token input history and hash. Request 1 selected token 780
+with a margin of 0.0001220703; request 2 selected token 440 with a margin of
+0.0000915527. Maximum absolute logit difference was 0.0006694794 and relative
+L2 difference was 3.64895e-5. Both GPU selections agreed with their respective
+row maxima; the server exited successfully, while text equality failed.
+
+This control means the underlying numerical variation is **not established as
+an RMS regression**. The earlier uninstrumented baseline repeat passed, but the
+diagnostic extends a buffer lifetime and reproduces variation in both versions.
+Neither universal baseline determinism nor an RMS-specific defect follows from
+these results. Evidence: `qwen-baseline-logit-diagnostic` and
+`baseline-logits-337/comparison.json` under `build/tests/driver195-hardware`.
+
+### CPU kernel preparation experiment
+
+An isolated stable-based candidate constructs the Loom structural identity/hash
+once during preparation instead of independently in cache lookup and emission.
+It retains full-string cache comparison and reconstructs bindings for the current
+graph. Eight host suites passed, including 208 exact original/candidate emissions,
+120 matching declines and 188 cache hits per implementation. GPU shader source,
+cache keys, launch metadata and bindings matched.
+
+On the R9700, one warmup followed by three measured requests used 64 input tokens,
+33 generated tokens, KV128, flush64/poll64 and the same model/cache/HSA library:
+
+| Implementation | Median prompt tokens/s | Median decode tokens/s |
+| --- | ---: | ---: |
+| Single-identity preparation candidate | 86.7399 | 12.5717 |
+| Unchanged baseline, measured immediately afterward | 87.0505 | 12.5775 |
+
+All output text matched and both servers exited successfully. This comparison
+establishes no meaningful end-to-end speedup, so the candidate is not promoted.
+Evidence: `qwen-prepare-v2/result.json` and `qwen-prepare-v2-baseline/result.json`
+under `build/tests/driver195-hardware`; candidate manifest and patch are in
+`build/perf-loom-prepare-v2`. Its emission trace span includes identity construction,
+which was previously outside that span; total request timing is the comparison.
