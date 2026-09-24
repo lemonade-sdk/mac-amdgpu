@@ -32,6 +32,59 @@ index a8848b0d..2c52bfe7 100644
    if (iree_status_is_ok(status)) {
      status = iree_hal_device_queue_alloca(
          stream->device->hal_device,
+diff --git a/libhrx/src/libhrx/runtime.c b/libhrx/src/libhrx/runtime.c
+index 396c75cf..8afad494 100644
+--- a/libhrx/src/libhrx/runtime.c
++++ b/libhrx/src/libhrx/runtime.c
+@@ -491,7 +491,11 @@ static iree_status_t hrx_get_profile_data_families(
+     *out_data_families = IREE_HAL_DEVICE_PROFILING_DATA_QUEUE_EVENTS;
+   } else if (strcmp(value, "dispatch") == 0) {
+     *out_data_families = IREE_HAL_DEVICE_PROFILING_DATA_EXECUTABLE_METADATA |
++#if defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
++                         IREE_HAL_DEVICE_PROFILING_DATA_QUEUE_EVENTS |
++#else
+                          IREE_HAL_DEVICE_PROFILING_DATA_DEVICE_QUEUE_EVENTS |
++#endif
+                          IREE_HAL_DEVICE_PROFILING_DATA_DISPATCH_EVENTS;
+   } else if (strcmp(value, "executable") == 0) {
+     *out_data_families = IREE_HAL_DEVICE_PROFILING_DATA_EXECUTABLE_METADATA |
+diff --git a/libhrx/src/libhrx/stream.c b/libhrx/src/libhrx/stream.c
+index 7d5319af..91abe2e4 100644
+--- a/libhrx/src/libhrx/stream.c
++++ b/libhrx/src/libhrx/stream.c
+@@ -6,6 +6,10 @@
+ // Adapted from iree-hal-streaming's stream.c timeline semaphore pattern.
+
+ #include <stdlib.h>
++#if defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
++#include <pthread.h>
++static pthread_mutex_t hrx_profile_flush_mutex = PTHREAD_MUTEX_INITIALIZER;
++#endif
+
+ #include "hrx_internal.h"
+
+@@ -198,7 +202,20 @@ hrx_status_t hrx_stream_synchronize(hrx_stream_t stream) {
+   hrx_status_t status = hrx_stream_flush(stream);
+   if (!hrx_status_is_ok(status)) HRX_RETURN_AND_END_ZONE(z0, status);
+
+-  HRX_RETURN_AND_END_ZONE(z0, hrx_stream_wait(stream));
++  status = hrx_stream_wait(stream);
++#if defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
++  if (hrx_status_is_ok(status) && stream->device->profiling_active) {
++    // Retire ready events at the application's existing synchronization point.
++    // No extra device wait and no per-dispatch flush: this bounds the 64K event
++    // ring across long model runs while preserving normal batching.
++    pthread_mutex_lock(&hrx_profile_flush_mutex);
++    iree_status_t flushed =
++        iree_hal_device_profiling_flush(stream->device->hal_device);
++    pthread_mutex_unlock(&hrx_profile_flush_mutex);
++    status = hrx_status_from_iree(flushed);
++  }
++#endif
++  HRX_RETURN_AND_END_ZONE(z0, status);
+ }
+
+ hrx_status_t hrx_stream_wait(hrx_stream_t stream) {
 diff --git a/runtime/src/iree/hal/drivers/amdgpu/access_policy.c b/runtime/src/iree/hal/drivers/amdgpu/access_policy.c
 index 48b80aa0..605ae8ee 100644
 --- a/runtime/src/iree/hal/drivers/amdgpu/access_policy.c
@@ -76,11 +129,144 @@ index 48b80aa0..605ae8ee 100644
    return iree_hsa_amd_agents_allow_access(IREE_LIBHSA(libhsa),
                                            agent_list->count, agent_list->values,
                                            /*flags=*/NULL, ptr);
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/host_queue.c b/runtime/src/iree/hal/drivers/amdgpu/host_queue.c
+index 08590310..43343040 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/host_queue.c
++++ b/runtime/src/iree/hal/drivers/amdgpu/host_queue.c
+@@ -7,6 +7,7 @@
+ #include "iree/hal/drivers/amdgpu/host_queue.h"
+
+ #include <string.h>
++#include <stdlib.h>
+
+ #include "iree/async/frontier_tracker.h"
+ #include "iree/async/notification.h"
+@@ -895,6 +896,19 @@ iree_status_t iree_hal_amdgpu_host_queue_initialize(
+   // Initialize the AQL ring from the hardware queue.
+   if (iree_status_is_ok(status)) {
+     out_queue->hardware_queue = hardware_queue;
++#if defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
++    // Opt-in process capture must latch CP profiling before any setup dispatch.
++    // Starting a new collection on an already used queue is intentionally not
++    // supported by this adapter; it would require synchronized queue remapping.
++    const char* profile_file = getenv("HRX_PROFILE_FILE");
++    const char* profile_mode = getenv("HRX_PROFILE_MODE");
++    if (profile_file && profile_file[0] && profile_mode &&
++        strcmp(profile_mode, "dispatch") == 0) {
++      status = iree_hsa_amd_profiling_set_profiler_enabled(
++          IREE_LIBHSA(libhsa), hardware_queue, 1);
++      out_queue->profiling.macos_profile_latched = iree_status_is_ok(status);
++    }
++#endif
+     iree_hal_amdgpu_aql_ring_initialize(
+         libhsa, (iree_amd_queue_t*)hardware_queue, &out_queue->aql_ring);
+   }
+@@ -1098,6 +1112,13 @@ iree_status_t iree_hal_amdgpu_host_queue_set_hsa_profiling_enabled(
+   IREE_TRACE_ZONE_BEGIN(z0);
+   IREE_TRACE_ZONE_APPEND_VALUE_I64(z0, enabled ? 1 : 0);
+
++#if defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
++  if (enabled && !queue->profiling.macos_profile_latched) {
++    return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
++        "macOS dispatch profiling requires HRX_PROFILE_FILE and "
++        "HRX_PROFILE_MODE=dispatch before device creation");
++  }
++#endif
+   if (enabled) {
+     IREE_RETURN_AND_END_ZONE_IF_ERROR(
+         z0, iree_hal_amdgpu_host_queue_ensure_profile_event_storage(queue));
+@@ -1107,8 +1128,14 @@ iree_status_t iree_hal_amdgpu_host_queue_set_hsa_profiling_enabled(
+     iree_hal_amdgpu_host_queue_clear_profile_events(queue);
+   }
+
++#if defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
++  // Collection can end while the immutable CP property remains enabled. Its
++  // queue is retired normally; future unprofiled packets have no private slots.
++  iree_status_t status = iree_ok_status();
++#else
+   iree_status_t status = iree_hsa_amd_profiling_set_profiler_enabled(
+       IREE_LIBHSA(queue->libhsa), queue->hardware_queue, enabled ? 1 : 0);
++#endif
+   if (iree_status_is_ok(status)) {
+     queue->profiling.hsa_queue_timestamps_enabled = enabled ? 1 : 0;
+   }
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/host_queue.h b/runtime/src/iree/hal/drivers/amdgpu/host_queue.h
+index c2f43b06..5e2f6062 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/host_queue.h
++++ b/runtime/src/iree/hal/drivers/amdgpu/host_queue.h
+@@ -345,6 +345,9 @@ typedef struct iree_hal_amdgpu_host_queue_t {
+   struct {
+     // True when ROCR should populate dispatch completion signal timestamps.
+     uint32_t hsa_queue_timestamps_enabled : 1;
++    // macOS: CP property latched before the first packet, until queue retirement.
++    uint32_t macos_profile_latched : 1;
++    uint32_t completion_signals_ready : 1;
+     // True when host-side queue operation events should be recorded.
+     uint32_t queue_events_enabled : 1;
+     // True when device-timestamped queue operation events should be recorded.
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/host_queue_profile_events.c b/runtime/src/iree/hal/drivers/amdgpu/host_queue_profile_events.c
+index 210111d4..2b6dead3 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/host_queue_profile_events.c
++++ b/runtime/src/iree/hal/drivers/amdgpu/host_queue_profile_events.c
+@@ -142,12 +142,16 @@ iree_hal_amdgpu_host_queue_allocate_profiling_completion_signals(
+         (iree_host_size_t)iree_alignof(iree_amd_signal_t));
+   }
+   if (iree_status_is_ok(status)) {
++    // Publish ownership before a setup dispatch can reference this allocation.
++    // A failed/timeout initialization is retired by normal queue teardown; it
++    // does not prove the GPU has stopped using the signal storage.
++    queue->profiling.completion_signals = signals;
+     status = iree_hal_amdgpu_host_queue_initialize_profiling_completion_signals(
+         queue, signals, signal_count);
++    queue->profiling.completion_signals_ready = iree_status_is_ok(status);
+   }
+-  if (iree_status_is_ok(status)) {
+-    queue->profiling.completion_signals = signals;
+-  } else if (signals) {
++  if (!iree_status_is_ok(status) && signals &&
++      !queue->profiling.completion_signals) {
+     status = iree_status_join(status, iree_hsa_amd_memory_pool_free(
+                                           IREE_LIBHSA(queue->libhsa), signals));
+   }
+@@ -158,7 +162,11 @@ iree_hal_amdgpu_host_queue_allocate_profiling_completion_signals(
+
+ iree_status_t iree_hal_amdgpu_host_queue_ensure_profiling_completion_signals(
+     iree_hal_amdgpu_host_queue_t* queue) {
+-  if (queue->profiling.completion_signals) return iree_ok_status();
++  if (queue->profiling.completion_signals) {
++    return queue->profiling.completion_signals_ready ? iree_ok_status() :
++        iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
++                        "profiling signal initialization previously failed");
++  }
+   IREE_RETURN_IF_ERROR(
+       iree_hal_amdgpu_host_queue_require_profiling_signal_memory_pool(queue));
+   return iree_hal_amdgpu_host_queue_allocate_profiling_completion_signals(
+@@ -173,6 +181,7 @@ void iree_hal_amdgpu_host_queue_deallocate_profiling_completion_signals(
+   iree_hal_amdgpu_hsa_cleanup_assert_success(iree_hsa_amd_memory_pool_free_raw(
+       queue->libhsa, queue->profiling.completion_signals));
+   queue->profiling.completion_signals = NULL;
++  queue->profiling.completion_signals_ready = 0;
+
+   IREE_TRACE_ZONE_END(z0);
+ }
 diff --git a/runtime/src/iree/hal/drivers/amdgpu/logical_device.c b/runtime/src/iree/hal/drivers/amdgpu/logical_device.c
-index be7c4cfc..1728323a 100644
+index be7c4cfc..67dcfbe8 100644
 --- a/runtime/src/iree/hal/drivers/amdgpu/logical_device.c
 +++ b/runtime/src/iree/hal/drivers/amdgpu/logical_device.c
-@@ -2021,6 +2021,36 @@ iree_status_t iree_hal_amdgpu_logical_device_create(
+@@ -676,6 +676,12 @@ static bool iree_hal_amdgpu_logical_device_profiling_needs_hsa_timestamps(
+
+ static bool iree_hal_amdgpu_logical_device_profiling_needs_clock_correlations(
+     iree_hal_device_profiling_data_families_t data_families) {
++#if defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
++  // Raw CP ticks are meaningful within the GPU clock domain. Do not fabricate
++  // host/GPU samples when the runtime has no calibrated clock-counter API.
++  (void)data_families;
++  return false;
++#endif
+   return iree_hal_amdgpu_logical_device_profiling_needs_hsa_timestamps(
+              data_families) ||
+          iree_any_bit_set(data_families,
+@@ -2021,6 +2027,36 @@ iree_status_t iree_hal_amdgpu_logical_device_create(
    iree_hal_amdgpu_logical_device_options_t resolved_options = *options;
    iree_hal_amdgpu_logical_device_options_apply_create_params(&resolved_options,
                                                               create_params);
@@ -117,13 +303,35 @@ index be7c4cfc..1728323a 100644
    // PM4 and automatic modes promise reusable dispatch command buffers,
    // including dynamic binding-table fixups. Provision their queue-control
    // storage here so a valid recording cannot fail only when first submitted.
-@@ -3199,6 +3229,10 @@ iree_hal_amdgpu_logical_device_verify_queue_device_profiling_supported(
+@@ -2792,6 +2828,15 @@ static iree_status_t iree_hal_amdgpu_logical_device_create_command_buffer(
+     iree_hal_command_buffer_t** out_command_buffer) {
+   iree_hal_amdgpu_logical_device_t* logical_device =
+       iree_hal_amdgpu_logical_device_cast(base_device);
++#if defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
++  // HRX streams do not request retained profile metadata themselves. A capture
++  // must retain command IDs and dispatch summaries at recording time; without
++  // them the upstream collector deliberately skips every dispatch.
++  if (iree_hal_amdgpu_logical_device_profiling_requests_dispatch_timestamps(
++          logical_device)) {
++    mode |= IREE_HAL_COMMAND_BUFFER_MODE_RETAIN_PROFILE_METADATA;
++  }
++#endif
+   iree_hal_queue_affinity_t effective_queue_affinity = 0;
+   iree_host_size_t device_ordinal = 0;
+   IREE_RETURN_IF_ERROR(
+@@ -3199,6 +3244,16 @@ iree_hal_amdgpu_logical_device_verify_queue_device_profiling_supported(
  static iree_status_t iree_hal_amdgpu_logical_device_profiling_begin(
      iree_hal_device_t* base_device,
      const iree_hal_device_profiling_options_t* options) {
 +#if defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
-+  return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-+                          "macOS adapter queue profiling is not supported");
++  const uint64_t supported = IREE_HAL_DEVICE_PROFILING_DATA_QUEUE_EVENTS |
++      IREE_HAL_DEVICE_PROFILING_DATA_EXECUTABLE_METADATA |
++      IREE_HAL_DEVICE_PROFILING_DATA_DISPATCH_EVENTS;
++  if (!options || (options->data_families & ~supported)) {
++    return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
++        "macOS profiling supports host queue events, executable metadata and "
++        "CP dispatch timestamps only; counters/PM4/clock correlation unavailable");
++  }
 +#endif
    iree_hal_amdgpu_logical_device_t* logical_device =
        iree_hal_amdgpu_logical_device_cast(base_device);

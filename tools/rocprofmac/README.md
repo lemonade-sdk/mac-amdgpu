@@ -6,7 +6,7 @@ It enables CP dispatch profiling on an unused AQL queue, submits 32 kernels with
 
 ## Verified result
 
-The unprofiled control and two profiled batches each completed 32 dispatches with exact outputs, unchanged inputs/full-slice guards and acknowledged queue retirement. All 64 profiled dispatches returned ordered nonzero CP timestamps at the device-reported 100 MHz. Logs: `build/tests/driver195-hardware/rocprofmac.log` and `rocprofmac.json`. This small sequential qualification is not a controlled overhead benchmark. General LSE profiling integration and CPU sampling execution remain pending.
+The unprofiled control and two profiled batches each completed 32 dispatches with exact outputs, unchanged inputs/full-slice guards and acknowledged queue retirement. All 64 profiled dispatches returned ordered nonzero CP timestamps at the device-reported 100 MHz. Logs: `build/tests/driver195-hardware/rocprofmac.log` and `rocprofmac.json`. This small sequential qualification is not a controlled overhead benchmark. The HRX integration and full Qwen model capture also passed; CPU Time Profiler recording remains unverified.
 
 ## Build and qualification
 
@@ -24,7 +24,7 @@ Running without arguments only prints help. The tool has bounded batch waits and
 
 The new `mac_hsa_dispatch_timestamps` query returns raw **GPU clock** ticks and the device-reported frequency. The caller retains a fresh completion signal, submits it on the specified queue with SYSTEM release scope, then leaves it unchanged until readout. The query requires completion zero and nonzero ordered timestamps; missing timestamps fail rather than substitute host elapsed time. The runtime verifies GPU ownership but cannot prove which queue last used an arbitrary signal.
 
-The trace separates host and GPU lanes, with independent zero origins. They are **not correlated**: do not infer launch latency by subtracting timestamps across them. Adjacent GPU dispatch intervals may overlap. A positive interval between adjacent dispatches is a queue gap; it does not identify bandwidth, cache misses, occupancy, or a particular scheduling bottleneck. Profiling perturbation has not been measured. No SDMA timestamps or hardware counters are claimed.
+The trace separates host and GPU lanes, with independent zero origins. They are **not correlated**: do not infer launch latency by subtracting timestamps across them. Adjacent GPU dispatch intervals may overlap. A positive interval between adjacent dispatches is a queue gap; it does not identify bandwidth, cache misses, occupancy, or a particular scheduling bottleneck. Measured model profiling overhead is reported below; it is workload- and runtime-dependent. No SDMA timestamps or hardware counters are claimed.
 
 The standard `hsa_amd_profiling_get_dispatch_time` remains unsupported: that API promises HSA system-clock timestamps, and ROCr converts device timestamps using a calibrated clock model. Returning raw ticks there would violate its contract.
 
@@ -58,7 +58,7 @@ open build/cpu.trace
 
 A `.trace` includes sampled CPU stacks, not GPU utilization. Retain matching binaries/debug symbols for useful names. Recording is permission-dependent. A native recording attempt timed out without a trace, so actual CPU sampling remains unverified; help and dry-run validation do not establish recording support. On timeout the wrapper stops xctrace, but does not claim the launched target retired and never kills an attached process. The installed `xcrun xctrace help record` confirms `Time Profiler`, bounded recording, launch/attach and explicit environment options. Apple's [Instruments help](https://developer.apple.com/library/archive/documentation/AnalysisTools/Conceptual/instruments_help-collection/) describes Time Profiler's low-overhead CPU sampling; its [command-line recording example](https://developer.apple.com/videos/play/wwdc2022/10106/) documents the xctrace workflow.
 
-The GPU qualification trace currently contains CPU submission spans. LSE's existing opt-in phase measurements can identify JIT/partition/bind/wait costs; wiring those labels, transfers and waits into a common buffered trace is a subsequent integration step. Neither those wall spans nor CPU samples replace CP dispatch timestamps. GPU-to-host clock calibration is still needed before combining them on a shared time axis.
+The GPU qualification trace contains CPU submission spans, and HRX exports host queue events. LSE's existing opt-in phase measurements identify JIT/partition/bind/wait costs; its buffered dispatch summary supplies operation and shape labels to the exporter. Neither those wall spans nor CPU samples replace CP dispatch timestamps. GPU-to-host clock calibration is still needed before combining them on a shared time axis.
 
 ## Experimental HRX / LSE integration
 
@@ -66,7 +66,18 @@ The separate `testing/rocprofmac` HRX candidate at `build/hrx-testing-rocprofmac
 
 The candidate records executable metadata, CPU queue events and raw GPU dispatch intervals. PM4 queue ranges, counters, thread traces and host/GPU correlation remain rejected. Raw completion slots live in device memory and are initialized once by a GPU kernel; completed dispatch timestamps are harvested in command-buffer batches. There is no timestamp-marker kernel for each model dispatch. Ready events are flushed at existing application stream synchronization points to bound the 64K event ring. A single unsynchronized batch exceeding that capacity fails explicitly.
 
-The HRX candidate builds and loads, but its GPU/model capture is **not yet qualified**. Wait for the active demo/test session to finish before invoking hardware. The tested standalone CP path does not by itself qualify these additional HRX lifecycle paths.
+The HRX candidate passed the real 4,093-element affine and 256-element matrix workloads, including inputs, guards and shutdown. Both dispatches appeared in the capture with GPU timestamps (5.56 and 5.32 microseconds in that run). A full Qwen model server then completed two requests of 64 input and 33 output tokens with matching text and clean shutdown.
+
+The model capture contains 110,154 GPU dispatches and 6,416 host events. Queue/event IDs are unique, and dispatch counts match the independent LSE host summary for all 95 kernel exports. Its GPU envelope is 13.6336 seconds; first-to-last host submission spans 13.6489 seconds, supporting the reported 100 MHz scale without pretending to calibrate the clocks. The 5.6517-second sum of dispatch durations and 7.9819 seconds of positive gaps include a 5.7987-second setup gap before model computation. They must not be mistaken for one request's generation time or a GPU utilization percentage.
+
+Three sequential profile-off requests followed by three profile-on requests, using the same candidate libraries and 64-input/33-output workload, measured:
+
+| Median rate | Profile off | Profile on | Observed change |
+| --- | ---: | ---: | ---: |
+| Prefill tokens/s | 87.29354 | 86.524477 | -0.88% |
+| Decode tokens/s | 12.578807 | 12.217472 | -2.87% |
+
+The corresponding decode time increase is 2.96%. This includes capture buffering/export work at existing synchronization boundaries. Run order and thermal drift were not randomized, so these are observed results rather than a universal overhead guarantee. Evidence is under `build/tests/driver195-hardware/rocprofmac-model`, `rocprofmac-model-off`, and `rocprofmac-model-on3`; the first model's raw capture, JSONL, summary and server log support the count/clock audit. No hardware counters, memory-bandwidth attribution or occupancy measurements are provided.
 
 ```sh
 # Explicit hardware command for the small HRX correctness workload first:
