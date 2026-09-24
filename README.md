@@ -343,6 +343,22 @@ For granular dext-side diagnostics, tail the dext log:
 log stream --predicate 'eventMessage CONTAINS "mac.amdgpu"'
 ```
 
+## HRX status regression check
+
+After building the patched HRX adapter, run this host-only check from the project
+root. It compiles the actual HRX/IREE status conversion with ASan/UBSan and checks
+all 16 public status codes in both directions, including callback `ABORTED`
+propagation. It does not initialize HSA, open the GPU, or run device work.
+
+```sh
+python3 scripts/test-hrx-status-roundtrip.py \
+  --source build/hrx-macos-source \
+  --build build/hrx-macos-adapter
+```
+
+Both paths must name the matching patched source and configured build; the
+build must contain `compile_commands.json` and the built IREE base library.
+
 ## Entitlement reference
 
 | Entitlement | Bundle | What it does |

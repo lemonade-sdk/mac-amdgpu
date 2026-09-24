@@ -427,3 +427,32 @@ index 18ff2256..ab1d3837 100644
  #else
      // Versioned soname first — this is the real soname baked into the library
      // and is always present. The unversioned .so is a development symlink that
+diff --git a/libhrx/src/libhrx/status.c b/libhrx/src/libhrx/status.c
+index d8c1a89e..6c6265e6 100644
+--- a/libhrx/src/libhrx/status.c
++++ b/libhrx/src/libhrx/status.c
+@@ -79,6 +79,24 @@ hrx_status_t hrx_status_from_iree(iree_status_t iree_status) {
+   iree_status_code_t iree_code = iree_status_code(iree_status);
+   hrx_status_code_t hrx_code;
+   switch (iree_code) {
++    case IREE_STATUS_CANCELLED:
++      hrx_code = HRX_STATUS_CANCELLED;
++      break;
++    case IREE_STATUS_UNKNOWN:
++      hrx_code = HRX_STATUS_UNKNOWN;
++      break;
++    case IREE_STATUS_PERMISSION_DENIED:
++      hrx_code = HRX_STATUS_PERMISSION_DENIED;
++      break;
++    case IREE_STATUS_FAILED_PRECONDITION:
++      hrx_code = HRX_STATUS_FAILED_PRECONDITION;
++      break;
++    case IREE_STATUS_ABORTED:
++      hrx_code = HRX_STATUS_ABORTED;
++      break;
++    case IREE_STATUS_DATA_LOSS:
++      hrx_code = HRX_STATUS_DATA_LOSS;
++      break;
+     case IREE_STATUS_INVALID_ARGUMENT:
+       hrx_code = HRX_STATUS_INVALID_ARGUMENT;
+       break;
