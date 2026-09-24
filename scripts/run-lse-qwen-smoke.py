@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only model preflight; --run explicitly opts into one GPU-only token."""
+"""Read-only model preflight; --run opts into bounded GPU-only generation."""
 import argparse
 import json
 import math
@@ -88,16 +88,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model', type=Path, default=DEFAULT_MODEL)
     parser.add_argument('--run', action='store_true')
+    parser.add_argument('--tokens', type=int, default=1)
     parser.add_argument('--timeout-seconds', type=int, default=1200)
     parser.add_argument('--log-dir', type=Path, default=ROOT / 'build/tests/lse-qwen-smoke')
     args = parser.parse_args()
     if not 30 <= args.timeout_seconds <= 3600:
         parser.error('timeout must be30..3600 seconds')
+    if not 1 <= args.tokens <= 64:
+        parser.error('tokens must be 1..64 for this KV128 qualification')
     model = args.model.resolve()
     metadata = census(model)
     executable = ROOT / 'build/lse-macos-adapter/lse'
     command = [str(executable), '--pool', 'hrx:0', '--dialect', 'loom', '--model', str(model),
-               '--kv-len', '128', '--no-mtp', '-n', '1', '-t', '0', '--stats',
+               '--kv-len', '128', '--no-mtp', '-n', str(args.tokens), '-t', '0', '--stats',
                'The capital of France is']
     metadata['command'] = command
     print(json.dumps(metadata, indent=2), flush=True)
@@ -139,8 +142,12 @@ def main():
     generated = re.search(r'generated (\d+) tokens', transcript)
     qualified = bool(not timed_out and child.returncode == 0 and groups and generated and
                      int(groups[1]) > 0 and int(groups[2]) == 0 and int(groups[3]) == 0 and
-                     int(generated[1]) == 1)
-    result = {'qualified_gpu_one_token': qualified, 'returncode': child.poll(), 'elapsed_seconds': time.monotonic() - started,
+                     int(generated[1]) == args.tokens)
+    result = {'qualified_gpu_generation': qualified,
+              'qualified_gpu_one_token': qualified and args.tokens == 1,
+              'requested_tokens': args.tokens,
+              'generated_tokens': int(generated[1]) if generated else None,
+              'returncode': child.poll(), 'elapsed_seconds': time.monotonic() - started,
               'timed_out_or_interrupted': timed_out,
               'retirement': 'unconfirmed; inspect driver state' if timed_out else 'inspect normal shutdown and driver state'}
     (args.log_dir / 'result.json').write_text(json.dumps(result, indent=2) + '\n')

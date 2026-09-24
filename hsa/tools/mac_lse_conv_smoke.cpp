@@ -86,6 +86,29 @@ int main(int argc,char **argv) {
       std::printf("PASS: B2 T%d C17 K4 history=%d, %zu exact outputs; four inputs/guards unchanged; GPU groups=%u host=%u fallback=%u\n",
         seq,history,actual.size(),trace.device_groups,trace.host_groups,trace.host_fallbacks);
     }
+    for(const int seq:{1,2,3,7}) {
+      std::vector<float> tail(batch*3*channels),x(batch*seq*channels),expected(tail.size());
+      for(size_t i=0;i<tail.size();++i) tail[i]=float(i+10000);
+      for(size_t i=0;i<x.size();++i) x[i]=float(i+20000);
+      for(int b=0;b<batch;++b) for(int t=0;t<3;++t) for(int c=0;c<channels;++c) {
+        const int source=seq+t;
+        expected[(b*3+t)*channels+c]=source<3?tail[(b*3+source)*channels+c]:x[(b*seq+source-3)*channels+c];
+      }
+      auto ti=upload(tail.data(),tail.size()*4,Shape{batch,3,channels},DType::kF32);
+      auto xi=upload(x.data(),x.size()*4,Shape{batch,seq,channels},DType::kF32);
+      auto output=conv_tail(ti.array,xi.array);std::vector<float> actual(expected.size());
+      check(output.to_host(actual.data(),actual.size()*4),"evaluate conv tail");
+      const auto trace=scheduler->last_trace();
+      require(trace.device_groups && trace.kernels_launched && !trace.host_groups && !trace.host_fallbacks,"GPU-only conv tail required");
+      require(actual==expected,"convolution tail mismatch");
+      for(auto *input:{&ti,&xi}) {
+        std::vector<std::byte> unchanged(input->original.size());
+        check(backend.copy_d2h(input->array.node()->buffer,unchanged.data(),unchanged.size(),0),"read conv-tail guards");
+        require(unchanged==input->original,"conv-tail input/guard changed");
+      }
+      check(backend.synchronize(),"retire conv tail");
+      std::printf("PASS conv_tail B2 T%d C17 L3: %zu exact outputs; two inputs/guards unchanged; GPU groups=%u host=%u fallback=%u\n",seq,actual.size(),trace.device_groups,trace.host_groups,trace.host_fallbacks);
+    }
     return 0;
   } catch(const std::exception &e) {std::fprintf(stderr,"FAIL: %s\n",e.what());return 1;}
 }

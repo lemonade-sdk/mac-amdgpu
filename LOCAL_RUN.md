@@ -2,7 +2,7 @@
 
 Open with `open -a TextEdit LOCAL_RUN.md` or `less LOCAL_RUN.md` (`q` exits). Dependency pins and signing requirements: [full setup guide](docs/LSE_QUICKSTART.md). Projects: [mac_amdgpu](https://github.com/lemonade-sdk/mac-amdgpu), [Lemon Seed Engine](https://github.com/Geramy/LSE).
 
-**Current boundary:** HRX compute, LSE Q6 and convolution pass on the GPU. Qwen weights load; full execution stops at a missing Loom `repeat` template. Full GPU token generation, HTTP chat and TPS/PP/s remain unverified.
+**Current boundary:** Qwen 27B Q6 generated 16 tokens through LSE/Loom/HRX with zero CPU fallback and clean shutdown. Initial short-run rates were about 1.49 prompt tokens/s and 3.0 decode tokens/s. HTTP chat and longer-run qualification are next.
 
 ## Build locally
 
@@ -57,7 +57,7 @@ python3 scripts/run-lse-qwen-smoke.py
 python3 scripts/run-lse-qwen-smoke.py --run --timeout-seconds 1200
 ```
 
-Default model: `~/.lmstudio/models/lmstudio-community/Qwen3.8-27B-MLX-6bit`; override with `--model PATH`. The runner uses HRX/Loom, strict GPU execution, KV128, no MTP, one greedy token and statistics. Run one GPU workload at a time.
+Default model: `~/.lmstudio/models/lmstudio-community/Qwen3.8-27B-MLX-6bit`; override with `--model PATH`. The runner uses HRX/Loom, strict GPU execution, KV128, no MTP, greedy generation and statistics. One token is the default; add `--tokens 16` to exercise decoding. Run one GPU workload at a time.
 
 ## HTTP chat candidate — pending full-model qualification
 

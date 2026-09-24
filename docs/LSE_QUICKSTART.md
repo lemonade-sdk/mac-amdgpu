@@ -68,6 +68,9 @@ bash scripts/build-lse-macos.sh
 bash scripts/test-lse-loom-compile.sh
 bash scripts/build-lse-q6-smoke.sh
 bash scripts/build-lse-conv-smoke.sh
+bash scripts/build-lse-repeat-smoke.sh
+bash scripts/build-lse-gdn-smoke.sh
+bash scripts/build-lse-paged-smoke.sh
 ```
 
 The HRX script builds Loom by default; do not set `HRX_BUILD_LOOM=OFF` for this path. `HRX_BUILD_JOBS` and `LSE_BUILD_JOBS` control build parallelism. The HRX library check and LSE `--help`/CPU tests do not initialize the GPU. The compile-only Loom check includes small FP32/quantized operations and real model-shaped kernel compilation; successful compilation alone is not an inference result.
@@ -83,6 +86,9 @@ The resulting artifacts include:
 | LSE HTTP server | `build/lse-macos-adapter/lse-server` |
 | LSE Q6 test | `build/lse-macos-adapter/mac-lse-q6-smoke` |
 | LSE convolution test | `build/lse-macos-adapter/mac-lse-conv-smoke` |
+| LSE repeat test | `build/lse-macos-adapter/mac-lse-repeat-smoke` |
+| LSE GDN test | `build/lse-macos-adapter/mac-lse-gdn-smoke` |
+| LSE paged KV/attention test | `build/lse-macos-adapter/mac-lse-paged-smoke` |
 
 The Linux release binary from the upstream LSE project is not the macOS adapter built here.
 
@@ -99,17 +105,26 @@ DYLD_LIBRARY_PATH="$PWD/build/hsa" \
 
 DYLD_LIBRARY_PATH="$PWD/build/hsa" \
   build/lse-macos-adapter/mac-lse-conv-smoke --run
+
+DYLD_LIBRARY_PATH="$PWD/build/hsa" \
+  build/lse-macos-adapter/mac-lse-repeat-smoke --run
+
+DYLD_LIBRARY_PATH="$PWD/build/hsa" \
+  build/lse-macos-adapter/mac-lse-gdn-smoke --run
+
+DYLD_LIBRARY_PATH="$PWD/build/hsa" \
+  build/lse-macos-adapter/mac-lse-paged-smoke --run
 ```
 
 The first check covers actual HRX streams, copy/fill, FP32 affine compute and matrix multiplication with exact readback and guards. The second builds and runs an actual LSE/Loom/HRX affine Q6 projection, checks 51 exact outputs and all four input buffers/guards, requires GPU dispatch without CPU fallback, and checks runtime shutdown. Neither test needs model downloads or LM Studio.
 
-The convolution regression has passed six GPU cases, checking 680 exact outputs, causal padding, retained history, input preservation, guards, and clean shutdown.
+The convolution regression has passed six GPU cases, checking 680 exact outputs, causal padding and retained history, plus four convolution-tail cases checking 408 exact outputs. Repeat has passed nine GPU cases, including Qwen-shaped tensors and integer/BF16/FP32 bit preservation. These checks require unchanged input guards, no host fallback and clean shutdown.
 
 ## Current inference boundary
 
-The Q6 projection and the small HRX workloads above have passed on hardware. CPU portability tests and offline Loom compilation also pass. The GPU-owned HSA signal mailbox is the default on the qualified shared-memory/driver profile, with verified idle retirement and preservation of all seven application queue slots; see [the signal service qualification](ATOMIC_MAILBOX_SERVICE.md).
+The Q6 projection and the small HRX workloads above have passed on hardware. GDN passes 18 numerical GPU cases including prefill-to-decode state carry at the real Qwen dimensions. Paged KV/attention passes four metadata configurations with exact cache images, numerical outputs and guards. The offline audit covers 60 operator/composition cases and 192 generated groups. The GPU-owned HSA signal mailbox is the default on the qualified shared-memory/driver profile, with verified idle retirement and preservation of all seven application queue slots; see [the signal service qualification](ATOMIC_MAILBOX_SERVICE.md).
 
-Full model loading and token generation are still being qualified. The Qwen3.8-27B six-bit checkpoint loaded 1,847 text tensors into 11 VRAM slabs (21.731 GiB). The initial `causal_conv1d` lowering gap is fixed and the focused convolution test passes. The latest full-model retry progressed to a further strict rejection: `no Loom template for repeat`; that operator is under implementation. No full-model GPU token, model accuracy, chat-server generation, or token throughput is qualified yet. Small Q6 success does not establish arbitrary quantization support.
+The Qwen3.8-27B six-bit checkpoint loaded 1,847 text tensors into 11 VRAM slabs (21.731 GiB). After the operator/compiler fixes, the one-token GPU test answered "Paris"; the 16-token test continued with correct capitals for France and Germany. That run used 42,785 GPU groups with zero host groups/fallbacks, exited normally and left the driver at clean stage 0. Five prompt tokens took 3.36 seconds; 15 subsequent decode tokens ran at approximately 3.0 tokens/s. The old CLI printed 3.21 tokens/s because its numerator included the first token produced from prefill; the corrected figure excludes it. These are short-run measurements, not independent full-model accuracy or general quantization qualification. HTTP generation and longer runs remain to be checked.
 
 ## Local model and HTTP server
 

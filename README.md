@@ -4,7 +4,7 @@ This driver and HSA runtime connect AMD GPUs on Apple Silicon to
 [Lemon Seed Engine (LSE)](https://github.com/Geramy/LSE/tree/main) through native HRX/Loom.
 See the [LSE reproduction guide](docs/LSE_QUICKSTART.md) for pinned dependencies,
 build commands and GPU validation, or the shorter [local run guide](LOCAL_RUN.md).
-Full model token generation is still being qualified.
+Qwen 27B Q6 text generation now runs on the GPU; HTTP chat and longer runs are being qualified.
 
 ## Working
 
@@ -14,7 +14,10 @@ Full model token generation is still being qualified.
 - Loading linked gfx1201 HSA code objects, freezing executables and resolving kernel descriptors.
 - Actual HRX initialization, streams, 64 KiB copy/fill, 4,093-result FP32 vector compute and 16×16 FP32 matrix multiplication, with exact results and full input/output guards.
 - Actual LSE→Loom→HRX affine Q6 projection: 51 exact outputs, four unchanged input buffers/guards, no CPU fallback and clean runtime shutdown.
-- Actual LSE causal convolution: six zero-padding/history cases passed 680 exact GPU outputs with unchanged input guards and no CPU fallback.
+- Actual LSE causal convolution: six zero-padding/history cases passed 680 exact GPU outputs. Four convolution-tail cases passed another 408 exact outputs. Input guards and normal shutdown passed with no CPU fallback.
+- Actual LSE repeat: nine GPU cases passed exact byte comparisons, including Qwen-shaped tensors, integer values, BF16 and floating-point bit patterns, with unchanged input guards and no CPU fallback.
+- Actual LSE GDN recurrence: 18 GPU cases passed numerical checks, including Qwen's 48 heads of width 128 and GPU state carried from prefill into decode. Paged KV/attention passed exact cache-image and numerical output checks across four runtime metadata cases.
+- Qwen3.8-27B-MLX-6bit text inference through LSE→Loom→HRX: the 16-token run produced coherent continuation with 42,785 GPU groups, zero CPU fallback and clean shutdown. Five prompt tokens took 3.36 seconds; 15 subsequent decode tokens ran at approximately 3.0 tokens/s. These are initial short-run measurements, not a general benchmark.
 - Large allocation workloads: 1,024 simultaneous VRAM buffers passed full data and fragmentation/reuse checks. HRX passed 96 pooled buffers alongside a guarded 2 GiB allocation. Driver buffer bookkeeping grows and shrinks in 64-entry pages, with a 4,096-handle limit per client; see [capacity and lifetime limits](docs/BUFFER_CAPACITY.md).
 - Native synchronous compute: HSA-loaded kernels passed with 128 and 256 results in both VRAM and shared host memory, including every byte of the input/output guards.
 - Bounded hardware AQL dispatch: kernels passed in VRAM and shared host memory, with firmware-acknowledged queue removal and recreation between launches.
@@ -31,7 +34,7 @@ Full model token generation is still being qualified.
 ## Not working yet
 
 - General fine-grained CPU/GPU atomic interoperability. The controlled staggered test returned **6,131,574 with Requester Enable OFF** and **6,133,395 with it ON**, versus **11,000,000 expected**. Single-agent controls passed, the bit change was read back and the original value was restored. This result applies to the tested mapping and queue configuration; see the [experiment details](docs/PCIE_ATOMIC_TEST_POLICY.md).
-- End-to-end HRX/LSE token generation. The local Qwen 27B Q6 text model loaded 1,847 tensors in about 33 seconds. The convolution compiler fix passes GPU checks; the next model run stopped because `repeat` has no Loom template. No valid inference PP/s or TP/s result is available yet.
+- HTTP chat-server qualification, long generation, independent full-model accuracy comparison and broad model/quantization coverage. Short GPU-only CLI generation passes on the local Qwen 27B Q6 checkpoint.
 - Full HSA conformance and general executable linking. The gfx12-generic HRX helper loader passes software tests. Hardware profiling and some platform-specific APIs explicitly return errors.
 - General firmware telemetry support beyond the tested SMU 14.0.3 firmware profile; independent sensor accuracy and idle/load behavior need further validation.
 - Larger PCIe BAR allocation through a public Apple API, and Mesa/Vulkan integration.
@@ -41,7 +44,7 @@ Full model token generation is still being qualified.
 - Measure signal-service batching and IRQ-assisted wakeup options while keeping concurrent native cross-agent RMW unsupported.
 - Extend idle/load and concurrent-client validation of the monitor.
 - Extend the [combined HRX validation suite](docs/HRX_MACOS_VALIDATION.md) beyond the verified small compute workloads.
-- Validate LSE model execution through the tested HRX compute path, then verify a real inference workload.
+- Qualify repeated HTTP chat requests and graceful shutdown, then measure longer prompt/generation workloads.
 - Finish the firmware telemetry path for amdgpu_mtop.
 
 Detailed changes and hardware results are in [PROGRESS.md](PROGRESS.md).
@@ -60,8 +63,8 @@ but no public PCI resource-resizing operation was found in its headers. A
 ReBAR capability ID alone cannot allocate larger Thunderbolt bridge windows.
 The driver does not write ReBAR size controls.
 
-The next inference milestone is end-to-end LSE model execution through HRX,
-building on the verified compute and HSA paths. Mesa winsys integration remains unimplemented.
+The next inference milestone is repeatable HTTP chat through the verified LSE/HRX
+compute path. Mesa winsys integration remains unimplemented.
 
 Software checks and the non-submitting status probe:
 
