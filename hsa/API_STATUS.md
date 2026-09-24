@@ -1,15 +1,18 @@
 # HSA behavior status
 
-LSE's pinned HRX resolves **119/119 symbols**. This does **not** mean 119 fully
-working GPU operations or a runtime ready for HRX inference. The seven
-platform-unsupported APIs below deliberately return errors. Several other
-families currently support host behavior only.
+LSE's pinned HRX resolves **119/119 symbols**, and the runtime supports validated
+R9700 Qwen inference through HRX/Loom. Symbol coverage does not imply full HSA
+conformance: platform-unsupported APIs deliberately return errors, and several
+families below support host behavior only.
 
 The driver 190 candidate includes public GPU-backed coarse/kernarg host pools,
 discovery-based device properties, dynamic queue scratch/LDS support and loading
 of the actual gfx12-generic HRX helper image. Queue service failures wake signal
 waiters and report an error without changing completion values. Hardware queue
-profiling enablement explicitly fails until CP property refresh is implemented.
+profiling can now be enabled before the first submission. Used queues reject
+property changes; raw GPU dispatch timestamps are validated through
+[rocprofmac](../tools/rocprofmac/README.md). Host-correlated standard profiling
+queries and hardware counters remain unavailable.
 Installed driver 189 passed public pools, device properties, GPU-backed signals
 and multi-process queues. Driver 190 passed scratch/LDS output and guard validation on two queues
 through initial allocation, scratch growth and reuse after correcting the
@@ -17,8 +20,9 @@ architecture-specific wave-size unit. HRX startup queries now include product na
 capability responses; actual HRX compute now passes exact guarded vector and matrix outputs.
 The [macOS HRX adapter and combined test procedure](../docs/HRX_MACOS_VALIDATION.md)
 describe the supported host AQL path and the remaining exclusions. LSE's native macOS CLI now builds against HRX/Loom and passes selected CPU
-suites; actual HRX GPU compute passes, while LSE model inference remains unverified. Symbol resolution
-or successful host compilation alone does not establish either.
+suites. Actual HRX GPU compute and LSE model inference pass the
+[documented hardware checks](../docs/LSE_PERFORMANCE.md). Symbol resolution or
+successful host compilation alone does not establish hardware correctness.
 
 The 29 symbols added with build 181 have these behaviors:
 
@@ -29,7 +33,7 @@ The 29 symbols added with build 181 have these behaviors:
 | Virtual-memory reserve/free, handle create/release, map/unmap/access | 7 | Real host mappings, aligned reservations, physical aliases, access protection, pinned backing when requested and retained lifetimes. GPU VA aliases are unsupported. The system-wide GPU virtual-memory capability remains false. |
 | GPU memory IPC create/attach/detach | 3 | Driver 181 uses a random 128-bit sharing token and per-client BO references. Full allocation, one explicitly selected GPU agent; CPU/peer-GPU mappings are rejected. Repeated imports share a process-local pointer with balanced detach references. Importing over an existing owned MC-address allocation is rejected until distinct process GPU VAs exist. |
 | Signal IPC create/attach | 2 | CPU-only shared atomic signal backing and process-local waits. All core CPU signal operations use the shared value. Cross-process updates, exporter destruction, repeated attachment and abrupt peer death are tested. These signals are not GPU-visible. |
-| Queue profiling/info/CU-mask/priority | 4 | Software-queue profiling updates the AMD ABI flag; hardware profiling enablement returns an error until CP properties can be refreshed safely. Persistent queues return their owning agent. Physical doorbell IDs, CU affinity and priority changes remain unsupported; persistent dispatch passed on driver 187. |
+| Queue profiling/info/CU-mask/priority | 4 | Profiling can be enabled on an unused hardware queue; changes after submission are rejected. Raw CP timestamp capture passes on driver 195. Persistent queues return their owning agent. Physical doorbell IDs, CU affinity and priority changes remain unsupported. |
 | System-event registration | 1 | One handler per runtime session, reset on final shutdown; callback delivery occurs outside the runtime lock and preserves callback status. Delivery is tested with injected events; DriverKit hardware-fault notifications are not connected yet. |
 | Interop map/unmap and portable DMA-BUF export/close | 4 | Unsupported platform paths. No Linux DMA-BUF namespace is available through this transport. Failures preserve export outputs and never close unrelated caller descriptors. |
 | SVM attribute get/set and prefetch | 3 | Unsupported until GPU fault servicing and shared virtual-memory migration exist. Calls fail without changing attributes or falsely decrementing completion signals. SVM capability queries return false. |
@@ -39,8 +43,8 @@ images. AMD loader extension 1.03 now provides all seven table entries:
 address translation, segment/executable/object enumeration, object metadata,
 and embedded-file readers. Original storage and relocated descriptor copies
 remain alive until executable destruction, even after reader destruction.
-General global linking remains incomplete. The driver 189 scratch/LDS resource
-implementation awaits hardware validation.
+General global linking remains incomplete. Scratch/LDS growth and reuse have
+passed hardware output and guard validation.
 Native synchronous and bounded AQL dispatch passed in both VRAM and explicit
 shared host memory. Public HSA queues passed on driver 187: seven device-wide
 slots across gfx1201's two four-queue compute pipes, 64–4096 packets per queue,

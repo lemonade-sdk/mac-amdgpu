@@ -56,10 +56,11 @@ and validation commands.
   their existing queues when a participating process exits.
 - **GPU dispatch timing:** [rocprofmac](tools/rocprofmac/README.md) reads
   hardware start/end timestamps from completion signals. Its R9700 qualification
-  passed 64 profiled dispatches with exact outputs and intact guards, without
-  marker kernels. The tool also includes a macOS CPU sampling helper. Full LSE
-  trace collection, CPU capture validation and profiling overhead measurements
-  are still in progress.
+  passed 64 guarded dispatches, followed by actual HRX and Qwen model captures,
+  without marker kernels. All 110,154 events in the first model capture match
+  host submission counts. Three warm requests measured 12.58 TPS with profiling
+  off and 12.22 TPS with it on, with identical text; this sequential comparison
+  is workload-specific. The tool also includes a macOS CPU sampling helper.
 
 ## Measured Qwen performance
 
@@ -119,7 +120,7 @@ Metal/display integration and Mesa/Vulkan support are separate future work.
   1,024-input / 1,024-output workload.
 - Improve throughput using measured tile, register, LDS and workgroup choices.
 - Expand model accuracy checks, multi-client coverage and hardware compatibility.
-- Connect verified GPU timestamps to LSE traces, measure profiler overhead,
+- Optimize kernels using LSE dispatch traces, expand profiler measurements,
   improve activity measurement and validate IRQ-assisted wakeups.
 
 Detailed engineering results live in [PROGRESS.md](PROGRESS.md). The README

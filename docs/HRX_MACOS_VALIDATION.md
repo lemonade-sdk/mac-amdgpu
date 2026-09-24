@@ -32,8 +32,11 @@ readbacks. Model inference remains unverified.
 The adapter uses one GPU, CPU-published AQL queues and dispatch/completion
 ownership transitions for host buffers. It does not claim general fine-grained
 memory, SVM or GPU virtual-memory aliases. GPU-driven enqueue, ASAN/TSAN/feedback,
-hostcalls and PM4 replay are rejected. Hardware profiling is unavailable until
-the driver can safely refresh CP queue properties. This is an explicit port,
+hostcalls and PM4 replay are rejected. Opt-in dispatch profiling enables CP
+timestamps before the first queue submission and harvests them through HRX's
+existing completion records. Actual model capture and observed overhead are
+documented in [rocprofmac](../tools/rocprofmac/README.md); hardware counters and
+GPU-to-host clock correlation remain unavailable. This is an explicit port,
 not full ROCr/HSA conformance or unmodified HRX support.
 
 ## Architecture selection
