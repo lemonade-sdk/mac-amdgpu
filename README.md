@@ -79,15 +79,26 @@ also matched the corrected scalar control.
 | --- | --- | ---: | ---: |
 | Earlier 64 input / 33 output, KV128 | Scalar control | 87.28 tokens/s | 12.61 tokens/s |
 | Earlier 64 input / 33 output, KV128 | Cooperative RMS | about 116 tokens/s | 16.75–16.82 tokens/s |
+| 512 input / 33 output, KV1024 | Current cooperative RMS | **88.74 tokens/s** | **15.91 tokens/s** |
+| 512 input / 33 output, KV1024 | RMS + vector prefill candidate | **143.26 tokens/s** | **15.84 tokens/s** |
 | 1,024 input / 1,024 output, KV2048 | Corrected scalar control | warming cache | 11.18 tokens/s |
 | 1,024 input / 1,024 output, KV2048 | Corrected cooperative RMS | warming cache | **14.28 tokens/s** |
+| 1,024 input / 1,024 output, KV2048 | RMS + vector prefill candidate, warmed | **139.85 tokens/s** | **14.23 tokens/s** |
 
-The long-run figures are second-request rates from separate sequential runs,
+The scalar/RMS long-run comparison uses second-request rates from separate sequential runs,
 with 1,023 decode steps each, MTP disabled, flush64 and 64 µs polling. They show
 about 28% higher decode throughput; they are not interleaved multi-run medians.
 The earlier short RMS fixture has not yet been remeasured on the final
 integration. Growing KV capacity can trigger new prefill specializations even
 on the second request, so those prompt rates are not steady-state results.
+
+The matched 512-token comparison uses two warmups and three measured requests.
+Compiler counters confirm zero compiles in every measured request; all outputs
+match across the two implementations. Vector prefill is about **61% faster**
+on this fixture, with essentially unchanged decode. The combined candidate also
+passed three identical 1,024-input/1,024-output requests and clean shutdown.
+The table reports its third request, with zero new compilations after two
+warmups. Final source integration checks remain before it becomes the default.
 
 These measurements do not establish matched llama.cpp parity. Closing the
 remaining throughput gap is active work. See

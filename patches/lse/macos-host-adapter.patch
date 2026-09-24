@@ -5058,16 +5058,17 @@ index 3530bd4..31b843f 100644
  
    return generated;
 diff --git a/src/server/http_server.cpp b/src/server/http_server.cpp
-index 4f9dbd3..adc0b9a 100644
+index 4f9dbd3..18c338f 100644
 --- a/src/server/http_server.cpp
 +++ b/src/server/http_server.cpp
-@@ -1,4 +1,5 @@
+@@ -1,4 +1,6 @@
  #include "lse/server/http_server.hpp"
 +#include "lse/server/shutdown.hpp"
- 
++#include "jit_timings.hpp"
+
  #include <atomic>
  #include <chrono>
-@@ -109,6 +110,7 @@ struct HttpServer::Impl {
+@@ -109,6 +111,7 @@ struct HttpServer::Impl {
    // long as its completion takes and the server outlives the ^C that asked it
    // to stop.
    std::atomic<bool> stopping{false};
@@ -5075,7 +5076,7 @@ index 4f9dbd3..adc0b9a 100644
    // One resident session, restarted between requests instead of rebuilt: the
    // state arrays keep their nodes, so the model's retained program replays
    // and a warm request skips the per-request partition and emit entirely.
-@@ -181,6 +183,8 @@ struct Outcome {
+@@ -181,6 +184,8 @@ struct Outcome {
    std::string text;
    int prompt_tokens = 0;
    int completion_tokens = 0;
@@ -5084,20 +5085,29 @@ index 4f9dbd3..adc0b9a 100644
    bool hit_limit = false;
    // Prefill and decode are different rates and a single figure hides which one
    // is the problem, so both are reported. Speculation moves the decode rate
-@@ -201,6 +205,9 @@ struct HttpServer::Run {
+@@ -189,6 +194,7 @@ struct Outcome {
+   double decode_per_second = 0.0;
+   std::uint64_t prefill_ns = 0;
+   std::uint64_t decode_ns = 0;
++  detail::JitTotals jit;
+   double acceptance = -1.0;  // negative when nothing was speculated
+ };
+
+@@ -201,6 +207,9 @@ struct HttpServer::Run {
        HttpServer::Impl& impl, const Request& r,
        const std::function<bool(const std::string&)>& emit) {
      std::lock_guard<std::mutex> held(impl.generate_lock);
 +    // A request queued behind another generation must not start new device
 +    // work after shutdown has asked the active generation to stop.
 +    if (impl.stopping.load()) return LSE_ERROR(kCancelled, "server is stopping");
- 
+
      runtime::Generator gen(impl.model, r.sampling);
      if (impl.mtp != nullptr) gen.use_mtp(*impl.mtp);
-@@ -256,20 +263,19 @@ struct HttpServer::Run {
+@@ -256,20 +265,20 @@ struct HttpServer::Run {
                      out.completion_tokens >= r.limits.max_tokens;
- 
+
      const runtime::GenerationStats& st = gen.stats();
++    out.jit = detail::JitTotals::from(st);
 +    out.prefill_tokens = st.prompt_tokens;
 +    out.decode_tokens = st.decoded_tokens();
      out.prefill_ns = st.prefill_ns;
@@ -5109,7 +5119,7 @@ index 4f9dbd3..adc0b9a 100644
 -    }
 +    out.prompt_per_second = st.prompt_tokens_per_second();
      if (st.spec_steps != 0) out.acceptance = st.acceptance_rate();
- 
+
      std::fprintf(stderr,
                   "lse-server: prompt %d in %.2fs (%.1f tok/s) | decode %d in "
                   "%.2fs (%.1f tok/s)%s\n",
@@ -5120,7 +5130,7 @@ index 4f9dbd3..adc0b9a 100644
                   out.decode_per_second,
                   out.acceptance >= 0.0
                       ? (" | accepted " + std::to_string(
-@@ -291,10 +297,14 @@ json usage_of(const Outcome& o) {
+@@ -291,12 +300,17 @@ json usage_of(const Outcome& o) {
  // a client that does not know it ignores it, which is what llama.cpp does with
  // the same information.
  json timings_of(const Outcome& o) {
@@ -5136,17 +5146,20 @@ index 4f9dbd3..adc0b9a 100644
 +         {"predicted_n", o.decode_tokens},
           {"predicted_ms", o.decode_ns / 1e6},
           {"predicted_per_second", o.decode_per_second}};
++  o.jit.append_to(t);
    if (o.acceptance >= 0.0) t["acceptance_rate"] = o.acceptance;
-@@ -328,7 +338,7 @@ void HttpServer::use_mtp(model::MtpModule& mtp) noexcept { impl_->mtp = &mtp; }
- 
+   return t;
+ }
+@@ -328,7 +342,7 @@ void HttpServer::use_mtp(model::MtpModule& mtp) noexcept { impl_->mtp = &mtp; }
+
  void HttpServer::stop() {
    impl_->stopping.store(true, std::memory_order_relaxed);
 -  impl_->http.stop();
 +  detail::stop_listener_once(impl_->http, impl_->listener_stop_issued);
  }
- 
+
  Status HttpServer::listen() {
-@@ -384,6 +394,10 @@ Status HttpServer::listen() {
+@@ -384,6 +398,10 @@ Status HttpServer::listen() {
    // choice is shaped; everything after that is shared.
    auto completion_route = [&impl](bool chat) {
      return [&impl, chat](const httplib::Request& req, httplib::Response& res) {
@@ -5157,7 +5170,7 @@ index 4f9dbd3..adc0b9a 100644
        json body;
        try {
          body = json::parse(req.body);
-@@ -464,7 +478,8 @@ Status HttpServer::listen() {
+@@ -464,7 +482,8 @@ Status HttpServer::listen() {
        if (!r.stream) {
          auto out = HttpServer::Run::generate(impl, r, {});
          if (!out.ok()) {
@@ -5167,10 +5180,10 @@ index 4f9dbd3..adc0b9a 100644
            return;
          }
          json resp{{"id", id},
-@@ -556,6 +571,7 @@ Status HttpServer::listen() {
+@@ -556,6 +575,7 @@ Status HttpServer::listen() {
      });
    }
- 
+
 +  if (impl.stopping.load()) return OkStatus();
    if (!impl.http.listen(impl.opt.host, impl.opt.port)) {
      return LSE_ERROR(kIoError, "could not listen on ", impl.opt.host, ":",
@@ -5207,10 +5220,10 @@ index 9f17d38..35db5ad 100644
  }
  
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index a787603..954b4ba 100644
+index a787603..7f302a7 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
-@@ -12,6 +12,56 @@ function(lse_add_test name)
+@@ -12,6 +12,59 @@ function(lse_add_test name)
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
  endfunction()
 
@@ -5248,6 +5261,9 @@ index a787603..954b4ba 100644
 +  lse_add_test(test_submission_decode lse_runtime lse_model lse_graph lse_backends lse_backend_cpu)
 +endif()
 +lse_add_test(test_generation_stats)
++lse_add_test(test_http_timings)
++target_include_directories(test_http_timings PRIVATE
++  ${CMAKE_SOURCE_DIR}/src/server ${CMAKE_SOURCE_DIR}/third_party/vendor)
 +# Ordinary fused SSA chains need no device or model.
 +if(TARGET lse_backend_cpu)
 +  lse_add_test(test_scheduler_epilogue lse_graph lse_kernels lse_ir lse_backend_cpu)
@@ -5267,7 +5283,7 @@ index a787603..954b4ba 100644
  lse_add_test(test_dtype)
  lse_add_test(test_reflect)
  # lse_backends is the set of backends this build ships. A test that runs a
-@@ -19,9 +69,95 @@ lse_add_test(test_reflect)
+@@ -19,9 +72,95 @@ lse_add_test(test_reflect)
  # deliberately does not link any of them, so nothing arrives transitively.
  lse_add_test(test_kernel_env lse_graph lse_backends)
  lse_add_test(test_ir lse_ir lse_graph lse_backends)
@@ -5363,7 +5379,7 @@ index a787603..954b4ba 100644
  lse_add_test(test_model lse_model lse_backends)
 
  if(LSE_ENABLE_CPU)
-@@ -35,7 +171,7 @@ endif()
+@@ -35,7 +174,7 @@ endif()
 
  if(LSE_ENABLE_CPU)
    lse_add_test(test_backend_cpu lse_backend_cpu)
@@ -5372,7 +5388,7 @@ index a787603..954b4ba 100644
    lse_add_test(test_primitive lse_graph lse_backends)
  endif()
 
-@@ -86,3 +222,129 @@ if(LSE_ROCM_RUNTIME_DIR)
+@@ -86,3 +225,129 @@ if(LSE_ROCM_RUNTIME_DIR)
    set_tests_properties(${lse_tests} PROPERTIES
      ENVIRONMENT "LD_LIBRARY_PATH=${LSE_ROCM_RUNTIME_DIR}")
  endif()
@@ -10370,10 +10386,10 @@ index 0000000..4eba262
 +LSE_TEST_MAIN()
 diff --git a/tests/test_matrix_probe_lifecycle.cpp b/tests/test_matrix_probe_lifecycle.cpp
 new file mode 100644
-index 0000000..09cfe5a
+index 0000000..788363d
 --- /dev/null
 +++ b/tests/test_matrix_probe_lifecycle.cpp
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,99 @@
 +#include "harness.hpp"
 +#include "lse/backends/cpu/cpu_backend.hpp"
 +#include "lse/backends/hrx/arch_database.hpp"
@@ -10405,7 +10421,14 @@ index 0000000..09cfe5a
 +  Result<std::size_t> sample_free_memory() const { return 32u << 20; }
 +  Result<backend::DeviceBuffer> allocate(std::size_t bytes,backend::MemoryClass cls,backend::Stream stream) {
 +    auto result=backend::CpuBackend::allocate(bytes,cls,stream);
-+    if(result.ok()) {result->storage=std::shared_ptr<void>(result->ptr,std::free); owners.push_back(result->storage);}
++    if (result.ok()) {
++      // CpuBackend already owns the allocation. Creating a second owner from
++      // ptr would release the first owner here and leave both a dangling pointer
++      // and a second free pending.
++      LSE_EXPECT(result->storage != nullptr);
++      LSE_EXPECT(result->storage.get() == result->ptr);
++      owners.push_back(result->storage);
++    }
 +    return result;
 +  }
 +  void deallocate(backend::DeviceBuffer& buffer) noexcept { ++releases; buffer={}; }
@@ -12865,26 +12888,45 @@ index 522e6b5..47cc95d 100644
    CpuBackend be;
    LSE_EXPECT_OK(be.init(0));
 diff --git a/tests/test_graph.cpp b/tests/test_graph.cpp
-index ea1b7ed..1c58860 100644
+index ea1b7ed..7a8d079 100644
 --- a/tests/test_graph.cpp
 +++ b/tests/test_graph.cpp
-@@ -17,6 +17,7 @@
+@@ -17,6 +17,8 @@
 
  #include "harness.hpp"
  #include "lse/graph/interpreter.hpp"
++#include "lse/backends/cpu/cpu_backend.hpp"
 +#include "lse/graph/codegen.hpp"
  #include "lse/graph/ops.hpp"
  #include "lse/graph/program.hpp"
  #include "lse/graph/sharding.hpp"
-@@ -315,6 +316,83 @@ LSE_TEST(reshape_of_a_materialized_buffer_is_a_view) {
+@@ -40,6 +42,18 @@ Array host_array(std::vector<float> values, Shape shape) {
+   return a;
+ }
+
++// These fixtures exercise interpreter storage semantics independently of the
++// machine's selected compute backend (Linux CI also has a real GPU backend).
++Array cpu_host_array(backend::IBackend& cpu, std::vector<float> values,
++                     Shape shape) {
++  auto allocation = cpu.allocate(values.size() * sizeof(float),
++      backend::MemoryClass::kStaging, backend::kDefaultStream);
++  LSE_EXPECT(allocation.ok());
++  if (!allocation.ok()) return {};
++  std::memcpy(allocation->ptr, values.data(), values.size() * sizeof(float));
++  return Array::from_buffer(allocation.release(), shape, DType::kF32);
++}
++
+ std::vector<float> drain(Array& a) {
+   (void)a.eval();
+   std::vector<float> out(a.shape().elem_count());
+@@ -315,6 +329,83 @@ LSE_TEST(reshape_of_a_materialized_buffer_is_a_view) {
    for (std::size_t i = 0; i < 6; ++i) LSE_EXPECT_NEAR(out[i], want[i], 1e-6);
  }
 
 +LSE_TEST(host_reshape_preserves_window_mutations_and_allocation_owner) {
-+  auto* scheduler = default_scheduler();
-+  LSE_EXPECT(scheduler != nullptr);
-+  if (!scheduler || !scheduler->backend().device_info().unified_memory) return;
-+  auto allocation = scheduler->backend().allocate(10 * sizeof(float),
++  backend::BackendAdapter<backend::CpuBackend> cpu;
++  LSE_EXPECT_OK(cpu.init(0));
++  auto allocation = cpu.allocate(10 * sizeof(float),
 +      backend::MemoryClass::kStaging, backend::kDefaultStream);
 +  LSE_EXPECT(allocation.ok());
 +  if (!allocation.ok()) return;
@@ -12897,7 +12939,7 @@ index ea1b7ed..1c58860 100644
 +  buffer.size_bytes = 6 * sizeof(float);
 +  auto base = Array::from_buffer(std::move(buffer), Shape{2, 3}, DType::kF32);
 +  auto view = reshape(base, Shape{3, 2});
-+  LSE_EXPECT_OK(view.eval());
++  LSE_EXPECT_OK(interpreter::evaluate(view.node(), cpu));
 +  LSE_EXPECT(view.node()->buffer.storage == base.node()->buffer.storage);
 +  LSE_EXPECT_EQ(view.node()->buffer.offset, 2 * sizeof(float));
 +  interpreter::store_element(*base.node(), 1, 7.0f);
@@ -12920,20 +12962,19 @@ index ea1b7ed..1c58860 100644
 +}
 +
 +LSE_TEST(host_reshape_rebinds_replaced_storage_and_dirty_state) {
-+  auto* scheduler = default_scheduler();
-+  LSE_EXPECT(scheduler != nullptr);
-+  if (!scheduler || !scheduler->backend().device_info().unified_memory) return;
-+  auto base = host_array({1, 2, 3, 4}, Shape{4});
++  backend::BackendAdapter<backend::CpuBackend> cpu;
++  LSE_EXPECT_OK(cpu.init(0));
++  auto base = cpu_host_array(cpu, {1, 2, 3, 4}, Shape{4});
 +  auto view = reshape(base, Shape{2, 2});
-+  LSE_EXPECT_OK(view.eval());
-+  auto replacement = host_array({5, 6, 7, 8}, Shape{4});
++  LSE_EXPECT_OK(interpreter::evaluate(view.node(), cpu));
++  auto replacement = cpu_host_array(cpu, {5, 6, 7, 8}, Shape{4});
 +  const auto old_handle = view.node()->buffer.handle;
 +  base.node()->buffer = replacement.node()->buffer;
 +  base.node()->host_dirty = true;
 +  base.node()->device_dirty = true;
 +  view.node()->host_mirror.assign(16, std::byte{0xff});
 +  view.node()->materialized = false;
-+  LSE_EXPECT_OK(interpreter::evaluate(view.node(), scheduler->backend()));
++  LSE_EXPECT_OK(interpreter::evaluate(view.node(), cpu));
 +  LSE_EXPECT(view.node()->buffer.handle != old_handle);
 +  LSE_EXPECT(view.node()->buffer.storage == replacement.node()->buffer.storage);
 +  LSE_EXPECT(view.node()->host_mirror.empty());
@@ -12943,24 +12984,26 @@ index ea1b7ed..1c58860 100644
 +  base.node()->host_dirty = false;
 +  base.node()->device_dirty = true;
 +  view.node()->materialized = false;
-+  LSE_EXPECT_OK(interpreter::evaluate(view.node(), scheduler->backend()));
++  LSE_EXPECT_OK(interpreter::evaluate(view.node(), cpu));
 +  LSE_EXPECT(!view.node()->host_dirty);
 +  LSE_EXPECT(view.node()->device_dirty);
 +}
 +
 +LSE_TEST(host_reshape_rejects_invalid_shape_and_short_windows) {
-+  auto a = host_array({1, 2, 3, 4}, Shape{4});
++  backend::BackendAdapter<backend::CpuBackend> cpu;
++  LSE_EXPECT_OK(cpu.init(0));
++  auto a = cpu_host_array(cpu, {1, 2, 3, 4}, Shape{4});
 +  auto wrong = reshape(a, Shape{5});
-+  LSE_EXPECT(!wrong.eval().ok());
++  LSE_EXPECT(!interpreter::evaluate(wrong.node(), cpu).ok());
 +  auto short_view = reshape(a, Shape{2, 2});
 +  a.node()->buffer.size_bytes = 3 * sizeof(float);
-+  LSE_EXPECT(!short_view.eval().ok());
++  LSE_EXPECT(!interpreter::evaluate(short_view.node(), cpu).ok());
 +}
 +
  LSE_TEST(slice_copies_a_window) {
    Array a = host_array({1, 2, 3, 4, 5, 6}, Shape{1, 3, 2});
    Array prefix = slice(a, 1, 0, 1);
-@@ -605,7 +683,12 @@ LSE_TEST(a_held_overwrite_keeps_the_first_write) {
+@@ -605,7 +696,12 @@ LSE_TEST(a_held_overwrite_keeps_the_first_write) {
 
    p.reset_compute();
    LSE_EXPECT_OK(sched->eval(roots, true, &p));
@@ -12974,7 +13017,7 @@ index ea1b7ed..1c58860 100644
    const auto out = drain(y);
    const float want[] = {1, 2, 3, 4, 0, 0, 0, 0};
    for (std::size_t i = 0; i < 8; ++i) LSE_EXPECT_NEAR(out[i], want[i], 1e-6);
-@@ -1178,7 +1261,7 @@ LSE_TEST(prefill_and_decode_are_separate_phases) {
+@@ -1178,7 +1274,7 @@ LSE_TEST(prefill_and_decode_are_separate_phases) {
    LSE_EXPECT_EQ(pre.ideal_launches(), 1u);
  }
 
@@ -12983,7 +13026,7 @@ index ea1b7ed..1c58860 100644
    Array x = Array::full(Shape{1, 32}, DType::kF32, 1.0f);
    Array rw = Array::full(Shape{32}, DType::kF32, 1.0f);
    Array w1 = Array::full(Shape{64, 32}, DType::kF32, 0.1f);
-@@ -1193,7 +1276,15 @@ LSE_TEST(decode_ffn_phase_kernel_launches_once) {
+@@ -1193,7 +1289,15 @@ LSE_TEST(decode_ffn_phase_kernel_launches_once) {
                launches, sched->last_trace().device_groups,
                sched->last_trace().phase_groups,
                sched->last_trace().phase_ideal_launches);
@@ -13000,7 +13043,7 @@ index ea1b7ed..1c58860 100644
    const auto got = drain(y);
    LSE_EXPECT_EQ(got.size(), 32u);
    // x=1 → rms≈1 → linear 32*0.1=3.2 → silu(3.2)≈3.077 → linear 64*0.2*silu
-@@ -1241,10 +1332,18 @@ LSE_TEST(two_slices_same_count_do_not_share_a_body) {
+@@ -1241,10 +1345,18 @@ LSE_TEST(two_slices_same_count_do_not_share_a_body) {
    std::printf("       slice launches=%u phase=%u ideal=%u\n", launches,
                sched->last_trace().phase_groups,
                sched->last_trace().phase_ideal_launches);
@@ -13021,7 +13064,7 @@ index ea1b7ed..1c58860 100644
    Array x = Array::full(Shape{1, 4}, DType::kF32, 1.0f);
    Array wg = Array::full(Shape{8, 4}, DType::kF32, 0.1f);
    Array wu = Array::full(Shape{8, 4}, DType::kF32, 0.2f);
-@@ -1258,7 +1357,15 @@ LSE_TEST(swiglu_phase_kernel_launches_once) {
+@@ -1258,7 +1370,15 @@ LSE_TEST(swiglu_phase_kernel_launches_once) {
      std::printf("       swiglu launches=%u phase=%u ideal=%u\n", launches,
                  sched->last_trace().phase_groups,
                  sched->last_trace().phase_ideal_launches);
@@ -13038,7 +13081,7 @@ index ea1b7ed..1c58860 100644
    }
    const auto got = drain(y);
    LSE_EXPECT_EQ(got.size(), 4u);
-@@ -1285,7 +1392,15 @@ LSE_TEST(gdn_phase_kernel_matches_the_delta_rule) {
+@@ -1285,7 +1405,15 @@ LSE_TEST(gdn_phase_kernel_matches_the_delta_rule) {
      std::printf("       gdn launches=%u phase=%u ideal=%u\n", launches,
                  sched->last_trace().phase_groups,
                  sched->last_trace().phase_ideal_launches);
@@ -13593,4 +13636,86 @@ index 0000000..a1a6277
 +  for(auto count:writes)LSE_EXPECT_EQ(count,2u);
 + }
 +}
++LSE_TEST_MAIN()
+diff --git a/src/server/jit_timings.hpp b/src/server/jit_timings.hpp
+new file mode 100644
+index 0000000..c6546d0
+--- /dev/null
++++ b/src/server/jit_timings.hpp
+@@ -0,0 +1,29 @@
++#pragma once
++
++#include "lse/runtime/generator.hpp"
++#include "nlohmann/json.hpp"
++
++namespace lse::server::detail {
++
++// Generator snapshots the scheduler's persistent JitCache. Generation and
++// session restarts do not reset these counters; they are never request costs.
++struct JitTotals {
++  std::uint64_t memory_hits = 0;
++  std::uint64_t disk_hits = 0;
++  std::uint64_t compiles = 0;
++  std::uint64_t compile_ns = 0;
++
++  static JitTotals from(const runtime::GenerationStats& stats) {
++    return {stats.jit_memory_hits, stats.jit_disk_hits,
++            stats.jit_compiles, stats.jit_compile_ns};
++  }
++
++  void append_to(nlohmann::json& timings) const {
++    timings["jit_memory_hits_total"] = memory_hits;
++    timings["jit_disk_hits_total"] = disk_hits;
++    timings["jit_compiles_total"] = compiles;
++    timings["jit_compile_ms_total"] = static_cast<double>(compile_ns) / 1e6;
++  }
++};
++
++}  // namespace lse::server::detail
+diff --git a/tests/test_http_timings.cpp b/tests/test_http_timings.cpp
+new file mode 100644
+index 0000000..caa575b
+--- /dev/null
++++ b/tests/test_http_timings.cpp
+@@ -0,0 +1,41 @@
++#include "harness.hpp"
++#include "jit_timings.hpp"
++
++using namespace lse;
++
++LSE_TEST(http_jit_timings_preserve_cumulative_counts_and_convert_nanoseconds) {
++  runtime::GenerationStats stats;
++  stats.jit_memory_hits = (std::uint64_t{1} << 54) + 7;
++  stats.jit_disk_hits = 19;
++  stats.jit_compiles = 23;
++  stats.jit_compile_ns = 123456789;
++  nlohmann::json timing{{"prompt_ms", 4.5}};
++  server::detail::JitTotals::from(stats).append_to(timing);
++  LSE_EXPECT_EQ(timing.at("jit_memory_hits_total").get<std::uint64_t>(), stats.jit_memory_hits);
++  LSE_EXPECT_EQ(timing.at("jit_disk_hits_total").get<std::uint64_t>(), 19u);
++  LSE_EXPECT_EQ(timing.at("jit_compiles_total").get<std::uint64_t>(), 23u);
++  LSE_EXPECT_NEAR(timing.at("jit_compile_ms_total").get<double>(), 123.456789, 1e-9);
++  LSE_EXPECT_NEAR(timing.at("prompt_ms").get<double>(), 4.5, 0.0);
++  LSE_EXPECT(!timing.contains("jit_compiles"));
++  LSE_EXPECT(!timing.contains("jit_compile_ms"));
++  // JSON round trips must retain integer precision beyond 2^53.
++  auto parsed = nlohmann::json::parse(timing.dump());
++  LSE_EXPECT_EQ(parsed.at("jit_memory_hits_total").get<std::uint64_t>(), stats.jit_memory_hits);
++}
++
++LSE_TEST(http_jit_timings_snapshot_is_stable_and_zero_totals_are_explicit) {
++  runtime::GenerationStats stats;
++  stats.jit_compiles = 5;
++  auto snapshot = server::detail::JitTotals::from(stats);
++  stats = {};
++  nlohmann::json old, fresh;
++  snapshot.append_to(old);
++  server::detail::JitTotals::from(stats).append_to(fresh);
++  LSE_EXPECT_EQ(old.at("jit_compiles_total").get<unsigned>(), 5u);
++  LSE_EXPECT_EQ(fresh.at("jit_compiles_total").get<unsigned>(), 0u);
++  LSE_EXPECT_EQ(fresh.at("jit_memory_hits_total").get<unsigned>(), 0u);
++  LSE_EXPECT_EQ(fresh.at("jit_disk_hits_total").get<unsigned>(), 0u);
++  LSE_EXPECT_EQ(fresh.at("jit_compile_ms_total").get<double>(), 0.0);
++}
++
 +LSE_TEST_MAIN()

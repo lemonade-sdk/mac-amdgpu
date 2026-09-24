@@ -7,10 +7,13 @@ working baseline and identify work to profile; they are not a matched benchmark
 against another engine.
 
 The earlier **HIPC** (`--dialect hip`) throughput is reported at approximately
-**34 decode tokens/s**. The current qualified **macOS Loom** (`--dialect loom`)
-64-input/33-output resident-server stable median is **12.61 decode tokens/s**.
-The cooperative RMS experiment reached **16.75**, but remains on a testing
-branch because long-request repeatability qualification failed.
+**34 decode tokens/s**. Current **macOS Loom** (`--dialect loom`) with cooperative
+RMS reaches **15.91 decode tokens/s** on the 512-input/33-output fixture and
+**14.28 decode tokens/s** on the 1,024-input/1,024-output fixture. Cooperative
+RMS is now the default after a fused-kernel buffer-lifetime fix resolved the
+long-request repeatability failure. The combined vector-prefill candidate passes
+the long fixture at **139.85 prompt tokens/s and 14.23 decode tokens/s**, with
+zero new compilations in the measured third request; final integration is pending.
 These must not be presented as one backend's performance. The HIPC figure is
 recalled rather than recovered from a benchmark artifact; its exact checkpoint,
 quantization, context, MTP settings and platform need verification before a
@@ -550,11 +553,13 @@ speedup. Evidence and executable/runtime hashes:
 
 ## Cooperative RMS normalization experiment
 
-**Not promoted:** the faster implementation is preserved on
+**Promoted after the planner fix:** the original experiment is preserved on
 [`testing/r9700-cooperative-rms`](https://github.com/Geramy/LSE/tree/testing/r9700-cooperative-rms).
-Stable source and the default local server retain the preceding implementation.
-Short-fixture results below passed, but the long-repeat failure described below
-blocks acceptance. No runtime switch hides the rejected implementation in stable.
+The shared HIP/Loom implementation is now the default for supported shapes.
+The historical investigation below records the repeatability failure that
+initially blocked acceptance. Final qualification after correcting fused-kernel
+buffer lifetimes is recorded later in this document; the earlier failure is no
+longer an open RMS blocker.
 
 Hardware profiling found that the original 5120-wide RMS kernel repeated a
 serial row reduction across all 160 waves. The replacement assigns one
@@ -997,6 +1002,38 @@ pairings. This removes the previously observed 0.005177 candidate repeat noise.
 Long generation and throughput qualification are separate. Evidence:
 `bf16-vector-m256-r2-logit-comparison.json` under the hardware test directory.
 
+A matched current-source RMS control/vector pair subsequently completed five
+512-input/33-output requests each, KV1024, two warmups and three measured
+requests. Only `wmma_q6_linear.cpp.o` differs; all other link inputs are frozen
+and shared. Both use the corrected planner, shared CPU ownership and explicit
+HTTP compiler totals. Every measured request has exactly zero new compilations.
+
+| Implementation | Median PP/s | Median TPS |
+| --- | ---: | ---: |
+| Cooperative RMS control | 88.735 | 15.913 |
+| RMS + M256 vector BF16 candidate | 143.264 | 15.838 |
+
+All ten responses match exactly across both variants. Prompt throughput gains
+61.45%; decode differs by less than 0.5% in this sequential comparison. The
+combined candidate also passed three full 1K-input/1K-output requests with
+identical text and clean shutdown. After two warmups the third request measured
+139.851 PP/s and 14.230 TPS, with exactly zero new JIT compilations. These are
+one warmed long-request measurement, not a multi-run median. Final source and
+native-code integration checks remain before promotion.
+Evidence: `rms-vector-current-pp512-comparison.json` and the
+`qwen-rms-vector-current-{baseline,candidate}-pp512` and
+`qwen-rms-vector-current-1k1k` result directories.
+
+The next isolated centered-affine Q6 candidate passed 32 guarded GPU cases,
+nine identical repeats each, against the original ordered FP32 reference and
+the unchanged 0.005 relative-L2 limit. Coverage includes row tails, full model
+K widths, cancellation, exceptional values and unchanged inputs/guards. It
+factors group scale and bias around centered integer codes to reduce matrix
+products, with ordered FP32 fallback for exceptional and cancellation-sensitive
+outputs. This is numerical qualification only: full-shape throughput and model
+logits are still required. Evidence: `q6-centered-affine-numeric.log`; frozen
+fixture and source identities are in `build/perf-q6-centered-affine/gpu-manifest.json`.
+
 ### FP32 subnormal descriptor correction
 
 The scalar exceptional-value failure exposed a Loom compiler bug. Its assembly
@@ -1040,7 +1077,17 @@ With the corrected compiler, matched full-projection measurements gave:
 
 These are means of eight post-warmup host evaluation/retirement intervals,
 including dispatch overhead, not GPU timestamps. Every output hash matched.
-The smaller projection did not improve; whole-model validation and timing are
-required before promotion. Evidence: `q6-packed-three-{baseline,candidate}-perf.log`
+The smaller projection did not improve. In the subsequent combined RMS+b96
+model run, three 1K-input/1K-output requests produced identical text, also
+matching the RMS control. Decode rates were 13.036, 13.303 and 13.134 TPS,
+below the preceding RMS-only 14.281 TPS result. The b96 change is not promoted:
+the isolated improvement did not carry through to this whole-model workload.
+
+The fresh cache contained 104, 107 and 107 code objects at the three response
+checkpoints. The final request processed the prompt at 86.999 PP/s. These file
+counts corroborate cache convergence but are not direct compiler counters;
+HTTP compiler-total instrumentation is being added for explicit attribution.
+Evidence: `q6-b96-rms-model-comparison.json`,
+`q6-packed-three-{baseline,candidate}-perf.log`
 and `q6-packed-three-{baseline,candidate}-numeric.log` under
 `build/tests/driver195-hardware`.

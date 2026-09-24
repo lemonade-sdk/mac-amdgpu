@@ -17,6 +17,45 @@ import urllib.request
 ROOT = Path(__file__).resolve().parents[1]
 
 
+JIT_TOTAL_FIELDS = ('jit_memory_hits_total', 'jit_disk_hits_total',
+                    'jit_compiles_total', 'jit_compile_ms_total')
+
+
+def jit_observation(timing, previous=None):
+    """Difference successive scheduler snapshots; no first-request zero guess."""
+    if not all(name in timing for name in JIT_TOTAL_FIELDS):
+        return {'available': False, 'reason': 'missing_totals', 'compiled': None}
+    totals = {name: timing[name] for name in JIT_TOTAL_FIELDS}
+    for name, value in totals.items():
+        if (isinstance(value, bool) or not isinstance(value, (int, float)) or
+                not math.isfinite(value) or value < 0 or
+                (name != 'jit_compile_ms_total' and not isinstance(value, int))):
+            raise ValueError(f'invalid JIT counter {name}: {value!r}')
+    result = {'available': True, 'totals': totals, 'delta': None, 'compiled': None}
+    if previous is None:
+        result['reason'] = 'no_previous_snapshot'
+    elif any(totals[name] < previous[name] for name in JIT_TOTAL_FIELDS):
+        result['reason'] = 'counter_reset'
+    else:
+        result['delta'] = {name.removesuffix('_total'): totals[name] - previous[name]
+                           for name in JIT_TOTAL_FIELDS}
+        result['compiled'] = result['delta']['jit_compiles'] > 0
+    return result
+
+
+def jit_benchmark_summary(requests):
+    observations = [request['jit'] for request in requests]
+    compiled = [item['compiled'] for item in observations]
+    known = all(value is not None for value in compiled)
+    return {'scope': 'successive cumulative scheduler snapshots in this serialized server',
+            'all_measured_deltas_available': known,
+            'measured_requests_compiled': True if any(value is True for value in compiled)
+                                         else False if known else None,
+            'all_measured_requests_compile_free': all(value is False for value in compiled)
+                                                  if known else None,
+            'requests': observations}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run', action='store_true')
@@ -160,12 +199,16 @@ def main():
                          for _ in range(args.benchmark_repeats + args.benchmark_warmup)]
             first_completion = None
             benchmark_completion = None
+            previous_jit_totals = None
             for path, payload in cases:
                 payload.update(model='gpu-qwen-check', temperature=0, stream=False)
                 started = time.monotonic()
                 response = request(path, payload)
                 entry = {'endpoint': path, 'elapsed_seconds': time.monotonic() - started,
                          'request': payload, 'response': response}
+                entry['jit'] = jit_observation(response.get('timings', {}), previous_jit_totals)
+                # A missing response breaks the adjacency needed for attribution.
+                previous_jit_totals = entry['jit'].get('totals')
                 result['requests'].append(entry)
                 (args.log_dir / f'response-{len(result["requests"])}.json').write_text(
                     json.dumps(entry, indent=2) + '\n')
@@ -210,11 +253,12 @@ def main():
                     expected = count * 1000 / ms if ms > 0 else 0
                     if not math.isclose(rate, expected, rel_tol=1e-9, abs_tol=1e-9):
                         raise RuntimeError('timing rate does not match its count and duration')
-                print(json.dumps({'endpoint': path, 'text': text, 'timings': timing}), flush=True)
+                print(json.dumps({'endpoint': path, 'text': text, 'timings': timing, 'jit': entry['jit']}), flush=True)
             if args.benchmark_repeats:
                 measured = [r['response']['timings'] for r in
                             result['requests'][args.benchmark_warmup:]]
                 summary = result['benchmark']
+                summary['jit'] = jit_benchmark_summary(result['requests'][args.benchmark_warmup:])
                 summary['all_requested_decode_steps_completed'] = all(
                     t['decode_n'] == args.generated_tokens - 1 for t in measured)
                 for prefix in ('prompt', 'decode'):

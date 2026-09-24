@@ -37,7 +37,7 @@ lse_link_flags="-L$llvm_bin/../lib/c++ -Wl,-rpath,$llvm_bin/../lib/c++"
 lse_common_args=(-G Ninja "-DCMAKE_CXX_COMPILER=$llvm_bin/clang++"
   "-DCMAKE_EXE_LINKER_FLAGS=$lse_link_flags" -DLSE_ENABLE_CPU=ON)
 cmake -S "$lse_copy" -B "$lse_build" "${lse_common_args[@]}" \
-  -DLSE_ENABLE_HRX=ON -DLSE_BUILD_TESTS=OFF -DLSE_GPU_TARGETS=gfx1201 \
+  -DLSE_ENABLE_HRX=ON -DLSE_BUILD_TESTS=ON -DLSE_GPU_TARGETS=gfx1201 \
   "-DLSE_HRX_INCLUDE_DIR=$hrx_copy/libhrx/include" \
   "-DLSE_HRX_LIBRARY=$hrx_build/libhrx/src/libhrx/libhrx.dylib" \
   "-DLSE_LOOMC_INCLUDE_DIR=$hrx_copy/loom/binding/c/include" \
@@ -46,16 +46,21 @@ cmake --build "$lse_build" --target lse lse-server --parallel "${LSE_BUILD_JOBS:
 # --help exits before backend initialization: this does not access the GPU.
 "$lse_build/lse" --help > "$lse_build/help.txt"
 python3 scripts/test-lse-server-cli.py "$lse_build/lse-server"
+# HRX-linked calibration lifecycle coverage uses CPU allocations and simulated
+# kernels only; the CPU-only configuration below cannot define this target.
+cmake --build "$lse_build" --target test_matrix_probe_lifecycle --parallel "${LSE_BUILD_JOBS:-4}"
+LSE_BACKEND=cpu ctest --test-dir "$lse_build" --output-on-failure \
+  -R '^test_matrix_probe_lifecycle$'
 cmake -S "$lse_copy" -B "$lse_tests" "${lse_common_args[@]}" \
   -DLSE_ENABLE_HRX=OFF -DLSE_BUILD_TESTS=ON
-lse_test_targets=(test_kernel_env test_ir test_dtype test_shape test_quant test_backend_cpu test_primitive test_trace
+lse_test_targets=(test_kernel_env test_ir test_dtype test_shape test_quant test_graph test_backend_cpu test_primitive test_trace
   test_loom_print test_loom_repeat test_loom_gdn test_loom_extent test_loom_conv test_loom_words test_loom_flash
-  test_generation_stats test_server_shutdown test_dispatch_profile test_loom_cache test_pointwise_fusion test_probe_measurement test_probe_policy test_quant_prefill test_attention_decode test_token_ids test_submission_tuner test_submission_constants test_submission_decode test_decode_sample
+  test_generation_stats test_http_timings test_server_shutdown test_dispatch_profile test_loom_cache test_pointwise_fusion test_probe_measurement test_probe_policy test_quant_prefill test_attention_decode test_token_ids test_submission_tuner test_submission_constants test_submission_decode test_decode_sample
   test_loaded_runtime test_compiler_identity test_compiler_override test_hrx_copy_route test_gdn_pair test_gdn_scheduler
   test_scheduler_epilogue test_loom_matrix test_loom_dot test_fp8_conversion test_quant_operand_policy test_cooperative_rms)
 cmake --build "$lse_tests" --target "${lse_test_targets[@]}" lse_communication --parallel "${LSE_BUILD_JOBS:-4}"
 ctest --test-dir "$lse_tests" --output-on-failure \
-  -R '^(test_(kernel_env|ir|dtype|shape|quant|backend_cpu|primitive|trace|loom_print|loom_repeat|loom_gdn|loom_extent|loom_conv|loom_words|loom_flash|generation_stats|server_shutdown|dispatch_profile|loom_cache|pointwise_fusion|probe_measurement|probe_policy|quant_prefill|token_ids|submission_tuner|submission_constants|submission_decode|decode_sample|loaded_runtime|compiler_identity|hrx_copy_route|gdn_pair|gdn_scheduler|scheduler_epilogue|loom_matrix|loom_dot|fp8_conversion|quant_operand_policy|cooperative_rms)|compiler_identity_(default|override))$'
+  -R '^(test_(kernel_env|ir|dtype|shape|quant|graph|backend_cpu|primitive|trace|loom_print|loom_repeat|loom_gdn|loom_extent|loom_conv|loom_words|loom_flash|generation_stats|http_timings|server_shutdown|dispatch_profile|loom_cache|pointwise_fusion|probe_measurement|probe_policy|quant_prefill|token_ids|submission_tuner|submission_constants|submission_decode|decode_sample|loaded_runtime|compiler_identity|hrx_copy_route|gdn_pair|gdn_scheduler|scheduler_epilogue|loom_matrix|loom_dot|fp8_conversion|quant_operand_policy|cooperative_rms)|compiler_identity_(default|override))$'
 bash scripts/test-lse-runtime-lifetime.sh
 "$llvm_bin/clang++" -std=c++26 -Wall -Wextra -Werror \
   -I"$lse_copy/include" tests/lse_macos_poller_test.cpp \
