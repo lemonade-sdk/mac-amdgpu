@@ -275,6 +275,24 @@ index f46f7d5..4524e03 100644
  };
  
  }  // namespace lse::backend
+diff --git a/include/lse/backends/hrx/loomc/loom_sources.hpp b/include/lse/backends/hrx/loomc/loom_sources.hpp
+index 76b4bc7..a08fd70 100644
+--- a/include/lse/backends/hrx/loomc/loom_sources.hpp
++++ b/include/lse/backends/hrx/loomc/loom_sources.hpp
+@@ -7,8 +7,13 @@
+ 
+ #include "lse/graph/dialect_source.hpp"
+ 
++namespace lse::math { struct MatrixCoreRow; }
++
+ namespace lse::backend {
+ 
++// Shared register/layout contract for the qualified Loom matrix spelling.
++[[nodiscard]] const math::MatrixCoreRow* loom_matrix_row(std::string_view key) noexcept;
++
+ [[nodiscard]] graph::DialectSourceTable loom_sources() noexcept;
+ 
+ // The Loom type of `$r` for a row of that table. Loom statements annotate their
 diff --git a/include/lse/communication/poller.hpp b/include/lse/communication/poller.hpp
 index e51c708..fdf066f 100644
 --- a/include/lse/communication/poller.hpp
@@ -646,10 +664,17 @@ index 2f05ce3..5c93fd5 100644
  
  lse_apply_common_flags(lse_backend_hrx)
 diff --git a/src/backends/hrx/hrx_backend.cpp b/src/backends/hrx/hrx_backend.cpp
-index 76bb223..ea3f567 100644
+index 76bb223..6072aca 100644
 --- a/src/backends/hrx/hrx_backend.cpp
 +++ b/src/backends/hrx/hrx_backend.cpp
-@@ -6,6 +6,7 @@
+@@ -1,4 +1,6 @@
+ #include "lse/backends/hrx/hrx_backend.hpp"
++#include "lse/backends/hrx/loaded_library.hpp"
++#include "lse/backends/hrx/copy_route.hpp"
+ 
+ #include <dlfcn.h>
+ 
+@@ -6,6 +8,7 @@
  #include <atomic>
  #include <cctype>
  #include <charconv>
@@ -657,7 +682,7 @@ index 76bb223..ea3f567 100644
  #include <cstdio>
  #include <cstdlib>
  #include <cstring>
-@@ -17,6 +18,7 @@
+@@ -17,6 +20,7 @@
  
  #include "lse/backends/hrx/arch_database.hpp"
  #include "lse/backends/hrx/code_object.hpp"
@@ -665,7 +690,7 @@ index 76bb223..ea3f567 100644
  
  extern "C" {
  #include "hrx_runtime.h"
-@@ -154,9 +156,14 @@ class HsaRuntime {
+@@ -154,9 +158,14 @@ class HsaRuntime {
    // preload_gpu_runtime already loaded rather than a second runtime. The hot
    // path keeps load_if_missing=false, so it behaves exactly as before.
    explicit HsaRuntime(bool load_if_missing = false) noexcept {
@@ -675,14 +700,24 @@ index 76bb223..ea3f567 100644
 +#else
 +    constexpr const char* soname = "libhsa-runtime64.so.1";
 +#endif
-+    lib_ = dlopen(soname, RTLD_LAZY | RTLD_NOLOAD);
++    lib_ = detail::open_loaded_library(soname, "hsa_init");
      if (lib_ == nullptr && load_if_missing) {
 -      lib_ = dlopen("libhsa-runtime64.so.1", RTLD_LAZY);
 +      lib_ = dlopen(soname, RTLD_LAZY);
      }
      if (lib_ == nullptr) return;
      init_ = reinterpret_cast<InitFn>(dlsym(lib_, "hsa_init"));
-@@ -287,10 +294,11 @@ class HsaRuntime {
+@@ -270,6 +279,9 @@ class HsaRuntime {
+   [[nodiscard]] bool dma_copy(void* dst, HsaAgent dst_agent, const void* src,
+                               HsaAgent src_agent, std::size_t bytes) const noexcept {
+     if (!can_dma()) return false;
++    // One reusable signal belongs to one transfer at a time, including reset
++    // and completion observation. Different backend instances share this helper.
++    const std::lock_guard lock(dma_mutex_);
+     if (!shared_signal_ready_) {
+       if (signal_create_(1, 0, nullptr, &shared_signal_) != kHsaSuccess) {
+         return false;
+@@ -287,10 +299,11 @@ class HsaRuntime {
        // an interrupt round trip is the same order as the transfer.
        constexpr int kConditionLt = 2;
        constexpr int kWaitActive = 1;
@@ -697,7 +732,15 @@ index 76bb223..ea3f567 100644
    }
  
    // Pins a host range so the copy engine can reach it, returning the address
-@@ -673,26 +681,26 @@ StreamCapabilities derive_stream_capabilities(const DeviceInfo& info,
+@@ -427,6 +440,7 @@ class HsaRuntime {
+   // One completion signal, reused. Creating one is a driver object and costs
+   // about 40 us -- at 1 MB that was two thirds of the transfer, and it is paid
+   // per copy, so a model load pays it per tensor.
++  mutable std::mutex dma_mutex_;
+   mutable HsaSignal shared_signal_{};
+   mutable bool shared_signal_ready_ = false;
+   SignalWaitFn signal_wait_ = nullptr;
+@@ -673,26 +687,26 @@ StreamCapabilities derive_stream_capabilities(const DeviceInfo& info,
  // exactly what enumerating devices before binding one would otherwise cause.
  std::atomic<bool> g_accelerator_up{false};
  
@@ -742,7 +785,7 @@ index 76bb223..ea3f567 100644
    static std::mutex mu;
    const std::lock_guard lock(mu);
    if (g_accelerator_up.load(std::memory_order_relaxed)) return OkStatus();
-@@ -702,9 +710,17 @@ Status accelerator_up() {
+@@ -702,9 +716,17 @@ Status accelerator_up() {
    // for here because bringing the accelerator up is once per process and the
    // topology is fixed at that moment.
    const std::string group = backend::requested_device_group("hrx");
@@ -760,7 +803,7 @@ index 76bb223..ea3f567 100644
    if (hrx_status_is_ok(status)) {
      g_accelerator_up.store(true, std::memory_order_release);
      return OkStatus();
-@@ -720,6 +736,12 @@ Status accelerator_up() {
+@@ -720,6 +742,12 @@ Status accelerator_up() {
  
  }  // namespace
  
@@ -773,7 +816,7 @@ index 76bb223..ea3f567 100644
  bool HrxBackend::available() noexcept {
  #if LSE_HRX_LINKED
    return true;
-@@ -1138,6 +1160,15 @@ Status HrxBackend::init_impl(int device_ordinal) {
+@@ -1138,6 +1166,15 @@ Status HrxBackend::init_impl(int device_ordinal) {
      }
    }
  
@@ -789,7 +832,34 @@ index 76bb223..ea3f567 100644
    queue_count_ = probe_queue_count(device);
    stream_caps_ = derive_stream_capabilities(info_, queue_count_);
    if (physical_count_ > 1 && stream_caps_.stream_count < physical_count_) {
-@@ -1985,6 +2016,88 @@ Result<KernelHandle> HrxBackend::load_executable_impl(
+@@ -1812,6 +1849,26 @@ Status HrxBackend::copy_peer_impl(const DeviceBuffer& src, DeviceBuffer& dst,
+       !hrx_owns_residency(dst.residency)) {
+     return LSE_ERROR(kUnimplemented, "copy_peer needs two hrx-owned buffers");
+   }
++  if (detail::own_single_device_copy(device_index(), physical_count_,
++                                     streams_.size(), src, dst)) {
++    // HRX allocations may be opaque GPU buffers: get_device_ptr currently
++    // attempts a CPU mapping and cannot supply a native VA for those buffers.
++    // Its standard copy API owns the address resolution and GPU submission.
++    // Drain every producer/consumer stream before overwriting the destination;
++    // retirement below makes source release safe when this blocking call returns.
++    LSE_RETURN_IF_ERROR(synchronize_impl());
++    LSE_ASSIGN_OR(void* stream, stream_at(0));
++    LSE_SYNC_TRACE("copy_d2d HRX-owned buffers %zu bytes", bytes);
++    LSE_RETURN_IF_ERROR(from_hrx(
++        hrx_stream_copy_buffer(static_cast<hrx_stream_t>(stream),
++                               reinterpret_cast<hrx_buffer_t>(src.handle),
++                               src.offset + src_offset,
++                               reinterpret_cast<hrx_buffer_t>(dst.handle),
++                               dst.offset + dst_offset, bytes),
++        "hrx_stream_copy_buffer (d2d)"));
++    unflushed_launches_[0] = 0;
++    return synchronize_stream_impl(Stream{0});
++  }
+   const HsaRuntime& hsa = shared_hsa();
+   if (!hsa.can_dma()) return LSE_ERROR(kUnimplemented, "no DMA entry points");
+   const std::vector<HsaAgent>& agents = peer_agents();
+@@ -1985,6 +2042,88 @@ Result<KernelHandle> HrxBackend::load_executable_impl(
  #endif
  }
  
@@ -878,7 +948,7 @@ index 76bb223..ea3f567 100644
  Status HrxBackend::launch_impl(const KernelHandle& kernel, const LaunchDims& dims,
                                 const DispatchArgs& args,
                                 const DispatchTarget& target) {
-@@ -2024,6 +2137,30 @@ Status HrxBackend::launch_impl(const KernelHandle& kernel, const LaunchDims& dim
+@@ -2024,6 +2163,30 @@ Status HrxBackend::launch_impl(const KernelHandle& kernel, const LaunchDims& dim
      bindings.push_back(out);
    }
  
@@ -910,7 +980,7 @@ index 76bb223..ea3f567 100644
    auto* s = static_cast<hrx_stream_t>(*stream);
  
 diff --git a/src/backends/hrx/kernels/probe.cpp b/src/backends/hrx/kernels/probe.cpp
-index 8cadbf3..8c02a13 100644
+index 8cadbf3..e9504f0 100644
 --- a/src/backends/hrx/kernels/probe.cpp
 +++ b/src/backends/hrx/kernels/probe.cpp
 @@ -19,6 +19,8 @@
@@ -922,28 +992,124 @@ index 8cadbf3..8c02a13 100644
  #include <memory>
  #include <optional>
  #include <span>
-@@ -26,6 +28,10 @@
+@@ -26,6 +28,13 @@
  #include <vector>
  
  #include "lse/backends/hrx/hipc/comgr_compiler.hpp"
 +#include "lse/backends/hrx/loomc/loomc_compiler.hpp"
 +#include "lse/backends/hrx/probe_emit.hpp"
++#include "lse/backends/hrx/probe_matrix.hpp"
++#include "lse/backends/hrx/probe_matrix_measurement.hpp"
++#include "lse/backends/hrx/loomc/loom_sources.hpp"
 +#include "lse/backends/hrx/probe_measurement.hpp"
 +#include "lse/backends/hrx/probe_retirement.hpp"
  #include "lse/backends/hrx/device_info.hpp"
  #include "lse/backends/hrx/hipc/hip_emitter.hpp"
  #include "lse/backends/hrx/hipc/hip_sources.hpp"
-@@ -74,8 +80,7 @@ constexpr int kTileM = 16;
- constexpr int kTileN = 16;
- constexpr int kTileK = 16;
+@@ -58,24 +67,9 @@ double ns_since(Clock::time_point t0) {
+           .count());
+ }
  
+-// The shape the matrix rows are rated at.
+-//
+-// Deliberately small enough that both operands stay resident in L2: the tile
+-// re-reads its A row and B column for every output tile, so a shape that spills
+-// to DRAM would measure the same roofline the streaming probe already reports
+-// and tell the cost model nothing new about the matrix core. K is long so the
+-// instruction loop, not the tile setup, dominates.
+-constexpr std::uint32_t kRateM = 256;
+-constexpr std::uint32_t kRateN = 256;
+-constexpr std::uint32_t kRateK = 1024;
+-constexpr int kRateReps = 8;
+-
+-constexpr int kTileM = 16;
+-constexpr int kTileN = 16;
+-constexpr int kTileK = 16;
+-
 -// 64 MB is far past this class of part's L2, so the streaming number is DRAM's.
 -constexpr std::size_t kStreamBytes = 64u << 20;
++using namespace probe_matrix;
++
 +// The allocation budget chooses the streaming working set at runtime.
  constexpr int kStreamReps = 4;
  constexpr std::uint32_t kBlock = 256;
  constexpr int kLaunchReps = 512;
-@@ -262,9 +267,11 @@ std::string rate_source(std::string_view entry, const DeviceInfo& info,
+@@ -148,41 +142,6 @@ std::string touch_source(std::string_view entry) {
+   return wrapper(entry, params, body);
+ }
+ 
+-template <class E, class X = kir::f32, class W = kir::f32>
+-struct RateArgs {
+-  env::In<X, E> x;
+-  env::In<W, E> w;
+-  env::Out<kir::f32, E> out;
+-};
+-
+-// The one thing this adds to the shared tile: the accumulator goes straight to
+-// memory. There is no fused epilogue to run and no emitter store hook outside
+-// the graph, so the Out slot the binding contract already names is the target.
+-template <math::MatrixTarget G, math::MatrixElem A, math::MatrixElem T>
+-struct RateTile : MatrixTile<RateTile<G, A, T>, G, A, T, kTileM, kTileN, kTileK> {
+-  const env::Out<kir::f32, env::Emit>* out = nullptr;
+-  std::uint32_t cols = 0;
+-
+-  void emit_element(env::Emit&, const kir::Val<kir::u32>& row,
+-                    const kir::Val<kir::u32>& col,
+-                    const kir::Val<kir::f32>& v) const {
+-    (*out)[row * cols + col] = v;
+-  }
+-};
+-
+-// The generations whose lane layouts have been measured here. Same pack the
+-// linear kernel carries, for the same reason: an unmeasured layout is a silent
+-// wrong answer, and a probe that emitted one would be timing nonsense.
+-template <math::MatrixTarget... Live, class F>
+-[[nodiscard]] std::string for_live_target(math::MatrixTarget t, F&& fn) {
+-  std::string out;
+-  const auto one = [&]<math::MatrixTarget L>() {
+-    if (t == L) out = fn.template operator()<L>();
+-  };
+-  (one.template operator()<Live>(), ...);
+-  return out;
+-}
+-
+ // The storage format whose operand form a row consumes, or none when this probe
+ // has no body that can feed it. `with_matrix_operand` is the table of arms, so
+ // this is the same set the linear kernel can emit and not a second list.
+@@ -215,31 +174,7 @@ std::string rate_source(std::string_view entry, const DeviceInfo& info,
+                         const math::MatrixCoreRow& row, DType storage) {
+   const kir::TypeTable types = hip_types();
+   const DialectSourceTable table = hip_sources();
+-  const std::uint32_t kb = static_cast<std::uint32_t>(
+-      kRateK / static_cast<std::uint32_t>(row.pack));
+-
+-  const std::string body = for_live_target<math::MatrixTarget::kRdna3,
+-                                   math::MatrixTarget::kRdna4>(
+-      row.target, [&]<math::MatrixTarget G>() -> std::string {
+-        return with_matrix_operand<std::string>(
+-            storage,
+-            [&]<class X, class W, math::MatrixElem A, math::MatrixElem T>()
+-                -> std::string {
+-              if (A != row.acc || T != row.operand) return {};
+-              kir::KernelBody k(types, table);
+-              RateArgs<env::Emit, X, W> a;
+-              const DType ins[] = {env::elem_dtype<X>::value,
+-                                   env::elem_dtype<W>::value};
+-              if (!env::bind(k, a, ins, DType::kF32)) return {};
+-              env::Emit e{&k};
+-              RateTile<G, A, T> tile;
+-              tile.out = &a.out;
+-              tile.cols = kRateN;
+-              tile.run(e, a.x, a.w, kRateM, kRateN, kb,
+-                       device_load_bytes(&info));
+-              return k.str();
+-            });
+-      });
++  const std::string body = rate_body(info, row, storage, types, table);
+   if (body.empty()) return {};
+ 
+   const std::string params[] = {
+@@ -262,9 +197,11 @@ std::string rate_source(std::string_view entry, const DeviceInfo& info,
  class HrxDeviceProbe final : public probe::IDeviceProbe {
   public:
    explicit HrxDeviceProbe(IBackend& be)
@@ -957,19 +1123,15 @@ index 8cadbf3..8c02a13 100644
        declined_ = "no JIT compiler in this build, so no probe kernel can be "
                    "compiled and every device-side rate stays unknown";
      } else if (device_extension<AmdDeviceInfo>(info) == nullptr) {
-@@ -287,13 +294,34 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
+@@ -287,13 +224,31 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
      // A measurement that fails leaves its field unknown; it never falls back to
      // a plausible number, and it does not stop the others from being taken.
      if (const Status s = measure_stream(out); !s.ok()) note(s);
 +    if (!retired_) return OkStatus();
      if (const Status s = measure_launch(out); !s.ok()) note(s);
--    if (const Status s = measure_matrix(out); !s.ok()) note(s);
 +    if (!retired_) return OkStatus();
-+    if (!use_loom_) {
-+      if (const Status s = measure_matrix(out); !s.ok()) note(s);
-+    } else {
-+      note(LSE_ERROR(kUnimplemented, "Loom matrix-rate calibration is unavailable"));
-+    }
+     if (const Status s = measure_matrix(out); !s.ok()) note(s);
++    if (!retired_) return OkStatus();
      fill_paths(out);
      return OkStatus();
    }
@@ -993,7 +1155,7 @@ index 8cadbf3..8c02a13 100644
    void note(const Status& s) {
      if (!declined_.empty()) declined_ += "; ";
      declined_ += s.message();
-@@ -313,41 +341,82 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
+@@ -313,41 +268,82 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
      return cache_.get_or_compile(0, hash_bytes(entry), emitted);
    }
  
@@ -1087,7 +1249,7 @@ index 8cadbf3..8c02a13 100644
  
      // Written before it is read: an allocation nothing has touched is not
      // backed by anything, and streaming it would time the page fault path
-@@ -358,9 +427,7 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
+@@ -358,9 +354,7 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
                                      static_cast<std::size_t>(elems) *
                                          sizeof(float), 0);
        if (!s.ok()) {
@@ -1098,7 +1260,7 @@ index 8cadbf3..8c02a13 100644
        }
      }
  
-@@ -369,12 +436,18 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
+@@ -369,12 +363,18 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
      dims.workgroup_count[0] = groups;
      dims.subgroup_size = wavefront();
      const BufferRef refs[] = {{&src, 0, src.size_bytes},
@@ -1119,7 +1281,7 @@ index 8cadbf3..8c02a13 100644
      if (status.ok()) {
        const auto t0 = Clock::now();
        for (int r = 0; r < kStreamReps && status.ok(); ++r) {
-@@ -382,34 +455,51 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
+@@ -382,34 +382,51 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
        }
        if (status.ok()) status = be_.synchronize();
        const double ns = ns_since(t0);
@@ -1178,7 +1340,7 @@ index 8cadbf3..8c02a13 100644
      if (status.ok()) {
        const auto t0 = Clock::now();
        for (int r = 0; r < kLaunchReps && status.ok(); ++r) {
-@@ -417,6 +507,7 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
+@@ -417,6 +434,7 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
        }
        if (status.ok()) status = be_.synchronize();
        const double ns = ns_since(t0);
@@ -1186,7 +1348,7 @@ index 8cadbf3..8c02a13 100644
        if (status.ok() && ns > 0.0) {
          // One workgroup of one wave writing one float: what is left after
          // dividing is the submission path, which is what a placement decision
-@@ -425,7 +516,8 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
+@@ -425,7 +443,8 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
              probe::Measured::measured(ns / static_cast<double>(kLaunchReps));
        }
      }
@@ -1196,7 +1358,177 @@ index 8cadbf3..8c02a13 100644
      return status;
    }
  
-@@ -664,6 +756,8 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
+@@ -435,7 +454,7 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
+     const std::optional<math::MatrixTarget> target = matrix_target(info);
+     if (!target.has_value()) return;
+     const std::uint32_t caps = device_matrix_caps(info);
+-    const DialectSourceTable table = hip_sources();
++    const DialectSourceTable table = use_loom_ ? loom_sources() : hip_sources();
+ 
+     for (const math::MatrixCoreRow& r : math::matrix_core_table()) {
+       if (r.target != *target) continue;
+@@ -483,6 +502,7 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
+ 
+       const Status s = measure_one_row(info, *row, *storage, rate);
+       if (!s.ok() && first.ok()) first = s;
++      if (!retired_) break;
+     }
+     return first;
+   }
+@@ -491,8 +511,9 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
+                          const math::MatrixCoreRow& row, DType storage,
+                          probe::MatrixRowRate& rate) {
+     const std::string entry = "lse_probe_mma_" + std::string(to_string(storage));
+-    LSE_ASSIGN_OR(const KernelHandle kernel,
+-                  compiled(entry, rate_source(entry, info, row, storage)));
++    LSE_ASSIGN_OR(const KernelHandle kernel, use_loom_
++        ? compiled_loom(emit_loom_matrix_rate_probe(info, row, storage))
++        : compiled(entry, rate_source(entry, info, row, storage)));
+ 
+     const std::size_t operand_elems =
+         static_cast<std::size_t>(kRateK / static_cast<std::uint32_t>(row.pack));
+@@ -503,53 +524,44 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
+     }
+     const std::size_t a_bytes = kRateM * operand_elems * widths.x;
+     const std::size_t b_bytes = kRateN * operand_elems * widths.w;
++    ProbeRetirement<DeviceBuffer> buffers;
++    if (!buffers.available()) return LSE_ERROR(kDeviceError, "probe retirement capacity unavailable");
++    constexpr std::size_t guard = 16;
++    constexpr std::size_t output_elements = static_cast<std::size_t>(kRateM) * kRateN;
+     auto ba = be_.allocate(a_bytes, MemoryClass::kDevice);
+     if (!ba.ok()) return ba.status();
+-    DeviceBuffer x = ba.release();
++    DeviceBuffer x = ba.release(); buffers.track(x);
+     auto bb = be_.allocate(b_bytes, MemoryClass::kDevice);
+-    if (!bb.ok()) {
+-      be_.deallocate(x);
+-      return bb.status();
+-    }
+-    DeviceBuffer w = bb.release();
+-    auto bo = be_.allocate(
+-        static_cast<std::size_t>(kRateM) * kRateN * sizeof(float),
+-        MemoryClass::kDevice);
+-    if (!bo.ok()) {
+-      be_.deallocate(x);
+-      be_.deallocate(w);
+-      return bo.status();
+-    }
+-    DeviceBuffer o = bo.release();
+-
+-    // Defined operands: an uninitialized buffer is a timing measurement over
+-    // whatever the allocator last left there.
+-    std::vector<std::byte> seed(std::max(a_bytes, b_bytes), std::byte{0x11});
+-    Status seeded = be_.copy_h2d(seed.data(), x, a_bytes, 0);
+-    if (seeded.ok()) seeded = be_.copy_h2d(seed.data(), w, b_bytes, 0);
+-    if (!seeded.ok()) {
+-      be_.deallocate(x);
+-      be_.deallocate(w);
+-      be_.deallocate(o);
+-      return seeded;
+-    }
+-
+-    const auto lanes = static_cast<std::uint32_t>(row.wave);
+-    const std::uint32_t tiles_n = (kRateN + kTileN - 1) / kTileN;
+-    const std::uint32_t tiles = ((kRateM + kTileM - 1) / kTileM) * tiles_n;
+-    const std::uint32_t cap =
+-        info.max_threads_per_workgroup >= 256 ? 256u : 64u;
+-    const std::uint32_t waves = cap / lanes;
+-    LaunchDims dims;
+-    dims.workgroup_size[0] = waves * lanes;
+-    dims.workgroup_count[0] = (tiles + waves - 1) / waves;
+-    dims.subgroup_size = lanes;
+-
+-    const BufferRef refs[] = {{&x, 0, x.size_bytes},
+-                              {&w, 0, w.size_bytes},
+-                              {&o, 0, o.size_bytes}};
+-    DispatchArgs args;
+-    args.bindings = refs;
++    if (!bb.ok()) return finish_buffers(buffers, bb.status());
++    DeviceBuffer w = bb.release(); buffers.track(w);
++    auto bo = be_.allocate((output_elements + 2 * guard) * sizeof(float), MemoryClass::kDevice);
++    if (!bo.ok()) return finish_buffers(buffers, bo.status());
++    DeviceBuffer o = bo.release(); buffers.track(o);
++
++    auto x_seed = matrix_probe_ones(storage, true, a_bytes);
++    auto w_seed = matrix_probe_ones(storage, false, b_bytes);
++    if (!x_seed.ok()) return finish_buffers(buffers, x_seed.status());
++    if (!w_seed.ok()) return finish_buffers(buffers, w_seed.status());
++    Status seeded = be_.copy_h2d(x_seed->data(), x, a_bytes, 0);
++    if (seeded.ok()) seeded = be_.copy_h2d(w_seed->data(), w, b_bytes, 0);
++    if (!seeded.ok()) return finish_buffers(buffers, seeded);
++
++    const auto poison = [&] {
++      std::vector<float> data(output_elements + 2 * guard, -1234.0f);
++      std::fill_n(data.begin() + guard, output_elements, std::numeric_limits<float>::quiet_NaN());
++      return be_.copy_h2d(data.data(), o, data.size() * sizeof(float), 0);
++    };
++    const auto validate = [&]() -> Status {
++      std::vector<float> data(output_elements + 2 * guard);
++      LSE_RETURN_IF_ERROR(be_.copy_d2h(o, data.data(), data.size() * sizeof(float), 0));
++      return check_matrix_probe_output(data, guard, output_elements, static_cast<float>(kRateK));
++    };
++    const LaunchDims dims = rate_dims(info, row);
++    const BufferRef refs[] = {{&x, 0, a_bytes}, {&w, 0, b_bytes},
++                              {&o, guard * sizeof(float), output_elements * sizeof(float)}};
++    DispatchArgs args; args.bindings = refs;
++    const std::uint32_t count = static_cast<std::uint32_t>(output_elements);
++    if (use_loom_) args.constants = std::as_bytes(std::span(&count, 1));
+ 
+     // WARM THE CLOCKS BEFORE TIMING THEM.
+     //
+@@ -565,8 +577,11 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
+     // price every fusion and tile decision against these figures, so an
+     // under-measured compute rate tells the whole optimizer that compute is
+     // scarce on a part where it is abundant.
+-    Status status = be_.launch(kernel, dims, args);
++    Status status = poison();
++    if (status.ok()) status = be_.launch(kernel, dims, args);
+     if (status.ok()) status = be_.synchronize();
++    if (status.ok()) status = validate();
++    double measured_rate = 0.0;
+     if (status.ok()) {
+       // Sustained load until the governor has had time to ramp, then a timed
+       // window long enough that the ramp is not inside it.
+@@ -579,6 +594,9 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
+         }
+         if (status.ok()) status = be_.synchronize();
+       }
++      // Re-poison after warming so timed work must produce the full image.
++      if (status.ok()) status = poison();
++      if (status.ok()) status = be_.synchronize();
+       int reps = 0;
+       const auto t0 = Clock::now();
+       while (status.ok() && ns_since(t0) < kMinNs) {
+@@ -590,18 +608,22 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
+       }
+       if (status.ok()) status = be_.synchronize();
+       const double ns = ns_since(t0);
+-      if (status.ok() && ns > 0.0) {
++      if (status.ok()) status = validate();
++      if (status.ok() && ns > 0.0 && reps > 0) {
+         // `reps` actually issued, not the batch constant: the timed window
+         // now runs as many batches as it needs to fill 20 ms.
+         const double flops =
+             2.0 * kRateM * kRateN * kRateK * static_cast<double>(reps);
+-        rate.flops = probe::Measured::measured(flops * 1e9 / ns);
+-        rate.support = probe::RowSupport::kMeasured;
++        measured_rate = flops * 1e9 / ns;
+       }
+     }
+-    be_.deallocate(x);
+-    be_.deallocate(w);
+-    be_.deallocate(o);
++    status = finish_buffers(buffers, status);
++    if (status.ok() && measured_rate > 0.0) {
++      rate.flops = probe::Measured::measured(measured_rate);
++      rate.support = probe::RowSupport::kMeasured;
++    } else {
++      rate.flops = {};
++    }
+     return status;
+   }
+ 
+@@ -664,6 +686,8 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
  
    IBackend& be_;
    ComgrCompiler compiler_;
@@ -1206,7 +1538,7 @@ index 8cadbf3..8c02a13 100644
    bool usable_ = false;
    std::string declined_;
 diff --git a/src/backends/hrx/loomc/loom_emitter.cpp b/src/backends/hrx/loomc/loom_emitter.cpp
-index 7558527..712e95b 100644
+index 7558527..2d361a5 100644
 --- a/src/backends/hrx/loomc/loom_emitter.cpp
 +++ b/src/backends/hrx/loomc/loom_emitter.cpp
 @@ -1,6 +1,9 @@
@@ -1219,7 +1551,16 @@ index 7558527..712e95b 100644
  #include <unordered_map>
  #include <unordered_set>
  #include <vector>
-@@ -18,6 +21,116 @@ using namespace lse::graph;
+@@ -10,6 +13,8 @@
+ #include "lse/backends/hrx/loomc/loom_print.hpp"
+ #include "lse/backends/hrx/loomc/loom_types.hpp"
+ #include "lse/graph/kernel_primitive.hpp"
++#include "lse/graph/gdn_pair.hpp"
++#include "lse/kernels/gdn.hpp"
+ #include "lse/graph/ops.hpp"
+ 
+ namespace lse::backend {
+@@ -18,6 +23,116 @@ using namespace lse::graph;
  
  namespace {
  
@@ -1336,7 +1677,7 @@ index 7558527..712e95b 100644
  kir::Scalar elem_of(DType dt) {
    switch (dt) {
      case DType::kF16: return kir::Scalar::kF16;
-@@ -231,13 +344,7 @@ std::string kernel_header(const EmittedKernel& out,
+@@ -231,13 +346,7 @@ std::string kernel_header(const EmittedKernel& out,
  
  std::uint64_t LoomEmitter::cache_key(const FusionGroup& group,
                                       const DeviceInfo& device) const {
@@ -1351,8 +1692,41 @@ index 7558527..712e95b 100644
  }
  
  Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
-@@ -323,7 +430,8 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -291,7 +400,13 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+     return s;
+   };
  
+-  if (kernels::linked_bindings(group).ok) {
++  GdnPair gdn_pair;
++  if (group.nodes.size() == 2 && group.outputs.size() == 2) {
++    gdn_pair = exact_gdn_pair(group.nodes[0], group.nodes[1]);
++    if (gdn_pair && (!std::ranges::count(group.outputs, gdn_pair.output) ||
++                     !std::ranges::count(group.outputs, gdn_pair.state))) gdn_pair = {};
++  }
++  if (!gdn_pair && kernels::linked_bindings(group).ok) {
+     KernelShapes probe;
+     if (kernels::linked_kernel_for(group, probe) != nullptr) {
+       return LSE_ERROR(kUnimplemented,
+@@ -321,9 +436,26 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+     break;
+   }
+ 
++  std::vector<NodePtr> logical_inputs;
++  if (gdn_pair) {
++    self_indexed = kernels::gdn_pair_kernel();
++    anchor = gdn_pair.output;
++    logical_inputs = anchor->inputs;
++    logical_inputs.push_back(gdn_pair.state);
++    si_storage.clear(); si_dtypes.clear();
++    for (const auto& input : logical_inputs) {
++      si_storage.push_back(input->shape);
++      si_dtypes.push_back(input->dtype);
++    }
++    si_shapes = shapes_for(anchor, storage, dtypes);
++    si_shapes.inputs = si_storage;
++    si_shapes.input_dtypes = si_dtypes;
++  } else if (anchor) logical_inputs = anchor->inputs;
++
    EmittedKernel out;
    out.dialect = Dialect::kLoom;
 -  out.entry_name = "lse_loom_" + std::to_string(group.signature());
@@ -1361,7 +1735,16 @@ index 7558527..712e95b 100644
  
    std::unordered_map<const Node*, std::size_t> binding_of;
    auto bind = [&](const NodePtr& n) {
-@@ -348,6 +456,35 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -334,7 +466,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+   // A self-indexing primitive names its operands in0..inN in its own order, so
+   // they are bound first and an epilogue's extra inputs cannot shift them.
+   if (self_indexed != nullptr && anchor) {
+-    for (const NodePtr& in : anchor->inputs) bind(in);
++    for (const NodePtr& in : logical_inputs) bind(in);
+   }
+   for (const NodePtr& in : group.inputs) bind(in);
+   const std::size_t input_count = out.binding_order.size();
+@@ -348,6 +480,35 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
    }
    out.constants.add("count", 4);
  
@@ -1397,7 +1780,34 @@ index 7558527..712e95b 100644
    // The launch parameters, and the views the body reads through. Parameter
    // names follow the emitter convention the recorder already binds against:
    // `in0..inN` and `out` for a self-indexed body, `b0..bN` for the per-element
-@@ -453,6 +590,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -365,7 +526,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+                        ", which is a block layout rather than a Loom element "
+                        "type");
+     }
+-    const bool is_out = output_set.count(n.get()) != 0;
++    const bool is_out = gdn_pair ? n == gdn_pair.output : output_set.count(n.get()) != 0;
+     const std::string name =
+         si ? (is_out ? std::string("out") : "in" + std::to_string(i))
+            : "b" + std::to_string(i);
+@@ -405,7 +566,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+   // on the pair.
+   const int inplace =
+       (si && anchor && anchor->prim) ? anchor->prim->inplace_input() : -1;
+-  const bool aliased = inplace >= 0;
++  const bool aliased = inplace >= 0 || bool(gdn_pair);
+   if (!aliased && out.binding_order.size() > 1) {
+     std::string lhs;
+     std::string rhs;
+@@ -444,7 +605,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+ 
+   if (si) {
+     // ---- a primitive that owns its indexing -------------------------------
+-    const NodePtr& sink = group.outputs.front();
++    const NodePtr& sink = gdn_pair ? gdn_pair.output : group.outputs.front();
+     Status epilogue_error;
+     bool stored = false;
+     Mint hook_mint;
+@@ -453,6 +614,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
        stored = true;
        std::string s;
        std::unordered_map<const Node*, std::string> value_of;
@@ -1405,14 +1815,23 @@ index 7558527..712e95b 100644
        value_of[anchor.get()] = std::string(value);
        const std::string idx(index);
  
-@@ -561,8 +699,19 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -460,7 +622,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+         const NodePtr& n = out.binding_order[j];
+         // A kernel primitive indexes its own operands; they must not be
+         // pre-loaded at the output index, because the shapes do not line up.
+-        bool is_operand = false;
++        bool is_operand = std::ranges::count(logical_inputs, n) != 0;
+         for (const NodePtr& m : group.nodes) {
+           if (dynamic_cast<const KernelPrimitiveBase*>(m->prim) == nullptr) {
+             continue;
+@@ -561,8 +723,19 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
      si_shapes.types = type_table;
      si_shapes.intrinsics = &spellings;
  
 +    // Binding order deduplicates aliases. Record the logical argument names
 +    // through that map too, so a repeated input cannot shift later operands.
 +    std::vector<std::string> input_names;
-+    for (const NodePtr& input : anchor->inputs) {
++    for (const NodePtr& input : logical_inputs) {
 +      input_names.push_back(names[binding_of.at(input.get())]);
 +    }
      ir::KernelBody::Capture cap;
@@ -1426,7 +1845,7 @@ index 7558527..712e95b 100644
      if (!epilogue_error.ok()) return epilogue_error;
      if (text.empty() || !cap.has()) {
        return LSE_ERROR(kUnimplemented, "primitive '",
-@@ -595,6 +744,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -595,6 +768,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
      }
      out.source = kernel_header(out, params) + prologue + printed->text +
                   "  kernel.return\n}\n";
@@ -1434,7 +1853,7 @@ index 7558527..712e95b 100644
      return out;
    }
  
-@@ -607,7 +757,8 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -607,7 +781,8 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
  
    std::unordered_set<const Node*> pointer_inputs;
    for (const NodePtr& n : group.nodes) {
@@ -1444,7 +1863,7 @@ index 7558527..712e95b 100644
      for (const NodePtr& in : n->inputs) pointer_inputs.insert(in.get());
    }
  
-@@ -624,6 +775,8 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -624,6 +799,8 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
  
    std::string inner;
    std::unordered_map<const Node*, std::string> value_of;
@@ -1453,7 +1872,7 @@ index 7558527..712e95b 100644
    for (std::size_t i = 0; i < input_count; ++i) {
      const NodePtr& n = out.binding_order[i];
      if (pointer_inputs.count(n.get()) != 0) continue;
-@@ -716,6 +869,79 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -716,6 +893,79 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
        continue;
      }
  
@@ -1533,7 +1952,7 @@ index 7558527..712e95b 100644
      std::vector<std::string> args;
      args.reserve(n->inputs.size());
      for (const NodePtr& in : n->inputs) {
-@@ -785,7 +1011,8 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -785,7 +1035,8 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
        inner += "  scf.if " + ok + " {\n";
        guard_close = "  }\n";
      }
@@ -1543,7 +1962,7 @@ index 7558527..712e95b 100644
          narrow_from_f32(it->second, n->dtype, mint, inner);
      const std::string dst = bounded("%i", n->element_count(), mint, inner);
      inner += "  view.store " + narrowed + ", %" + names[i] + "_view[" + dst +
-@@ -809,7 +1036,13 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
+@@ -809,7 +1060,13 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
    out.lds_bytes = 0;
    out.source =
        kernel_header(out, params) + prologue + body + "  kernel.return\n}\n";
@@ -1558,10 +1977,18 @@ index 7558527..712e95b 100644
 +
  }  // namespace lse::backend
 diff --git a/src/backends/hrx/loomc/loom_print.cpp b/src/backends/hrx/loomc/loom_print.cpp
-index 50b9aef..cc78f90 100644
+index 50b9aef..8e754a6 100644
 --- a/src/backends/hrx/loomc/loom_print.cpp
 +++ b/src/backends/hrx/loomc/loom_print.cpp
-@@ -112,8 +112,9 @@ class Printer {
+@@ -12,6 +12,7 @@
+ #include "lse/backends/hrx/loomc/loom_sources.hpp"
+ #include "lse/backends/hrx/loomc/loom_types.hpp"
+ #include "lse/ir/lower.hpp"
++#include "lse/math.hpp"
+ 
+ namespace lse::backend {
+ 
+@@ -112,15 +113,20 @@ class Printer {
    // has `index` for the first and `i32` for the second and no unsigned type
    // for either. A word is born in a memory read of an unsigned buffer or in a
    // bit-manipulation row, and it stays a word through the arithmetic it feeds.
@@ -1573,7 +2000,19 @@ index 50b9aef..cc78f90 100644
    void classify_words() {
      word_.assign(b_.value_count(), 0);
      auto seed = [&](OpId id) {
-@@ -136,6 +137,9 @@ class Printer {
+       const Operation& o = b_.op(id);
+       if (o.result == kNoValue) return;
+       if (o.type.elem != Scalar::kU32) return;
+-      if (o.kind == OpKind::kLoadVec || o.kind == OpKind::kSubscript) {
++      if (o.kind == OpKind::kCast && !o.operands.empty() &&
++          b_.value(o.operands[0]).type.elem == Scalar::kI32) {
++        // Signed activation bytes cast to u32 keep their 32-bit pattern.
++        word_[o.result] = 1;
++      } else if (o.kind == OpKind::kLoadVec || o.kind == OpKind::kSubscript) {
+         word_[o.result] = 1;
+       } else if (o.kind == OpKind::kCall &&
+                  loom_result_type(o.key) == "i32") {
+@@ -136,6 +142,9 @@ class Printer {
          bool any = o.result != kNoValue && o.type.elem == Scalar::kU32 &&
                     word_[o.result] != 0;
          for (ValueId v : o.operands) {
@@ -1583,7 +2022,7 @@ index 50b9aef..cc78f90 100644
            if (v < word_.size() && b_.value(v).type.elem == Scalar::kU32 &&
                word_[v] != 0) {
              any = true;
-@@ -147,13 +151,7 @@ class Printer {
+@@ -147,13 +156,7 @@ class Printer {
            word_[o.result] = 1;
            changed = true;
          }
@@ -1598,7 +2037,31 @@ index 50b9aef..cc78f90 100644
        });
      }
    }
-@@ -244,6 +242,10 @@ class Printer {
+@@ -171,10 +174,21 @@ class Printer {
+       const Operation& o = b_.op(id);
+       if (o.erased) continue;
+       if (o.kind == OpKind::kAssign && !o.operands.empty()) {
+-        const ValueId t = resolve(o.operands[0]);
++        ValueId t = resolve(o.operands[0]);
++        if (t < b_.value_count()) {
++          const auto& target = b_.value(t);
++          if (target.def != kNoOp) {
++            const auto& sub = b_.op(target.def);
++            if (sub.kind == OpKind::kSubscript && !sub.operands.empty())
++              t = resolve(sub.operands[0]);
++          }
++        }
+         if (t < b_.value_count()) {
+           const ValueDef& d = b_.value(t);
+-          if (d.def != kNoOp && b_.op(d.def).kind == OpKind::kMutable) {
++          if (d.def != kNoOp && (b_.op(d.def).kind == OpKind::kMutable ||
++              (b_.op(d.def).kind == OpKind::kAlloc &&
++               b_.op(d.def).type.space == Space::kPrivate &&
++               !b_.op(d.def).has(kFlagArray)))) {
+             here.insert(t);
+           }
+         }
+@@ -244,6 +258,10 @@ class Printer {
        for (OpId id : users_[at]) {
          const Operation& u = b_.op(id);
          switch (u.kind) {
@@ -1609,7 +2072,7 @@ index 50b9aef..cc78f90 100644
            case OpKind::kSubscript:
            case OpKind::kLoadVec:
            case OpKind::kStoreVec:
-@@ -466,6 +468,18 @@ class Printer {
+@@ -466,6 +484,18 @@ class Printer {
    }
  
    Status emit_extent(const Operation& o, int depth) {
@@ -1628,7 +2091,7 @@ index 50b9aef..cc78f90 100644
      if (o.has(kFlagRuntimeExtent)) {
        // A dispatch-bound extent is a launch parameter plus an index.assume
        // stating the bound Loom will not take on faith. Both belong to the
-@@ -513,22 +527,28 @@ class Printer {
+@@ -513,22 +543,28 @@ class Printer {
      if (a == nullptr || b == nullptr) {
        return unsupported("operand of '" + o.key + "' was never defined");
      }
@@ -1663,7 +2126,7 @@ index 50b9aef..cc78f90 100644
 +        if (a_index) { lhs = cast; a = &converted; }
 +        else { rhs = cast; b = &converted; }
 +      } else {
-+        return unsupported("'" + o.key + "' mixes " + a->type + " and " + b->type);
++        return unsupported("'" + o.key + "' mixes " + a->type + " " + lhs + " and " + b->type + " " + rhs + " result " + name(o.result));
 +      }
      }
 -    const std::string lhs = name(o.operands[0]);
@@ -1671,6 +2134,320 @@ index 50b9aef..cc78f90 100644
      const std::string res = name(o.result);
      const std::string& k = o.key;
  
+@@ -662,6 +698,15 @@ class Printer {
+       define(o.result, dst_type, o.cast_to, dst_cls);
+       return Status{};
+     };
++    if (src->type == "i32" && dst_type == "i32" &&
++        (src->elem == Scalar::kI32 || src->elem == Scalar::kU32) &&
++        (o.cast_to == Scalar::kI32 || o.cast_to == Scalar::kU32)) {
++      // Loom integers are signless. C's same-width signedness conversion
++      // changes the interpretation of later operations, not these bits.
++      auto st = done();
++      cur_[o.result] = in;
++      return st;
++    }
+     if (src->type == dst_type) {
+       // A conversion between one Loom type and itself. C spells it and Loom
+       // has no op for it, so there is nothing to name the result with; the
+@@ -760,7 +805,22 @@ class Printer {
+       if (operand(v) == nullptr) {
+         return unsupported("operand of '" + o.key + "' was never defined");
+       }
+-      args.push_back(name(v));
++      auto arg = name(v);
++      if ((o.key == "min.u32" || o.key == "max.u32") &&
++          operand(v)->cls == Cls::kIndex) {
++        arg = fresh("word");
++        line(depth, arg + " = index.cast " + name(v) + " : index to i32");
++      }
++      args.push_back(arg);
++    }
++    if (const auto* row = loom_matrix_row(o.key)) {
++      if (o.operands.size() != 3 ||
++          operand(o.operands[0])->type != loom_vector_type(row->a_elem, static_cast<std::uint32_t>(row->a_len)) ||
++          operand(o.operands[1])->type != loom_vector_type(row->b_elem, static_cast<std::uint32_t>(row->b_len)) ||
++          operand(o.operands[2])->type != loom_vector_type(row->c_elem, static_cast<std::uint32_t>(row->c_len)) ||
++          o.type.elem != row->c_elem || o.type.lanes != static_cast<std::uint32_t>(row->c_len)) {
++        return unsupported("matrix fragment types do not match the shared contract for '" + o.key + "'");
++      }
+     }
+     const std::string prefix =
+         "%" + o_.name_prefix + "c" + std::to_string(seq_++) + "_t";
+@@ -778,9 +838,11 @@ class Printer {
+     if (o.result != kNoValue) {
+       if (rt.empty()) return unsupported("row '" + o.key + "' has no result");
+       define(o.result, std::string(rt), o.type.elem,
+-             rt == "index" ? Cls::kIndex
++             rt.starts_with("vector<") ? Cls::kOther
++             : rt == "index" ? Cls::kIndex
+              : rt == "f32" ? Cls::kFloat
+-                           : Cls::kUnsignedInt);
++             : o.type.elem == Scalar::kI32 ? Cls::kSignedInt
++                                           : Cls::kUnsignedInt);
+     }
+     return Status{};
+   }
+@@ -854,6 +916,12 @@ class Printer {
+     if (o.result < store_target_.size() && store_target_[o.result] != 0) {
+       // The address half of `buf[i] = v`. kAssign prints the store; nothing is
+       // loaded here.
++      const auto* base = operand(o.operands[0]);
++      if (base && base->type.starts_with("vector<") &&
++          cur_.count(resolve(o.operands[0]))) {
++        pending_vector_store_.insert(o.result);
++        return Status{};
++      }
+       auto acc = access_of(o.operands[0]);
+       if (!acc.ok()) return acc.status();
+       pending_store_[o.result] = *acc;
+@@ -875,7 +943,7 @@ class Printer {
+       // lowering sees it. A lane from any other loop would survive to codegen
+       // as a dynamic lane select, which this target has no plan for, so it
+       // declines instead of emitting something that fails downstream.
+-      if (!literal && !unrolled_iv_.count(lane)) {
++      if (!literal && !static_vector_lane(lane)) {
+         return unsupported("a register-vector lane that is not a literal");
+       }
+       const std::string elem(loom_storage_type(base->elem));
+@@ -901,6 +969,16 @@ class Printer {
+   }
+ 
+   Status emit_alloc(const Operation& o, int depth) {
++    if (!o.has(kFlagArray) && o.type.space == Space::kPrivate &&
++        o.type.lanes > 1 && o.type.lanes <= 64) {
++      const std::string vt = loom_vector_type(o.type.elem, o.type.lanes);
++      const std::string n = name(o.result);
++      line(depth, n + " = vector.constant " +
++          (is_float(o.type.elem) ? "0.0" : "0") + " : " + vt);
++      define(o.result, vt, o.type.elem, Cls::kOther);
++      cur_[o.result] = n;
++      return Status{};
++    }
+     if (!o.has(kFlagArray) || o.type.space != Space::kWorkgroup) {
+       return unsupported(
+           "a private allocation; Loom keeps register state in SSA and this "
+@@ -927,9 +1005,48 @@ class Printer {
+     return Status{};
+   }
+ 
++  bool static_vector_lane(ValueId value) const {
++    const auto v = resolve(value);
++    if (unrolled_iv_.count(v)) return true;
++    if (v >= b_.value_count() || b_.value(v).def == kNoOp) return false;
++    const auto& op = b_.op(b_.value(v).def);
++    if (op.has(kFlagIntConst)) return true;
++    if (op.kind != OpKind::kBinary ||
++        (op.key != "+" && op.key != "*" && op.key != "/" && op.key != "%")) return false;
++    for (const auto arg : op.operands) if (!static_vector_lane(arg)) return false;
++    return !op.operands.empty();
++  }
++
+   Status emit_assign(const Operation& o, int depth) {
+     if (o.operands.size() != 2) return unsupported("assign with 2 operands");
+     const ValueId target = resolve(o.operands[0]);
++    if (pending_vector_store_.count(target)) {
++      const auto& sub = b_.op(b_.value(target).def);
++      const auto base = resolve(sub.operands[0]);
++      const auto* vector = operand(base);
++      const auto* value = operand(o.operands[1]);
++      std::string input = name(o.operands[1]);
++      Typed converted;
++      if (vector && value && vector->elem == Scalar::kU32 && value->cls == Cls::kIndex) {
++        input = fresh("word");
++        line(depth, input + " = index.cast " + name(o.operands[1]) + " : index to i32");
++        converted = Typed{"i32", Scalar::kU32, Cls::kUnsignedInt, true};
++        value = &converted;
++      }
++      if (!vector || !value || value->type != loom_storage_type(vector->elem) ||
++          !static_vector_lane(sub.operands[1]))
++        return unsupported("a private-vector store with nonstatic lane or wrong element type: vector=" + (vector ? vector->type : "missing") + " value=" + (value ? value->type : "missing") + " lane=" + name(sub.operands[1]));
++      std::int64_t lane = 0;
++      const bool literal = int_const(sub.operands[1], &lane);
++      if (literal && (lane < 0 || static_cast<std::uint64_t>(lane) >= b_.value(base).type.lanes))
++        return unsupported("an out-of-range private-vector lane");
++      const std::string at = literal ? std::to_string(lane) : name(sub.operands[1]);
++      const std::string next = fresh("insert");
++      line(depth, next + " = vector.insert " + input + " into " +
++          name(base) + "[" + at + "] : " + value->type + ", " + vector->type);
++      cur_[base] = next;
++      return Status{};
++    }
+     if (cur_.count(target) != 0) {
+       const Typed* v = operand(o.operands[1]);
+       if (v == nullptr) return unsupported("assigned value was never defined");
+@@ -1240,6 +1357,7 @@ class Printer {
+   std::vector<std::string> results_;
+   std::vector<std::vector<OpId>> users_;
+   std::unordered_map<ValueId, Access> pending_store_;
++  std::unordered_set<ValueId> pending_vector_store_;
+   std::unordered_set<ValueId> unprefixed_;
+   std::unordered_map<std::string, ValueId> raw_names_;
+   std::string retarget_;
+diff --git a/src/backends/hrx/loomc/loom_sources.cpp b/src/backends/hrx/loomc/loom_sources.cpp
+index b67d0d5..25f7349 100644
+--- a/src/backends/hrx/loomc/loom_sources.cpp
++++ b/src/backends/hrx/loomc/loom_sources.cpp
+@@ -15,11 +15,9 @@
+ //     a `buffer.alloca` + `buffer.view` pair the printer synthesizes from the
+ //     allocation's own type. A row would let something text-scan for a keyword
+ //     that has no Loom form.
+-//   * every `wmma.*`, `wmma12.*` and `mfma.*` row — Loom's matrix path is
+-//     `vector.mma` against a fragment descriptor whose layout Loom owns, not a
+-//     builtin call on a hand-shaped ext_vector. Porting it is a join against
+-//     the 152-row contract catalog, not a string swap, so the rows are absent
+-//     rather than wrong.
++//   * Unqualified matrix rows remain absent. The measured RDNA4 wave32
++//     rows below join the shared matrix contract to Loom fragment schemas;
++//     the register payload and lane mapping remain owned by that contract.
+ //
+ // Where Loom offers a NAMED op for something HIP spells as a formula —
+ // `siluf`, `logisticf`, `softplusf`, `geluf` — the formula is spelled out here
+@@ -29,12 +27,15 @@
+ #include "lse/backends/hrx/loomc/loom_sources.hpp"
+ 
+ #include <array>
++#include <vector>
++#include "lse/math.hpp"
++#include "lse/backends/hrx/loomc/loom_types.hpp"
+ 
+ namespace lse::backend {
+ 
+ namespace {
+ 
+-constexpr std::array<graph::PrimitiveSource, 35> kLoomSources{{
++constexpr std::array<graph::PrimitiveSource, 37> kLoomSources{{
+     {"add", "$r = scalar.addf $0, $1 : f32"},
+     {"sub", "$r = scalar.subf $0, $1 : f32"},
+     {"mul", "$r = scalar.mulf $0, $1 : f32"},
+@@ -121,8 +122,14 @@ constexpr std::array<graph::PrimitiveSource, 35> kLoomSources{{
+ 
+     {"fma", "$r = scalar.fmaf $0, $1, $2 : f32"},
+     {"max", "$r = scalar.maxnumf $0, $1 : f32"},
+-    {"min.u32", "$r = scalar.minui $0, $1 : i32"},
+-    {"max.u32", "$r = scalar.maxui $0, $1 : i32"},
++    // Unsigned min/max may be workgroup-uniform. The current target lowers
++    // scalar.minui/maxui to VGPR-only instructions without converting uniform
++    // SGPR operands/results. Compare/select preserves unsigned semantics and
++    // lets the target choose scalar or vector register classes consistently.
++    {"min.u32", "$t0 = scalar.cmpi ult, $0, $1 : i32\n"
++                "$r = scf.select $t0, $0, $1 : i32"},
++    {"max.u32", "$t0 = scalar.cmpi ugt, $0, $1 : i32\n"
++                "$r = scf.select $t0, $0, $1 : i32"},
+     {"min", "$r = scalar.minnumf $0, $1 : f32"},
+     {"neg_inf", "$r = scalar.constant -inf : f32"},
+     {"abs", "$r = scalar.absf $0 : f32"},
+@@ -145,6 +152,18 @@ constexpr std::array<graph::PrimitiveSource, 35> kLoomSources{{
+      "$t1 = scalar.bitcast $t0 : i16 to f16\n"
+      "$r = scalar.extf $t1 : f16 to f32"},
+ 
++    // Preserve the HIP mixed-sign dot: signed activation bytes, unsigned
++    // affine codes, and a wrapping i32 accumulator (no saturation).
++    {"dot4.i32.iu8",
++     "$t0 = vector.splat $0 : vector<1xi32>\n"
++     "$t1 = vector.splat $1 : vector<1xi32>\n"
++     "$t2 = vector.splat $2 : vector<1xi32>\n"
++     "$t3 = vector.bitcast $t0 : vector<1xi32> to vector<4xi8>\n"
++     "$t4 = vector.bitcast $t1 : vector<1xi32> to vector<4xi8>\n"
++     "$t5 = vector.dot4i<s8u8> $t3, $t4, $t2 : vector<4xi8>, vector<4xi8>, vector<1xi32>\n"
++     "$r = vector.extract $t5[0] : vector<1xi32> -> i32"},
++    {"rint", "$r = scalar.roundevenf $0 : f32"},
++
+     {"thread.local_id", "$r = kernel.workitem.id<x> : index"},
+     {"thread.workgroup_id.x", "$r = kernel.workgroup.id<x> : index"},
+     {"thread.workgroup_id.y", "$r = kernel.workgroup.id<y> : index"},
+@@ -170,8 +189,11 @@ struct ResultType {
+ };
+ 
+ // Everything not listed produces f32, which is what every arithmetic row does.
+-constexpr std::array<ResultType, 6> kNonFloatResults{{
++constexpr std::array<ResultType, 9> kNonFloatResults{{
+     {"bits.f16", "i32"},
++    {"dot4.i32.iu8", "i32"},
++    {"min.u32", "i32"},
++    {"max.u32", "i32"},
+     {"thread.local_id", "index"},
+     {"thread.workgroup_id.x", "index"},
+     {"thread.workgroup_id.y", "index"},
+@@ -179,13 +201,77 @@ constexpr std::array<ResultType, 6> kNonFloatResults{{
+     {"thread.grid_dim.x", "index"},
+ }};
+ 
++// Only these shared measured layouts match Loom's RDNA4 single-tile catalog.
++// Chained/unmeasured rows are deliberately absent even when a key is shared.
++struct MatrixSpelling {
++  const math::MatrixCoreRow* row = nullptr;
++  std::string text;
++  std::string result;
++};
++const std::vector<MatrixSpelling>& matrix_spellings() {
++  static const std::vector<MatrixSpelling> rows = [] {
++    std::vector<MatrixSpelling> out;
++    for (const auto& r : math::matrix_core_table()) {
++      if (r.target != math::MatrixTarget::kRdna4 || !r.emittable() ||
++          r.chained != 1 || r.m != 16 || r.n != 16 || r.k != 16 ||
++          r.wave != 32 || r.operands != math::OperandLayout::kLaneRowSplitK ||
++          r.acc_layout != math::AccLayout::kRowBlockHalfWave) continue;
++      std::string a_format, b_format;
++      switch (r.operand) {
++        case math::MatrixElem::kF16: a_format = b_format = "f16"; break;
++        case math::MatrixElem::kBF16: a_format = b_format = "bf16"; break;
++        case math::MatrixElem::kI8: a_format = b_format = "i8"; break;
++        case math::MatrixElem::kSU8: a_format = "i8"; b_format = "u8"; break;
++        case math::MatrixElem::kFp8: a_format = b_format = "f8e4m3"; break;
++        case math::MatrixElem::kBf8: a_format = b_format = "f8e5m2"; break;
++        default: continue;
++      }
++      const std::string a = loom_vector_type(r.a_elem, static_cast<std::uint32_t>(r.a_len));
++      const std::string b = loom_vector_type(r.b_elem, static_cast<std::uint32_t>(r.b_len));
++      const std::string c = loom_vector_type(r.c_elem, static_cast<std::uint32_t>(r.c_len));
++      auto schema = [&](int temporary, const std::string& format, int length,
++                        ir::Scalar elem) {
++        return "$t" + std::to_string(temporary) +
++            " = encoding.define #matrix_operand<element_format=" + format +
++            ", payload_elements=" + std::to_string(length * r.pack) +
++            ", payload_registers=" + std::to_string(static_cast<unsigned>(length) * ir::scalar_bytes(elem) / 4) +
++            "> : encoding<schema>\n";
++      };
++      std::string text = "$t0 = index.constant " + std::to_string(r.m) + " : index\n";
++      text += "$t1 = index.constant " + std::to_string(r.n) + " : index\n";
++      text += "$t2 = index.constant " + std::to_string(r.k) + " : index\n";
++      text += schema(3, a_format, r.a_len, r.a_elem);
++      text += schema(4, b_format, r.b_len, r.b_elem);
++      text += "$t5 = vector.fragment<lhs> $0 shape [$t0, $t2] using {schema = $t3 : encoding<schema>} : " + a + "\n";
++      text += "$t6 = vector.fragment<rhs> $1 shape [$t2, $t1] using {schema = $t4 : encoding<schema>} : " + b + "\n";
++      text += "$t7 = vector.fragment<init> $2 shape [$t0, $t1] : " + c + "\n";
++      text += "$r = vector.mma $t5, $t6, $t7 : " + a + ", " + b + ", " + c;
++      out.push_back({&r, std::move(text), c});
++    }
++    return out;
++  }();
++  return rows;
++}
+ }  // namespace
+ 
++const math::MatrixCoreRow* loom_matrix_row(std::string_view key) noexcept {
++  for (const auto& r : matrix_spellings()) if (r.row->key == key) return r.row;
++  return nullptr;
++}
++
+ graph::DialectSourceTable loom_sources() noexcept {
+-  return graph::DialectSourceTable(kLoomSources, graph::Dialect::kLoom);
++  static const std::vector<graph::PrimitiveSource> rows = [] {
++    std::vector<graph::PrimitiveSource> all(kLoomSources.begin(), kLoomSources.end());
++    for (const auto& r : matrix_spellings()) all.push_back({r.row->key, r.text});
++    return all;
++  }();
++  return graph::DialectSourceTable(rows, graph::Dialect::kLoom);
+ }
+ 
+ std::string_view loom_result_type(std::string_view primitive) noexcept {
++  for (const auto& r : matrix_spellings()) {
++    if (r.row->key == primitive) return r.result;
++  }
+   if (graph::DialectSourceTable(kLoomSources).find(primitive).empty()) {
+     return {};
+   }
 diff --git a/src/backends/registry.cpp b/src/backends/registry.cpp
 index afeb740..ecf962d 100644
 --- a/src/backends/registry.cpp
@@ -2105,11 +2882,77 @@ index 3ad7a35..0abc576 100644
      if (fd < 0) {
        // Out of descriptors: the connection stays queued and the listening
        // socket stays readable, so waiting on it again would report ready
+diff --git a/src/graph/partitioner.cpp b/src/graph/partitioner.cpp
+index 9a56b49..e3613b1 100644
+--- a/src/graph/partitioner.cpp
++++ b/src/graph/partitioner.cpp
+@@ -1,4 +1,5 @@
+ #include "lse/graph/graph.hpp"
++#include "lse/graph/gdn_pair.hpp"
+ 
+ #include "lse/graph/kernel_primitive.hpp"
+ #include "lse/graph/workgroup.hpp"
+@@ -722,6 +723,40 @@ std::vector<FusionGroup> Partitioner::partition(
+     groups = std::move(kept);
+   }
+ 
++  // Both recurrence siblings read the same six immutable input nodes. Move
++  // only the later singleton into the earlier singleton; all inputs were
++  // already ready there, and every consumer/root keeps its original node.
++  // Other kernel/epilogue groups remain untouched.
++  std::unordered_map<const Node*, std::vector<std::size_t>> gdn_candidates;
++  for (std::size_t gi = 0; gi < groups.size(); ++gi) {
++    auto& group = groups[gi];
++    if (group.nodes.size() != 1 || group.is_phase) continue;
++    const auto& n = group.nodes.front();
++    if (!n || n->kind != OpKind::kGDNChunkScan || n->inputs.size() != 6 || !n->inputs[0]) continue;
++    auto& earlier = gdn_candidates[n->inputs[0].get()];
++    bool merged = false;
++    for (const auto dst : earlier) {
++      if (groups[dst].nodes.size() != 1 ||
++          !exact_gdn_pair(groups[dst].nodes.front(), n) || !inputs_ordered(*n, dst)) continue;
++      groups[dst].nodes.push_back(n);
++      group_of[n.get()] = dst;
++      group.nodes.clear();
++      merged = true;
++      break;
++    }
++    if (!merged) earlier.push_back(gi);
++  }
++  {
++    std::vector<FusionGroup> kept;
++    std::vector<std::size_t> remap(groups.size());
++    for (std::size_t gi = 0; gi < groups.size(); ++gi) {
++      remap[gi] = kept.size();
++      if (!groups[gi].nodes.empty()) kept.push_back(std::move(groups[gi]));
++    }
++    for (auto& [node, gi] : group_of) gi = remap[gi];
++    groups = std::move(kept);
++  }
++
+   // Inputs are values read from outside the group; outputs are values a node in
+   // another group, or a root, needs.
+   for (std::size_t gi = 0; gi < groups.size(); ++gi) {
+@@ -757,7 +792,8 @@ std::vector<FusionGroup> Partitioner::partition(
+ 
+     Workgroup wg(wg_dev);
+     for (const NodePtr& n : g.nodes) (void)wg.try_add(n);
+-    g.launches = wg.launches();
++    g.launches = g.nodes.size() == 2 && exact_gdn_pair(g.nodes[0], g.nodes[1])
++        ? 1u : wg.launches();
+   }
+ 
+   return groups;
 diff --git a/src/graph/scheduler.cpp b/src/graph/scheduler.cpp
-index e5045ed..318f792 100644
+index e5045ed..8d12810 100644
 --- a/src/graph/scheduler.cpp
 +++ b/src/graph/scheduler.cpp
-@@ -23,7 +23,9 @@
+@@ -1,3 +1,4 @@
++#include "lse/graph/gdn_pair.hpp"
+ #include "lse/graph/graph.hpp"
+ 
+ #include <algorithm>
+@@ -23,7 +24,9 @@
  #include "lse/graph/program.hpp"
  #include "lse/graph/stream_plan.hpp"
  #include "lse/graph/kernel_primitive.hpp"
@@ -2119,7 +2962,7 @@ index e5045ed..318f792 100644
  
  namespace lse::graph {
  namespace {
-@@ -656,7 +658,33 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
+@@ -656,7 +659,33 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
    // ones a wrong-device launch would read.
    LSE_RETURN_IF_ERROR(check_residency(bindings, member));
  
@@ -2154,7 +2997,7 @@ index e5045ed..318f792 100644
    if (impl_->member_dirty.size() <= member) {
      impl_->member_dirty.resize(member + 1, 0);
    }
-@@ -664,8 +692,37 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
+@@ -664,8 +693,37 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
    const Status submitted = be.launch(
        launched, emitted->dims, args,
        backend::DispatchTarget{stream, devices_.residency(member), {}});
@@ -2194,7 +3037,25 @@ index e5045ed..318f792 100644
    // Diagnostic: LSE_DUMP_BUFFERS=<entry substring> drains the device after
    // this dispatch and prints a checksum and the first values of every bound
    // buffer, so a kernel's inputs and outputs can be compared across builds.
-@@ -827,6 +884,7 @@ std::uint64_t attributed_ns(const Scheduler::Trace::Spans& s) noexcept {
+@@ -788,17 +846,6 @@ void alias_ready_reshapes(const FusionGroup& group) {
+   }
+ }
+ 
+-bool is_gdn_node(const Node& n) noexcept {
+-  return n.kind == OpKind::kGDNChunkScan;
+-}
+-
+-bool same_gdn_inputs(const Node& a, const Node& b) noexcept {
+-  if (a.inputs.size() != 6 || b.inputs.size() != 6) return false;
+-  for (std::size_t i = 0; i < 6; ++i) {
+-    if (a.inputs[i].get() != b.inputs[i].get()) return false;
+-  }
+-  return true;
+-}
+ 
+ Status accumulate_spans(Scheduler::Trace::Spans& acc,
+                         const Scheduler::Trace::Spans& step) {
+@@ -827,6 +874,7 @@ std::uint64_t attributed_ns(const Scheduler::Trace::Spans& s) noexcept {
  
  Status accumulate(Scheduler::Trace& acc, const Scheduler::Trace& step) {
    acc.device_groups += step.device_groups;
@@ -2202,7 +3063,7 @@ index e5045ed..318f792 100644
    acc.host_groups += step.host_groups;
    acc.phase_groups += step.phase_groups;
    acc.phase_ideal_launches += step.phase_ideal_launches;
-@@ -951,6 +1009,31 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
+@@ -951,6 +999,31 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
    trace_.launch_ns = trace_.spans.submit.ns;
    trace_.sync_ns = trace_.spans.host_wait.ns;
  
@@ -2234,7 +3095,7 @@ index e5045ed..318f792 100644
    const Status accumulated = accumulate(acc_, trace_);
    if (!ran.ok()) return ran;
    return accumulated;
-@@ -1004,6 +1087,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
+@@ -1004,6 +1077,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
    // ones and pays none of it, which is why this and `schedule` are two spans
    // and not one.
    SpanTimer build_span(trace_.spans.partition, setup_span.close());
@@ -2242,7 +3103,7 @@ index e5045ed..318f792 100644
    auto planned = replayed
                       ? std::vector<Workgroup>{}
                       : Partitioner::phases(roots, &backend().device_info());
-@@ -1019,6 +1103,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
+@@ -1019,6 +1093,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
      // the same one-group path a node it refuses to stage already takes.
      const IPhaseStaging* staging = emitter->staging();
      for (Workgroup& wg : planned) {
@@ -2250,7 +3111,30 @@ index e5045ed..318f792 100644
        FusionGroup g = Partitioner::phase_group(wg, roots);
        if (g.nodes.empty()) continue;
        alias_ready_reshapes(g);
-@@ -1207,6 +1292,12 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
+@@ -1077,18 +1152,13 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
+         return 0;
+       };
+       auto join_gdn_pair = [&](const NodePtr& n) -> bool {
+-        if (phase_groups.empty() || !is_gdn_node(*n)) return false;
++        if (phase_groups.empty()) return false;
+         FusionGroup& prev = phase_groups.back();
+         if (prev.is_phase || prev.nodes.size() != 1) return false;
+-        if (!is_gdn_node(*prev.nodes[0])) return false;
+-        if (!same_gdn_inputs(*prev.nodes[0], *n)) return false;
+-        if (prev.nodes[0]->iattrs[0] == n->iattrs[0]) return false;
++        const auto pair = exact_gdn_pair(prev.nodes.front(), n);
++        if (!pair) return false;
+         prev.nodes.push_back(n);
+-        prev.outputs.clear();
+-        for (const NodePtr& m : prev.nodes) {
+-          if (m->iattrs[0] == 0) prev.outputs.push_back(m);
+-        }
+-        if (prev.outputs.empty()) prev.outputs.push_back(prev.nodes[0]);
++        prev.outputs = {pair.output, pair.state};
+         return true;
+       };
+       auto join_wide_linear = [&](const NodePtr& n) -> bool {
+@@ -1207,6 +1277,12 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
          if (staging == nullptr || !staging->can_stage(*n)) {
            flush_staged();
            if (join_gdn_pair(n)) continue;
@@ -2263,7 +3147,42 @@ index e5045ed..318f792 100644
            FusionGroup one;
            one.nodes.push_back(n);
            one.outputs.push_back(n);
-@@ -1599,6 +1690,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
+@@ -1295,6 +1371,34 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
+     }
+   }
+ 
++  // Exact GDN siblings can be separated by consumers of the primary output.
++  // Both read the same six nodes, so the later pure recurrence can run at the
++  // earlier position. Preserve both original output identities and bindings.
++  if (!replayed && emitter != nullptr && emitter->staging() == nullptr) {
++    std::unordered_map<const Node*, std::vector<std::size_t>> candidates;
++    for (std::size_t i = 0; i < phase_groups.size(); ++i) {
++      auto& group = phase_groups[i];
++      if (group.is_phase || group.nodes.size() != 1) continue;
++      const auto n = group.nodes.front();
++      if (!n || n->kind != OpKind::kGDNChunkScan || n->inputs.size() != 6) continue;
++      auto& earlier = candidates[n->inputs.front().get()];
++      bool merged = false;
++      for (auto j : earlier) {
++        auto& previous = phase_groups[j];
++        if (previous.nodes.size() != 1) continue;
++        const auto pair = exact_gdn_pair(previous.nodes.front(), n);
++        if (!pair) continue;
++        previous.nodes.push_back(n);
++        previous.outputs = {pair.output, pair.state};
++        group.nodes.clear();
++        merged = true;
++        break;
++      }
++      if (!merged) earlier.push_back(i);
++    }
++    std::erase_if(phase_groups, [](const FusionGroup& g) { return g.nodes.empty(); });
++  }
++
+   std::vector<FusionGroup> ran;
+   // Back to per-step setup: the stream plan and the entry barriers.
+   SpanTimer place_span(trace_.spans.schedule, build_span.close());
+@@ -1599,6 +1703,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
    // dispatch loop to the remainder rather than being folded in here — which is
    // what the old partition_ns did, silently.
    const auto t_repartition = place_span.close();
@@ -2271,7 +3190,7 @@ index e5045ed..318f792 100644
    std::vector<FusionGroup> groups =
        Partitioner::partition(roots, &backend().device_info());
    trace_.spans.partition.add(elapsed_ns(t_repartition, SpanClock::now()));
-@@ -1677,8 +1769,18 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
+@@ -1677,8 +1782,18 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
          ran.push_back(g);
          continue;
        }
@@ -2292,7 +3211,7 @@ index e5045ed..318f792 100644
        ++trace_.host_groups;
        trace_.host_group_reasons.push_back(dispatched.message());
      }
-@@ -1691,6 +1793,12 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
+@@ -1691,6 +1806,12 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
        launched = false;
      }
  
@@ -2305,7 +3224,7 @@ index e5045ed..318f792 100644
      // Host-only mode reaches here without passing the device-first arm above,
      // so nothing had counted this group. Leaving it uncounted printed
      // `groups device=0 host=0` beside a five-figure launch count, which reads
-@@ -1870,6 +1978,9 @@ ScopedMember::ScopedMember(std::size_t member) noexcept
+@@ -1870,6 +1991,9 @@ ScopedMember::ScopedMember(std::size_t member) noexcept
  ScopedMember::~ScopedMember() { g_preferred_member = previous_; }
  
  Scheduler* default_scheduler() {
@@ -3514,7 +4433,7 @@ index 82f522d..c9926d2 100644
    std::lock_guard lock(d.mu);
    if (d.built) {
 diff --git a/src/probe/pool.cpp b/src/probe/pool.cpp
-index 22ffa1b..937e999 100644
+index 22ffa1b..beb83f0 100644
 --- a/src/probe/pool.cpp
 +++ b/src/probe/pool.cpp
 @@ -1,6 +1,8 @@
@@ -3550,7 +4469,7 @@ index 22ffa1b..937e999 100644
    if (member.backend == nullptr) return "absent";
    const backend::DeviceInfo& info = member.backend->device_info();
 -  std::string s;
-+  std::string s = "device-probe-v3-validated-stream-touch|";
++  std::string s = "device-probe-v4-validated-matrix|";
    s += member.backend->name();
    s += '|';
    s += info.arch;
@@ -3889,13 +4808,27 @@ index 9f17d38..35db5ad 100644
  }
  
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index a787603..c1f700e 100644
+index a787603..82243de 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
-@@ -12,6 +12,34 @@ function(lse_add_test name)
+@@ -12,6 +12,56 @@ function(lse_add_test name)
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
  endfunction()
  
++if(APPLE)
++  add_library(lse_runtime_fixture SHARED loaded_runtime_fixture.cpp)
++  set_target_properties(lse_runtime_fixture PROPERTIES VERSION 1.2 SOVERSION 1)
++  add_executable(test_loaded_runtime test_loaded_runtime.cpp)
++  target_link_libraries(test_loaded_runtime PRIVATE lse_core)
++  target_include_directories(test_loaded_runtime PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
++  lse_apply_common_flags(test_loaded_runtime)
++  add_dependencies(test_loaded_runtime lse_runtime_fixture)
++  add_test(NAME test_loaded_runtime COMMAND ${CMAKE_COMMAND} -E env
++    "DYLD_LIBRARY_PATH=$<TARGET_FILE_DIR:lse_runtime_fixture>"
++    $<TARGET_FILE:test_loaded_runtime> $<TARGET_FILE:lse_runtime_fixture>)
++endif()
++
++lse_add_test(test_hrx_copy_route)
 +lse_add_test(test_probe_measurement)
 +lse_add_test(test_token_ids)
 +lse_add_test(test_attention_decode lse_graph lse_kernels lse_ir)
@@ -3917,6 +4850,14 @@ index a787603..c1f700e 100644
 +endif()
 +lse_add_test(test_generation_stats)
 +# Ordinary fused SSA chains need no device or model.
++if(TARGET lse_backend_cpu)
++  lse_add_test(test_scheduler_epilogue lse_graph lse_kernels lse_ir lse_backend_cpu)
++  target_sources(test_scheduler_epilogue PRIVATE
++    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
++    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
++    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
++    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
++endif()
 +lse_add_test(test_pointwise_fusion lse_graph lse_kernels lse_ir)
 +target_sources(test_pointwise_fusion PRIVATE
 +  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
@@ -3927,7 +4868,7 @@ index a787603..c1f700e 100644
  lse_add_test(test_dtype)
  lse_add_test(test_reflect)
  # lse_backends is the set of backends this build ships. A test that runs a
-@@ -19,9 +47,82 @@ lse_add_test(test_reflect)
+@@ -19,9 +69,95 @@ lse_add_test(test_reflect)
  # deliberately does not link any of them, so nothing arrives transitively.
  lse_add_test(test_kernel_env lse_graph lse_backends)
  lse_add_test(test_ir lse_ir lse_graph lse_backends)
@@ -3995,6 +4936,19 @@ index a787603..c1f700e 100644
 +    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
 +    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
 +endif()
++# Exact paired recurrence scheduling and logical binding contracts, no GPU.
++lse_add_test(test_gdn_pair lse_graph lse_kernels lse_backends lse_ir)
++if(NOT TARGET lse_backend_hrx)
++  target_sources(test_gdn_pair PRIVATE
++    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_emitter.cpp
++    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/phase_emit.cpp
++    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_sources.cpp
++    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_types.cpp
++    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
++    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
++    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
++    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
++endif()
  lse_add_test(test_shape)
  lse_add_test(test_server lse_server lse_tokenizer lse_model lse_backends)
 +# Socket lifecycle coverage never opens a model or device.
@@ -4010,7 +4964,7 @@ index a787603..c1f700e 100644
  lse_add_test(test_model lse_model lse_backends)
  
  if(LSE_ENABLE_CPU)
-@@ -35,7 +136,7 @@ endif()
+@@ -35,7 +171,7 @@ endif()
  
  if(LSE_ENABLE_CPU)
    lse_add_test(test_backend_cpu lse_backend_cpu)
@@ -4019,17 +4973,52 @@ index a787603..c1f700e 100644
    lse_add_test(test_primitive lse_graph lse_backends)
  endif()
  
-@@ -86,3 +187,11 @@ if(LSE_ROCM_RUNTIME_DIR)
+@@ -86,3 +222,46 @@ if(LSE_ROCM_RUNTIME_DIR)
    set_tests_properties(${lse_tests} PROPERTIES
      ENVIRONMENT "LD_LIBRARY_PATH=${LSE_ROCM_RUNTIME_DIR}")
  endif()
 +
 +if(TARGET lse_backend_hrx AND LSE_HAVE_LOOMC)
 +  lse_add_test(test_loom_probe lse_backend_hrx)
++  if(TARGET lse_backend_cpu)
++    lse_add_test(test_matrix_probe_lifecycle lse_backend_hrx lse_backend_cpu lse_probe)
++    target_sources(test_matrix_probe_lifecycle PRIVATE
++      ${CMAKE_SOURCE_DIR}/src/backends/hrx/kernels/probe.cpp)
++  endif()
 +endif()
 +
 +if(TARGET lse_backend_cpu)
 +  lse_add_test(test_probe_policy lse_probe lse_backend_cpu)
++endif()
++
++if(TARGET lse_backend_cpu)
++  lse_add_test(test_gdn_scheduler lse_graph lse_kernels lse_ir lse_backend_cpu)
++  target_sources(test_gdn_scheduler PRIVATE
++    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
++    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
++    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
++    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
++endif()
++
++lse_add_test(test_loom_matrix lse_ir lse_kernels lse_graph)
++target_sources(test_loom_matrix PRIVATE
++ ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
++ ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp
++ ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp)
++if(LSE_ENABLE_HRX)
++ add_executable(compile_loom_matrix compile_loom_matrix.cpp)
++ target_link_libraries(compile_loom_matrix PRIVATE lse_backend_hrx lse_graph lse_kernels)
++endif()
++
++# Mixed-sign dot and activation rounding remain independently typed and gated.
++lse_add_test(test_loom_dot lse_graph lse_kernels lse_ir)
++target_sources(test_loom_dot PRIVATE
++  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
++  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
++  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
++  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
++if(TARGET lse_backend_hrx AND LSE_HAVE_LOOMC)
++  lse_add_test(test_loom_dot_native lse_backend_hrx lse_graph lse_kernels lse_ir)
 +endif()
 diff --git a/tests/test_ir.cpp b/tests/test_ir.cpp
 index 56fefa9..1a578b0 100644
@@ -4235,16 +5224,69 @@ index dd9e019..79de680 100644
 +    for (const auto& old : old_outputs) LSE_EXPECT(c.in.get() != old.get());
 +  }
 +}
+diff --git a/include/lse/backends/hrx/copy_route.hpp b/include/lse/backends/hrx/copy_route.hpp
+new file mode 100644
+index 0000000..dd16c4c
+--- /dev/null
++++ b/include/lse/backends/hrx/copy_route.hpp
+@@ -0,0 +1,16 @@
++#pragma once
++#include "lse/backend/backend.hpp"
++namespace lse::backend::detail {
++// Residency is the non-recycled token Backend::init assigns to this instance,
++// stamped by Backend::allocate. A shared backend family or equal foreign tokens
++// do not authorize use of this instance's queues. On a single physical device,
++// valid member indices name local streams; a spanning device needs peer policy.
++inline bool own_single_device_copy(DeviceIndex owner, unsigned physical_count,
++                                   std::size_t stream_count,
++                                   const DeviceBuffer &src,
++                                   const DeviceBuffer &dst) noexcept {
++  return owner.bound() && physical_count == 1 && src.residency == owner &&
++         dst.residency == owner && src.member < stream_count &&
++         dst.member < stream_count;
++}
++} // namespace lse::backend::detail
+diff --git a/include/lse/backends/hrx/loaded_library.hpp b/include/lse/backends/hrx/loaded_library.hpp
+new file mode 100644
+index 0000000..c8a97f4
+--- /dev/null
++++ b/include/lse/backends/hrx/loaded_library.hpp
+@@ -0,0 +1,24 @@
++#pragma once
++#include <dlfcn.h>
++
++namespace lse::backend::detail {
++// Acquire a reference to an existing image only. Darwin's RTLD_NOLOAD lookup
++// need not resolve the search-path alias used to load a versioned dylib. A
++// globally visible anchor identifies its actual resident path without loading
++// another runtime or bypassing an already-installed interposer.
++inline void *open_loaded_library(const char *name,
++                                 const char *anchor) noexcept {
++  if (void *library = dlopen(name, RTLD_LAZY | RTLD_NOLOAD))
++    return library;
++#if defined(__APPLE__)
++  Dl_info image{};
++  void *symbol = dlsym(RTLD_DEFAULT, anchor);
++  if (symbol != nullptr && dladdr(symbol, &image) != 0 &&
++      image.dli_fname != nullptr)
++    return dlopen(image.dli_fname, RTLD_LAZY | RTLD_NOLOAD);
++#else
++  (void)anchor;
++#endif
++  return nullptr;
++}
++} // namespace lse::backend::detail
 diff --git a/include/lse/backends/hrx/probe_emit.hpp b/include/lse/backends/hrx/probe_emit.hpp
 new file mode 100644
-index 0000000..05f4cea
+index 0000000..390528a
 --- /dev/null
 +++ b/include/lse/backends/hrx/probe_emit.hpp
-@@ -0,0 +1,13 @@
+@@ -0,0 +1,16 @@
 +#pragma once
 +
 +#include <cstdint>
 +#include "lse/graph/codegen.hpp"
++#include "lse/math.hpp"
 +
 +namespace lse::backend::hrx_kernels {
 +// Compile-only seam: records the shared calibration bodies, without allocating
@@ -4253,7 +5295,166 @@ index 0000000..05f4cea
 +    const DeviceInfo& device, std::uint32_t elements, std::uint32_t threads,
 +    std::uint32_t load_bytes);
 +Result<graph::EmittedKernel> emit_loom_touch_probe(const DeviceInfo& device);
++Result<graph::EmittedKernel> emit_loom_matrix_rate_probe(
++    const DeviceInfo& device, const math::MatrixCoreRow& row, DType storage);
 +}  // namespace lse::backend::hrx_kernels
+diff --git a/include/lse/backends/hrx/probe_matrix.hpp b/include/lse/backends/hrx/probe_matrix.hpp
+new file mode 100644
+index 0000000..cdbd314
+--- /dev/null
++++ b/include/lse/backends/hrx/probe_matrix.hpp
+@@ -0,0 +1,109 @@
++#pragma once
++#include "lse/kernels/wmma.hpp"
++#include "lse/graph/kernel_env.hpp"
++#include "lse/graph/kernel_args.hpp"
++
++namespace lse::backend::hrx_kernels::probe_matrix {
++using namespace lse::graph;
++using namespace lse::kernels;
++// The shape the matrix rows are rated at.
++//
++// Deliberately small enough that both operands stay resident in L2: the tile
++// re-reads its A row and B column for every output tile, so a shape that spills
++// to DRAM would measure the same roofline the streaming probe already reports
++// and tell the cost model nothing new about the matrix core. K is long so the
++// instruction loop, not the tile setup, dominates.
++inline constexpr std::uint32_t kRateM = 256;
++inline constexpr std::uint32_t kRateN = 256;
++inline constexpr std::uint32_t kRateK = 1024;
++inline constexpr int kRateReps = 8;
++
++inline constexpr int kTileM = 16;
++inline constexpr int kTileN = 16;
++inline constexpr int kTileK = 16;
++
++template <class E, class X = kir::f32, class W = kir::f32>
++struct RateArgs {
++  env::In<X, E> x;
++  env::In<W, E> w;
++  env::Out<kir::f32, E> out;
++};
++
++// The shared tile writes its final accumulator directly in the standalone
++// HIP wrapper, or through the existing output hook in the Loom graph emitter.
++// The arithmetic and logical output index are identical in both cases.
++template <math::MatrixTarget G, math::MatrixElem A, math::MatrixElem T>
++struct RateTile : MatrixTile<RateTile<G, A, T>, G, A, T, kTileM, kTileN, kTileK> {
++  const env::Out<kir::f32, env::Emit>* out = nullptr;
++  std::uint32_t cols = 0;
++  bool store_through_hook = false;
++
++  void emit_element(env::Emit& e, const kir::Val<kir::u32>& row,
++                    const kir::Val<kir::u32>& col,
++                    const kir::Val<kir::f32>& v) const {
++    if (store_through_hook) e.store(row * cols + col, v);
++    else (*out)[row * cols + col] = v;
++  }
++};
++
++// The generations whose lane layouts have been measured here. Same pack the
++// linear kernel carries, for the same reason: an unmeasured layout is a silent
++// wrong answer, and a probe that emitted one would be timing nonsense.
++template <math::MatrixTarget... Live, class F>
++[[nodiscard]] std::string for_live_target(math::MatrixTarget t, F&& fn) {
++  std::string out;
++  const auto one = [&]<math::MatrixTarget L>() {
++    if (t == L) out = fn.template operator()<L>();
++  };
++  (one.template operator()<Live>(), ...);
++  return out;
++}
++
++inline std::string rate_body(const DeviceInfo& info,
++    const math::MatrixCoreRow& row, DType storage,
++    const kir::TypeTable& types, const DialectSourceTable& table,
++    const KernelShapes* shapes = nullptr) {
++  const std::uint32_t kb = static_cast<std::uint32_t>(
++      kRateK / static_cast<std::uint32_t>(row.pack));
++
++  return for_live_target<math::MatrixTarget::kRdna3,
++                                   math::MatrixTarget::kRdna4>(
++      row.target, [&]<math::MatrixTarget G>() -> std::string {
++        return with_matrix_operand<std::string>(
++            storage,
++            [&]<class X, class W, math::MatrixElem A, math::MatrixElem T>()
++                -> std::string {
++              if (A != row.acc || T != row.operand) return {};
++              kir::KernelBody k(types, table);
++              RateArgs<env::Emit, X, W> a;
++              const DType ins[] = {env::elem_dtype<X>::value,
++                                   env::elem_dtype<W>::value};
++              if (shapes != nullptr) {
++                k.set_store(shapes->store);
++                if (!env::bind(k, a, *shapes)) return {};
++              } else if (!env::bind(k, a, ins, DType::kF32)) return {};
++              env::Emit e{&k};
++              RateTile<G, A, T> tile;
++              tile.out = &a.out;
++              tile.cols = kRateN;
++              tile.store_through_hook = shapes != nullptr;
++              tile.run(e, a.x, a.w, kRateM, kRateN, kb,
++                       device_load_bytes(&info));
++              return k.str();
++            });
++      });
++
++}
++inline LaunchDims rate_dims(const DeviceInfo& info, const math::MatrixCoreRow& row) {
++  const auto lanes = static_cast<std::uint32_t>(row.wave);
++  const std::uint32_t tiles_n = (kRateN + kTileN - 1) / kTileN;
++  const std::uint32_t tiles = ((kRateM + kTileM - 1) / kTileM) * tiles_n;
++  const std::uint32_t cap = info.max_threads_per_workgroup >= 256 ? 256u : 64u;
++  const std::uint32_t waves = cap / lanes;
++  LaunchDims dims;
++  dims.workgroup_size[0] = waves * lanes;
++  dims.workgroup_count[0] = (tiles + waves - 1) / waves;
++  dims.subgroup_size = lanes;
++  return dims;
++}
++} // namespace lse::backend::hrx_kernels::probe_matrix
+diff --git a/include/lse/backends/hrx/probe_matrix_measurement.hpp b/include/lse/backends/hrx/probe_matrix_measurement.hpp
+new file mode 100644
+index 0000000..60da4ef
+--- /dev/null
++++ b/include/lse/backends/hrx/probe_matrix_measurement.hpp
+@@ -0,0 +1,36 @@
++#pragma once
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <span>
++#include <vector>
++#include "lse/core/dtype.hpp"
++#include "lse/core/status.hpp"
++
++namespace lse::backend::hrx_kernels {
++inline Result<std::vector<std::byte>> matrix_probe_ones(
++    DType storage, bool activation, std::size_t bytes) {
++  std::uint32_t bits = 0;
++  std::size_t width = 0;
++  if (storage == DType::kI32) { bits=0x01010101u; width=4; }
++  else if (activation && (storage==DType::kF16 || storage==DType::kBF16)) {
++    bits=0x3f800000u; width=4;
++  } else if (storage==DType::kF16) { bits=0x3c00u; width=2; }
++  else if (storage==DType::kBF16) { bits=0x3f80u; width=2; }
++  else return LSE_ERROR(kUnimplemented,"no exact matrix-probe operand seed");
++  if (bytes==0 || bytes%width) return LSE_ERROR(kInvalidArgument,"partial matrix-probe operand");
++  std::vector<std::byte> result(bytes);
++  for(std::size_t i=0;i<bytes;i+=width)std::memcpy(result.data()+i,&bits,width);
++  return result;
++}
++inline Status check_matrix_probe_output(std::span<const float> values,
++    std::size_t guard, std::size_t payload, float expected) {
++  if(!guard || !payload || values.size()!=payload+2*guard)
++    return LSE_ERROR(kInvalidArgument,"invalid guarded matrix output");
++  for(std::size_t i=0;i<values.size();++i) {
++    const float want=i>=guard && i<guard+payload?expected:-1234.0f;
++    if(values[i]!=want)return LSE_ERROR(kDeviceError,"matrix probe output mismatch at ",std::to_string(i));
++  }
++  return OkStatus();
++}
++} // namespace lse::backend::hrx_kernels
 diff --git a/include/lse/backends/hrx/probe_measurement.hpp b/include/lse/backends/hrx/probe_measurement.hpp
 new file mode 100644
 index 0000000..17b7901
@@ -4294,7 +5495,7 @@ index 0000000..17b7901
 +}  // namespace lse::backend::hrx_kernels
 diff --git a/include/lse/backends/hrx/probe_retirement.hpp b/include/lse/backends/hrx/probe_retirement.hpp
 new file mode 100644
-index 0000000..3fc09d9
+index 0000000..ef319f2
 --- /dev/null
 +++ b/include/lse/backends/hrx/probe_retirement.hpp
 @@ -0,0 +1,82 @@
@@ -4316,7 +5517,7 @@ index 0000000..3fc09d9
 +class ProbeRetirement {
 +  struct Slot {
 +    bool used = false;
-+    std::array<Buffer, 2> buffers{};
++    std::array<Buffer, 3> buffers{};
 +    std::size_t count = 0;
 +  };
 +  struct Registry {
@@ -4492,12 +5693,54 @@ index 0000000..f041067
 +}
 +
 +}  // namespace lse::backend
+diff --git a/include/lse/graph/gdn_pair.hpp b/include/lse/graph/gdn_pair.hpp
+new file mode 100644
+index 0000000..0fbc936
+--- /dev/null
++++ b/include/lse/graph/gdn_pair.hpp
+@@ -0,0 +1,36 @@
++#pragma once
++#include "lse/graph/graph.hpp"
++
++namespace lse::graph {
++// Only exact pure recurrence siblings qualify. Other consumers still observe
++// their original output nodes; this changes scheduling, never graph identity.
++struct GdnPair {
++  NodePtr output;
++  NodePtr state;
++  explicit operator bool() const { return output && state; }
++};
++inline GdnPair exact_gdn_pair(const NodePtr& a, const NodePtr& b) {
++  if (!a || !b || a == b || a->kind != OpKind::kGDNChunkScan ||
++      b->kind != OpKind::kGDNChunkScan || a->inputs.size() != 6 || b->inputs.size() != 6 ||
++      a->member != b->member || a->dtype != DType::kF32 || b->dtype != DType::kF32 ||
++      !a->prim || !b->prim || a->prim->name() != "gdn_chunk_scan" ||
++      b->prim->name() != "gdn_chunk_scan" || a->attrs != b->attrs) return {};
++  for (std::size_t i = 1; i < a->iattrs.size(); ++i)
++    if (a->iattrs[i] != b->iattrs[i]) return {};
++  if (!((a->iattrs[0] == 0 && b->iattrs[0] == 1) ||
++        (a->iattrs[0] == 1 && b->iattrs[0] == 0))) return {};
++  for (std::size_t i = 0; i < 6; ++i)
++    if (!a->inputs[i] || a->inputs[i] != b->inputs[i] || a->inputs[i]->dtype != DType::kF32) return {};
++  const auto& q = a->inputs[0]->shape;
++  if (q.rank() != 4 || q.dim(0) <= 0 || q.dim(1) <= 0 || q.dim(2) <= 0 ||
++      (q.dim(3) != 16 && q.dim(3) != 32 && q.dim(3) != 64 && q.dim(3) != 128) ||
++      a->inputs[1]->shape != q || a->inputs[2]->shape != q) return {};
++  const Shape scalar{q.dim(0), q.dim(1), q.dim(2)};
++  const Shape state_shape{q.dim(0), q.dim(2), q.dim(3), q.dim(3)};
++  if (a->inputs[3]->shape != scalar || a->inputs[4]->shape != scalar ||
++      a->inputs[5]->shape != state_shape) return {};
++  GdnPair pair{a->iattrs[0] == 0 ? a : b, a->iattrs[0] == 1 ? a : b};
++  if (pair.output->shape != q || pair.state->shape != state_shape) return {};
++  return pair;
++}
++} // namespace lse::graph
 diff --git a/include/lse/graph/pointwise_fusion.hpp b/include/lse/graph/pointwise_fusion.hpp
 new file mode 100644
-index 0000000..2db3038
+index 0000000..6d5ea6e
 --- /dev/null
 +++ b/include/lse/graph/pointwise_fusion.hpp
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,77 @@
 +#pragma once
 +
 +#include <algorithm>
@@ -4509,9 +5752,11 @@ index 0000000..2db3038
 +
 +namespace lse::graph {
 +
-+// Preserve ordinary per-element fusion when an emitter has no staged-phase
-+// form. This never fuses a reduction, an indexed kernel, a view or a state
-+// write. Call only for adjacent nodes within the same already ordered phase.
++// Preserve the common partitioner's pointwise and kernel-epilogue contracts
++// when an emitter has no staged-phase form. A supported kernel may be the
++// first producer, but never an appended consumer: its existing output hook
++// evaluates the equal-shape FP32 epilogue at the same logical element index.
++// Call only for adjacent nodes within the same already ordered phase.
 +inline bool join_pointwise_chain(FusionGroup &previous, const NodePtr &next,
 +                                 std::span<const NodePtr> roots,
 +                                 const DialectSourceTable &sources) {
@@ -4537,16 +5782,24 @@ index 0000000..2db3038
 +  // or change the indexing of an aliased/broadcast value.
 +  if (!Partitioner::can_fuse(*producer, *next))
 +    return false;
-+  for (const NodePtr &n : previous.nodes) {
-+    if (!ordinary(n) || n->shape != next->shape || n->member != next->member) {
-+      return false;
-+    }
++  bool kernel_anchor = false;
++  for (std::size_t i = 0; i < previous.nodes.size(); ++i) {
++    const NodePtr &n = previous.nodes[i];
++    if (!n || n->materialized || n->dtype != DType::kF32 ||
++        n->shape != next->shape || n->member != next->member) return false;
++    if (ordinary(n)) continue;
++    const auto *kernel = dynamic_cast<const KernelPrimitiveBase *>(n->prim);
++    if (i != 0 || kernel == nullptr || !kernel->supports_epilogue() ||
++        kernel->inplace_input() >= 0) return false;
++    kernel_anchor = true;
 +  }
 +
 +  previous.nodes.push_back(next);
 +  previous.outputs.assign(1, next);
-+  previous.anchor = next->kind;
-+  previous.anchor_class = next->fclass;
++  if (!kernel_anchor) {
++    previous.anchor = next->kind;
++    previous.anchor_class = next->fclass;
++  }
 +  // Retain only outside bindings. Repeated operands share a binding, while
 +  // every internal producer remains an SSA value in the generated body.
 +  previous.inputs.clear();
@@ -4676,11 +5929,12 @@ index 0000000..279a9c6
 +}  // namespace lse::server::detail
 diff --git a/src/backends/hrx/kernels/probe_loom.cpp b/src/backends/hrx/kernels/probe_loom.cpp
 new file mode 100644
-index 0000000..7ae0491
+index 0000000..c9d24a6
 --- /dev/null
 +++ b/src/backends/hrx/kernels/probe_loom.cpp
-@@ -0,0 +1,115 @@
+@@ -0,0 +1,178 @@
 +#include "lse/backends/hrx/probe_emit.hpp"
++#include "lse/backends/hrx/probe_matrix.hpp"
 +
 +#include "lse/backends/hrx/loomc/loom_emitter.hpp"
 +#include "lse/graph/graph.hpp"
@@ -4749,6 +6003,34 @@ index 0000000..7ae0491
 +  }
 +};
 +
++struct MatrixRateProbe final : KernelPrimitive<MatrixRateProbe> {
++  static constexpr std::string_view kName = "probe.matrix_rate";
++  static constexpr std::string_view kEntry = "lse_probe_matrix_rate";
++  static constexpr std::string_view kSource = {};
++  std::size_t arity() const noexcept override { return 2; }
++  bool owns_indexing() const noexcept override { return true; }
++  Result<Shape> infer_shape(std::span<const Shape>) const override {
++    return Shape{probe_matrix::kRateM, probe_matrix::kRateN};
++  }
++  DType infer_dtype(std::span<const DType>) const override { return DType::kF32; }
++  std::string emit_kernel(const KernelShapes& s) const override {
++    if (!s.intrinsics || s.iattrs.size() < 2 || !s.device) return {};
++    const auto rows = math::matrix_core_table();
++    const auto index = static_cast<std::size_t>(s.iattrs[0]);
++    if (index >= rows.size()) return {};
++    return probe_matrix::rate_body(*s.device, rows[index],
++        static_cast<DType>(s.iattrs[1]), s.types, *s.intrinsics, &s);
++  }
++  static ThreadPlan plan_impl(const KernelShapes& s) {
++    ThreadPlan p;
++    const auto dims = probe_matrix::rate_dims(*s.device,
++        math::matrix_core_table()[static_cast<std::size_t>(s.iattrs[0])]);
++    p.workgroup_size[0] = dims.workgroup_size[0];
++    p.workgroup_count[0] = dims.workgroup_count[0];
++    return p;
++  }
++};
++
 +NodePtr node(Shape shape, const Primitive* primitive = nullptr) {
 +  auto n = std::make_shared<Node>();
 +  n->set_kind(primitive ? OpKind::kCustom : OpKind::kBuffer);
@@ -4793,6 +6075,40 @@ index 0000000..7ae0491
 +  }
 +  static const TouchProbe primitive;
 +  return emit(node(Shape{1}, &primitive), device);
++}
++Result<graph::EmittedKernel> emit_loom_matrix_rate_probe(
++    const DeviceInfo& device, const math::MatrixCoreRow& requested, DType storage) {
++  using namespace probe_matrix;
++  const auto target = kernels::matrix_target(device);
++  const auto table = math::matrix_core_table();
++  std::size_t index = table.size();
++  for (std::size_t i = 0; i < table.size(); ++i) {
++    if (table[i].key == requested.key && table[i].acc == requested.acc &&
++        table[i].operand == requested.operand) { index = i; break; }
++  }
++  if (index == table.size() || !target || table[index].target != *target ||
++      !table[index].emittable() || table[index].m != kTileM ||
++      table[index].n != kTileN || table[index].k_step != kTileK ||
++      table[index].wave != device.wavefront_size ||
++      device.max_threads_per_workgroup < 64 ||
++      !math::has_cap(kernels::device_matrix_caps(device), table[index].cap) ||
++      loom_sources().find(table[index].key).empty()) {
++    return LSE_ERROR(kUnimplemented, "no supported Loom matrix probe row");
++  }
++  const auto& row = table[index];
++  const auto elements = static_cast<std::int64_t>(kRateK / row.pack);
++  static const MatrixRateProbe primitive;
++  auto out = node(Shape{kRateM, kRateN}, &primitive);
++  bool bound = kernels::with_matrix_operand<bool>(storage,
++      [&]<class X, class W, math::MatrixElem A, math::MatrixElem T>() {
++        if (A != row.acc || T != row.operand) return false;
++        auto x = node(Shape{kRateM, elements}); x->dtype = env::elem_dtype<X>::value;
++        auto w = node(Shape{kRateN, elements}); w->dtype = env::elem_dtype<W>::value;
++        out->inputs = {x,w}; return true;
++      });
++  if (!bound) return LSE_ERROR(kUnimplemented, "matrix probe has no matching storage arm");
++  out->iattrs = {static_cast<std::int32_t>(index), static_cast<std::int32_t>(storage)};
++  return emit(out, device);
 +}
 +}  // namespace lse::backend::hrx_kernels
 diff --git a/src/cli/token_ids.hpp b/src/cli/token_ids.hpp
@@ -5065,6 +6381,260 @@ index 0000000..e03e6e2
 +};
 +
 +}  // namespace lse::graph::detail
+diff --git a/tests/compile_loom_matrix.cpp b/tests/compile_loom_matrix.cpp
+new file mode 100644
+index 0000000..dcbbde4
+--- /dev/null
++++ b/tests/compile_loom_matrix.cpp
+@@ -0,0 +1,157 @@
++// Offline compilation of the shared matrix tile; never opens a device.
++#include "lse/backends/hrx/arch_database.hpp"
++#include "lse/backends/hrx/loomc/loom_emitter.hpp"
++#include "lse/backends/hrx/loomc/loomc_compiler.hpp"
++#include "lse/graph/graph.hpp"
++#include "lse/graph/kernel_args.hpp"
++#include "lse/kernels/wmma.hpp"
++#include <cstdio>
++#include <fstream>
++using namespace lse;
++namespace kir = graph::kir;
++namespace env = graph::env;
++template <class X, class W> struct Args {
++  env::In<X, env::Emit> x;
++  env::In<W, env::Emit> w;
++};
++template <math::MatrixElem T, math::MatrixElem C>
++struct Tile final : kernels::MatrixTile<Tile<T, C>, math::MatrixTarget::kRdna4,
++                                        C, T, 16, 16, 16> {
++  void emit_element(env::Emit &e, const kir::Val<kir::u32> &row,
++                    const kir::Val<kir::u32> &col,
++                    const kir::Val<kir::f32> &v) const {
++    e.store(row * 16u + col, v);
++  }
++};
++template <math::MatrixElem T, math::MatrixElem C>
++struct Primitive final : graph::KernelPrimitive<Primitive<T, C>> {
++  static constexpr std::string_view kName = "matrix_parity",
++                                    kEntry = "matrix_parity", kSource = "";
++  using Op = math::op::Mma<math::MatrixTarget::kRdna4, C, T, 16, 16, 16>;
++  static constexpr auto row = Op::kRow;
++  using X = math::matrix_scalar_t<row.a_elem>;
++  using W = math::matrix_scalar_t<row.b_elem>;
++  size_t arity() const noexcept override { return 2; }
++  bool owns_indexing() const noexcept override { return true; }
++  Result<Shape> infer_shape(std::span<const Shape>) const override {
++    return Shape{16, 16};
++  }
++  DType infer_dtype(std::span<const DType>) const override {
++    return DType::kF32;
++  }
++  std::string emit_kernel(const graph::KernelShapes &s) const override {
++    kir::KernelBody k(s.types, *s.intrinsics);
++    k.set_store(s.store);
++    Args<X, W> a;
++    if (!env::bind(k, a, s))
++      return {};
++    env::Emit e{&k};
++    Tile<T, C> tile;
++    tile.run(e, a.x, a.w, 16, 16, 32 / row.pack, 16);
++    return k.str();
++  }
++  static graph::ThreadPlan plan_impl(const graph::KernelShapes &) {
++    graph::ThreadPlan p;
++    p.workgroup_size[0] = 32;
++    p.workgroup_count[0] = 1;
++    return p;
++  }
++};
++template <math::MatrixElem T, math::MatrixElem C>
++bool compile(backend::DeviceInfo &info, backend::LoomcCompiler &compiler,
++             const std::string &path, const char *label) {
++  static Primitive<T, C> primitive;
++  constexpr auto row = Primitive<T, C>::row;
++  constexpr auto geometry = kernels::geometry_of(row);
++  std::ofstream layout(path + "/" + label + ".layout");
++  layout << row.wave << " " << row.pack << " " << row.a_len << " " << row.b_len
++         << " " << row.c_len << "\n";
++  for (int lane = 0; lane < row.wave; ++lane) {
++    for (int element = 0; element < row.a_len * row.pack; ++element)
++      layout << "lhs " << lane << " " << element << " " << lane % row.n << " "
++             << (lane / row.n) * geometry.lane_k + element << "\n";
++    for (int element = 0; element < row.b_len * row.pack; ++element)
++      layout << "rhs " << lane << " " << element << " " << lane % row.n << " "
++             << (lane / row.n) * geometry.lane_k + element << "\n";
++    for (int element = 0; element < row.c_len; ++element)
++      layout << "result " << lane << " " << element << " "
++             << element * geometry.slot_step +
++                    (lane / row.n) * geometry.half_rows
++             << " " << lane % row.n << "\n";
++  }
++  auto leaf = [](Shape shape, DType type) {
++    auto n = std::make_shared<graph::Node>();
++    n->set_kind(graph::OpKind::kBuffer);
++    n->shape = shape;
++    n->dtype = type;
++    return n;
++  };
++  auto x = leaf(Shape{16, 32 / row.pack},
++                env::elem_dtype<typename Primitive<T, C>::X>::value);
++  auto w = leaf(Shape{16, 32 / row.pack},
++                env::elem_dtype<typename Primitive<T, C>::W>::value);
++  auto out = leaf(Shape{16, 16}, DType::kF32);
++  out->set_kind(graph::OpKind::kCustom);
++  out->prim = &primitive;
++  out->inputs = {x, w};
++  graph::FusionGroup group;
++  group.nodes = {out};
++  group.inputs = {x, w};
++  group.outputs = {out};
++  group.anchor = graph::OpKind::kCustom;
++  group.anchor_class = graph::FusionClass::kBarrier;
++  backend::LoomEmitter emitter;
++  auto emitted = emitter.emit(group, info);
++  if (!emitted.ok()) {
++    std::fprintf(stderr, "%s emit: %s\n", label,
++                 emitted.status().to_string().c_str());
++    return false;
++  }
++  std::ofstream(path + "/" + label + ".loom") << emitted->source;
++  auto obj = compiler.compile(emitted->source, "gfx1201");
++  if (!obj.ok()) {
++    std::fprintf(stderr, "%s compile: %s\n", label,
++                 obj.status().to_string().c_str());
++    return false;
++  }
++  std::ofstream file(path + "/" + label + ".hsaco", std::ios::binary);
++  file.write(reinterpret_cast<const char *>(obj->code.data()),
++             obj->code.size());
++  std::printf("PASS shared MatrixTile %s bytes=%zu\n", label, obj->code.size());
++  return true;
++}
++int main(int argc, char **argv) {
++  if (argc != 2)
++    return 2;
++  backend::DeviceInfo info;
++  info.arch = "gfx1201";
++  info.compute_units = 64;
++  info.wavefront_size = 32;
++  info.max_threads_per_workgroup = 1024;
++  info.lds_bytes_per_workgroup = 65536;
++  backend::AmdDeviceInfo amd;
++  backend::apply_arch_defaults(info, amd);
++  info.extension_id = backend::AmdDeviceInfo::kExtensionId;
++  info.extension = &amd;
++  backend::LoomcCompiler compiler;
++  bool ok = true;
++  ok = compile<math::MatrixElem::kI8, math::MatrixElem::kI32>(info, compiler,
++                                                              argv[1], "i8") &&
++       ok;
++  ok = compile<math::MatrixElem::kSU8, math::MatrixElem::kI32>(
++           info, compiler, argv[1], "su8") &&
++       ok;
++  ok = compile<math::MatrixElem::kFp8, math::MatrixElem::kF32>(
++           info, compiler, argv[1], "fp8") &&
++       ok;
++  ok = compile<math::MatrixElem::kBf8, math::MatrixElem::kF32>(
++           info, compiler, argv[1], "bf8") &&
++       ok;
++  ok = compile<math::MatrixElem::kF16, math::MatrixElem::kF32>(
++           info, compiler, argv[1], "f16") &&
++       ok;
++  ok = compile<math::MatrixElem::kBF16, math::MatrixElem::kF32>(
++           info, compiler, argv[1], "bf16") &&
++       ok;
++  return ok ? 0 : 1;
++}
+diff --git a/tests/loaded_runtime_fixture.cpp b/tests/loaded_runtime_fixture.cpp
+new file mode 100644
+index 0000000..268c708
+--- /dev/null
++++ b/tests/loaded_runtime_fixture.cpp
+@@ -0,0 +1,9 @@
++// A host-only runtime image: no HSA entry points or device initialization.
++extern "C" __attribute__((visibility("default"))) int
++lse_runtime_fixture_anchor() {
++  return 42;
++}
++extern "C" __attribute__((visibility("default"))) int
++lse_runtime_fixture_copy() {
++  return 17;
++}
+diff --git a/tests/loom_dot_fixture.hpp b/tests/loom_dot_fixture.hpp
+new file mode 100644
+index 0000000..9507596
+--- /dev/null
++++ b/tests/loom_dot_fixture.hpp
+@@ -0,0 +1,70 @@
++#pragma once
++#include "lse/backends/hrx/loomc/loom_print.hpp"
++#include "lse/backends/hrx/loomc/loom_types.hpp"
++#include "lse/backends/hrx/loomc/loom_sources.hpp"
++#include "lse/backends/hrx/loomc/loom_emitter.hpp"
++#include "lse/backends/hrx/arch_database.hpp"
++#include "lse/graph/ops.hpp"
++#include "lse/ir/env.hpp"
++#include "lse/math.hpp"
++namespace dot_fixture {
++using namespace lse;
++inline Result<backend::LoomBody> body(unsigned kind) {
++  const auto types=backend::loom_types();
++  const auto intrinsics=backend::loom_sources();
++  ir::KernelBody recorded(types,intrinsics);
++  ir::env::Emit e{&recorded};
++  ir::Buffer<ir::i32> x(&recorded,&types,"x"), codes(&recorded,&types,"codes"), acc(&recorded,&types,"acc");
++  ir::Buffer<ir::f32> values(&recorded,&types,"values");
++  if(kind==0) {
++    const auto at=e.thread_id();
++    const auto signed_x=e.let(x[at].read());
++    const auto bits=e.let(ir::cast<ir::u32>(signed_x));
++    const auto signed_again=e.let(ir::cast<ir::i32>(bits));
++    const auto dot=e.let(math::dot4_iu8(signed_again,codes[at].read(),acc[at].read()));
++    e.ret(ir::cast<ir::f32>(dot));
++  } else if(kind==1) {
++    e.ret(math::rint(values[e.thread_id()].read()));
++  } else {
++    const auto index=e.let(math::workgroup_id_x());
++    const auto lo=e.let(math::min(index,e.u32(2)));
++    const auto hi=e.let(math::max(lo,e.u32(1)));
++    e.ret(ir::cast<ir::f32>(hi));
++  }
++  backend::LoomPrintOptions opts;
++  for(const auto* name:{"x","codes","acc"})opts.buffers.emplace(name,backend::LoomBufferView{ir::Scalar::kI32,128,std::string("%")+name+"_view"});
++  opts.buffers.emplace("values",backend::LoomBufferView{ir::Scalar::kF32,128,"%values_view"});
++  return backend::loom_print(recorded.ir(),opts);
++}
++inline std::string kernel(const backend::LoomBody& b) {
++ return R"(kernel.def export("dot_fixture") @dot_fixture() {
++ %one = index.constant 1 : index
++ %groups = index.constant 4 : index
++ %lanes = index.constant 32 : index
++ kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%lanes, %one, %one) : index
++} launch(%x: buffer, %codes: buffer, %acc: buffer, %values: buffer, %out: buffer) {
++ %base = index.constant 0 : offset
++ %x_view = buffer.view %x[%base] : buffer -> view<128xi32, #dense>
++ %codes_view = buffer.view %codes[%base] : buffer -> view<128xi32, #dense>
++ %acc_view = buffer.view %acc[%base] : buffer -> view<128xi32, #dense>
++ %values_view = buffer.view %values[%base] : buffer -> view<128xf32, #dense>
++ %out_view = buffer.view %out[%base] : buffer -> view<128xf32, #dense>
++ %group = kernel.workgroup.id<x> : index
++ %lane = kernel.workitem.id<x> : index
++ %lanes = index.constant 32 : index
++ %flat = index.madd %group, %lanes, %lane : index
++ %i = index.assume %flat [range(%flat, 0, 127)] : index
++)"+b.text+" view.store "+b.result+", %out_view[%i] : f32, view<128xf32, #dense>\n kernel.return\n}\n";
++}
++inline Result<graph::EmittedKernel> projection(const char* arch,int bits,bool disable_mixed=false) {
++ using namespace graph;
++ auto leaf=[](Shape shape,DType dtype){auto n=std::make_shared<Node>();n->shape=shape;n->dtype=dtype;return Array(n);};
++ auto result=quant_linear(leaf({3,64},DType::kF32),leaf({17,64*bits/32},DType::kU32),leaf({17,1},DType::kBF16),leaf({17,1},DType::kBF16),bits,64);
++ backend::DeviceInfo device;device.arch=arch;device.compute_units=64;device.max_threads_per_workgroup=1024;device.wavefront_size=32;device.lds_bytes_per_workgroup=65536;
++ backend::AmdDeviceInfo amd;backend::apply_arch_defaults(device,amd);if(disable_mixed)amd.has_dot4_iu8=false;
++ device.extension_id=backend::AmdDeviceInfo::kExtensionId;device.extension=&amd;
++ backend::LoomEmitter emitter;const NodePtr roots[]={result.node()};
++ for(const auto& group:Partitioner::partition(roots))if(group.anchor==OpKind::kQuantMatMul)return emitter.emit(group,device);
++ return LSE_ERROR(kInternal,"projection group missing");
++}
++}
 diff --git a/tests/test_attention_decode.cpp b/tests/test_attention_decode.cpp
 new file mode 100644
 index 0000000..c66a23a
@@ -5410,6 +6980,188 @@ index 0000000..51f11ce
 +  LSE_EXPECT_EQ(rows[0].second.submit_ns, 11u);
 +}
 +LSE_TEST_MAIN()
+diff --git a/tests/test_gdn_pair.cpp b/tests/test_gdn_pair.cpp
+new file mode 100644
+index 0000000..e943642
+--- /dev/null
++++ b/tests/test_gdn_pair.cpp
+@@ -0,0 +1,99 @@
++#include "harness.hpp"
++#include "lse/graph/gdn_pair.hpp"
++#include "lse/graph/ops.hpp"
++#include "lse/backends/hrx/loomc/loom_emitter.hpp"
++#include "lse/backends/hrx/hipc/hip_emitter.hpp"
++#include <array>
++#include <unordered_set>
++using namespace lse;
++using namespace lse::graph;
++namespace {
++Array leaf(Shape shape) {
++  auto n=std::make_shared<Node>();n->shape=shape;n->dtype=DType::kF32;n->materialized=true;
++  return Array(n);
++}
++struct Fixture {
++  std::array<Array,6> inputs;
++  Array output,state;
++  Fixture(int dim=128,int seq=1) {
++    const Shape q{1,seq,48,dim},scalar{1,seq,48},s{1,48,dim,dim};
++    inputs={leaf(q),leaf(q),leaf(q),leaf(scalar),leaf(scalar),leaf(s)};
++    output=gated_delta_step(inputs[0],inputs[1],inputs[2],inputs[3],inputs[4],inputs[5],&state);
++  }
++  std::vector<FusionGroup> groups(bool reverse=false) {
++    const NodePtr roots[]{reverse?state.node():output.node(),reverse?output.node():state.node()};
++    return Partitioner::partition(roots);
++  }
++};
++backend::DeviceInfo device() {backend::DeviceInfo d;d.arch="gfx1201";d.wavefront_size=32;d.max_threads_per_workgroup=1024;return d;}
++}
++LSE_TEST(exact_pair_coalesces_both_root_orders_and_binds_separate_writes) {
++  for (int dim:{16,32,64,128}) for(int seq:{1,6}) for(bool reverse:{false,true}) for(unsigned wave:{32u,64u}) {
++    auto dev=device();dev.wavefront_size=wave;
++    Fixture f(dim,seq);auto groups=f.groups(reverse);LSE_EXPECT_EQ(groups.size(),1u);
++    if(groups.size()!=1)continue;
++    LSE_EXPECT_EQ(groups[0].launches,1u);LSE_EXPECT_EQ(groups[0].outputs.size(),2u);
++    auto emitted=backend::LoomEmitter{}.emit(groups[0],dev);
++    if(!emitted.ok()){test::fail(__FILE__,__LINE__,emitted.status().to_string());continue;}
++    LSE_EXPECT_EQ(emitted->binding_order.size(),8u);
++    for(unsigned i=0;i<6;++i)LSE_EXPECT(emitted->binding_order[i]==f.inputs[i].node());
++    LSE_EXPECT(emitted->binding_order[6]==f.state.node());
++    LSE_EXPECT(emitted->binding_order[7]==f.output.node());
++    LSE_EXPECT(emitted->source.find("%in6_view")!=std::string::npos);
++    LSE_EXPECT(emitted->source.find("%out_view")!=std::string::npos);
++    LSE_EXPECT(emitted->source.find("buffer.assume.noalias")==std::string::npos);
++    LSE_EXPECT(emitted->source.find("buffer.alloca")==std::string::npos);
++    auto hip=backend::HipEmitter{}.emit(groups[0],dev);LSE_EXPECT(hip.ok());
++    if(hip.ok())LSE_EXPECT_EQ(hip->dims.workgroup_count[0],emitted->dims.workgroup_count[0]);
++  }
++}
++LSE_TEST(single_roots_and_materialized_siblings_remain_standalone) {
++  Fixture f;
++  for(const NodePtr& root:{f.output.node(),f.state.node()}) {
++    const NodePtr roots[]{root};auto groups=Partitioner::partition(roots);LSE_EXPECT_EQ(groups.size(),1u);
++    auto e=backend::LoomEmitter{}.emit(groups[0],device());LSE_EXPECT(e.ok());
++    if(e.ok())LSE_EXPECT_EQ(e->binding_order.size(),7u);
++  }
++  f.state.node()->materialized=true;auto groups=f.groups();LSE_EXPECT_EQ(groups.size(),1u);
++  LSE_EXPECT_EQ(groups[0].nodes.size(),1u);
++}
++LSE_TEST(only_identical_inputs_shapes_types_modes_and_placement_match) {
++  for(int reason=0;reason<9;++reason) {
++    Fixture f;
++    if(reason==0)f.state.node()->inputs[0]=leaf(f.inputs[0].shape()).node();
++    if(reason==1)f.state.node()->member=3;
++    if(reason==2)f.state.node()->iattrs[0]=0;
++    if(reason==3)f.state.node()->shape=Shape{1,48,128,127};
++    if(reason==4)f.inputs[2].node()->shape=Shape{1,1,48,127};
++    if(reason==5)f.inputs[3].node()->dtype=DType::kBF16;
++    if(reason==6)f.output.node()->dtype=DType::kBF16;
++    if(reason==7)f.state.node()->attrs[0]=1.0f;
++    if(reason==8)f.state.node()->iattrs[1]=1;
++    LSE_EXPECT(!exact_gdn_pair(f.output.node(),f.state.node()));
++  }
++}
++LSE_TEST(other_consumers_keep_original_nodes_and_topological_order) {
++  Fixture f;
++  auto out_consumer=f.output+Array::full(Shape{1},DType::kF32,0.5f);
++  auto state_consumer=f.state*Array::full(Shape{1},DType::kF32,2.0f);
++  const NodePtr roots[]{out_consumer.node(),state_consumer.node()};
++  auto groups=Partitioner::partition(roots);std::unordered_set<const Node*> done;
++  bool sawOut=false,sawState=false;
++  for(const auto& group:groups) {
++    for(const auto& in:group.inputs) if(!in->materialized && in->fclass!=FusionClass::kLeaf)LSE_EXPECT(done.contains(in.get()));
++    for(const auto& n:group.nodes){done.insert(n.get());sawOut|=n==f.output.node();sawState|=n==f.state.node();}
++    auto emitted=backend::LoomEmitter{}.emit(group,device());LSE_EXPECT(emitted.ok());
++  }
++  LSE_EXPECT(sawOut&&sawState);LSE_EXPECT(done.contains(out_consumer.node().get())&&done.contains(state_consumer.node().get()));
++}
++LSE_TEST(cached_pair_rebinds_new_graph_and_preserves_alias_arguments) {
++  backend::LoomEmitter emitter;Fixture first;auto a=first.groups();auto x=emitter.emit(a[0],device());LSE_EXPECT(x.ok());
++  Fixture next;auto b=next.groups(true);auto y=emitter.emit(b[0],device());LSE_EXPECT(y.ok());
++  if(y.ok()) {LSE_EXPECT(y->binding_order[6]==next.state.node());LSE_EXPECT(y->binding_order[7]==next.output.node());}
++  // A repeated q/k operand consumes one physical binding but still occupies
++  // two logical arguments in the typed recorder.
++  Fixture alias;alias.output.node()->inputs[1]=alias.inputs[0].node();alias.state.node()->inputs[1]=alias.inputs[0].node();
++  auto groups=alias.groups();auto emitted=emitter.emit(groups[0],device());LSE_EXPECT(emitted.ok());
++  if(emitted.ok())LSE_EXPECT_EQ(emitted->binding_order.size(),7u);
++}
++LSE_TEST_MAIN()
+diff --git a/tests/test_gdn_scheduler.cpp b/tests/test_gdn_scheduler.cpp
+new file mode 100644
+index 0000000..c953b96
+--- /dev/null
++++ b/tests/test_gdn_scheduler.cpp
+@@ -0,0 +1,71 @@
++#include "harness.hpp"
++// Host-only scheduler audit. Launches are recorded, never executed.
++#include "lse/backends/cpu/cpu_backend.hpp"
++#include "lse/backends/hrx/loomc/loom_emitter.hpp"
++#include "lse/graph/codegen.hpp"
++#include "lse/graph/graph.hpp"
++#include "lse/graph/ops.hpp"
++#include "lse/graph/program.hpp"
++#include <cstdio>
++#include <stdexcept>
++using namespace lse;
++using namespace lse::graph;
++struct CaptureEmitter final : IKernelEmitter {
++  mutable backend::LoomEmitter real;
++  mutable unsigned attempts=0, failures=0, pairs=0;
++  Result<EmittedKernel> emit(const FusionGroup& g,const backend::DeviceInfo& d) const override {
++    ++attempts;
++    auto result=real.emit(g,d);
++    std::printf("EMIT nodes=%zu outputs=%zu phase=%d ok=%d |",g.nodes.size(),g.outputs.size(),g.is_phase,result.ok());
++    for(auto&n:g.nodes)std::printf(" %s",n->prim?std::string(n->prim->name()).c_str():"view");
++    if(!result.ok()){++failures;std::printf(" => %s",result.status().to_string().c_str());}
++    if(result.ok()&&g.nodes.size()==2&&g.nodes[0]->kind==OpKind::kGDNChunkScan)++pairs;
++    std::puts("");return result;
++  }
++  Dialect dialect()const noexcept override{return Dialect::kLoom;}
++  std::string_view prelude()const noexcept override{return {};}
++  DialectSourceTable sources()const noexcept override{return real.sources();}
++};
++struct CaptureCompiler final : IKernelCompiler {
++  Result<CompiledKernel> compile(std::string_view,std::string_view)const override{CompiledKernel k;k.code.push_back(std::byte{1});return k;}
++  bool available()const override{return true;}
++  std::string identity()const override{return "scheduler-capture-no-execution-v1";}
++};
++struct CaptureDevice:backend::CpuBackend {
++  unsigned launches=0;
++  mutable CaptureEmitter emitter;
++  mutable CaptureCompiler compiler;
++  mutable KernelToolchain chain{Dialect::kLoom,&emitter,&compiler};
++  backend::DeviceInfo info;
++  CaptureDevice(){info.arch="gfx1201";info.compute_units=64;info.wavefront_size=32;info.max_threads_per_workgroup=1024;info.lds_bytes_per_workgroup=65536;}
++  const backend::DeviceInfo& device_info()const noexcept{return info;}
++  std::span<const KernelToolchain>toolchains()const noexcept{return {&chain,1};}
++  Result<backend::KernelHandle>load_executable(std::string_view name,std::span<const std::byte>){return backend::KernelHandle{1,0,std::string(name)};}
++  Status launch(const backend::KernelHandle&,const backend::LaunchDims&,const backend::DispatchArgs&,const backend::DispatchTarget&){++launches;return OkStatus();}
++};
++void check(Status s){if(!s.ok())throw std::runtime_error(s.to_string());}
++
++LSE_TEST(scheduler_preserves_both_pair_outputs_and_replay) {
++  for (bool separated : {false,true}) for (bool reverse : {false,true}) {
++    backend::BackendAdapter<CaptureDevice> backend;check(backend.init(0));
++    Scheduler scheduler(backend);scheduler.set_dialect(Dialect::kLoom);
++    auto leaf=[&](Shape sh){auto b=backend.allocate(sh.elem_count()*4,backend::MemoryClass::kDevice,backend::kDefaultStream);if(!b.ok())throw std::runtime_error(b.status().to_string());return Array::from_buffer(std::move(*b),sh,DType::kF32);};
++    auto q=leaf({1,1,48,128}),k=leaf({1,1,48,128}),v=leaf({1,1,48,128});
++    auto a=leaf({1,1,48}),b=leaf({1,1,48}),s=leaf({1,48,128,128});Array next;
++    auto out=gated_delta_step(q,k,v,a,b,s,&next);
++    auto visible=separated?silu(out):out;
++    const NodePtr roots[]{reverse?next.node():visible.node(),reverse?visible.node():next.node()};
++    Program program;check(scheduler.eval(roots,false,&program));
++    LSE_EXPECT_EQ(scheduler.last_trace().kernels_launched,separated?2u:1u);
++    LSE_EXPECT_EQ(scheduler.last_trace().host_groups,0u);
++    LSE_EXPECT_EQ(backend.impl().emitter.failures,0u);
++    LSE_EXPECT_EQ(backend.impl().emitter.pairs,1u);
++    LSE_EXPECT(out.node()->buffer.valid());LSE_EXPECT(next.node()->buffer.valid());
++    LSE_EXPECT(out.node()->buffer.ptr!=next.node()->buffer.ptr);
++    program.reset_compute();check(scheduler.eval(roots,false,&program));
++    LSE_EXPECT(scheduler.last_trace().replayed);
++    LSE_EXPECT_EQ(scheduler.last_trace().kernels_launched,separated?2u:1u);
++    LSE_EXPECT_EQ(scheduler.last_trace().host_groups,0u);
++  }
++}
++LSE_TEST_MAIN()
 diff --git a/tests/test_generation_stats.cpp b/tests/test_generation_stats.cpp
 new file mode 100644
 index 0000000..839c867
@@ -5447,6 +7199,111 @@ index 0000000..839c867
 +  LSE_EXPECT_EQ(s.prompt_tokens_per_second(), 0.0);
 +}
 +LSE_TEST_MAIN()
+diff --git a/tests/test_hrx_copy_route.cpp b/tests/test_hrx_copy_route.cpp
+new file mode 100644
+index 0000000..38cf319
+--- /dev/null
++++ b/tests/test_hrx_copy_route.cpp
+@@ -0,0 +1,43 @@
++#include "harness.hpp"
++#include "lse/backends/hrx/copy_route.hpp"
++using namespace lse::backend;
++LSE_TEST(hrx_copy_route_requires_this_backend_owner_for_both_buffers) {
++  DeviceBuffer src, dst;
++  src.handle = 1;
++  dst.handle = 2;
++  src.member = dst.member = 0;
++  src.residency = dst.residency = DeviceIndex{4};
++  LSE_EXPECT(detail::own_single_device_copy(DeviceIndex{4}, 1, 2, src, dst));
++  // Equal tokens from another backend are still foreign to this queue.
++  LSE_EXPECT(!detail::own_single_device_copy(DeviceIndex{5}, 1, 2, src, dst));
++  src.residency = DeviceIndex{5};
++  LSE_EXPECT(!detail::own_single_device_copy(DeviceIndex{4}, 1, 2, src, dst));
++  src.residency = DeviceIndex{4};
++  dst.residency = DeviceIndex{5};
++  LSE_EXPECT(!detail::own_single_device_copy(DeviceIndex{4}, 1, 2, src, dst));
++  src.residency = dst.residency = kNoDevice;
++  LSE_EXPECT(!detail::own_single_device_copy(kNoDevice, 1, 2, src, dst));
++}
++LSE_TEST(hrx_copy_route_rejects_spanning_and_unknown_member_placements) {
++  DeviceBuffer src, dst;
++  src.residency = dst.residency = DeviceIndex{1};
++  src.member = 0;
++  dst.member = 1;
++  LSE_EXPECT(detail::own_single_device_copy(DeviceIndex{1}, 1, 2, src, dst));
++  LSE_EXPECT(!detail::own_single_device_copy(DeviceIndex{1}, 2, 2, src, dst));
++  LSE_EXPECT(!detail::own_single_device_copy(DeviceIndex{1}, 1, 1, src, dst));
++  dst.member = DeviceBuffer::kAnyMember;
++  LSE_EXPECT(!detail::own_single_device_copy(DeviceIndex{1}, 1, 2, src, dst));
++  src.member = DeviceBuffer::kAnyMember;
++  LSE_EXPECT(!detail::own_single_device_copy(DeviceIndex{1}, 1, 2, src, dst));
++}
++LSE_TEST(hrx_copy_route_does_not_require_cpu_mapped_gpu_memory) {
++  DeviceBuffer src, dst;
++  src.residency = dst.residency = DeviceIndex{1};
++  src.member = dst.member = 0;
++  src.handle = 7;
++  dst.handle = 8;
++  LSE_EXPECT(src.ptr == nullptr && dst.ptr == nullptr);
++  LSE_EXPECT(detail::own_single_device_copy(DeviceIndex{1}, 1, 1, src, dst));
++}
++LSE_TEST_MAIN()
+diff --git a/tests/test_loaded_runtime.cpp b/tests/test_loaded_runtime.cpp
+new file mode 100644
+index 0000000..5950a35
+--- /dev/null
++++ b/tests/test_loaded_runtime.cpp
+@@ -0,0 +1,50 @@
++#include "harness.hpp"
++#include "lse/backends/hrx/loaded_library.hpp"
++#include <cstring>
++namespace {
++const char *fixture_path = nullptr;
++}
++LSE_TEST(loaded_runtime_absence_never_loads_the_requested_library) {
++  LSE_EXPECT(dlsym(RTLD_DEFAULT, "lse_runtime_fixture_anchor") == nullptr);
++  void *loaded = lse::backend::detail::open_loaded_library(
++      fixture_path, "lse_runtime_fixture_anchor");
++  LSE_EXPECT(loaded == nullptr);
++  LSE_EXPECT(dlsym(RTLD_DEFAULT, "lse_runtime_fixture_anchor") == nullptr);
++  if (loaded)
++    dlclose(loaded);
++}
++LSE_TEST(loaded_runtime_resolves_the_existing_versioned_image) {
++  void *first = dlopen(fixture_path, RTLD_NOW | RTLD_GLOBAL);
++  LSE_EXPECT(first != nullptr);
++  if (!first)
++    return;
++  void *through_name = lse::backend::detail::open_loaded_library(
++      "liblse_runtime_fixture.dylib", "lse_runtime_fixture_anchor");
++  LSE_EXPECT(through_name != nullptr);
++  if (!through_name) {
++    dlclose(first);
++    return;
++  }
++  LSE_EXPECT(through_name == first);
++  for (const char *name :
++       {"lse_runtime_fixture_anchor", "lse_runtime_fixture_copy"})
++    LSE_EXPECT(dlsym(through_name, name) == dlsym(first, name));
++  // A missing search alias still resolves only the already-resident image.
++  void *alias = lse::backend::detail::open_loaded_library(
++      "liblse_missing_runtime_alias.dylib", "lse_runtime_fixture_anchor");
++  LSE_EXPECT(alias == first);
++  if (alias)
++    dlclose(alias);
++  dlclose(first);
++  // The resolver holds its own reference, independent of the original loader.
++  auto call = reinterpret_cast<int (*)()>(
++      dlsym(through_name, "lse_runtime_fixture_copy"));
++  LSE_EXPECT(call != nullptr && call() == 17);
++  dlclose(through_name);
++}
++int main(int argc, char **argv) {
++  if (argc != 2)
++    return 2;
++  fixture_path = argv[1];
++  return lse::test::run_all();
++}
 diff --git a/tests/test_loom_cache.cpp b/tests/test_loom_cache.cpp
 new file mode 100644
 index 0000000..fa321b9
@@ -5639,6 +7496,79 @@ index 0000000..e2b301c
 +  }
 +}
 +
++LSE_TEST_MAIN()
+diff --git a/tests/test_loom_dot.cpp b/tests/test_loom_dot.cpp
+new file mode 100644
+index 0000000..ce8c16c
+--- /dev/null
++++ b/tests/test_loom_dot.cpp
+@@ -0,0 +1,36 @@
++#include "harness.hpp"
++#include "loom_dot_fixture.hpp"
++LSE_TEST(mixed_dot_signed_result_and_same_width_casts_keep_signed_conversion) {
++ auto b=dot_fixture::body(0);LSE_EXPECT(b.ok());if(!b.ok())return;
++ LSE_EXPECT(b->text.find("vector.dot4i<s8u8>")!=std::string::npos);
++ LSE_EXPECT(b->text.find("scalar.sitofp")!=std::string::npos);
++ LSE_EXPECT(b->text.find("scalar.uitofp")==std::string::npos);
++ LSE_EXPECT(b->text.find("i32 to i32")==std::string::npos);
++ LSE_EXPECT(b->result_type == "f32");
++}
++LSE_TEST(activation_rint_uses_ties_to_even_not_away_from_zero) {
++ auto b=dot_fixture::body(1);LSE_EXPECT(b.ok());if(!b.ok())return;
++ LSE_EXPECT(b->text.find("scalar.roundevenf")!=std::string::npos);
++ LSE_EXPECT(b->text.find("scalar.roundf")==std::string::npos);
++}
++LSE_TEST(uniform_unsigned_min_max_keep_index_casts_and_compare_select) {
++ auto b=dot_fixture::body(2);LSE_EXPECT(b.ok());if(!b.ok())return;
++ LSE_EXPECT(b->text.find("index to i32")!=std::string::npos);
++ LSE_EXPECT(b->text.find("scalar.cmpi ult")!=std::string::npos);
++ LSE_EXPECT(b->text.find("scalar.cmpi ugt")!=std::string::npos);
++ LSE_EXPECT(b->text.find("scf.select")!=std::string::npos);
++ LSE_EXPECT(b->text.find("scalar.minui")==std::string::npos);
++ LSE_EXPECT(b->text.find("scalar.maxui")==std::string::npos);
++ LSE_EXPECT(b->text.find("scalar.uitofp")!=std::string::npos);
++}
++LSE_TEST(q4_mixed_dot_is_gated_by_actual_arch_capability) {
++ for(const auto* arch:{"gfx1030","gfx90a","gfx942","gfx950","gfx1100","gfx1201"}) {
++  auto out=dot_fixture::projection(arch,4);LSE_EXPECT(out.ok());if(!out.ok()){std::fprintf(stderr,"%s: %s\n",arch,out.status().to_string().c_str());continue;}
++  const bool expected=std::string_view(arch)=="gfx1100" || std::string_view(arch)=="gfx1201";
++  LSE_EXPECT((out->source.find("vector.dot4i<s8u8>")!=std::string::npos)==expected);
++ }
++ auto disabled=dot_fixture::projection("gfx1201",4,true);LSE_EXPECT(disabled.ok());
++ if(disabled.ok())LSE_EXPECT(disabled->source.find("vector.dot4i")==std::string::npos);
++ for(int bits:{6,8}){auto out=dot_fixture::projection("gfx1201",bits);LSE_EXPECT(out.ok());if(out.ok())LSE_EXPECT(out->source.find("vector.dot4i")==std::string::npos);}
++}
++LSE_TEST_MAIN()
+diff --git a/tests/test_loom_dot_native.cpp b/tests/test_loom_dot_native.cpp
+new file mode 100644
+index 0000000..85b47c2
+--- /dev/null
++++ b/tests/test_loom_dot_native.cpp
+@@ -0,0 +1,25 @@
++#include "harness.hpp"
++#include "loom_dot_fixture.hpp"
++#include "lse/backends/hrx/loomc/loomc_compiler.hpp"
++namespace {
++void compile_fixture(unsigned kind) {
++ lse::backend::LoomcCompiler compiler;
++ LSE_EXPECT(compiler.available()); if (!compiler.available()) return;
++ auto body = dot_fixture::body(kind);
++ LSE_EXPECT(body.ok()); if (!body.ok()) return;
++ // This native compiler build links the RDNA4 descriptor set. Other
++ // architecture capability gates are checked by test_loom_dot.
++ auto code = compiler.compile(dot_fixture::kernel(*body), "gfx1201");
++ LSE_EXPECT(code.ok());
++ if (!code.ok()) std::fprintf(stderr, "fixture%u: %s\n", kind, code.status().to_string().c_str());
++ else LSE_EXPECT(!code->code.empty());
++}
++}
++LSE_TEST(signed_mixed_dot_and_ties_even_rounding_emit_shader_bytes) {
++ compile_fixture(0);
++ compile_fixture(1);
++}
++LSE_TEST(workgroup_uniform_unsigned_minmax_emit_shader_bytes) {
++ compile_fixture(2);
++}
 +LSE_TEST_MAIN()
 diff --git a/tests/test_loom_extent.cpp b/tests/test_loom_extent.cpp
 new file mode 100644
@@ -5865,6 +7795,205 @@ index 0000000..de5b67c
 +  }
 +}
 +LSE_TEST_MAIN()
+diff --git a/tests/test_loom_matrix.cpp b/tests/test_loom_matrix.cpp
+new file mode 100644
+index 0000000..649b73b
+--- /dev/null
++++ b/tests/test_loom_matrix.cpp
+@@ -0,0 +1,193 @@
++#include "harness.hpp"
++#include "lse/backends/hrx/arch_database.hpp"
++#include "lse/backends/hrx/loomc/loom_print.hpp"
++#include "lse/backends/hrx/loomc/loom_sources.hpp"
++#include "lse/backends/hrx/loomc/loom_types.hpp"
++#include "lse/graph/kernel_env.hpp"
++#include "lse/kernels/wmma.hpp"
++#include "lse/math.hpp"
++using namespace lse;
++namespace {
++template <math::MatrixElem T, math::MatrixElem C>
++Result<backend::LoomBody> print_mma() {
++  using Op = math::op::Mma<math::MatrixTarget::kRdna4, C, T, 16, 16, 16>;
++  constexpr auto row = Op::kRow;
++  const auto types = backend::loom_types();
++  const auto sources = backend::loom_sources();
++  ir::KernelBody b(types, sources);
++  ir::env::Emit e{&b};
++  auto a = e.local<math::matrix_scalar_t<row.a_elem>, row.a_len>();
++  auto w = e.local<math::matrix_scalar_t<row.b_elem>, row.b_len>();
++  auto c = e.local<math::matrix_scalar_t<row.c_elem>, row.c_len>();
++  for (auto i : e.unroll(row.a_len))
++    a[i] = math::narrow<math::matrix_scalar_t<row.a_elem>>(e.f32(1.0f));
++  for (auto i : e.unroll(row.b_len))
++    w[i] = math::narrow<math::matrix_scalar_t<row.b_elem>>(e.f32(2.0f));
++  for (auto i : e.unroll(row.c_len))
++    c[i] = math::narrow<math::matrix_scalar_t<row.c_elem>>(e.f32(0.0f));
++  c = math::mma<Op>(a.value(), w.value(), c.value());
++  e.ret(c[0].read());
++  return backend::loom_print(b.ir(), {});
++}
++} // namespace
++LSE_TEST(loom_matrix_uses_shared_measured_rows_and_declines_other_layouts) {
++  const auto table = backend::loom_sources();
++  size_t present = 0;
++  for (const auto &row : math::matrix_core_table()) {
++    const auto *supported = backend::loom_matrix_row(row.key);
++    if (supported && row.chained == 1) {
++      ++present;
++      LSE_EXPECT(supported->emittable());
++      LSE_EXPECT(supported->target == math::MatrixTarget::kRdna4);
++      LSE_EXPECT(supported->wave == 32 && supported->chained == 1);
++      LSE_EXPECT(!table.find(row.key).empty());
++    }
++  }
++  LSE_EXPECT(present == 6);
++  LSE_EXPECT(table.find("wmma12.i32.16x16x32.iu4").empty());
++  LSE_EXPECT(table.find("wmma.f32.16x16x16.f16").empty());
++}
++LSE_TEST(loom_matrix_mixed_signedness_is_a_schema_not_a_type_guess) {
++  const auto t = backend::loom_sources().find("wmma12.i32.16x16x16.su8");
++  LSE_EXPECT(t.find("element_format=i8") != std::string_view::npos);
++  LSE_EXPECT(t.find("element_format=u8") != std::string_view::npos);
++  LSE_EXPECT(t.find("payload_elements=8, payload_registers=2") !=
++             std::string_view::npos);
++  LSE_EXPECT(backend::loom_result_type("wmma12.i32.16x16x16.su8") ==
++             "vector<8xi32>");
++}
++LSE_TEST(loom_matrix_shared_ir_preserves_vector_results) {
++  auto i8 = print_mma<math::MatrixElem::kI8, math::MatrixElem::kI32>();
++  auto su8 = print_mma<math::MatrixElem::kSU8, math::MatrixElem::kI32>();
++  auto fp8 = print_mma<math::MatrixElem::kFp8, math::MatrixElem::kF32>();
++  auto bf8 = print_mma<math::MatrixElem::kBf8, math::MatrixElem::kF32>();
++  for (const auto *result : {&i8, &su8, &fp8, &bf8}) {
++    LSE_EXPECT(result->ok());
++    if (!result->ok())
++      std::fprintf(stderr, "%s\n", result->status().to_string().c_str());
++    else
++      LSE_EXPECT((*result)->text.find("vector.mma") != std::string::npos);
++  }
++}
++
++LSE_TEST(loom_register_fragment_updates_are_carried_through_loops_and_guards) {
++  const auto types = backend::loom_types();
++  const auto table = backend::loom_sources();
++  ir::KernelBody body(types, table);
++  ir::env::Emit e{&body};
++  auto a = e.local<ir::f32, 8>();
++  for (auto z : e.unroll(8u))
++    a[z] = e.f32(1.0f);
++  for (auto k : e.range(0u, 3u, 1u)) {
++    if (auto live = e.when(e.thread_id() < 32u)) {
++      for (auto z : e.unroll(8u))
++        a[z] = a[z].read() + ir::cast<ir::f32>(k);
++    }
++  }
++  e.ret(a[3].read());
++  const auto printed = backend::loom_print(body.ir(), {});
++  LSE_EXPECT(printed.ok());
++  if (printed.ok()) {
++    LSE_EXPECT(printed->text.find("scf.for") != std::string::npos);
++    LSE_EXPECT(printed->text.find("-> (vector<8xf32>)") != std::string::npos);
++    LSE_EXPECT(printed->text.find("scf.yield") != std::string::npos);
++    LSE_EXPECT(printed->text.find("vector.insert") != std::string::npos);
++    LSE_EXPECT(printed->text.find("buffer.alloca") == std::string::npos);
++  }
++}
++LSE_TEST(loom_register_fragment_dynamic_lane_and_bad_width_decline) {
++  const auto types = backend::loom_types();
++  const auto table = backend::loom_sources();
++  {
++    ir::KernelBody body(types, table);
++    ir::env::Emit e{&body};
++    auto a = e.local<ir::f32, 8>();
++    a[e.thread_id()] = e.f32(1.0f);
++    e.ret(a[0].read());
++    LSE_EXPECT(!backend::loom_print(body.ir(), {}).ok());
++  }
++  {
++    ir::KernelBody body(types, table);
++    ir::env::Emit e{&body};
++    using Op = math::op::Mma<math::MatrixTarget::kRdna4, math::MatrixElem::kI32,
++                             math::MatrixElem::kI8, 16, 16, 16>;
++    auto a = e.local<int, 2>();
++    auto b = e.local<int, 2>();
++    auto c = e.local<int, 8>();
++    c = math::mma<Op>(a.value(), b.value(), c.value());
++    e.ret(c[0].read());
++    body.ir().walk([&](ir::OpId id) {
++      auto &op = body.ir().op(id);
++      if (op.kind == ir::OpKind::kCall)
++        op.type.lanes = 4;
++    });
++    auto result = backend::loom_print(body.ir(), {});
++    LSE_EXPECT(!result.ok());
++    if (!result.ok())
++      LSE_EXPECT(result.status().message().find("matrix fragment types") !=
++                 std::string::npos);
++  }
++}
++
++LSE_TEST(loom_matrix_availability_does_not_requantize_q6_or_q8) {
++  backend::DeviceInfo info;
++  backend::AmdDeviceInfo amd;
++  info.arch = "gfx1201";
++  info.wavefront_size = 32;
++  info.max_threads_per_workgroup = 1024;
++  info.lds_bytes_per_workgroup = 65536;
++  backend::apply_arch_defaults(info, amd);
++  info.extension_id = backend::AmdDeviceInfo::kExtensionId;
++  info.extension = &amd;
++  const auto sources = backend::loom_sources();
++  const auto types = backend::loom_types();
++  const DType dtypes[] = {DType::kF32, DType::kU32, DType::kBF16, DType::kBF16};
++  for (int bits : {4, 6, 8})
++    for (int m : {16, 64}) {
++      const Shape inputs[] = {Shape{m, 64}, Shape{32, 64 * bits / 32},
++                              Shape{32, 1}, Shape{32, 1}};
++      graph::KernelShapes s;
++      s.inputs = inputs;
++      s.input_dtypes = dtypes;
++      s.output = Shape{m, 32};
++      s.output_dtype = DType::kF32;
++      s.iattrs = {bits, 64, 0, 0};
++      s.device = &info;
++      s.intrinsics = &sources;
++      s.types = types;
++      const auto *specialized = kernels::wmma_quant_linear_for(s);
++      if (bits == 4)
++        LSE_EXPECT(specialized != nullptr);
++      else
++        LSE_EXPECT(specialized == nullptr);
++    }
++}
++
++LSE_TEST(
++    loom_inner_fragment_lifetime_and_unsigned_zero_keep_register_semantics) {
++  const auto types = backend::loom_types();
++  const auto table = backend::loom_sources();
++  ir::KernelBody body(types, table);
++  ir::env::Emit e{&body};
++  auto total = e.var(0.0f);
++  for (auto k : e.range(0u, 2u, 1u)) {
++    auto fragment = e.local<ir::u32, 2>();
++    for (auto lane : e.unroll(2u))
++      fragment[lane] = e.u32(0);
++    if (auto live = e.when(k < 1u))
++      fragment[1] = e.u32(7);
++    total = total.read() + ir::cast<ir::f32>(fragment[1].read());
++  }
++  e.ret(total.read());
++  auto printed = backend::loom_print(body.ir(), {});
++  LSE_EXPECT(printed.ok());
++  if (printed.ok()) {
++    const auto outer = printed->text.find(" = scf.for ");
++    const auto brace = printed->text.find('{', outer);
++    const auto header = printed->text.substr(outer, brace - outer);
++    LSE_EXPECT(header.find("-> (f32)") != std::string::npos);
++    LSE_EXPECT(header.find("vector<2xi32>") == std::string::npos);
++    LSE_EXPECT(printed->text.find("index to i32") != std::string::npos);
++  }
++}
++LSE_TEST_MAIN()
 diff --git a/tests/test_loom_print.cpp b/tests/test_loom_print.cpp
 new file mode 100644
 index 0000000..adaa508
@@ -5927,13 +8056,17 @@ index 0000000..adaa508
 +LSE_TEST_MAIN()
 diff --git a/tests/test_loom_probe.cpp b/tests/test_loom_probe.cpp
 new file mode 100644
-index 0000000..92a561e
+index 0000000..0c9c208
 --- /dev/null
 +++ b/tests/test_loom_probe.cpp
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,81 @@
++#include "lse/graph/graph.hpp"
++
 +#include "harness.hpp"
 +#include "lse/backends/hrx/probe_emit.hpp"
 +#include "lse/backends/hrx/loomc/loomc_compiler.hpp"
++#include "lse/backends/hrx/arch_database.hpp"
++#include "lse/backends/hrx/probe_matrix.hpp"
 +
 +using namespace lse;
 +using namespace lse::backend;
@@ -5987,6 +8120,25 @@ index 0000000..92a561e
 +  d.wavefront_size = 0;
 +  LSE_EXPECT(!emit_loom_touch_probe(d).ok());
 +  LSE_EXPECT(!emit_loom_stream_probe(d, 1024, 256, 16).ok());
++}
++LSE_TEST(loom_matrix_probe_compiles_shared_hip_tile_and_geometry) {
++  auto d=probe_fixture();AmdDeviceInfo amd;apply_arch_defaults(d,amd);d.extension_id=AmdDeviceInfo::kExtensionId;d.extension=&amd;
++  const LoomcCompiler compiler;unsigned compiled=0;
++  for(auto storage:{DType::kF16,DType::kBF16,DType::kI32})for(const auto& row:math::matrix_core_table()) {
++    const auto want=storage==DType::kF16?math::MatrixElem::kF16:storage==DType::kBF16?math::MatrixElem::kBF16:math::MatrixElem::kI8;
++    if(row.target!=math::MatrixTarget::kRdna4||row.operand!=want||row.acc!=(storage==DType::kI32?math::MatrixElem::kI32:math::MatrixElem::kF32)||row.m!=16||row.n!=16||row.k_step!=16)continue;
++    auto emitted=emit_loom_matrix_rate_probe(d,row,storage);LSE_EXPECT(emitted.ok());
++    if(!emitted.ok()){std::fprintf(stderr,"%s\n",emitted.status().to_string().c_str());continue;}
++    const auto dims=probe_matrix::rate_dims(d,row);
++    LSE_EXPECT_EQ(emitted->binding_order.size(),3u);LSE_EXPECT_EQ(emitted->constants.total_bytes,4u);
++    LSE_EXPECT_EQ(emitted->dims.workgroup_size[0],dims.workgroup_size[0]);LSE_EXPECT_EQ(emitted->dims.workgroup_count[0],dims.workgroup_count[0]);
++    LSE_EXPECT_EQ(emitted->binding_order[0]->element_count(),256u*1024u/static_cast<unsigned>(row.pack));
++    LSE_EXPECT_EQ(emitted->binding_order.back()->element_count(),256u*256u);
++    auto object=compiler.compile(emitted->source,d.arch);LSE_EXPECT(object.ok());if(!object.ok())std::fprintf(stderr,"%s\n",object.status().to_string().c_str());else ++compiled;
++    auto wrong=d;wrong.wavefront_size=0;LSE_EXPECT(!emit_loom_matrix_rate_probe(wrong,row,storage).ok());
++    LSE_EXPECT(!emit_loom_matrix_rate_probe(d,row,DType::kU8).ok());
++  }
++  LSE_EXPECT_EQ(compiled,3u);
 +}
 +LSE_TEST_MAIN()
 diff --git a/tests/test_loom_repeat.cpp b/tests/test_loom_repeat.cpp
@@ -6146,12 +8298,110 @@ index 0000000..4eba262
 +}
 +
 +LSE_TEST_MAIN()
+diff --git a/tests/test_matrix_probe_lifecycle.cpp b/tests/test_matrix_probe_lifecycle.cpp
+new file mode 100644
+index 0000000..09cfe5a
+--- /dev/null
++++ b/tests/test_matrix_probe_lifecycle.cpp
+@@ -0,0 +1,92 @@
++#include "harness.hpp"
++#include "lse/backends/cpu/cpu_backend.hpp"
++#include "lse/backends/hrx/arch_database.hpp"
++#include "lse/backends/hrx/probe_emit.hpp"
++#include "lse/probe/device_probe.hpp"
++#include <algorithm>
++#include <cstring>
++#include <limits>
++#include <map>
++using namespace lse;
++namespace {
++// Runs the actual HRX calibration state machine using host allocations and
++// simulated kernel results. It never opens an HRX or HSA device.
++struct RecordingDevice : backend::CpuBackend {
++  static constexpr std::string_view kName = "hrx";
++  backend::DeviceInfo info;
++  backend::AmdDeviceInfo amd;
++  enum class Failure { None, Result, TimedResult, Guard, Retirement } failure = Failure::None;
++  bool retirement_failed = false;
++  unsigned matrix_launches = 0, releases = 0;
++  std::vector<std::weak_ptr<void>> owners;
++  RecordingDevice() {
++    info.arch="gfx1201"; info.compute_units=64; info.wavefront_size=32;
++    info.max_threads_per_workgroup=1024; info.lds_bytes_per_workgroup=65536;
++    backend::apply_arch_defaults(info,amd);
++    info.extension_id=backend::AmdDeviceInfo::kExtensionId; info.extension=&amd;
++  }
++  const backend::DeviceInfo& device_info() const noexcept { return info; }
++  Result<std::size_t> sample_free_memory() const { return 32u << 20; }
++  Result<backend::DeviceBuffer> allocate(std::size_t bytes,backend::MemoryClass cls,backend::Stream stream) {
++    auto result=backend::CpuBackend::allocate(bytes,cls,stream);
++    if(result.ok()) {result->storage=std::shared_ptr<void>(result->ptr,std::free); owners.push_back(result->storage);}
++    return result;
++  }
++  void deallocate(backend::DeviceBuffer& buffer) noexcept { ++releases; buffer={}; }
++  Result<backend::KernelHandle> load_executable(std::string_view name,std::span<const std::byte>) {
++    return backend::KernelHandle{1,0,std::string(name)};
++  }
++  Status synchronize() {
++    return retirement_failed?LSE_ERROR(kDeviceError,"injected unfinished dispatch"):OkStatus();
++  }
++  Status launch(const backend::KernelHandle&,const backend::LaunchDims&,const backend::DispatchArgs& args,const backend::DispatchTarget&) {
++    const auto& ref=args.bindings.back();
++    auto* out=reinterpret_cast<float*>(static_cast<std::byte*>(ref.buffer->ptr)+ref.buffer->offset+ref.offset);
++    const auto count=ref.length/sizeof(float);
++    if(args.bindings.size()==3) {
++      ++matrix_launches;
++      std::fill_n(out,count,1024.0f);
++      if(failure==Failure::Result || (failure==Failure::TimedResult && matrix_launches>1))out[count/2]=std::numeric_limits<float>::quiet_NaN();
++      if(failure==Failure::Guard)out[-1]=0;
++      if(failure==Failure::Retirement)retirement_failed=true;
++    } else {
++      const float expected=args.bindings.size()==2?float(args.bindings.front().length/ref.length):1.0f;
++      std::fill_n(out,count,expected);
++    }
++    return OkStatus();
++  }
++};
++unsigned measured(const probe::DeviceProfile& profile) {
++  unsigned result=0; for(auto&row:profile.rows)if(row.support==probe::RowSupport::kMeasured)++result;return result;
++}
++void run(RecordingDevice::Failure failure) {
++  backend::BackendAdapter<RecordingDevice> be;LSE_EXPECT_OK(be.init(0));be.impl().failure=failure;
++  auto probe=probe::create_device_probe(be);LSE_EXPECT(probe!=nullptr);if(!probe)return;
++  probe::DeviceProfile profile;LSE_EXPECT_OK(probe->run(be,profile));
++  if(failure==RecordingDevice::Failure::None) {
++    LSE_EXPECT_EQ(measured(profile),3u);
++    for(auto&owner:be.impl().owners)LSE_EXPECT(owner.expired());
++  } else {
++    LSE_EXPECT_EQ(measured(profile),0u);
++    for(auto&row:profile.rows)LSE_EXPECT(!row.flops.positive());
++    if(failure==RecordingDevice::Failure::Retirement) {
++      LSE_EXPECT_EQ(be.impl().matrix_launches,1u);
++      unsigned alive=0;for(auto&owner:be.impl().owners)if(!owner.expired())++alive;
++      LSE_EXPECT_EQ(alive,3u);
++      const auto before=be.impl().owners.size();
++      auto later=probe::create_device_probe(be);probe::DeviceProfile next;LSE_EXPECT_OK(later->run(be,next));
++      LSE_EXPECT_EQ(be.impl().owners.size(),before);
++    } else {
++      if(failure==RecordingDevice::Failure::TimedResult)LSE_EXPECT(be.impl().matrix_launches>3u);
++      else LSE_EXPECT_EQ(be.impl().matrix_launches,3u);
++      for(auto&owner:be.impl().owners)LSE_EXPECT(owner.expired());
++    }
++  }
++}
++}
++LSE_TEST(matrix_probe_records_only_verified_retired_rates) {run(RecordingDevice::Failure::None);}
++LSE_TEST(matrix_probe_corrupt_result_is_not_a_measurement) {run(RecordingDevice::Failure::Result);}
++LSE_TEST(matrix_probe_later_corruption_is_not_a_measurement) {run(RecordingDevice::Failure::TimedResult);}
++LSE_TEST(matrix_probe_corrupt_guard_is_not_a_measurement) {run(RecordingDevice::Failure::Guard);}
++LSE_TEST(matrix_probe_retirement_failure_stops_remaining_rows_and_keeps_owners) {run(RecordingDevice::Failure::Retirement);}
++LSE_TEST_MAIN()
 diff --git a/tests/test_pointwise_fusion.cpp b/tests/test_pointwise_fusion.cpp
 new file mode 100644
-index 0000000..36fa314
+index 0000000..ac0fe1c
 --- /dev/null
 +++ b/tests/test_pointwise_fusion.cpp
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,181 @@
 +#include "harness.hpp"
 +#include "lse/backends/hrx/arch_database.hpp"
 +#include "lse/backends/hrx/loomc/loom_emitter.hpp"
@@ -6239,7 +8489,7 @@ index 0000000..36fa314
 +  LSE_EXPECT(!join(g, b));
 +  LSE_EXPECT(g.outputs[0] == a.node());
 +}
-+LSE_TEST(reductions_and_indexed_kernels_cannot_join) {
++LSE_TEST(kernel_consumers_cannot_join_but_supported_epilogues_can) {
 +  auto x = leaf();
 +  auto a = sigmoid(x);
 +  auto r = sum(a, -1, true);
@@ -6248,7 +8498,8 @@ index 0000000..36fa314
 +  auto n = rms_norm(x, leaf(Shape{128}), 1e-6f, false);
 +  auto out = n * x;
 +  auto norm = solo(n);
-+  LSE_EXPECT(!join(norm, out));
++  LSE_EXPECT(join(norm, out));
++  LSE_EXPECT(norm.anchor == n.node()->kind);
 +}
 +LSE_TEST(views_and_shape_changes_cannot_join) {
 +  auto x = leaf();
@@ -6293,15 +8544,54 @@ index 0000000..36fa314
 +  DialectSourceTable empty(std::span<const PrimitiveSource>{});
 +  LSE_EXPECT(!join_pointwise_chain(g, b.node(), {}, empty));
 +}
++LSE_TEST(kernel_roots_fanout_shape_and_narrowing_stay_materialized) {
++  auto x=leaf(Shape{1,256});auto cut=slice(x,-1,3,131);auto out=silu(cut);
++  const NodePtr roots[]{cut.node(),out.node()};auto g=solo(cut);
++  LSE_EXPECT(!join(g,out,roots));
++  auto extra=neg(cut);(void)extra;LSE_EXPECT(!join(g,out));
++  auto small=slice(x,-1,3,4);auto broad=small*leaf(Shape{1,128});auto sg=solo(small);
++  LSE_EXPECT(!join(sg,broad));
++  auto half=slice(leaf(Shape{1,256},DType::kBF16),-1,3,131);auto hn=silu(half);auto hg=solo(half);
++  LSE_EXPECT(!join(hg,hn));
++}
++LSE_TEST(epilogue_retains_anchor_shape_input_aliases_and_indexing) {
++  for(int rows:{1,64}) {
++    auto x=leaf(Shape{rows,256});auto cut=slice(x,-1,3,131);auto activated=silu(cut);auto out=activated*activated;
++    auto g=solo(cut);LSE_EXPECT(join(g,activated));LSE_EXPECT(join(g,out));
++    LSE_EXPECT(g.nodes.size()==3);LSE_EXPECT(g.inputs.size()==1);LSE_EXPECT(g.inputs.front()==x.node());
++    LSE_EXPECT(g.outputs.size()==1&&g.outputs.front()==out.node());
++    LSE_EXPECT(g.anchor==cut.node()->kind);
++  }
++}
++LSE_TEST(kernel_epilogue_body_matches_existing_generic_partitioner) {
++  backend::DeviceInfo device;device.arch="gfx1201";device.compute_units=64;device.max_threads_per_workgroup=1024;device.wavefront_size=32;device.lds_bytes_per_workgroup=65536;
++  backend::AmdDeviceInfo amd;backend::apply_arch_defaults(device,amd);device.extension_id=backend::AmdDeviceInfo::kExtensionId;device.extension=&amd;
++  for(int kind:{0,1,2})for(int rows:{1,64}) {
++    Array producer;
++    if(kind==0)producer=slice(leaf(Shape{rows,256}),-1,3,131);
++    if(kind==1)producer=l2_normalize(leaf(Shape{rows,128}),1e-6f);
++    if(kind==2)producer=quant_linear(leaf(Shape{rows,64}),leaf(Shape{17,12},DType::kU32),leaf(Shape{17,1},DType::kBF16),leaf(Shape{17,1},DType::kBF16),6,64);
++    auto out=silu(producer);const NodePtr roots[]{out.node()};
++    auto generic=Partitioner::partition(roots);LSE_EXPECT_EQ(generic.size(),1u);if(generic.size()!=1)continue;
++    auto local=solo(producer);LSE_EXPECT(join(local,out,roots));
++    backend::LoomEmitter emitter;auto before=emitter.emit(generic.front(),device);auto after=emitter.emit(local,device);
++    LSE_EXPECT(before.ok());LSE_EXPECT(after.ok());if(!before.ok()||!after.ok())continue;
++    LSE_EXPECT(before->binding_order==after->binding_order);
++    const auto a=before->source.find("} launch("),b=after->source.find("} launch(");
++    LSE_EXPECT(a!=std::string::npos&&b!=std::string::npos);
++    if(a!=std::string::npos&&b!=std::string::npos)LSE_EXPECT(before->source.substr(a)==after->source.substr(b));
++  }
++}
 +int main() { return lse::test::run_all(); }
 diff --git a/tests/test_probe_measurement.cpp b/tests/test_probe_measurement.cpp
 new file mode 100644
-index 0000000..f987048
+index 0000000..f8d7a63
 --- /dev/null
 +++ b/tests/test_probe_measurement.cpp
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,133 @@
 +#include "harness.hpp"
 +#include "lse/backends/hrx/probe_measurement.hpp"
++#include "lse/backends/hrx/probe_matrix_measurement.hpp"
 +#include <limits>
 +#include <memory>
 +#include "lse/backends/hrx/probe_retirement.hpp"
@@ -6393,6 +8683,43 @@ index 0000000..f987048
 +  LSE_EXPECT(!owner.expired());
 +  ProbeRetirement<Buffer, 2> next;
 +  LSE_EXPECT(!next.available());
++}
++LSE_TEST(matrix_probe_seeds_exact_typed_ones) {
++  for(auto storage:{lse::DType::kF16,lse::DType::kBF16,lse::DType::kI32})for(bool x:{false,true}) {
++    auto bytes=matrix_probe_ones(storage,x,64);LSE_EXPECT(bytes.ok());if(!bytes.ok())continue;
++    const unsigned width=storage==lse::DType::kI32||x?4:2;
++    const std::uint32_t expected=storage==lse::DType::kI32?0x01010101u:x?0x3f800000u:storage==lse::DType::kF16?0x3c00u:0x3f80u;
++    for(std::size_t i=0;i<bytes->size();i+=width){std::uint32_t bits=0;std::memcpy(&bits,bytes->data()+i,width);LSE_EXPECT_EQ(bits,expected);}
++  }
++  LSE_EXPECT(!matrix_probe_ones(lse::DType::kU8,false,64).ok());
++  LSE_EXPECT(!matrix_probe_ones(lse::DType::kF16,false,3).ok());
++}
++LSE_TEST(matrix_probe_checks_prefix_payload_and_suffix_exactly) {
++  constexpr std::size_t guard=16,payload=256*256;
++  std::vector<float> values(payload+2*guard,-1234.0f);std::fill_n(values.begin()+guard,payload,1024.0f);
++  LSE_EXPECT_OK(check_matrix_probe_output(values,guard,payload,1024));
++  for(std::size_t i:{std::size_t{0},guard-1,guard,guard+12345,guard+payload-1,guard+payload,values.size()-1}) {
++    const auto old=values[i];values[i]=std::numeric_limits<float>::quiet_NaN();
++    LSE_EXPECT(!check_matrix_probe_output(values,guard,payload,1024).ok());values[i]=old;
++  }
++  LSE_EXPECT(!check_matrix_probe_output(values,0,payload,1024).ok());
++}
++LSE_TEST(matrix_probe_three_buffer_retirement_retains_all_on_failure) {
++  using Buffer=OwnedProbeBuffer<4>;
++  ProbeRetirement<Buffer,2> pending;std::array<std::weak_ptr<int>,3> owners;
++  for(unsigned i=0;i<3;++i){Buffer b{std::make_shared<int>(int(i))};owners[i]=b.storage;LSE_EXPECT(pending.track(b));}
++  Buffer extra{std::make_shared<int>(9)};LSE_EXPECT(!pending.track(extra));
++  unsigned releases=0;LSE_EXPECT(!pending.finish([]{return false;},[&](Buffer&){++releases;}));
++  LSE_EXPECT_EQ(releases,0u);for(auto&owner:owners)LSE_EXPECT(!owner.expired());
++  ProbeRetirement<Buffer,2> later;LSE_EXPECT(!later.available());
++}
++LSE_TEST(matrix_probe_three_buffers_release_only_after_drain) {
++  using Buffer=OwnedProbeBuffer<5>;
++  ProbeRetirement<Buffer,2> pending;std::array<std::weak_ptr<int>,3> owners;
++  for(unsigned i=0;i<3;++i){Buffer b{std::make_shared<int>(int(i))};owners[i]=b.storage;LSE_EXPECT(pending.track(b));}
++  bool drained=false;unsigned releases=0;
++  LSE_EXPECT(pending.finish([&]{drained=true;return true;},[&](Buffer&b){LSE_EXPECT(drained);b={};++releases;}));
++  LSE_EXPECT_EQ(releases,3u);for(auto&owner:owners)LSE_EXPECT(owner.expired());
 +}
 +LSE_TEST_MAIN()
 diff --git a/tests/test_probe_policy.cpp b/tests/test_probe_policy.cpp
@@ -6794,6 +9121,95 @@ index 0000000..4a9bf19
 +  }
 +}
 +
++LSE_TEST_MAIN()
+diff --git a/tests/test_scheduler_epilogue.cpp b/tests/test_scheduler_epilogue.cpp
+new file mode 100644
+index 0000000..7a69a62
+--- /dev/null
++++ b/tests/test_scheduler_epilogue.cpp
+@@ -0,0 +1,83 @@
++#include <algorithm>
++
++#include "harness.hpp"
++// Host-only scheduler audit. Launches are recorded, never executed.
++#include "lse/backends/cpu/cpu_backend.hpp"
++#include "lse/backends/hrx/loomc/loom_emitter.hpp"
++#include "lse/graph/codegen.hpp"
++#include "lse/graph/graph.hpp"
++#include "lse/graph/ops.hpp"
++#include "lse/graph/program.hpp"
++#include <cstdio>
++#include "lse/backends/hrx/device_info.hpp"
++#include "lse/backends/hrx/arch_database.hpp"
++#include <map>
++#include <unordered_set>
++#include <cstdlib>
++#include "lse/kv/block.hpp"
++#include <stdexcept>
++using namespace lse;
++using namespace lse::graph;
++struct CaptureEmitter final : IKernelEmitter {
++  mutable backend::LoomEmitter real;
++  mutable unsigned attempts=0, failures=0, pairs=0;
++  Result<EmittedKernel> emit(const FusionGroup& g,const backend::DeviceInfo& d) const override {
++    ++attempts;
++    auto result=real.emit(g,d);
++    std::printf("EMIT nodes=%zu outputs=%zu phase=%d ok=%d |",g.nodes.size(),g.outputs.size(),g.is_phase,result.ok());
++    for(auto&n:g.nodes)std::printf(" %s",n->prim?std::string(n->prim->name()).c_str():"view");
++    if(!result.ok()){++failures;std::printf(" => %s",result.status().to_string().c_str());}
++    if(result.ok()&&g.nodes.size()==2&&g.nodes[0]->kind==OpKind::kGDNChunkScan)++pairs;
++    std::puts("");return result;
++  }
++  Dialect dialect()const noexcept override{return Dialect::kLoom;}
++  std::string_view prelude()const noexcept override{return {};}
++  DialectSourceTable sources()const noexcept override{return real.sources();}
++};
++struct CaptureCompiler final : IKernelCompiler {
++  Result<CompiledKernel> compile(std::string_view,std::string_view)const override{CompiledKernel k;k.code.push_back(std::byte{1});return k;}
++  bool available()const override{return true;}
++  std::string identity()const override{return "scheduler-capture-no-execution-v1";}
++};
++struct CaptureDevice:backend::CpuBackend {
++  unsigned launches=0;
++  mutable CaptureEmitter emitter;
++  mutable CaptureCompiler compiler;
++  mutable KernelToolchain chain{Dialect::kLoom,&emitter,&compiler};
++  backend::DeviceInfo info;
++  backend::AmdDeviceInfo amd;
++  CaptureDevice(){info.arch="gfx1201";info.compute_units=64;info.wavefront_size=32;info.max_threads_per_workgroup=1024;info.lds_bytes_per_workgroup=65536;backend::apply_arch_defaults(info,amd);info.extension_id=backend::AmdDeviceInfo::kExtensionId;info.extension=&amd;}
++  const backend::DeviceInfo& device_info()const noexcept{return info;}
++  std::span<const KernelToolchain>toolchains()const noexcept{return {&chain,1};}
++  Result<backend::KernelHandle>load_executable(std::string_view name,std::span<const std::byte>){return backend::KernelHandle{1,0,std::string(name)};}
++  Status launch(const backend::KernelHandle&,const backend::LaunchDims&,const backend::DispatchArgs&,const backend::DispatchTarget&){++launches;return OkStatus();}
++};
++void check(Status s){if(!s.ok())throw std::runtime_error(s.to_string());}
++
++LSE_TEST(actual_scheduler_epilogues_preserve_roots_fanout_and_replay) {
++ for(int kind:{0,1,2}) for(int rows:{1,17,64}) for(int escapes:{0,1,2}) for(bool reverse:{false,true}) {
++  backend::BackendAdapter<CaptureDevice> backend;check(backend.init(0));
++  Scheduler scheduler(backend);scheduler.set_dialect(Dialect::kLoom);
++  auto leaf=[&](Shape sh,DType dt=DType::kF32){auto b=backend.allocate(sh.elem_count()*4,backend::MemoryClass::kDevice,backend::kDefaultStream);if(!b.ok())throw std::runtime_error(b.status().to_string());return Array::from_buffer(std::move(*b),sh,dt);};
++  Array producer;
++  if(kind==0)producer=slice(leaf({rows,256}),-1,3,131);
++  if(kind==1)producer=l2_normalize(leaf({rows,128}),1e-6f);
++  if(kind==2)producer=quant_linear(leaf({rows,64}),leaf({17,12},DType::kU32),leaf({17,1},DType::kBF16),leaf({17,1},DType::kBF16),6,64);
++  auto out=silu(producer);
++  std::vector<NodePtr> roots{out.node()};Array other;
++  if(escapes==1)roots.push_back(producer.node());
++  if(escapes==2){other=neg(producer);roots.push_back(other.node());}
++  if(reverse)std::reverse(roots.begin(),roots.end());
++  Program program;check(scheduler.eval(roots,false,&program));
++  const unsigned expected=escapes==0?1u:escapes==1?2u:3u;
++  LSE_EXPECT_EQ(scheduler.last_trace().kernels_launched,expected);
++  LSE_EXPECT_EQ(scheduler.last_trace().host_groups,0u);
++  LSE_EXPECT_EQ(backend.impl().emitter.failures,0u);
++  if(escapes)LSE_EXPECT(producer.node()->buffer.valid());
++  program.reset_compute();check(scheduler.eval(roots,false,&program));
++  LSE_EXPECT(scheduler.last_trace().replayed);
++  LSE_EXPECT_EQ(scheduler.last_trace().kernels_launched,expected);
++  LSE_EXPECT_EQ(scheduler.last_trace().host_groups,0u);
++ }
++}
 +LSE_TEST_MAIN()
 diff --git a/tests/test_server_shutdown.cpp b/tests/test_server_shutdown.cpp
 new file mode 100644

@@ -444,6 +444,29 @@ confirmed the exact 64 prompt and 33 generated IDs still match the earlier
 float32 MLX reference. Its submission profile is diagnostic, not the resident
 throughput measurement. Logs are under `build/tests/driver195-hardware/`.
 
-A 512-token prompt at KV1024 currently fails with `no DMA entry points` during
-KV-pool growth. It exits normally and returns the driver to stage0; longer
-context inference remains unqualified until that copy path is corrected.
+The former `no DMA entry points` failure during KV-pool growth is corrected by
+copying opaque local buffers through HRX with checked ownership and retirement.
+Four guarded copy sizes through 16 MiB pass, including releasing the source
+before destination readback.
+
+### Validated Loom fusion and 1K context
+
+The promoted implementation combines paired GDN recurrence, kernel epilogues,
+HIP-equivalent matrix/dot lowering and validated matrix calibration. On the
+Mac/R9700, paired recurrence matches all 32 complete-buffer reference hashes;
+15 epilogue cases are bit-identical to materialized execution; 36 matrix cases
+cover F16/BF16/I8/mixed-sign/FP8/BF8, tails and replay. F16/BF16/I8 calibration
+validates full output and guards before exposing rates to the cost model.
+
+The completed long request used Qwen3.8-27B MLX affine Q6, no MTP, a 2,048-token
+KV cache, exactly 1,024 input tokens and 1,024 output tokens (1,023 decode steps).
+Cold prompt throughput was **16.4147 tokens/s**; decode was **10.9720 tokens/s**.
+The concurrent monitor remained an observer. These are one completed request,
+not repeated-run medians. A second request was stopped at user request after
+476 output tokens; its incomplete result is not counted as a 1K/1K pass.
+Evidence: `build/tests/driver195-hardware/qwen-combined-1k1k/response-1.json`.
+
+A short resident PP64 check returned the same text as the validated baseline,
+with one warm sample at 64.2187 prompt tokens/s and 12.6409 decode tokens/s.
+These results establish working inference and guide optimization; they do not
+claim parity with a different quantization or backend.

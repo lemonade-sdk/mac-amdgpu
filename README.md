@@ -82,8 +82,8 @@ Metal/display integration and Mesa/Vulkan support are separate future work.
 
 - **Inference coverage is expanding:** short-context generation and repeated
   HTTP requests work. Longer contexts, longer generations, MTP and additional
-  models/quantizations are being qualified. A KV-pool growth copy-path issue
-  currently blocks the 512-token prompt test.
+  models/quantizations are being qualified. Qwen Q6 has completed an exact
+  1,024-input / 1,024-output run with KV capacity 2,048; throughput optimization continues.
 - **HSA support targets real application needs:** the pinned HRX interface works,
   while full HSA conformance, general executable linking and hardware profiling
   remain incomplete. Unsupported APIs report errors rather than simulated success.
@@ -103,7 +103,8 @@ Metal/display integration and Mesa/Vulkan support are separate future work.
 
 - Reduce kernel launches through additional correct Loom fusion, including
   paired recurrent output/state computation.
-- Complete KV-cache growth support and qualify longer prompts and generations.
+- Optimize longer prompts and generations; KV-cache growth now passes the
+  1,024-input / 1,024-output workload.
 - Improve throughput using measured tile, register, LDS and workgroup choices.
 - Expand model accuracy checks, multi-client coverage and hardware compatibility.
 - Improve activity measurement and validate GPU timestamps and IRQ-assisted wakeups.

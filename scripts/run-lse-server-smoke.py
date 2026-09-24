@@ -25,17 +25,23 @@ def main():
                         help='one warmup, then N identical completion requests (1..20)')
     parser.add_argument('--generated-tokens', type=int, default=33,
                         help='benchmark output cap; 33 gives 32 decode steps unless EOS ends early')
+    parser.add_argument('--expected-prompt-tokens', type=int,
+                        help='require this exact input token count in benchmark responses')
+    parser.add_argument('--require-full-output', action='store_true',
+                        help='fail if generation stops before the requested output token count')
     parser.add_argument('--prompt-file', type=Path, help='benchmark prompt text; default: France fixture')
     parser.add_argument('--kv-len', type=int, default=128)
     parser.add_argument('--request-timeout', type=int, default=180)
     parser.add_argument('--hsa-library-dir', type=Path, default=ROOT / 'build/hsa',
                         help='runtime build directory, recorded in the benchmark')
+    parser.add_argument('--server', type=Path, default=ROOT / 'build/lse-macos-adapter/lse-server',
+                        help='server executable to qualify, recorded with its content hash')
     parser.add_argument('--model', type=Path, default=Path.home() /
                         '.lmstudio/models/lmstudio-community/Qwen3.8-27B-MLX-6bit')
     parser.add_argument('--log-dir', type=Path, default=ROOT / 'build/tests/lse-server-smoke')
     args = parser.parse_args()
-    if not 0 <= args.benchmark_repeats <= 20 or not 1 <= args.generated_tokens <= 513:
-        parser.error('benchmark repeats must be 0..20 and generated tokens must be 1..513')
+    if not 0 <= args.benchmark_repeats <= 20 or not 1 <= args.generated_tokens <= 4096:
+        parser.error('benchmark repeats must be 0..20 and generated tokens must be 1..4096')
     if not 128 <= args.kv_len <= 8192 or args.generated_tokens >= args.kv_len:
         parser.error('KV length must be 128..8192 and exceed the output token cap')
     if not 30 <= args.request_timeout <= 3600:
@@ -44,6 +50,13 @@ def main():
         parser.error('--chat-only and --benchmark-repeats select different scenarios')
     if args.prompt_file and not args.benchmark_repeats:
         parser.error('--prompt-file requires --benchmark-repeats')
+    if args.expected_prompt_tokens is not None:
+        if not args.benchmark_repeats or args.expected_prompt_tokens < 1:
+            parser.error('--expected-prompt-tokens requires a benchmark and a positive count')
+        if args.expected_prompt_tokens + args.generated_tokens > args.kv_len:
+            parser.error('KV length must cover the requested input plus output tokens')
+    if args.require_full_output and not args.benchmark_repeats:
+        parser.error('--require-full-output requires --benchmark-repeats')
     if not args.run:
         print('Pass --run to load the local model, submit GPU HTTP requests, and stop the server.')
         return 0
@@ -52,7 +65,7 @@ def main():
         reservation.bind(('127.0.0.1', 0))
         port = reservation.getsockname()[1]
     base = f'http://127.0.0.1:{port}'
-    command = [str(ROOT / 'build/lse-macos-adapter/lse-server'),
+    command = [str(args.server.resolve()),
                '--model', str(args.model.resolve()), '--pool', 'hrx:0', '--dialect', 'loom',
                '--no-mtp', '--kv-len', str(args.kv_len), '--host', '127.0.0.1', '--port', str(port),
                '--served-name', 'gpu-qwen-check', '--max-tokens', str(max(64, args.generated_tokens)),
@@ -155,6 +168,11 @@ def main():
                 generated = usage['completion_tokens']
                 if not 0 < generated <= payload['max_tokens']:
                     raise RuntimeError('invalid completion count')
+                if args.require_full_output and generated != args.generated_tokens:
+                    raise RuntimeError(f'output ended at {generated} tokens; required {args.generated_tokens}')
+                if (args.expected_prompt_tokens is not None and
+                        usage['prompt_tokens'] != args.expected_prompt_tokens):
+                    raise RuntimeError(f'input has {usage["prompt_tokens"]} tokens; required {args.expected_prompt_tokens}')
                 if timing['generated_n'] != generated or timing['decode_n'] != generated - 1:
                     raise RuntimeError('decode count includes the prefill token or loses tokens')
                 if timing['prompt_n'] != usage['prompt_tokens']:
