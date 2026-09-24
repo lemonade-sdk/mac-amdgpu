@@ -3,7 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import unittest
 
-spec = importlib.util.spec_from_file_location("cpu", Path(__file__).parents[1]/"scripts/rocprofmac-cpu.py")
+spec = importlib.util.spec_from_file_location("cpu", Path(__file__).with_name("cpu.py"))
 cpu = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cpu)
 

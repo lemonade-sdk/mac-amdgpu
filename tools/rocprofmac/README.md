@@ -49,9 +49,9 @@ macOS already provides sampled CPU stacks through Instruments Time Profiler. The
 
 ```sh
 # Dry run prints the exact argv; add --run to record.
-python3 scripts/rocprofmac-cpu.py --seconds 30 --output build/cpu.trace -- /absolute/path/to/lse [arguments]
+python3 tools/rocprofmac/cpu.py --seconds 30 --output build/cpu.trace -- /absolute/path/to/lse [arguments]
 # Attach to one existing process instead of starting another GPU workload:
-python3 scripts/rocprofmac-cpu.py --run --seconds 30 --output build/cpu.trace --attach PID
+python3 tools/rocprofmac/cpu.py --run --seconds 30 --output build/cpu.trace --attach PID
 xcrun xctrace export --input build/cpu.trace --toc --output build/cpu-toc.xml
 open build/cpu.trace
 ```
