@@ -9,6 +9,8 @@
 
 static unsigned allocated = 0, freed = 0, uploaded = 0;
 static bool failAllocation = false, failUpload = false, shortAllocation = false;
+static bool failCodeSync = false;
+static unsigned synchronizedUploads = 0;
 static std::vector<uint8_t> lastUpload;
 namespace mac_hsa {
 struct TestConnection final : Connection {
@@ -31,6 +33,11 @@ struct TestConnection final : Connection {
         if (failUpload) return HSA_STATUS_ERROR;
         auto bytes = static_cast<const uint8_t *>(data);
         lastUpload.assign(bytes, bytes + size); return HSA_STATUS_SUCCESS;
+    }
+    hsa_status_t invalidateCodeCaches() override {
+        assert(uploaded > synchronizedUploads && !failUpload && !lastUpload.empty());
+        ++synchronizedUploads;
+        return failCodeSync ? HSA_STATUS_ERROR : HSA_STATUS_SUCCESS;
     }
 };
 hsa_status_t discover(std::vector<std::shared_ptr<Connection>> &connections) {
@@ -74,6 +81,7 @@ int main(int argc, char **argv) {
     hsa_loaded_code_object_t loaded{};
     assert(hsa_executable_load_agent_code_object(exec, gpu, reader, nullptr, &loaded) == 0 && loaded.handle);
     assert(lastUpload == expected.image && allocated == 1 && uploaded == 1 && freed == 0);
+    assert(synchronizedUploads == 1);
     assert(hsa_executable_load_agent_code_object(exec, gpu, reader, nullptr, nullptr) == HSA_STATUS_ERROR_VARIABLE_ALREADY_DEFINED);
     assert(allocated == 1);
     hsa_executable_t owner{};
@@ -200,6 +208,11 @@ int main(int argc, char **argv) {
     shortAllocation = false; failUpload = true;
     assert(hsa_executable_load_agent_code_object(exec, gpu, reader, nullptr, nullptr) == HSA_STATUS_ERROR);
     failUpload = false;
+    failCodeSync = true;
+    loaded = {};
+    assert(hsa_executable_load_agent_code_object(exec, gpu, reader, nullptr, &loaded) == HSA_STATUS_ERROR);
+    assert(!loaded.handle);
+    failCodeSync = false;
     assert(allocated == freed);
     assert(hsa_executable_get_symbol_by_name(exec, "vector_add.kd", &gpu, &symbol) == HSA_STATUS_ERROR_INVALID_SYMBOL_NAME);
     assert(hsa_executable_load_agent_code_object(exec, gpu, reader, nullptr, nullptr) == 0);

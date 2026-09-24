@@ -12,6 +12,7 @@ static unsigned sharedLive = 0;
 static std::function<void()> duringDispatch;
 namespace mac_hsa {
 struct DispatchConnection : Connection {
+    hsa_status_t invalidateCodeCaches() override { return HSA_STATUS_SUCCESS; }
     bool supportsBuffers() const override { return true; }
     hsa_status_t read(DeviceSnapshot &s) override {
         s = {1, 182, 15, 256ull << 20, 32ull << 30, 12, 0, 1}; return HSA_STATUS_SUCCESS;

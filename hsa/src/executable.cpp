@@ -262,6 +262,11 @@ hsa_status_t hsa_executable_load_agent_code_object(hsa_executable_t handle, hsa_
         if (!mac_hsa::relocateCodeObject(image->object, image->buffer.address)) return HSA_STATUS_ERROR_INVALID_CODE_OBJECT;
         status = connection->writeBuffer(image->buffer, 0, image->object.image.data(), image->object.image.size());
         if (status != HSA_STATUS_SUCCESS) return status;
+        // ROCr RegionMemory::Freeze invalidates agent code caches after upload.
+        // AQL acquire fences alone do not retire stale instructions when a
+        // destroyed executable's allocation is reused by a different image.
+        status = connection->invalidateCodeCaches();
+        if (status != HSA_STATUS_SUCCESS) return status;
         std::vector<std::shared_ptr<ExecutableSymbol>> prepared;
         for (size_t i = 0; i < image->object.kernels.size(); ++i)
             prepared.push_back(std::make_shared<ExecutableSymbol>(ExecutableSymbol{executable, image, i}));

@@ -180,6 +180,36 @@ public:
         std::lock_guard lock(sessionMutex);
         return transfer(buffer, offset, const_cast<void *>(in), bytes, true);
     }
+    hsa_status_t invalidateCodeCaches() override {
+        // The existing native dispatch path brackets a bounded launch with
+        // ACQUIRE_MEM (GLI/GLK/GLV/GL1/GL2 invalidation and writeback) and waits
+        // for its EOP fence. A one-instruction utility kernel lets the loader
+        // use that path on existing drivers without exposing arbitrary PM4.
+        // Keep its small allocation for this connection's lifetime; it never
+        // aliases a released executable and is reclaimed when ownerPort closes.
+        std::lock_guard utilityLock(codeSyncMutex);
+        if (!codeSyncBuffer.handle) {
+            const auto status = allocateBuffer(sizeof(uint32_t), codeSyncBuffer);
+            if (status != HSA_STATUS_SUCCESS) return status;
+        }
+        if (!codeSyncUploaded) {
+            constexpr uint32_t endProgram = 0xbfb00000; // gfx1201 s_endpgm
+            const auto status = writeBuffer(codeSyncBuffer, 0, &endProgram, sizeof(endProgram));
+            if (status != HSA_STATUS_SUCCESS) return status;
+            codeSyncUploaded = true;
+        }
+        amdgpu::ComputeDispatchRequest request{};
+        request.version = 2;
+        request.codeHandle = codeSyncBuffer.handle;
+        request.codeBytes = sizeof(uint32_t);
+        request.groups[0] = request.groups[1] = request.groups[2] = 1;
+        request.threads[0] = 32;
+        request.threads[1] = request.threads[2] = 1;
+        request.rsrc1 = 0xc0000;
+        request.timeoutUS = 100000;
+        uint64_t fence = 0;
+        return dispatch(request, fence);
+    }
     hsa_status_t allocateSharedBuffer(uint64_t bytes, SharedBuffer &out) override {
         std::lock_guard lock(sessionMutex);
         out = {};
@@ -502,6 +532,9 @@ public:
 private:
     enum class State { Unclaimed, Initializing, Ready, Faulted } state = State::Unclaimed;
     std::mutex sessionMutex;
+    std::mutex codeSyncMutex;
+    DeviceBuffer codeSyncBuffer;
+    bool codeSyncUploaded = false;
     std::map<uint64_t,std::array<uint64_t,2>> hardwareQueues;
     io_connect_t ownerPort = IO_OBJECT_NULL;
     uint64_t lastComputeFence = 0;

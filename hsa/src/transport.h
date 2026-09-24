@@ -57,6 +57,9 @@ public:
     virtual hsa_status_t freeBuffer(const DeviceBuffer &) { return HSA_STATUS_ERROR; }
     virtual hsa_status_t readBuffer(const DeviceBuffer &, uint64_t, void *, size_t) { return HSA_STATUS_ERROR; }
     virtual hsa_status_t writeBuffer(const DeviceBuffer &, uint64_t, const void *, size_t) { return HSA_STATUS_ERROR; }
+    // Complete code-cache invalidation after upload, before publishing symbols.
+    // Data visibility alone does not invalidate reused instruction addresses.
+    virtual hsa_status_t invalidateCodeCaches() { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
     virtual hsa_status_t allocateSharedBuffer(uint64_t, SharedBuffer &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
     virtual hsa_status_t freeSharedBuffer(const SharedBuffer &) { return HSA_STATUS_ERROR; }
     // Diagnostic only: raw SDMA submission claims an exclusive client lease.

@@ -45,9 +45,12 @@ These branches are not merged into the LSE default:
 - [Two-iteration INT8 prefetch](https://github.com/Geramy/LSE/tree/perf/q6-int8-prefetch2):
   all 71 numerical cases pass nine repeats with hashes matching the prior INT8
   candidate. Performance remains unqualified. Earlier variants regress badly
-  on large FFN shapes. A direct same-input-buffer test passes its first shape
-  but fails the FP32 oracle after switching shapes; do not trust incomplete
-  captures or weaken that oracle.
+  on large FFN shapes. The direct same-input-buffer failure after switching
+  shapes is resolved by synchronizing GPU code caches after executable upload
+  in the Mac HSA loader. The original test passes twice and the prefetch variant
+  passes once, across all three shapes, with unchanged numerical checks and
+  normal executable release. This corrects a loader bug; it does not establish
+  an INT8 performance improvement. See [code-cache validation](HSA_CODE_CACHE_VALIDATION.md).
 
 ## Local continuation evidence
 
