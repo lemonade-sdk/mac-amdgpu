@@ -17,11 +17,16 @@ profile is now Candidate with failed model quality and a conservative 5031-ppm
 record; the ordinary selector uses FP32 for those shapes.
 
 The centered M256 candidate measures **0.00406726276905** against that same
-matched reference and passes. All three implementations repeat bit-exactly,
+matched reference on the story prompt and passes that context. All three implementations repeat bit-exactly,
 have finite logits and the same argmax. Its **0.00661439** difference against
 the vector implementation alone was not a valid substitute for comparison
-with the original FP32 projection. Performance and long-generation gates for
-the centered replacement remain pending. Evidence:
+with the original FP32 projection. Expanded checks reject the centered
+replacement: the code prompt measures **0.02952281953125** relative L2, above
+the unchanged **0.005** limit; the math prompt passes at **0.00122390946142**.
+Both use exactly 512 matching input tokens and 248,320 finite logits, with
+bit-exact repeats and matching argmax. Matching the next token alone does not
+satisfy the logit accuracy gate. The centered replacement remains experimental.
+Evidence: `centered-m256-quality-{code,math}.json`,
 `centered-m256-scalar-vs-{baseline,candidate}.json` and
 `build/perf-q6-m256-scalar-reference/identity-proof.json`.
 
@@ -35,17 +40,23 @@ requests, with text identical across all ten candidate/control responses and
 zero new compilations in the three measured requests. It measured median
 **119.215 PP/s and 16.648 TPS**, versus **143.262 PP/s and 16.691 TPS** for the
 withdrawn vector performance control. Thus the centered change is not a speedup
-over that approximation. A matched nondiagnostic FP32 fallback comparison,
-additional prompt contexts and long-generation qualification are still required
-before selecting it automatically. Evidence:
+over that approximation. The expanded-context accuracy failure above prevents
+automatic selection regardless of speed; full-model qualification must be
+repeated after an arithmetic correction. Evidence:
 `centered-current-pp512-tg128-comparison.json`.
 
 An isolated, explicitly enabled Q6 INT8 residual-correction implementation
 passed 60 normal and 11 exceptional GPU cases, nine identical repeats each,
 including independent arithmetic/FP32 quality checks, all outputs and guards.
 Single-product alternatives failed host accuracy and were not used. Hardware
-accuracy does not establish model quality or speed; retained-graph full-shape
-timing and full-model acceptance remain pending. The default path is unchanged.
+accuracy does not establish model quality or speed. Retained-graph timing now
+passes all three full projection shapes with matching input hashes, output
+checks, three warmups and sixteen measured iterations. Host evaluation plus
+retirement changes from **1.542 to 1.571 ms** (K5120→N17408), **1.605 to
+1.570 ms** (K17408→N5120), and **1.472 to 1.544 ms** (K6144→N5120).
+This is no consistent speedup; these are wall intervals, not GPU timestamps.
+GPU-duration profiling and full-model acceptance remain pending. The default
+path is unchanged. Timing evidence: `q6-int8-retained-perf-comparison.json`.
 Evidence: `q6-int8-residual2-numeric.log` and `build/perf-q6-int8/README.md`.
 
 The earlier **HIPC** (`--dialect hip`) throughput is reported at approximately

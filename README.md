@@ -77,8 +77,9 @@ including full **1,024-input/1,024-output** requests.
 The M256 residual-two-product BF16 prefill profile is currently withheld from
 automatic selection: a new matched FP32 reference measured **0.005030228**
 logit relative error, above the unchanged **0.005** limit. Those shapes use
-the FP32 fallback in current source. The centered replacement passes the initial
-matched accuracy check and is undergoing performance and long-generation tests.
+the FP32 fallback in current source. The centered replacement passed the story
+and math checks but failed the code prompt (0.029523 relative error against the
+same 0.005 limit), so it also remains experimental.
 The following rates were measured with the withdrawn prefill profile and are
 preserved as experimental results, not current-default throughput claims.
 
