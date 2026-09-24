@@ -7868,10 +7868,10 @@ index 0000000..f0ec881
 +}
 diff --git a/src/kernels/wmma_q6_linear.cpp b/src/kernels/wmma_q6_linear.cpp
 new file mode 100644
-index 0000000..c1cc996
+index 0000000..b4b1566
 --- /dev/null
 +++ b/src/kernels/wmma_q6_linear.cpp
-@@ -0,0 +1,687 @@
+@@ -0,0 +1,688 @@
 +// Measured floating-operand matrix contraction over unchanged MLX affine Q6.
 +// Weight storage remains packed; staged operands feed the measured matrix core.
 +#include "lse/graph/kernel_args.hpp"
@@ -8400,9 +8400,9 @@ index 0000000..c1cc996
 +  kernel.lds_bytes = kResidualLdsBytes;
 +  return kernel;
 +}
-+// Only these two M256 shapes have complete-model quality and measured cost
-+// evidence for the two-product BF16 implementation. Other widths retain their
-+// independently qualified implementation or scalar path.
++// Preserve the measured M256 candidate and its failed current-model quality
++// evidence. The shared policy rejects it; these shapes use the FP32 fallback.
++// Other widths retain their independently qualified implementation or scalar path.
 +const KernelPrimitiveBase* select_m256_residual2(
 +    const KernelShapes& s, const Dims& dims) {
 +  struct Measured { uint32_t n, k; uint64_t vector_ns, residual2_ns; };
@@ -8427,19 +8427,20 @@ index 0000000..c1cc996
 +  kernel.fp32_exceptional_block_fallback = true;
 +  kernel.lds_bytes = 24592;
 +  auto& profile = option.profile;
-+  profile.revision = 1;
-+  profile.qualification = OperandQualification::kAccepted;
++  profile.revision = 2;
++  profile.qualification = OperandQualification::kCandidate;
 +  profile.preferred = QuantOperand::kBF16;
 +  profile.strategy = QuantOperandStrategy::kNative;
 +  profile.min_m = profile.max_m = 256;
-+  // Sixteen guarded projection cases, two full-size projection checks and
-+  // complete-model logits: max projection L2 0.003061827, model 0.004085221.
-+  // Rounded upward in ppm. Model repeats are bit-identical with fixed slots.
-+  profile.measured_cases = 19;
-+  profile.measured_relative_l2_ppm = 4086;
++  // The current cooperative-RMS model versus its matched FP32 reference has
++  // relative L2 0.005030228, exceeding the 0.005 acceptance budget. The older
++  // 0.004085221 result used a different RMS context and does not qualify this
++  // profile. Preserve the observed error rounded upward in ppm.
++  profile.measured_cases = 20;
++  profile.measured_relative_l2_ppm = 5031;
 +  profile.absolute_error_pass = true;
 +  profile.nonfinite_pass = true;
-+  profile.model_quality_pass = true;
++  profile.model_quality_pass = false;
 +  profile.performance_pass = true;
 +  constexpr uint64_t cohort = 0x202609240001ull;
 +  auto& cost = option.cost;
@@ -13668,10 +13669,10 @@ index ea1b7ed..7a8d079 100644
      LSE_EXPECT_OK(o.eval());
      LSE_EXPECT_OK(s_out.eval());
 diff --git a/README.md b/README.md
-index 30ec016..edf439a 100644
+index 30ec016..c441e83 100644
 --- a/README.md
 +++ b/README.md
-@@ -6,6 +6,77 @@ interleaved with gated GQA, dense or sparse-MoE feed-forward -- running on the
+@@ -6,6 +6,92 @@ interleaved with gated GQA, dense or sparse-MoE feed-forward -- running on the
  are generated at run time from the model's own shapes rather than selected from
  a library.
 
@@ -13710,17 +13711,32 @@ index 30ec016..edf439a 100644
 +no MTP, flush64 and 64 µs polling. This is a long-context qualification result,
 +not a median across many runs.
 +
-+**The accepted M256 Q6 prefill path now uses vector LDS loads.** In matched
-+R9700 resident-server measurements with cooperative RMS, a **512-input/33-output**
-+workload measured median **143.26 prompt tokens/s and 15.84 decode tokens/s**, versus
-+88.74 prompt tokens/s and 15.91 decode tokens/s for the prior scalar-LDS control.
-+The three measured requests in each run reported zero JIT compilations. The
-+combined implementation also completed three identical **1,024-input/1,024-output**
-+requests with clean shutdown; the final request measured **139.85 prompt tokens/s
-+and 14.23 decode tokens/s**. These are different workloads, and the long-request
-+result is one post-warmup measurement rather than a many-run median. Tests cover
-+full projection outputs and guards, and model logits meet the stated acceptance
-+budget; the matrix operand path is not a claim of bitwise FP32 equivalence.
++**The M256 residual-two-product BF16 prefill profile is quarantined.** A new
++matched comparison with the current cooperative-RMS model measured logit relative
++L2 error **0.005030228**, above the **0.005** acceptance limit. Its earlier
++0.004085221 result used a different RMS context. The profile now remains a
++candidate with failed model quality, and the shared HIP/Loom selector uses the
++FP32 fallback for those M256 shapes until a replacement qualifies.
++
++Historical measurements with that withdrawn profile were **143.26 prompt tokens/s
++and 15.84 decode tokens/s** for a matched 512-input/33-output run, and **139.85
++prompt tokens/s and 14.23 decode tokens/s** for the final request of a three-request
++1,024-input/1,024-output run. They document the experiment, not the current default
++prefill rate or an accepted accuracy result.
++
++**Q6 decode now shares activation loads across four output columns** on the
++qualified gfx1201 layout, preserving each output's FP32 arithmetic order.
++A matched 512-input/129-output comparison improved median decode from
++**15.96 to 16.70 tokens/s**, with prefill unchanged at about **143.4 tokens/s**.
++All ten texts matched, with zero new compilations in all six measured requests.
++The separate three-request 1,024-input/1,024-output gate also passed: all text
++matched the previous implementation, and the warmed final request measured
++**139.36 prompt tokens/s and 14.83 decode tokens/s**, versus 14.23 decode
++tokens/s in the prior long run. The long comparison uses one measured request
++per implementation, not a multi-run median. Broader throughput parity remains
++active work. Those four-column performance runs also used the now-quarantined
++M256 prefill profile; their prompt rates are historical, not current-default
++throughput claims. The four-column decode arithmetic is unchanged.
 +
 +KV capacity growth can create additional prefill specializations on the second
 +request. Warm up the resident workload twice and check the HTTP JIT timing
@@ -13749,7 +13765,7 @@ index 30ec016..edf439a 100644
  ## Models
 
  The architecture is what a checkpoint is loaded as, not its name, so a family
-@@ -17,7 +88,7 @@ shares one kernel. `--list-models` prints what a build registers.
+@@ -17,7 +103,7 @@ shares one kernel. `--list-models` prints what a build registers.
  | `qwen3.5-moe` | The A3B-style MoE variants of the same families | MLX's SwitchGLU layout, experts stacked as one plane per projection |
  | `lemonseed` | [lemonseed-1.5b-base](https://huggingface.co/lemonade-sdk/lemonseed-1.5b-base) | Adds Mixture-of-Depths |
 
@@ -13758,7 +13774,7 @@ index 30ec016..edf439a 100644
  multi-token-prediction module is used when the checkpoint has one, which is
  what `--mtp` names and `--no-mtp` declines; the text tower loads on its own
  where a checkpoint also ships a vision tower, which this build does not run.
-@@ -26,8 +97,8 @@ where a checkpoint also ships a vision tower, which this build does not run.
+@@ -26,8 +112,8 @@ where a checkpoint also ships a vision tower, which this build does not run.
 
  Ops are lazy: they record into a DAG and execute only when a host-visible read
  demands a value. On demand the graph is partitioned into fusion groups, each
@@ -13769,7 +13785,7 @@ index 30ec016..edf439a 100644
  (`hrx_stream_dispatch`) — not through HIP. Every extension seam (backend,
  transport, quantization scheme, layer, sampler) is a CRTP base that owns the
  shared algorithms and calls into the derived type for the primitives.
-@@ -38,6 +109,36 @@ Releases are built by the **Build & Release** workflow in the Actions tab and
+@@ -38,6 +124,36 @@ Releases are built by the **Build & Release** workflow in the Actions tab and
  carry ahead-of-time kernels for the architectures selected for that build,
  which the release notes list.
 
@@ -13806,7 +13822,7 @@ index 30ec016..edf439a 100644
  ```bash
  # Pick the asset from https://github.com/Geramy/LSE/releases
  curl -LO https://github.com/Geramy/LSE/releases/download/<tag>/lse-<tag>-linux-x86_64.tar.gz
-@@ -83,6 +184,35 @@ prediction module, or point at one:
+@@ -83,6 +199,35 @@ prediction module, or point at one:
  ./lse -m mlx-community/Qwen3.8-27B-4bit --mtp <path-or-repo-id> -n 256 "..."
  ```
 
@@ -13842,7 +13858,7 @@ index 30ec016..edf439a 100644
  ### `lse` options
 
  | Option | Default | |
-@@ -133,6 +263,8 @@ works by changing the base URL.
+@@ -133,6 +278,8 @@ works by changing the base URL.
  | `--no-mtp` | off | Decode one token per pass, ignoring any MTP module |
  | `--tokenizer REPO` | `Qwen/Qwen3.6-27B` | HF repo for `tokenizer.json` when the model directory has none |
  | `--kv-len N` | from the config | Allocate the KV cache for N tokens |
@@ -13851,7 +13867,7 @@ index 30ec016..edf439a 100644
 
  Binding beyond localhost gives anyone who can reach the machine use of the
  GPU, so pair `--host 0.0.0.0` with `--api-key`:
-@@ -430,3 +562,14 @@ warnings under the full warning set.
+@@ -430,3 +577,14 @@ warnings under the full warning set.
  Non-commercial use is free for everyone; commercial use requires a separate
  license, with exceptions for the organizations listed in Exhibit A. See
  **[LICENSE.md](LICENSE.md)**.
@@ -14300,11 +14316,11 @@ index 0000000..caa575b
 +LSE_TEST_MAIN()
 diff --git a/tests/test_q6_m256_profile.cpp b/tests/test_q6_m256_profile.cpp
 new file mode 100644
-index 0000000..f3d9426
+index 0000000..d86381d
 --- /dev/null
 +++ b/tests/test_q6_m256_profile.cpp
-@@ -0,0 +1,54 @@
-+// Host-only selection contracts for the accepted M256 vector profile.
+@@ -0,0 +1,65 @@
++// Host-only selection contracts for the quarantined M256 vector profile.
 +#include "harness.hpp"
 +#include "lse/backends/hrx/arch_database.hpp"
 +#include "lse/backends/hrx/hipc/hip_sources.hpp"
@@ -14334,10 +14350,21 @@ index 0000000..f3d9426
 +  unsetenv("LSE_WMMA");
 +  for(bool loom:{false,true})for(int m:{1,17,64,128,256,512})for(auto [n,k]:{std::pair{17408,5120},std::pair{5120,17408}}){
 +    Fixture f(m,n,k,loom);auto p=kernels::wmma_q6_linear_for(f.shapes);
-+    LSE_EXPECT_EQ(p!=nullptr,m==64||m==256||m==512);if(!p)continue;
++    LSE_EXPECT_EQ(p!=nullptr,m==64||m==512);if(!p)continue;
 +    LSE_EXPECT_EQ(p->name().find("weight_residual2")!=std::string_view::npos,m==256);
 +    LSE_EXPECT_EQ(p->name().find("vector_lds_v4")!=std::string_view::npos,m==256);
-+    const auto plan=p->plan(f.shapes);LSE_EXPECT_EQ(plan.lds_bytes,m==256?24592u:16384u);
++    const auto plan=p->plan(f.shapes);LSE_EXPECT_EQ(plan.lds_bytes,16384u);
++  }
++}
++LSE_TEST(m256_profile_declines_previously_accepted_model_shapes) {
++  unsetenv("LSE_WMMA");
++  for (bool loom : {false, true}) {
++    for (auto [n, k] : {std::pair{17408, 5120}, std::pair{5120, 17408}}) {
++      Fixture f(256, n, k, loom);
++      // Full capabilities and formerly measured shapes must still decline:
++      // neither speed nor projection-only tests override failed model quality.
++      LSE_EXPECT(kernels::wmma_q6_linear_for(f.shapes) == nullptr);
++    }
 +  }
 +}
 +LSE_TEST(m256_profile_rejects_unmeasured_and_ineligible_requests) {
