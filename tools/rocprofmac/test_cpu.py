@@ -9,7 +9,7 @@ spec.loader.exec_module(cpu)
 
 class CPUCommandTest(unittest.TestCase):
     def args(self, **changes):
-        values = dict(seconds=30, attach=None, program=["/tmp/app name", "literal;$()"], env=[], output="/tmp/rocprofmac-unit-nonexistent.trace")
+        values = dict(tool="xctrace", seconds=30, attach=None, program=["/tmp/app name", "literal;$()"], env=[], output="/tmp/rocprofmac-unit-nonexistent.trace")
         values.update(changes)
         return SimpleNamespace(**values)
     def test_launch_preserves_argv(self):
@@ -20,6 +20,16 @@ class CPUCommandTest(unittest.TestCase):
         argv = cpu.command(self.args(attach=123, program=[]))
         self.assertEqual(argv[-2:], ["--attach", "123"])
         self.assertNotIn("--launch", argv)
+    def test_sample_attach_only(self):
+        argv = cpu.command(self.args(tool="sample", attach=123, program=[],
+                                     output="/tmp/rocprofmac-unit-nonexistent.txt"))
+        self.assertEqual(argv[:5], ["/usr/bin/sample", "123", "30", "1", "-file"])
+        self.assertTrue(argv[-1].endswith(".txt"))
+    def test_sample_rejects_launch_and_trace_output(self):
+        for values in [dict(), dict(attach=123, program=[]),
+                       dict(attach=123, program=[], env=["A=B"], output="/tmp/sample.txt")]:
+            with self.assertRaises(ValueError):
+                cpu.command(self.args(tool="sample", **values))
     def test_invalid_bounds_and_ambiguous_target(self):
         for values in [dict(seconds=0), dict(seconds=3601), dict(attach=123), dict(program=[]), dict(output="/tmp/no.json"), dict(env=["invalid"]), dict(attach=123,program=[],env=["A=B"])]:
             with self.assertRaises(ValueError): cpu.command(self.args(**values))

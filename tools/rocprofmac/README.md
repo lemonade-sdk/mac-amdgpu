@@ -45,6 +45,16 @@ The published rocprofiler SDK targets the Linux ROCm stack. A full macOS port wo
 
 ## CPU sampling
 
+An explicit alternative, Apple's `/usr/bin/sample`, is verified on a bounded CPU-only fixture: 852 snapshots resolved the expected nested functions and source lines, and both sampler and target exited successfully. It snapshots thread stacks, **including waiting threads**; sample counts are not CPU-time percentages. Attach to your existing LSE server without launching a second GPU workload:
+
+```sh
+python3 tools/rocprofmac/cpu.py --tool sample --run --seconds 10 \
+  --output build/lse-stacks.txt --attach YOUR_LSE_PID
+```
+
+The wrapper never kills the attached process and does not silently fall back between tools. `sample` requires an explicit positive PID and a new `.txt` output path. Evidence: `build/tests/rocprofmac-cpu-native.sample.txt`.
+
+
 macOS already provides sampled CPU stacks through Instruments Time Profiler. The bounded wrapper preserves each command argument and requires explicit execution:
 
 ```sh
@@ -56,7 +66,7 @@ xcrun xctrace export --input build/cpu.trace --toc --output build/cpu-toc.xml
 open build/cpu.trace
 ```
 
-A `.trace` includes sampled CPU stacks, not GPU utilization. Retain matching binaries/debug symbols for useful names. Recording is permission-dependent. A native recording attempt timed out without a trace, so actual CPU sampling remains unverified; help and dry-run validation do not establish recording support. On timeout the wrapper stops xctrace, but does not claim the launched target retired and never kills an attached process. The installed `xcrun xctrace help record` confirms `Time Profiler`, bounded recording, launch/attach and explicit environment options. Apple's [Instruments help](https://developer.apple.com/library/archive/documentation/AnalysisTools/Conceptual/instruments_help-collection/) describes Time Profiler's low-overhead CPU sampling; its [command-line recording example](https://developer.apple.com/videos/play/wwdc2022/10106/) documents the xctrace workflow.
+A `.trace` includes sampled CPU stacks, not GPU utilization. Retain matching binaries/debug symbols for useful names. Recording is permission-dependent. Native xctrace attempts timed out before launching even a CPU-only fixture, so Time Profiler recording remains unverified; help and dry-run validation do not establish recording support. Developer authorization is enabled and templates list successfully. Startup logs report a LaunchServices connection failure and a TCC ListenEvent denial; their causal role is not established. No security settings were changed. On timeout the wrapper stops xctrace, but does not claim the launched target retired and never kills an attached process. The installed `xcrun xctrace help record` confirms `Time Profiler`, bounded recording, launch/attach and explicit environment options. Apple's [Instruments help](https://developer.apple.com/library/archive/documentation/AnalysisTools/Conceptual/instruments_help-collection/) describes Time Profiler's low-overhead CPU sampling; its [command-line recording example](https://developer.apple.com/videos/play/wwdc2022/10106/) documents the xctrace workflow.
 
 The GPU qualification trace contains CPU submission spans, and HRX exports host queue events. LSE's existing opt-in phase measurements identify JIT/partition/bind/wait costs; its buffered dispatch summary supplies operation and shape labels to the exporter. Neither those wall spans nor CPU samples replace CP dispatch timestamps. GPU-to-host clock calibration is still needed before combining them on a shared time axis.
 
