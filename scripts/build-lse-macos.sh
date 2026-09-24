@@ -49,10 +49,11 @@ python3 scripts/test-lse-server-cli.py "$lse_build/lse-server"
 cmake -S "$lse_copy" -B "$lse_tests" "${lse_common_args[@]}" \
   -DLSE_ENABLE_HRX=OFF -DLSE_BUILD_TESTS=ON
 lse_test_targets=(test_kernel_env test_ir test_dtype test_shape test_quant test_backend_cpu test_primitive test_trace
-  test_loom_print test_loom_repeat test_loom_gdn test_loom_extent test_loom_conv test_loom_words)
+  test_loom_print test_loom_repeat test_loom_gdn test_loom_extent test_loom_conv test_loom_words test_loom_flash
+  test_generation_stats test_server_shutdown)
 cmake --build "$lse_tests" --target "${lse_test_targets[@]}" lse_communication --parallel "${LSE_BUILD_JOBS:-4}"
 ctest --test-dir "$lse_tests" --output-on-failure \
-  -R '^test_(kernel_env|ir|dtype|shape|quant|backend_cpu|primitive|trace|loom_print|loom_repeat|loom_gdn|loom_extent|loom_conv|loom_words)$'
+  -R '^test_(kernel_env|ir|dtype|shape|quant|backend_cpu|primitive|trace|loom_print|loom_repeat|loom_gdn|loom_extent|loom_conv|loom_words|loom_flash|generation_stats|server_shutdown)$'
 bash scripts/test-lse-runtime-lifetime.sh
 "$llvm_bin/clang++" -std=c++26 -Wall -Wextra -Werror \
   -I"$lse_copy/include" tests/lse_macos_poller_test.cpp \

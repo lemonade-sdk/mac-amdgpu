@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate server dialect parsing without backend initialization or sockets."""
+"""Validate server dialect and shutdown grace parsing without backend initialization or sockets."""
 import os
 from pathlib import Path
 import subprocess
@@ -17,6 +17,14 @@ cases = [
     (['--dialect'], 2, '--dialect needs a value'),
     (['--dialect', 'loom'], 2, 'no model.'),
 ]
+for value in ('1', '30', '600'):
+    cases.append((['--shutdown-grace-seconds', value, '--help'], 0,
+                  '--shutdown-grace-seconds'))
+for value in ('0', '601', '-1', '1.5', '30x', '', '99999999999999999999'):
+    cases.append((['--shutdown-grace-seconds', value], 2,
+                  'shutdown grace must be an integer'))
+cases.append((['--shutdown-grace-seconds'], 2,
+              '--shutdown-grace-seconds needs a value'))
 for args, code, message in cases:
     result = subprocess.run([str(server), *args], env=env, capture_output=True, text=True, timeout=10)
     output = result.stdout + result.stderr

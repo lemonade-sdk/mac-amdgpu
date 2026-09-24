@@ -9,6 +9,7 @@
 #include "lse/kv/block.hpp"
 #include <cstdio>
 #include <fstream>
+#include <map>
 #include <string>
 std::string loom_matmul_source(int m, int k, int n, unsigned threads) {
   const auto elems = static_cast<unsigned>(m * n);
@@ -157,7 +158,7 @@ bool compileQwenOperators(lse::backend::LoomcCompiler &compiler,const std::strin
   using namespace lse;using namespace lse::graph;
   auto leaf=[](Shape shape,DType dtype=DType::kF32) {auto n=std::make_shared<Node>();n->shape=shape;n->dtype=dtype;n->materialized=true;return Array(n);};
   std::vector<std::pair<std::string,Array>> cases;
-  for(int seq:{1,6}) {
+  for(int seq:{1,6,17,33}) {
     const auto suffix=std::to_string(seq);
     auto x=leaf(Shape{1,seq,5120});
     cases.emplace_back("rms"+suffix,rms_norm(x,leaf(Shape{5120},DType::kBF16),1e-6f,true));
@@ -213,8 +214,9 @@ bool compileQwenCompositions(lse::backend::LoomcCompiler &compiler,const std::st
   auto leaf=[](Shape shape,DType dtype=DType::kF32) {auto n=std::make_shared<Node>();n->shape=shape;n->dtype=dtype;n->materialized=true;return Array(n);};
   std::vector<std::pair<std::string,Array>> cases;
   std::vector<Array> carryRoots;
+  std::map<std::string,size_t> carryStarts;
   auto qlinear=[&](Array x,int n) {const auto k=x.shape().dim(x.shape().rank()-1);return quant_linear(x,leaf(Shape{n,k*6/32},DType::kU32),leaf(Shape{n,k/64},DType::kBF16),leaf(Shape{n,k/64},DType::kBF16),6,64);};
-  for(int seq:{1,6}) {
+  for(int seq:{1,2,4,8,16,17,32,33,64,128}) {
     const auto suffix=std::to_string(seq);
     auto q=leaf(Shape{1,24,seq,256});
     auto norm=rms_norm(q,leaf(Shape{256},DType::kBF16),1e-6f,false);
@@ -246,6 +248,7 @@ bool compileQwenCompositions(lse::backend::LoomcCompiler &compiler,const std::st
     Array newState; auto go=gated_delta_step(gq,gk,gv,alpha,beta,leaf(Shape{1,48,128,128}),&newState);
     auto gated=reshape(rms_norm(go,leaf(Shape{128},DType::kBF16),1e-6f,false),Shape{1,seq,6144})*silu(qlinear(x,6144));
     cases.emplace_back("whole-gdn-carry"+suffix,rms_norm(qlinear(gated,5120)+x,leaf(Shape{5120},DType::kBF16),1e-6f,false));
+    carryStarts["whole-gdn-carry"+suffix]=carryRoots.size();
     carryRoots.push_back(newState);carryRoots.push_back(conv_tail(hist,convInput));
     auto partial=[&](Array heads){auto rn=rms_norm(heads,leaf(Shape{256},DType::kBF16),1e-6f,false);return concat({rope(slice(rn,-1,0,64),leaf(Shape{128,64}),leaf(Shape{128,64}),leaf(Shape{kv::step_meta_elems(1)})),slice(rn,-1,64,256)},-1);};
     auto aq=partial(qheads),ak=partial(transpose(reshape(qlinear(x,1024),Shape{1,seq,4,256}),{0,2,1,3}));
@@ -265,7 +268,7 @@ bool compileQwenCompositions(lse::backend::LoomcCompiler &compiler,const std::st
   backend::LoomEmitter emitter;bool all=true;size_t compiled=0;
   for(auto &[name,output]:cases) {
     std::vector<NodePtr> roots{output.node()};
-    if(name.rfind("whole-gdn-carry",0)==0) {const size_t at=name.back()=='1'?0:2;roots.push_back(carryRoots[at].node());roots.push_back(carryRoots[at+1].node());}
+    if(name.rfind("whole-gdn-carry",0)==0) {const size_t at=carryStarts.at(name);roots.push_back(carryRoots[at].node());roots.push_back(carryRoots[at+1].node());}
     auto groups=Partitioner::partition(roots);
     for(size_t i=0;i<groups.size();++i) {
       auto &group=groups[i];

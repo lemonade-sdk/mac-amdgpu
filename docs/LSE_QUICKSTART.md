@@ -1,6 +1,6 @@
 # Lemon Seed Engine on mac_amdgpu
 
-[Lemon Seed Engine (LSE)](https://github.com/Geramy/LSE) is the inference engine. [mac_amdgpu](https://github.com/lemonade-sdk/mac-amdgpu) supplies the macOS DriverKit driver, HSA runtime, and tracked macOS adapters for LSE and [HRX/Loom](https://github.com/ROCm/hrx-system). This guide reproduces the current build and small GPU workloads; it does not claim working full-model inference.
+[Lemon Seed Engine (LSE)](https://github.com/Geramy/LSE) is the inference engine. [mac_amdgpu](https://github.com/lemonade-sdk/mac-amdgpu) supplies the macOS DriverKit driver, HSA runtime, and tracked macOS adapters for LSE and [HRX/Loom](https://github.com/ROCm/hrx-system). This guide reproduces the native build, guarded operator tests and qualified short CLI/HTTP inference on the local Qwen 27B Q6 checkpoint.
 
 The tested path is native Apple Silicon → LSE → Loom → HRX → this HSA runtime → the external `gfx1201` GPU. It does not use Metal, an x86 emulation layer, or an installed Linux ROCr runtime. The LSE adapter explicitly selects HRX/Loom for its GPU checks and rejects CPU fallback.
 
@@ -71,6 +71,7 @@ bash scripts/build-lse-conv-smoke.sh
 bash scripts/build-lse-repeat-smoke.sh
 bash scripts/build-lse-gdn-smoke.sh
 bash scripts/build-lse-paged-smoke.sh
+bash scripts/build-lse-flash-smoke.sh
 ```
 
 The HRX script builds Loom by default; do not set `HRX_BUILD_LOOM=OFF` for this path. `HRX_BUILD_JOBS` and `LSE_BUILD_JOBS` control build parallelism. The HRX library check and LSE `--help`/CPU tests do not initialize the GPU. The compile-only Loom check includes small FP32/quantized operations and real model-shaped kernel compilation; successful compilation alone is not an inference result.
@@ -89,6 +90,7 @@ The resulting artifacts include:
 | LSE repeat test | `build/lse-macos-adapter/mac-lse-repeat-smoke` |
 | LSE GDN test | `build/lse-macos-adapter/mac-lse-gdn-smoke` |
 | LSE paged KV/attention test | `build/lse-macos-adapter/mac-lse-paged-smoke` |
+| LSE flash attention test | `build/lse-macos-adapter/mac-lse-flash-smoke` |
 
 The Linux release binary from the upstream LSE project is not the macOS adapter built here.
 
@@ -114,6 +116,9 @@ DYLD_LIBRARY_PATH="$PWD/build/hsa" \
 
 DYLD_LIBRARY_PATH="$PWD/build/hsa" \
   build/lse-macos-adapter/mac-lse-paged-smoke --run
+
+DYLD_LIBRARY_PATH="$PWD/build/hsa" \
+  build/lse-macos-adapter/mac-lse-flash-smoke --run
 ```
 
 The first check covers actual HRX streams, copy/fill, FP32 affine compute and matrix multiplication with exact readback and guards. The second builds and runs an actual LSE/Loom/HRX affine Q6 projection, checks 51 exact outputs and all four input buffers/guards, requires GPU dispatch without CPU fallback, and checks runtime shutdown. Neither test needs model downloads or LM Studio.
@@ -122,14 +127,14 @@ The convolution regression has passed six GPU cases, checking 680 exact outputs,
 
 ## Current inference boundary
 
-The Q6 projection and the small HRX workloads above have passed on hardware. GDN passes 18 numerical GPU cases including prefill-to-decode state carry at the real Qwen dimensions. Paged KV/attention passes four metadata configurations with exact cache images, numerical outputs and guards. The offline audit covers 60 operator/composition cases and 192 generated groups. The GPU-owned HSA signal mailbox is the default on the qualified shared-memory/driver profile, with verified idle retirement and preservation of all seven application queue slots; see [the signal service qualification](ATOMIC_MAILBOX_SERVICE.md).
+The Q6 projection and the small HRX workloads above have passed on hardware. GDN passes 18 numerical GPU cases including prefill-to-decode state carry at the real Qwen dimensions. Paged KV/attention passes four metadata configurations with exact cache images, numerical outputs and guards. Flash attention passes five GPU cases including Qwen D256, nonidentity page tables, poisoned unused cache slots and multi-window attention. The offline audit covers 198 operator/composition cases and 846 generated groups, including prompt widths through 128. The GPU-owned HSA signal mailbox is the default on the qualified shared-memory/driver profile, with verified idle retirement and preservation of all seven application queue slots; see [the signal service qualification](ATOMIC_MAILBOX_SERVICE.md).
 
-The Qwen3.8-27B six-bit checkpoint loaded 1,847 text tensors into 11 VRAM slabs (21.731 GiB). After the operator/compiler fixes, the one-token GPU test answered "Paris"; the 16-token test continued with correct capitals for France and Germany. That run used 42,785 GPU groups with zero host groups/fallbacks, exited normally and left the driver at clean stage 0. Five prompt tokens took 3.36 seconds; 15 subsequent decode tokens ran at approximately 3.0 tokens/s. The old CLI printed 3.21 tokens/s because its numerator included the first token produced from prefill; the corrected figure excludes it. These are short-run measurements, not independent full-model accuracy or general quantization qualification. HTTP generation and longer runs remain to be checked.
+The Qwen3.8-27B six-bit checkpoint loaded 1,847 text tensors into 11 VRAM slabs (21.731 GiB). After the operator/compiler fixes, the one-token GPU test answered "Paris"; the 16-token test continued with correct capitals for France and Germany. That run used 42,785 GPU groups with zero host groups/fallbacks, exited normally and left the driver at clean stage 0. Five prompt tokens took 3.36 seconds; 15 subsequent decode tokens ran at approximately 3.0 tokens/s. The old CLI printed 3.21 tokens/s because its numerator included the first token produced from prefill; the corrected figure excludes it. These are short-run measurements, not independent full-model accuracy or general quantization qualification. Five interleaved HTTP requests now pass on one resident model, with identical output for the same greedy prompt before and after other completion/chat requests. Chat answered Berlin; its 23-token prefill measured 3.24 tokens/s and 28 subsequent decode tokens measured 2.63 tokens/s. Normal server exit returned the driver to stage 0. Longer contexts, generation, MTP and broader accuracy remain unqualified.
 
 ## Local model and HTTP server
 
-Use [LOCAL_RUN.md](../LOCAL_RUN.md) for the short Terminal commands, installed-driver launch, monitor, local checkpoint preflight, bounded one-token attempt, and HTTP chat request. The server now accepts `--pool hrx:0 --dialect loom`; its option parsing and native build have been checked without opening a GPU or HTTP socket. Server generation remains experimental until full-model execution and shutdown are qualified.
+Use [LOCAL_RUN.md](../LOCAL_RUN.md) for the short Terminal commands, installed-driver launch, monitor, local checkpoint preflight, bounded one-token attempt, and HTTP chat request. The server accepts `--pool hrx:0 --dialect loom`; real completion/chat, session isolation and graceful shutdown pass with KV128 and MTP disabled. Run `python3 scripts/run-lse-server-smoke.py --run` to reproduce the five-request hardware regression; it starts and stops its own loopback server and writes JSON results under `build/tests/lse-server-smoke/`.
 
-`LSE_REQUIRE_DEVICE_KERNELS=1` rejects host execution of device groups. Keep it set for qualification so unsupported Loom operations cannot silently become CPU inference. The ordinary CLI's `--stats` reports prompt count/prefill time, decode tokens/s, and device/host/fallback group counts. Non-streaming HTTP responses include `timings.prompt_per_second` (prompt processing tokens divided by prefill duration) and `timings.predicted_per_second` (generated tokens divided by decode duration), as well as token counts and milliseconds. These are workload timings, not GPU utilization or an established performance result.
+`LSE_REQUIRE_DEVICE_KERNELS=1` rejects host execution of device groups. Keep it set for qualification so unsupported Loom operations cannot silently become CPU inference. The ordinary CLI's `--stats` reports prompt count/prefill time, decode tokens/s, and device/host/fallback group counts. Non-streaming HTTP responses include `timings.prompt_per_second` (prompt processing tokens divided by prefill duration) and `timings.decode_per_second` (subsequent decode tokens divided by decode duration; excludes the first token produced by prefill), as well as token counts and milliseconds. These are workload timings, not GPU utilization or an established performance result.
 
 Use [the HRX validation notes](HRX_MACOS_VALIDATION.md), [HSA behavior status](../hsa/API_STATUS.md), and [the repository's current status](../README.md#working) for the supported boundaries. General native mixed CPU/GPU RMW, general fine-grained shared memory, multi-GPU LSE spanning, and hardware profiling remain separate unsupported or unqualified paths.
