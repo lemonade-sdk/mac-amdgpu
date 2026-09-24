@@ -961,10 +961,41 @@ those launch boundaries. The candidate fix plans lifetimes against the final
 submitted groups, retaining inputs through the entire consuming launch while
 preserving reuse between launches. An actual Scheduler regression with a
 recyclable producer and reshape view fails on the old planner and passes with
-the correction; pointwise fusion and replay are covered too. GPU qualification
-is still required before promotion. Evidence:
+the correction; pointwise fusion and replay are covered too.
+
+The corrected GPU diagnostic preserves the Mac runtime guards and verifies the
+new planner overload in the compiled object and linked archive. Both requests
+now have distinct input/output buffers at dispatch 6. All 62 captured FP32
+operands across the first 25 dispatches match bit-for-bit, versus 23 differing
+operands before the fix. The plain candidate also completed repeated
+1,024-input/1,024-output requests with identical text and clean shutdown on both
+preserved and current runtime configurations. Production integration and the
+RMS/vector variants are being qualified separately.
+
+The first diagnostic build accidentally retained the old scheduler overload;
+its captures are excluded from fixed-planner evidence. The corrected `-r2`
+diagnostic has explicit source, symbol and archive verification. Evidence:
 `build/tests/driver195-hardware/subop-baseline-old-mode-comparison.json` and
+`subop-final-slots-old-mode-r2-comparison.json`, and
 `build/perf-final-group-slots-check`.
+
+With that fix and the normal runtime/compiler, the cooperative RMS candidate
+also completes two strict GPU-only 1K-input/1K-output requests with identical
+text and clean shutdown. Its full generated text equals the corrected scalar
+control. Long-context decode rates were 14.103 and 14.281 TPS, versus 11.072
+and 11.177 TPS in the preceding scalar control run. These are sequential
+comparisons, not interleaved samples. Prompt times still include specialization
+as the KV pool grows and should not be presented as steady-state PP/s.
+Evidence: `qwen-rms-final-slots-r2-1k1k/result.json` and
+`qwen-final-slots-current-1k1k/result.json`.
+
+The M256 vector-BF16 model quality check also passes with the corrected planner:
+all 248,320 logits are bit-identical between repeated requests for both the
+scalar control and vector candidate. Cross-implementation relative L2 is
+0.00408522, below the unchanged 0.005 limit, with the same argmax in all four
+pairings. This removes the previously observed 0.005177 candidate repeat noise.
+Long generation and throughput qualification are separate. Evidence:
+`bf16-vector-m256-r2-logit-comparison.json` under the hardware test directory.
 
 ### FP32 subnormal descriptor correction
 
@@ -990,3 +1021,26 @@ Evidence: `loom-denorm32-scalar-subnormal.log`, `loom-denorm32-scalar-full.log`,
 and `qwen-loaded-compiler-identity/result.json` under
 `build/tests/driver195-hardware`. Canonical compiler SHA-256:
 `ebbb7cc3da1db6b7204b003b41afc6f01c5a355ff945553f34c89e2f41ee7a15`.
+
+### Packed Q6 three-dword loads
+
+An isolated shared HIP/Loom candidate loads exactly the 12 packed bytes needed
+for 16 Q6 weights. The emitted R9700 instruction is `global_load_b96`; it does
+not assume 16-byte alignment or read past the packed group. All 60 numerical
+cases passed nine repeated hashes and matched the control exactly, including
+260-byte-offset views and guarded tails.
+
+With the corrected compiler, matched full-projection measurements gave:
+
+| Decode shape (M=1) | Three scalar loads | One 96-bit load |
+| --- | ---: | ---: |
+| N17408, K5120 | 0.423938 ms | 0.375844 ms |
+| N5120, K17408 | 0.589031 ms | 0.388192 ms |
+| N5120, K6144 | 0.250714 ms | 0.252735 ms |
+
+These are means of eight post-warmup host evaluation/retirement intervals,
+including dispatch overhead, not GPU timestamps. Every output hash matched.
+The smaller projection did not improve; whole-model validation and timing are
+required before promotion. Evidence: `q6-packed-three-{baseline,candidate}-perf.log`
+and `q6-packed-three-{baseline,candidate}-numeric.log` under
+`build/tests/driver195-hardware`.

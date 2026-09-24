@@ -64,42 +64,35 @@ and validation commands.
 
 ## Measured Qwen performance
 
-**Backend performance differs substantially:** HIPC (`--dialect hip`) has a
-reported result of approximately **34 decode tokens/s**, while the measured
-macOS Loom (`--dialect loom`) result below is **12.61 decode tokens/s**.
-The HIPC figure is a recalled earlier result; its benchmark log and exact
-model, quantization, context and MTP settings still need to be recovered for a
-matched comparison. It is not a macOS Loom result. Closing this decode
-performance gap is a current optimization priority.
+**HIPC and Loom have different performance.** The earlier HIPC
+(`--dialect hip`) result is recalled at approximately **34 decode tokens/s**;
+its log, model, quantization, context and MTP settings still need to be recovered
+for a matched comparison. It is not a measured macOS Loom result.
 
-The local Qwen3.8-27B-MLX-6bit checkpoint runs entirely through the GPU kernel
-path using **Loom**, with MTP disabled and KV capacity 128. These resident-server results use
-one warmup followed by three measured requests, each generating 33 tokens
-(32 subsequent decode steps), with explicit flush64/poll64 settings:
+The local Qwen3.8-27B-MLX-6bit checkpoint runs through GPU kernels using **Loom**.
+Cooperative RMS normalization is now the default for supported shapes. After
+fixing a fused-kernel buffer-lifetime bug, it completed two identical greedy
+**1,024-input/1,024-output** requests with clean shutdown. Full generated text
+also matched the corrected scalar control.
 
-| Prompt length | Prompt processing | Decode |
-| --- | ---: | ---: |
-| 5 tokens | 14.12 tokens/s | **12.11 tokens/s** |
-| 64 tokens, automatic tiled operand selection | **87.28 tokens/s** | **12.61 tokens/s** |
+| Workload | Implementation | Prompt processing | Decode |
+| --- | --- | ---: | ---: |
+| Earlier 64 input / 33 output, KV128 | Scalar control | 87.28 tokens/s | 12.61 tokens/s |
+| Earlier 64 input / 33 output, KV128 | Cooperative RMS | about 116 tokens/s | 16.75–16.82 tokens/s |
+| 1,024 input / 1,024 output, KV2048 | Corrected scalar control | warming cache | 11.18 tokens/s |
+| 1,024 input / 1,024 output, KV2048 | Corrected cooperative RMS | warming cache | **14.28 tokens/s** |
 
-All requests produced the same text for their respective prompt. The 64-token
-fixture also retained exact agreement with its float32 MLX token reference.
-The previous combined implementation measured 64.22 PP/s and 12.64 TPS in one
-warm request: the new three-request median improves prompt processing by about
-36%, with essentially unchanged decode throughput. These were separate runs,
-not a simultaneous controlled comparison. The runtime's default blocked polling
-interval remains 1000 µs; the faster polling setting is an explicit override.
+The long-run figures are second-request rates from separate sequential runs,
+with 1,023 decode steps each, MTP disabled, flush64 and 64 µs polling. They show
+about 28% higher decode throughput; they are not interleaved multi-run medians.
+The earlier short RMS fixture has not yet been remeasured on the final
+integration. Growing KV capacity can trigger new prefill specializations even
+on the second request, so those prompt rates are not steady-state results.
 
-These are bounded end-to-end inference measurements, not a claim of matched
-llama.cpp benchmark parity. See [conditions and evidence](docs/LSE_PERFORMANCE.md)
-and the [reproduction command](LOCAL_RUN.md#experimental-resident-benchmark).
-
-The [cooperative RMS testing branch](https://github.com/Geramy/LSE/tree/testing/r9700-cooperative-rms)
-measured 16.75–16.82 TPS and about 116 PP/s on the short fixture, but failed
-repeated 1K-input/1K-output greedy text equality. It is **not the stable default**;
-the unchanged baseline passed that repeatability check, but also showed near-tied
-token variation in a later logit diagnostic. The cause is not isolated to RMS;
-investigation continues before the faster implementation can be promoted.
+These measurements do not establish matched llama.cpp parity. Closing the
+remaining throughput gap is active work. See
+[conditions and evidence](docs/LSE_PERFORMANCE.md) and the
+[reproduction command](LOCAL_RUN.md#experimental-resident-benchmark).
 
 ## Current scope
 
