@@ -103,6 +103,32 @@ the shell or change the interactive server defaults below.
 
 ## HTTP chat
 
+For interactive terminal chat, start the resident server from this project root:
+
+```sh
+DYLD_LIBRARY_PATH="$PWD/build/hsa-wait-perf" \
+LSE_REQUIRE_DEVICE_KERNELS=1 LSE_FLUSH_INTERVAL=64 MAC_HSA_BLOCKED_POLL_US=64 \
+build/lse-macos-adapter/lse-server \
+  --model "$HOME/.lmstudio/models/lmstudio-community/Qwen3.8-27B-MLX-6bit" \
+  --pool hrx:0 --dialect loom --no-mtp --kv-len 2048 --max-tokens 256 \
+  --host 127.0.0.1 --port 8080 --served-name local-qwen
+```
+
+Once it is listening, in a second Terminal at this project root:
+
+```sh
+python3 tools/lse_chat.py
+```
+
+The client streams text and prints the server's PP/s and decode TPS after each
+response. `/clear` resets conversation history and `/quit` exits the client.
+The server keeps the model loaded across requests; stop it with Ctrl-C and wait
+for shutdown when finished. The first response may need kernel compilation.
+This larger-context interactive configuration is separate from the KV128
+performance fixture. The client preserves conversation history, so use `/clear`
+before accumulated turns exhaust the context. `LSE_API_KEY` supplies a bearer
+token if the server was launched with `--api-key`.
+
 From the project root, start the qualified short-context server:
 
 ```sh
