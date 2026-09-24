@@ -1,8 +1,16 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 8143b41..6373625 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -89,12 +89,17 @@ add_subdirectory(src/backends)
+@@ -10,7 +10,7 @@
+ endif()
+
+ project(lse
+-  VERSION 0.2.1
++  VERSION 0.4.1
+   DESCRIPTION "Lemon Seed Engine — modular LLM training/inference engine on HRX"
+   LANGUAGES CXX)
+
+@@ -89,12 +89,17 @@
  # is chosen from the endpoint string and the declared capabilities, never
  # named by a caller.
  # ---------------------------------------------------------------------------
@@ -21,7 +29,7 @@ index 8143b41..6373625 100644
    src/communication/stream_link.cpp
    src/communication/socket.cpp
    src/communication/rdma.cpp
-@@ -104,8 +109,12 @@ add_library(lse::communication ALIAS lse_communication)
+@@ -104,8 +109,12 @@
  # machine what it has. It is not a build dependency on any fabric: there is none.
  target_link_libraries(lse_communication PUBLIC lse_core ${CMAKE_DL_LIBS})
  # Transports self-register from a TU with no referenced symbols.
@@ -33,9 +41,9 @@ index 8143b41..6373625 100644
    "LINKER:--whole-archive,$<TARGET_FILE:lse_communication>,--no-whole-archive")
 +endif()
  lse_apply_common_flags(lse_communication)
- 
+
  # ---------------------------------------------------------------------------
-@@ -139,8 +148,12 @@ add_library(lse_dist
+@@ -139,8 +148,12 @@
  add_library(lse::dist ALIAS lse_dist)
  target_link_libraries(lse_dist PUBLIC lse_core lse_ir lse_backend_registry lse_communication)
  # Transports self-register from a TU with no referenced symbols.
@@ -47,9 +55,9 @@ index 8143b41..6373625 100644
    "LINKER:--whole-archive,$<TARGET_FILE:lse_dist>,--no-whole-archive")
 +endif()
  lse_apply_common_flags(lse_dist)
- 
+
  # ---------------------------------------------------------------------------
-@@ -226,21 +239,30 @@ add_library(lse_kernels
+@@ -226,21 +239,30 @@
    src/kernels/transpose.cpp
    src/kernels/wmma_linear.cpp
    src/kernels/wmma_quant_linear.cpp
@@ -67,7 +75,7 @@ index 8143b41..6373625 100644
    "LINKER:--whole-archive,$<TARGET_FILE:lse_kernels>,--no-whole-archive")
 +endif()
  lse_apply_common_flags(lse_kernels)
- 
+
  # No backend edge here, in either direction of the build: lse_backend_hrx links
  # lse_graph because it implements graph's emitter and compiler seams, so an edge
  # back would be a cycle. Executables link lse_backends to make one selectable.
@@ -79,10 +87,10 @@ index 8143b41..6373625 100644
 +  target_link_options(lse_graph INTERFACE
    "LINKER:--whole-archive,$<TARGET_FILE:lse_graph>,--no-whole-archive")
 +endif()
- 
+
  lse_apply_common_flags(lse_graph)
  # Review copies of generated HIP land in ${CMAKE_BINARY_DIR}/hip/.
-@@ -307,8 +329,12 @@ add_library(lse_model
+@@ -307,8 +329,12 @@
  )
  add_library(lse::model ALIAS lse_model)
  # Model kernels self-register from a TU nothing references.
@@ -95,8 +103,8 @@ index 8143b41..6373625 100644
 +endif()
  target_link_libraries(lse_model PUBLIC lse_core lse_graph lse_ops)
  lse_apply_common_flags(lse_model)
- 
-@@ -335,8 +361,12 @@ target_compile_definitions(lse_place PRIVATE
+
+@@ -335,8 +361,12 @@
    LSE_CONFIGURED_ROCM_PATH="${LSE_ROCM_PATH}")
  # The set registers itself as graph's device-set factory from a TU with no
  # referenced symbols, the same way transports and backends register.
@@ -108,7 +116,7 @@ index 8143b41..6373625 100644
    "LINKER:--whole-archive,$<TARGET_FILE:lse_place>,--no-whole-archive")
 +endif()
  lse_apply_common_flags(lse_place)
- 
+
  # ---------------------------------------------------------------------------
 diff --git a/include/lse/backend/backend.hpp b/include/lse/backend/backend.hpp
 index 44a7e55..1198a72 100644
@@ -5391,10 +5399,9 @@ index 9f17d38..35db5ad 100644
  }
  
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index a787603..3030790 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
-@@ -12,6 +12,59 @@ function(lse_add_test name)
+@@ -12,6 +12,59 @@
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
  endfunction()
 
@@ -5454,7 +5461,7 @@ index a787603..3030790 100644
  lse_add_test(test_dtype)
  lse_add_test(test_reflect)
  # lse_backends is the set of backends this build ships. A test that runs a
-@@ -19,9 +72,95 @@ lse_add_test(test_reflect)
+@@ -19,9 +72,95 @@
  # deliberately does not link any of them, so nothing arrives transitively.
  lse_add_test(test_kernel_env lse_graph lse_backends)
  lse_add_test(test_ir lse_ir lse_graph lse_backends)
@@ -5550,7 +5557,7 @@ index a787603..3030790 100644
  lse_add_test(test_model lse_model lse_backends)
 
  if(LSE_ENABLE_CPU)
-@@ -35,7 +174,7 @@ endif()
+@@ -35,7 +174,7 @@
 
  if(LSE_ENABLE_CPU)
    lse_add_test(test_backend_cpu lse_backend_cpu)
@@ -5559,7 +5566,7 @@ index a787603..3030790 100644
    lse_add_test(test_primitive lse_graph lse_backends)
  endif()
 
-@@ -86,3 +225,134 @@ if(LSE_ROCM_RUNTIME_DIR)
+@@ -86,3 +225,136 @@
    set_tests_properties(${lse_tests} PROPERTIES
      ENVIRONMENT "LD_LIBRARY_PATH=${LSE_ROCM_RUNTIME_DIR}")
  endif()
@@ -5694,6 +5701,8 @@ index a787603..3030790 100644
 +  lse_add_test(test_q6_m256_profile lse_backend_hrx lse_graph lse_kernels lse_ir)
 +  lse_add_test(test_tile_vector_load lse_backend_hrx lse_graph lse_kernels lse_ir)
 +endif()
++
++lse_add_test(test_inplace_owner lse_graph lse_backend_cpu lse_kernels lse_ir)
 diff --git a/tests/test_ir.cpp b/tests/test_ir.cpp
 index 56fefa9..1a578b0 100644
 --- a/tests/test_ir.cpp
@@ -13374,10 +13383,14 @@ index 5d0e0ad..909a4fe 100644
      const int a = n.prim->inplace_input();
      if (a >= 0 && static_cast<std::size_t>(a) < n.inputs.size() &&
 diff --git a/src/graph/workgroup.cpp b/src/graph/workgroup.cpp
-index 26000b4..2780eda 100644
 --- a/src/graph/workgroup.cpp
 +++ b/src/graph/workgroup.cpp
-@@ -511,15 +511,36 @@ std::vector<WorkgroupCut> Workgroup::cuts() const {
+@@ -1,3 +1,4 @@
++#include <algorithm>
+ #include "lse/graph/workgroup.hpp"
+
+ #include "lse/core/dtype.hpp"
+@@ -511,21 +512,77 @@
  }
 
  void Workgroup::plan_slots(std::span<const NodePtr> roots) {
@@ -13390,6 +13403,33 @@ index 26000b4..2780eda 100644
 +  plan_slots(roots, launches);
 +}
 +
++namespace {
++// Slot lifetime belongs to the allocation, including temporary inplace
++// outputs. Following only reshapes lets a later reader of an inplace alias
++// observe a slot recycled after the alias-producing launch.
++const Node* alias_source(const Node* n) noexcept {
++  if (n == nullptr) return nullptr;
++  if (n->kind == OpKind::kReshape && n->inputs.size() == 1)
++    return n->inputs[0].get();
++  const int index = n->prim != nullptr ? n->prim->inplace_input() : -1;
++  if (index < 0 || static_cast<std::size_t>(index) >= n->inputs.size())
++    return nullptr;
++  return n->inputs[static_cast<std::size_t>(index)].get();
++}
++
++const Node* allocation_owner(const Node* n) noexcept {
++  const Node* slow = n;
++  const Node* fast = n;
++  while (const Node* next = alias_source(n)) {
++    n = next;
++    slow = alias_source(slow);
++    fast = alias_source(alias_source(fast));
++    if (slow != nullptr && slow == fast) return nullptr;
++  }
++  return n;
++}
++}  // namespace
++
 +void Workgroup::plan_slots(std::span<const NodePtr> roots,
 +                           std::span<const FusionGroup> launches) {
    slots_.clear();
@@ -13400,7 +13440,7 @@ index 26000b4..2780eda 100644
 -
    std::unordered_set<const Node*> member;
    for (const NodePtr& n : members_) member.insert(n.get());
-
++
 +  // The scheduler can merge siblings across original phase boundaries. Keep
 +  // this workgroup's ownership, but project its members onto the final launch
 +  // schedule so all nodes in one dispatch share one lifetime boundary.
@@ -13414,9 +13454,43 @@ index 26000b4..2780eda 100644
 +  }
 +  if (groups.empty()) return;
 +
++  // Nodes are public graph records, so malformed alias cycles are not ruled
++  // out by construction. Without an owner, no slot recycling is provably
++  // safe. Preserve unique allocations and let normal binding reject an
++  // unmaterialized cyclic input rather than guessing its lifetime.
++  const bool unknown_owner = std::any_of(
++      members_.begin(), members_.end(),
++      [](const NodePtr& n) { return allocation_owner(n.get()) == nullptr; });
+
    std::unordered_map<const Node*, std::uint32_t> last_cut;
    for (std::uint32_t ci = 0; ci < groups.size(); ++ci) {
      for (const NodePtr& n : groups[ci].nodes) {
+       last_cut[n.get()] = ci;
+       for (const NodePtr& in : n->inputs) {
+-        const Node* p = skip_reshape(in.get());
++        const Node* p = allocation_owner(in.get());
+         if (p && member.count(p)) last_cut[p] = ci;
+       }
+     }
+@@ -553,8 +610,7 @@
+     const auto it = direct_readers.find(n.get());
+     const std::uint32_t direct = it == direct_readers.end() ? 0 : it->second;
+     if (root_set.count(n.get()) == 0 && n->consumer_count <= direct) continue;
+-    if (n->kind == OpKind::kReshape && !n->inputs.empty()) {
+-      const Node* owner = skip_reshape(n->inputs[0].get());
++    if (const Node* owner = allocation_owner(n.get()); owner != n.get()) {
+       if (owner != nullptr && member.count(owner) != 0 &&
+           owner->fclass != FusionClass::kLeaf) {
+         last_cut[owner] = static_cast<std::uint32_t>(groups.size());
+@@ -581,7 +637,7 @@
+   static const bool no_reuse = std::getenv("LSE_NO_SLOT_REUSE") != nullptr;
+   auto take = [&](std::size_t bytes) -> std::uint32_t {
+     auto& bin = free[bytes];
+-    if (!no_reuse && !bin.empty()) {
++    if (!no_reuse && !unknown_owner && !bin.empty()) {
+       const std::uint32_t id = bin.back();
+       bin.pop_back();
+       ++reused_;
 diff --git a/tests/test_backend_cpu.cpp b/tests/test_backend_cpu.cpp
 index 522e6b5..47cc95d 100644
 --- a/tests/test_backend_cpu.cpp
@@ -14433,3 +14507,148 @@ index 0000000..4a44266
 + }
 + std::puts("PASS HIP/Loom BF16/F32 tile vector load, nested slices, shared alias ranges, all fragment alignments");return 0;
 +}catch(const std::exception &e){std::fprintf(stderr,"FAIL %s\n",e.what());return 1;}}
+diff --git a/tests/test_inplace_owner.cpp b/tests/test_inplace_owner.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test_inplace_owner.cpp
+@@ -0,0 +1,140 @@
++#include "harness.hpp"
++#include "lse/backends/cpu/cpu_backend.hpp"
++#include "lse/graph/graph.hpp"
++#include "lse/graph/kernel_primitive.hpp"
++#include "lse/graph/ops.hpp"
++#include <algorithm>
++using namespace lse;
++using namespace lse::graph;
++namespace {
++struct AllocationTestKernel final : KernelPrimitive<AllocationTestKernel> {
++  static constexpr std::string_view kName = "allocation_test";
++  static constexpr std::string_view kEntry = "allocation_test";
++  static constexpr std::string_view kSource = "";
++  explicit AllocationTestKernel(int input = -1) : alias_input(input) {}
++  int inplace_input() const noexcept override { return alias_input; }
++  std::size_t arity() const noexcept override { return 1; }
++  bool owns_indexing() const noexcept override { return true; }
++  Result<Shape> infer_shape(std::span<const Shape> inputs) const override {
++    return inputs[0];
++  }
++  DType infer_dtype(std::span<const DType>) const override {
++    return DType::kF32;
++  }
++  static ThreadPlan plan_impl(const KernelShapes &) { return {}; }
++  int alias_input;
++};
++NodePtr make_test_node(const Primitive *primitive, Shape shape,
++                       std::vector<NodePtr> inputs) {
++  auto node = std::make_shared<Node>();
++  node->kind = OpKind::kCustom;
++  node->prim = primitive;
++  node->shape = shape;
++  node->dtype = DType::kF32;
++  node->fclass = FusionClass::kBarrier;
++  node->inputs = std::move(inputs);
++  for (auto &input : node->inputs)
++    ++input->consumer_count;
++  return node;
++}
++std::vector<FusionGroup> separate_launches(const std::vector<NodePtr> &nodes) {
++  std::vector<FusionGroup> launches;
++  for (const auto &node : nodes) {
++    FusionGroup group;
++    group.nodes = {node};
++    group.inputs = node->inputs;
++    group.outputs = {node};
++    launches.push_back(std::move(group));
++  }
++  return launches;
++}
++void check_alias_lifetime(bool nested, bool shorter, bool escapes, int index) {
++  backend::BackendAdapter<backend::CpuBackend> backend;
++  LSE_EXPECT(backend.init(0).ok());
++  AllocationTestKernel ordinary, alias(index);
++  auto input = Array::full(Shape{1024}, DType::kF32, 0).node();
++  auto stage = make_test_node(&ordinary, {1024}, {input});
++  std::vector<NodePtr> order{stage};
++  NodePtr source = stage;
++  if (nested) {
++    source = reshape(Array(source), {32, 32}).node();
++    order.push_back(source);
++  }
++  auto alias_inputs = [&](NodePtr owner) {
++    return index == 0 ? std::vector<NodePtr>{owner}
++                      : std::vector<NodePtr>{input, owner};
++  };
++  auto repair = make_test_node(&alias, shorter ? Shape{512} : Shape{1024},
++                               alias_inputs(source));
++  order.push_back(repair);
++  NodePtr view = repair;
++  if (nested) {
++    view = reshape(Array(view), shorter ? Shape{16, 32} : Shape{32, 32}).node();
++    order.push_back(view);
++    view = make_test_node(&alias, view->shape, alias_inputs(view));
++    order.push_back(view);
++  }
++  auto temporary = make_test_node(&ordinary, {1024}, {input});
++  auto after = make_test_node(&ordinary, {1024}, {temporary});
++  auto late = make_test_node(&ordinary, {1024}, {view, after});
++  order.insert(order.end(), {temporary, after, late});
++  Workgroup workgroup;
++  for (auto &node : order)
++    LSE_EXPECT(workgroup.try_add(node));
++  std::vector<NodePtr> roots{late};
++  if (escapes)
++    roots.push_back(view);
++  workgroup.plan_slots(roots, separate_launches(order));
++  LSE_EXPECT(workgroup.bind_slots(backend).ok());
++  // Mirror the scheduler's topological binding of logical aliases. A shorter
++  // inplace result retains the physical input allocation; reshape narrows its
++  // logical buffer window. The planner must protect the full owning slot.
++  for (auto &node : order) {
++    if (node->kind == OpKind::kReshape) {
++      node->buffer = node->inputs[0]->buffer;
++      node->buffer.size_bytes = node->element_count() * sizeof(float);
++    } else if (node->prim && node->prim->inplace_input() >= 0) {
++      node->buffer = node->inputs[node->prim->inplace_input()]->buffer;
++    }
++  }
++  LSE_EXPECT(stage->buffer.valid());
++  LSE_EXPECT(view->buffer.valid());
++  LSE_EXPECT(stage->buffer.ptr == view->buffer.ptr);
++  LSE_EXPECT(view->buffer.size_bytes >= view->element_count() * sizeof(float));
++  LSE_EXPECT(stage->buffer.ptr != temporary->buffer.ptr);
++  LSE_EXPECT(stage->buffer.ptr != after->buffer.ptr);
++  LSE_EXPECT(stage->buffer.ptr != late->buffer.ptr);
++  auto *data = static_cast<float *>(stage->buffer.ptr);
++  std::fill(data, data + 1024, 3.25f);
++  auto *scratch = static_cast<float *>(temporary->buffer.ptr);
++  std::fill(scratch, scratch + 1024, -11.f);
++  auto *actual = static_cast<float *>(view->buffer.ptr);
++  for (size_t i = 0; i < view->element_count(); ++i)
++    LSE_EXPECT(actual[i] == 3.25f);
++}
++} // namespace
++LSE_TEST(inplace_alias_keeps_temporary_owner_live) {
++  for (bool nested : {false, true})
++    for (bool shorter : {false, true})
++      for (bool escapes : {false, true})
++        for (int index : {0, 1})
++          check_alias_lifetime(nested, shorter, escapes, index);
++}
++LSE_TEST(malformed_inplace_cycle_disables_slot_recycling) {
++  AllocationTestKernel ordinary, alias(1);
++  auto input = Array::full(Shape{1024}, DType::kF32, 0).node();
++  auto stage = make_test_node(&ordinary, {1024}, {input});
++  auto cycle = make_test_node(&alias, {1024}, {stage, input});
++  cycle->inputs[1] = cycle;
++  auto temporary = make_test_node(&ordinary, {1024}, {input});
++  auto late = make_test_node(&ordinary, {1024}, {cycle, temporary});
++  std::vector<NodePtr> nodes{stage, cycle, temporary, late};
++  Workgroup workgroup;
++  for (auto &node : nodes)
++    LSE_EXPECT(workgroup.try_add(node));
++  const NodePtr roots[]{late};
++  workgroup.plan_slots(roots, separate_launches(nodes));
++  LSE_EXPECT_EQ(workgroup.reused_slots(), 0u);
++  cycle->inputs[1] = stage; // Release the intentionally malformed shared cycle.
++}
++LSE_TEST_MAIN()

@@ -95,12 +95,14 @@ all generated text and added about 1.0% prefill time and 3.7% decode time in thi
 comparison. The two feed-forward projection shapes account for 67.3% of summed
 prefill kernel time, making matrix-kernel optimization the main prefill priority.
 
-Further prefill and INT8 improvements are being qualified on testing branches.
-The two-pass prefill prototype passes its numerical suite and first full-model
-accuracy context; remaining quality and speed checks precede promotion. INT8
-passes numerical tests but its large-shape performance investigation is ongoing. Historical measurements,
-profiling conditions, and [current evidence](docs/LSE_PERFORMANCE.md) are kept
-separately. Matched llama.cpp performance parity remains an active goal.
+The latest experimental qualification publishes the inplace allocation-owner
+lifetime fix with unchanged throughput: **88.63 PP/s / 17.45 TPS**, versus a
+matched control at **88.57 PP/s / 17.46 TPS**. The two-pass Q6 prefill candidate
+passes all three accuracy contexts but is 13.4% slower at prefill. INT8 prefetch
+is 6.5% slower at decode. Both remain experimental. See the
+[qualification results](docs/EXPERIMENTAL_QUALIFICATION.md) and
+[historical measurements](docs/LSE_PERFORMANCE.md). Matched llama.cpp
+performance parity remains an active goal.
 See the [reproduction command](LOCAL_RUN.md#experimental-resident-benchmark).
 
 ## Current scope

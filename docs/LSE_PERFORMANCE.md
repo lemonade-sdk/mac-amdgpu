@@ -102,6 +102,12 @@ Evidence: `q6-int8-residual2-numeric.log` and `build/perf-q6-int8/README.md`.
 
 ## Current optimization experiments
 
+The latest [matched qualification](EXPERIMENTAL_QUALIFICATION.md) keeps both
+arithmetic experiments off the default: two-pass Q6 measures 76.72 PP/s versus
+88.57 PP/s, and INT8 prefetch measures 16.32 TPS versus 17.46 TPS. The separate
+allocation-owner lifetime fix passes with unchanged throughput and is promoted.
+The older experiment history below is retained for context.
+
 These candidates remain separate from the accurate default above.
 
 The revised centered M256 implementation uses two BF16 activation terms and
@@ -121,7 +127,8 @@ distinct output allocation and requires no CPU readback or shared atomic RMW.
 All **37 numerical cases with nine repeats each** pass, with output hashes
 identical to the revised single-pass implementation. Automatic HIP/Loom model selection also passes the code context at relative L2
 0.0000495955, with bit-exact repeats and matching argmax. Math/story model gates
-and compilation-free throughput remain pending; the branch is not promoted. Evidence:
+also pass. The newer compilation-free comparison measures 76.72 PP/s, slower
+than the current default; the branch is not promoted. Evidence:
 `centered-v3-quality-{code,math,story}.json`,
 `q6-centered-repair-phase-numeric.log`, and
 `build/perf-q6-centered-repair-phase/gpu-manifest.json`.
