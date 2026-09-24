@@ -359,6 +359,17 @@ python3 scripts/test-hrx-status-roundtrip.py \
 Both paths must name the matching patched source and configured build; the
 build must contain `compile_commands.json` and the built IREE base library.
 
+The allocator regression check also runs entirely on the CPU:
+
+```sh
+bash scripts/test-hrx-tlsf-pool.sh
+```
+
+It exercises the actual HRX slab allocator: reuse beyond its recent-slab hints,
+dependency ordering, fragmentation, and concurrent allocation with trimming.
+The adapter searches all existing slabs before growing the pool, avoiding
+premature exhaustion when reusable memory remains in older slabs.
+
 ## Entitlement reference
 
 | Entitlement | Bundle | What it does |

@@ -655,7 +655,7 @@ contracts; they do not erase the model-level failure. Evidence:
 ### Targeted logits isolate a near tie
 
 An isolated diagnostic retained the normal GPU argmax and read back its existing
-248,320-element logit row only after selection at generated index337 (ordinal338).
+248,320-element logit row only after selection at generated index 337 (ordinal338).
 Both requests had exactly 1,361 input-history tokens and identical history hash
 `17e3d44d0fadb600`. The GPU selected the true maximum in each row:
 
@@ -716,3 +716,141 @@ Evidence: `qwen-prepare-v2/result.json` and `qwen-prepare-v2-baseline/result.jso
 under `build/tests/driver195-hardware`; candidate manifest and patch are in
 `build/perf-loom-prepare-v2`. Its emission trace span includes identity construction,
 which was previously outside that span; total request timing is the comparison.
+
+### Exact-arithmetic Q6 decode schedules
+
+Two isolated candidates preserve each output's load addresses and ordered FP32
+FMA/reduction expressions. The first hoists repeated rotated-LDS address
+arithmetic for each 16-code chunk. The second computes two output columns per
+wave and shares their activation loads. Both leave packed Q6 weights unchanged.
+
+Each baseline/candidate pair passed 60 guarded R9700 cases with nine executions
+per case. Whole-output hashes matched exactly, inputs stayed unchanged and the
+ragged final workgroup remained in bounds. A four-column variant subsequently
+passed the same hardware checks with N36, but its throughput is not yet measured.
+The address variant used N19 and the two-column variant N18.
+
+One warmup plus three measured 64-input/33-output requests, KV128 and flush64/
+poll64, gave the following paired results. Each candidate was followed by its
+unchanged control; all short-request text matched and shutdowns succeeded.
+
+| Candidate/control | Median prompt tokens/s | Median decode tokens/s |
+| --- | ---: | ---: |
+| Address hoisting | 87.2771 | 12.7959 |
+| Its unchanged control | 87.2946 | 12.5369 |
+| Two columns per wave | 86.7387 | 12.8677 |
+| Its unchanged control | 85.6220 | 12.4259 |
+
+These are small end-to-end gains, not the roughly 30% reduction suggested by
+counting instructions in isolation. Baseline rates also drift between runs.
+No RMS or queue-prefix change is included. Artifacts are `q6-panel-*-numeric.log`,
+`q6-two-column-*-numeric.log`, `q6-four-column-*-numeric.log`, and the
+`qwen-panel-hoist*`/`qwen-two-column*` directories under
+`build/tests/driver195-hardware`; source/build manifests are in the corresponding
+`build/perf-q6-*` directories.
+
+A strict-FMAC rewrite of the two-column shaders produced no dual-FMAC pairs.
+Twelve compiled variants covered widths 2/4/8/16 and three model shapes. Width8
+added an instruction; width16 increased register use substantially. This route
+has no measured performance benefit and is not promoted. Evidence:
+`build/perf-q6-two-column-fmac/README.md`.
+
+The two-column candidate subsequently completed two 1,024-input/1,024-output
+requests, but their greedy text differed at token index 337, reproducing the
+previous baseline/RMS near-tie branch. Its exact ordered kernel arithmetic
+therefore does not resolve the model-level repeatability issue. Server shutdown
+was clean. CPU build activity overlapped part of this run, so its timing is not
+a controlled performance result. Evidence: `qwen-two-column-1k1k/result.json`.
+
+A separate baseline diagnostic read the existing final hidden row after the
+normal synchronization, without adding graph roots. Both requests used identical
+1,024-token input history. The first hidden row, already at the end of prefill,
+differed in 5,117/5,120 FP32 words: maximum absolute difference 0.00067246,
+relative L2 error 0.000075469. All 338 captured rows differed. This moves the next
+investigation into prefill rather than attributing the initial difference to
+decode RMS or the final vocabulary projection. Readback/file I/O perturbs
+timing; this is not a throughput measurement or proof of identical compiled
+kernel sequences. Evidence: `hidden-baseline-series/comparison.json` under
+`build/tests/driver195-hardware`.
+
+### Same-queue device barriers
+
+The isolated HRX experiment admits a standard AQL prefix barrier only for a
+published same-physical-queue device epoch with no undrained earlier host action.
+Cross-queue and unproven dependencies retain software deferral. It is not enabled
+in the normal runtime.
+
+Hardware tests verified all outputs/guards and clean retirement for 257 dependent
+submissions, 513 alternating submissions on two physical queues, and 8,193
+submissions across ring wrap. Captures prove 256 device barriers replaced 256
+software deferrals in the short same-queue chain. Cross-queue submissions retained
+256 deferrals per queue. The long chain used 1,704 device barriers and 6,488
+deferrals. A deliberately blocked host callback kept its transitive consumer
+software-deferred. These tests prove ring wrap/reuse, not physical capacity
+backpressure; separate production-helper host tests cover full-ring admission.
+
+The 64-input/33-output off/on/on/off model sequence produced median decode rates
+12.5978 / 12.8751 / 12.8745 / 12.4116 TPS, with exact text and clean shutdown.
+Prompt rates were 87.2187 / 86.0356 / 85.6910 / 85.3374 PP/s. The small decode
+improvement coexists with run-order drift; this is not broad promotion evidence.
+Captured library SHA-256 was
+`4c004283ec1087908d6361a4657d0fac99ca57434c87b0a62c373f471f609f04`.
+Evidence: `prefix-*.jsonl`, `prefix-*.log` and `qwen-prefix-*` under
+`build/tests/driver195-hardware`.
+
+The failure fixture independently exposed missing HRX status conversions:
+`ABORTED` became `INTERNAL`. That status-only fix is now in the tracked adapter
+and normal runtime. All 16 public status codes pass production-code ASan/UBSan
+round trips, and the controlled GPU callback failure returns `ABORTED` followed
+by clean shutdown (`hrx-canonical-status-failure.log`).
+
+### Prefill chunk size and warmup limits
+
+The normal generator uses 256-token chunks, while current measured BF16 Q6 matrix
+selection records cover M64 and M512. A private generator-only 512-token-chunk
+prototype completed two 512-input/33-output requests, then failed allocation on
+the third with the old runtime. It shut down cleanly and is not promoted. The unchanged 256-token
+control completed all three requests with identical text.
+
+The control's prompt rates were 13.14, 22.63 and 70.36 PP/s. One warmup therefore
+did not establish steady prefill throughput. The harness now supports
+`--benchmark-warmup N`; all warmup outputs remain checked and retained, but only
+later requests enter the rate summary. Do not treat this control's two-sample
+median as a steady benchmark. Evidence: `qwen-prefill512-chunk512` and
+`qwen-prefill512-chunk256` under `build/tests/driver195-hardware`.
+
+The first M256 BF16 extension also failed its existing 0.5% cancellation-safe
+accuracy bound on an outlier. An independent CPU oracle reproduces compounded
+activation/weight rounding: 51,756.6914 in FP32 versus 51,478.8828 with BF16
+operands, exceeding a 258.8288 absolute bound. This is a precision-coverage gap,
+not evidence of an M256 indexing defect. The threshold remains unchanged and
+the candidate is unqualified pending correction. Evidence:
+`q6-m256-bf16-numeric.log` and `build/perf-q6-m256`.
+
+### Reusing free HRX slabs
+
+The prefill allocation failure exposed an HRX TLSF search limitation: after
+checking one preferred slab and four recently released slabs, allocation could
+grow the pool while older slabs still held reusable ranges. The adapter now
+searches the remaining slabs under the same pool lock, using the existing
+alignment and dependency-frontier checks. The fast path is unchanged.
+
+Production-code CPU tests reproduce 28 failures with the old search and none
+with the fix. A fixed 33-slab workload previously grew to 225 slabs over six
+cycles; the corrected search stays at 33. Coverage includes fragmented ranges,
+dependency ordering, and 2,000 concurrent allocations with trimming. Reproduce
+with `bash scripts/test-hrx-tlsf-pool.sh` after building the patched HRX adapter.
+
+With only the runtime allocator changed, the experimental 512-token generator
+completed six identical 512-input/33-output requests and shut down cleanly.
+After three warmups, measured prompt rates were 107.999/108.282/108.532 PP/s;
+median decode throughput was 11.830 TPS. This verifies the observed repeated
+allocation failure is resolved, not that all out-of-memory conditions are
+eliminated. The generator chunk-size change remains experimental. Evidence:
+`qwen-prefill512-tlsf-fixed/result.json` under
+`build/tests/driver195-hardware`.
+
+The rebuilt normal runtime also passed the same six-request check: identical
+text, clean shutdown, median 108.920 PP/s and 11.888 TPS after three warmups.
+Evidence: `qwen-prefill512-tlsf-canonical/result.json`. The runtime SHA-256 was
+`2b39fe18a74b4d42c67df5ac930e0bf796b65760f86aeeb56e9a54f0c3803cff`.

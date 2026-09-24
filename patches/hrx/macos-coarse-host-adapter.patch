@@ -456,3 +456,36 @@ index d8c1a89e..6c6265e6 100644
      case IREE_STATUS_INVALID_ARGUMENT:
        hrx_code = HRX_STATUS_INVALID_ARGUMENT;
        break;
+diff --git a/runtime/src/iree/hal/memory/tlsf_pool.c b/runtime/src/iree/hal/memory/tlsf_pool.c
+index bec35042..d25e51a5 100644
+--- a/runtime/src/iree/hal/memory/tlsf_pool.c
++++ b/runtime/src/iree/hal/memory/tlsf_pool.c
+@@ -928,6 +928,28 @@ static iree_status_t iree_hal_tlsf_pool_acquire_reservation(
+                               selected_result == IREE_HAL_POOL_ACQUIRE_OK_FRESH;
+   }
+
++  // The preferred slab and bounded reuse list are only search hints. Releases
++  // can leave usable ranges in older slabs that are no longer in either hint.
++  // Exhaust those slabs before reporting exhaustion or committing more backing.
++  for (uint32_t i = 0; i < pool->slab_count && iree_status_is_ok(status) &&
++                       !has_selected_allocation;
++       ++i) {
++    if (i == preferred_slab_index) continue;
++    bool already_tried = false;
++    for (uint8_t j = 0; j < pool->reuse_candidate_slab_count; ++j) {
++      if (pool->reuse_candidate_slab_indices[j] == i) {
++        already_tried = true;
++        break;
++      }
++    }
++    if (already_tried) continue;
++    status = iree_hal_tlsf_pool_try_acquire_from_slab(
++        pool, (uint16_t)i, allocation_length, requester_frontier,
++        /*record_reuse_miss=*/true, &selected_allocation, &selected_result);
++    has_selected_allocation = selected_result == IREE_HAL_POOL_ACQUIRE_OK ||
++                              selected_result == IREE_HAL_POOL_ACQUIRE_OK_FRESH;
++  }
++
+   if (iree_status_is_ok(status) && !has_selected_allocation) {
+     if (iree_all_bits_set(flags, IREE_HAL_POOL_RESERVE_FLAG_DISALLOW_GROWTH)) {
+       growth_required = true;

@@ -22,7 +22,9 @@ def main():
     parser.add_argument('--run', action='store_true')
     parser.add_argument('--chat-only', action='store_true', help='isolate chat from session-reuse checks')
     parser.add_argument('--benchmark-repeats', type=int, default=0,
-                        help='one warmup, then N identical completion requests (1..20)')
+                        help='N measured identical completion requests after warmup (1..20)')
+    parser.add_argument('--benchmark-warmup', type=int, default=1,
+                        help='warmup requests excluded from benchmark rates (1..20; default: 1)')
     parser.add_argument('--generated-tokens', type=int, default=33,
                         help='benchmark output cap; 33 gives 32 decode steps unless EOS ends early')
     parser.add_argument('--expected-prompt-tokens', type=int,
@@ -42,6 +44,10 @@ def main():
     args = parser.parse_args()
     if not 0 <= args.benchmark_repeats <= 20 or not 1 <= args.generated_tokens <= 4096:
         parser.error('benchmark repeats must be 0..20 and generated tokens must be 1..4096')
+    if not 1 <= args.benchmark_warmup <= 20:
+        parser.error('benchmark warmup must be 1..20')
+    if not args.benchmark_repeats and args.benchmark_warmup != 1:
+        parser.error('--benchmark-warmup requires --benchmark-repeats')
     if not 128 <= args.kv_len <= 8192 or args.generated_tokens >= args.kv_len:
         parser.error('KV length must be 128..8192 and exceed the output token cap')
     if not 30 <= args.request_timeout <= 3600:
@@ -80,6 +86,11 @@ def main():
     hsa_library = args.hsa_library_dir.resolve() / 'libhsa-runtime64.dylib'
     result['hsa_library'] = str(hsa_library)
     result['hsa_sha256'] = hashlib.sha256(hsa_library.read_bytes()).hexdigest()
+    result['runtime_overrides'] = {
+        name: {'path': str(path.resolve()),
+               'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+        for name in ('libhrx.0.dylib', 'libhrx.dylib')
+        if (path := args.hsa_library_dir.resolve() / name).is_file()}
     result['model_config_sha256'] = hashlib.sha256((args.model / 'config.json').read_bytes()).hexdigest()
     result['measurement_environment'] = {key: env[key] for key in
         ('LSE_REQUIRE_DEVICE_KERNELS', 'LSE_TIME_SPANS', 'LSE_TIME_STEPS',
@@ -88,7 +99,9 @@ def main():
          'LSE_SHARED_SCORE_SDPA', 'LSE_PROFILE_DISPATCH', 'MAC_HSA_SIGNAL_BACKEND',
          'MAC_HSA_BLOCKED_POLL_US', 'LSE_KV_PREALLOC', 'LSE_NO_REPLAY',
          'LSE_CACHE_DIR', 'LSE_LOGIT_DIAGNOSTIC_INDEX',
-         'LSE_LOGIT_DIAGNOSTIC_DIR') if key in env}
+         'LSE_LOGIT_DIAGNOSTIC_DIR', 'HRX_MAC_SAME_QUEUE_PREFIX',
+         'HRX_PROFILE_FILE', 'HRX_PROFILE_MODE', 'LSE_HIDDEN_DIAGNOSTIC_LAST',
+         'LSE_HIDDEN_DIAGNOSTIC_DIR') if key in env}
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def request(path, payload=None, timeout=args.request_timeout):
@@ -136,13 +149,13 @@ def main():
                 prompt = args.prompt_file.read_text() if args.prompt_file else 'The capital of France is'
                 if not prompt.strip():
                     raise ValueError('benchmark prompt is empty')
-                result['benchmark'] = {'warmup_requests': 1, 'measured_requests': args.benchmark_repeats,
+                result['benchmark'] = {'warmup_requests': args.benchmark_warmup, 'measured_requests': args.benchmark_repeats,
                     'prompt_sha256': hashlib.sha256(prompt.encode()).hexdigest(),
                     'requested_generated_tokens': args.generated_tokens,
                     'requested_decode_steps': args.generated_tokens - 1,
                     'scope': 'HTTP generation timings include sampling; not llama-bench kernel timings'}
                 cases = [('/v1/completions', {'prompt': prompt, 'max_tokens': args.generated_tokens})
-                         for _ in range(args.benchmark_repeats + 1)]
+                         for _ in range(args.benchmark_repeats + args.benchmark_warmup)]
             first_completion = None
             benchmark_completion = None
             for path, payload in cases:
@@ -197,7 +210,8 @@ def main():
                         raise RuntimeError('timing rate does not match its count and duration')
                 print(json.dumps({'endpoint': path, 'text': text, 'timings': timing}), flush=True)
             if args.benchmark_repeats:
-                measured = [r['response']['timings'] for r in result['requests'][1:]]
+                measured = [r['response']['timings'] for r in
+                            result['requests'][args.benchmark_warmup:]]
                 summary = result['benchmark']
                 summary['all_requested_decode_steps_completed'] = all(
                     t['decode_n'] == args.generated_tokens - 1 for t in measured)
