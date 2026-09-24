@@ -24,6 +24,21 @@ hsa_status_t mac_hsa_agent_get_driver_info(hsa_agent_t agent,
                                           mac_hsa_device_info_t *info,
                                           size_t info_size);
 
+// Raw CP dispatch timestamps in this GPU's clock domain, NOT HSA system time.
+// Enable queue profiling before its first submission. Use a fresh completion
+// signal per dispatch, SYSTEM release scope, and retain it unchanged until readout.
+// The caller associates the signal with its submitting queue; this API does not
+// prove that association. No submission/wait is performed; pending/missing stamps
+// fail without changing output. Cross-device/SDMA/host clock correlation is absent.
+enum { MAC_HSA_TIMESTAMP_DOMAIN_GPU = 1 };
+typedef struct mac_hsa_dispatch_timestamps_s {
+    uint64_t version, start_ticks, end_ticks, frequency_hz;
+    uint32_t valid_bits, clock_domain;
+} mac_hsa_dispatch_timestamps_t;
+__attribute__((visibility("default")))
+hsa_status_t mac_hsa_dispatch_timestamps(const hsa_queue_t *queue,hsa_signal_t completion,
+    mac_hsa_dispatch_timestamps_t *out,size_t out_size);
+
 // Synchronous native launch of a frozen HSA-loaded gfx1201 kernel. This is
 // not an HSA AQL queue. Currently accepts wave32, a kernarg-pointer-only user
 // SGPR layout, and no scratch, LDS, preload or dynamic stack. The caller lists

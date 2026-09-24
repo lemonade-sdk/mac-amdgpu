@@ -17,6 +17,8 @@ struct RuntimeQueue {
     void (*errorCallback)(hsa_status_t,hsa_queue_t *,void *)=nullptr;
     void *errorData=nullptr;
     bool errorDelivered=false;
+    bool everKicked=false;
+    uint64_t profilingFrequency=0;
     struct ServiceState {
         std::atomic<bool> stop{false};
         std::mutex waitMutex;
@@ -87,6 +89,7 @@ struct RuntimeQueue {
         {
             std::lock_guard lock(mutex);
             if (!active || !hardwareHandle || errorDelivered) return;
+            everKicked=true;
             if (connection->kickQueue(hardwareHandle,uint64_t(value))!=HSA_STATUS_SUCCESS) {
                 errorDelivered=true;notify=true;
             }
@@ -257,19 +260,57 @@ hsa_status_t hsa_queue_create(hsa_agent_t agent,uint32_t size,hsa_queue_type32_t
       catch (const std::system_error &) {return HSA_STATUS_ERROR_OUT_OF_RESOURCES;}
 }
 HSA_API_EXPORT hsa_status_t hsa_amd_profiling_set_profiler_enabled(hsa_queue_t *pointer, int enable) {
-    std::lock_guard lock(runtimeMutex);
-    if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
-    if (!pointer || (enable != 0 && enable != 1)) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
-    const auto queue = queues.find(pointer);
-    if (queue == queues.end()) return HSA_STATUS_ERROR_INVALID_QUEUE;
-    // CP caches these properties when mapping a hardware queue. Enabling
-    // profiling requires a synchronized suspend/resume, as in ROCr SetProfiling.
-    // Until that refresh exists, do not promise timestamps from a host-only bit.
-    if (enable && queue->second->connection) return HSA_STATUS_ERROR;
-    auto properties = std::atomic_ref<uint32_t>(queue->second->abi->queue_properties);
-    constexpr uint32_t mask = AMD_QUEUE_PROPERTIES_ENABLE_PROFILING;
-    if (enable) properties.fetch_or(mask, std::memory_order_release);
-    else properties.fetch_and(~mask, std::memory_order_release);
+    std::shared_ptr<RuntimeQueue> queue;
+    {
+        std::lock_guard lock(runtimeMutex);
+        if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+        if (!pointer || (enable != 0 && enable != 1)) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        const auto found=queues.find(pointer);
+        if (found==queues.end()) return HSA_STATUS_ERROR_INVALID_QUEUE;
+        queue=found->second;
+    }
+    std::lock_guard lock(queue->mutex);
+    if (!queue->active || queue->errorDelivered) return HSA_STATUS_ERROR_INVALID_QUEUE;
+    auto properties=std::atomic_ref<uint32_t>(queue->abi->queue_properties);
+    constexpr uint32_t mask=AMD_QUEUE_PROPERTIES_ENABLE_PROFILING;
+    if (bool(properties.load(std::memory_order_acquire)&mask)==bool(enable)) return HSA_STATUS_SUCCESS;
+    // ROCr AqlQueue::SetProfiling needs suspend/resume only after the first
+    // submission. We support the unused-queue case; callers serialize producers.
+    if (queue->connection) {
+        if (!queue->hardwareHandle || queue->everKicked ||
+            index(queue->abi->write_dispatch_id).load() || index(queue->abi->read_dispatch_id).load())
+            return HSA_STATUS_ERROR;
+        if (enable) {
+            mac_hsa::DeviceProperties device{};
+            const auto status=queue->connection->properties(device);
+            if (status!=HSA_STATUS_SUCCESS || !device.timestampFrequency) return HSA_STATUS_ERROR;
+            queue->profilingFrequency=device.timestampFrequency;
+        }
+    }
+    if (enable) properties.fetch_or(mask,std::memory_order_release);
+    else properties.fetch_and(~mask,std::memory_order_release);
+    return HSA_STATUS_SUCCESS;
+}
+hsa_status_t mac_hsa_dispatch_timestamps(const hsa_queue_t *pointer,hsa_signal_t completion,
+    mac_hsa_dispatch_timestamps_t *out,size_t outSize) {
+    if (!out || outSize!=sizeof(*out)) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    const auto queue=findQueue(pointer);
+    if (!queue) return HSA_STATUS_ERROR_INVALID_QUEUE;
+    const auto signal=findSignal(completion);
+    if (!signal) return HSA_STATUS_ERROR_INVALID_SIGNAL;
+    std::lock_guard lock(queue->mutex);
+    if (!queue->active || queue->errorDelivered || !queue->hardwareHandle || !queue->profilingFrequency ||
+        !(std::atomic_ref<uint32_t>(queue->abi->queue_properties).load(std::memory_order_acquire)&AMD_QUEUE_PROPERTIES_ENABLE_PROFILING))
+        return HSA_STATUS_ERROR_INVALID_QUEUE;
+    if (!signal->sharedABI || signal->gpuConnection.lock()!=queue->connection || !signal->alive.load())
+        return HSA_STATUS_ERROR_INVALID_SIGNAL;
+    // CP publishes timestamps before the SYSTEM-release completion decrement.
+    // The caller retains a unique signal and cannot reset/reuse it during readout.
+    if (signal->value().load(std::memory_order_acquire)!=0 || !signal->alive.load()) return HSA_STATUS_ERROR;
+    const auto start=std::atomic_ref<uint64_t>(signal->sharedABI->startTimestamp).load(std::memory_order_relaxed);
+    const auto end=std::atomic_ref<uint64_t>(signal->sharedABI->endTimestamp).load(std::memory_order_relaxed);
+    if (!start || end<start) return HSA_STATUS_ERROR;
+    *out={1,start,end,queue->profilingFrequency,64,MAC_HSA_TIMESTAMP_DOMAIN_GPU};
     return HSA_STATUS_SUCCESS;
 }
 HSA_API_EXPORT hsa_status_t hsa_amd_queue_cu_set_mask(const hsa_queue_t *pointer, uint32_t bits, const uint32_t *mask) {

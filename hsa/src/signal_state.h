@@ -14,6 +14,7 @@
 #include <unordered_map>
 
 namespace mac_hsa {
+class Connection;
 // AMD's 64-byte signal layout (amd_hsa_signal.h). This backing currently
 // uses CPU atomics for host-only signals. GPU-backed signals route all value
 // changes through the GPU atomic domain; CPU access is acquire observation.
@@ -28,12 +29,15 @@ struct alignas(64) SignalABI {
 static_assert(sizeof(SignalABI) == sizeof(amd_signal_t));
 static_assert(alignof(SignalABI) == alignof(amd_signal_t));
 static_assert(offsetof(SignalABI, value) == offsetof(amd_signal_t, value));
+static_assert(offsetof(SignalABI, startTimestamp) == offsetof(amd_signal_t, start_ts));
+static_assert(offsetof(SignalABI, endTimestamp) == offsetof(amd_signal_t, end_ts));
 static_assert(offsetof(SignalABI, queue) == offsetof(amd_signal_t, queue_ptr));
 static_assert(std::atomic_ref<int64_t>::is_always_lock_free);
 struct Signal {
     SignalABI abi;
     SignalABI *sharedABI = nullptr;
     std::shared_ptr<void> sharedStorage;
+    std::weak_ptr<Connection> gpuConnection;
     uint64_t ipcToken[4]{};
     std::function<bool(unsigned,int64_t,int64_t,int64_t &)> gpuAtomic;
     std::function<bool()> gpuHealthy;

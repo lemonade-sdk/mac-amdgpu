@@ -175,6 +175,7 @@ hsa_status_t createGPUSignalBacking(const std::shared_ptr<Connection> &connectio
     };
     signal->gpuHealthy=[context] {return !context->faulted && (!context->service || context->service->healthy());};
     signal->sharedStorage=std::move(backing);signal->sharedABI=abi;
+    signal->gpuConnection=context->connection;
     {
         std::lock_guard publish(context->slotsMutex);
         if (context->faulted) {signal->alive=false;return HSA_STATUS_ERROR_OUT_OF_RESOURCES;}

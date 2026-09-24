@@ -203,3 +203,7 @@ endif()
 add_executable(mac-hsa-signal-service-test tools/mac_hsa_signal_service_test.cpp)
 target_link_libraries(mac-hsa-signal-service-test PRIVATE hsa-runtime64)
 target_compile_options(mac-hsa-signal-service-test PRIVATE -Wall -Wextra -Werror)
+
+add_executable(rocprofmac tools/rocprofmac.cpp)
+target_link_libraries(rocprofmac PRIVATE hsa-runtime64)
+target_compile_options(rocprofmac PRIVATE -Wall -Wextra -Werror)

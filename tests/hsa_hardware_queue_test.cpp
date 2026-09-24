@@ -7,6 +7,7 @@
 
 static unsigned creates,kicks,destroys,atomics,callbacks;
 static bool failKick=false,failAtomic=false;
+static uint64_t testFrequency=100000000;
 static uint64_t driverBuild=187;
 static uint32_t gfxRevision=1;
 static unsigned diagnosticMode=0,diagnosticCalls=0;
@@ -20,6 +21,10 @@ struct TestConnection:Connection {
     std::set<uint64_t> queues;
     ~TestConnection() override {for (auto &[id,pointer]:shared) { (void)id;std::free(pointer); }}
     bool supportsBuffers() const override {return true;}
+    hsa_status_t properties(DeviceProperties &p) override {
+        uint64_t now;assert(hsa_system_get_info(HSA_SYSTEM_INFO_TIMESTAMP,&now)==0);
+        p.timestampFrequency=testFrequency;return HSA_STATUS_SUCCESS;
+    }
     hsa_status_t read(DeviceSnapshot &s) override {s={1,driverBuild,15,256ull<<20,32ull<<30,12,0,gfxRevision};return HSA_STATUS_SUCCESS;}
     hsa_status_t allocateSharedBuffer(uint64_t bytes,SharedBuffer &out) override {
         bytes=(bytes+16383)&~uint64_t(16383);
@@ -205,18 +210,48 @@ int main() {
     }
     diagnosticMode=0;
     const auto propertiesBefore=reinterpret_cast<amd_queue_t *>(queue)->queue_properties;
+    testFrequency=0;
     assert(hsa_amd_profiling_set_profiler_enabled(queue,1)==HSA_STATUS_ERROR);
     assert(reinterpret_cast<amd_queue_t *>(queue)->queue_properties==propertiesBefore);
-    assert(hsa_amd_profiling_set_profiler_enabled(queue,0)==HSA_STATUS_SUCCESS);
+    testFrequency=100000000;
+    assert(hsa_amd_profiling_set_profiler_enabled(queue,1)==0);
+    assert(reinterpret_cast<amd_queue_t *>(queue)->queue_properties==(propertiesBefore|AMD_QUEUE_PROPERTIES_ENABLE_PROFILING));
+    assert(hsa_amd_profiling_set_profiler_enabled(queue,0)==0);
     assert(reinterpret_cast<amd_queue_t *>(queue)->queue_properties==propertiesBefore);
+    assert(hsa_amd_profiling_set_profiler_enabled(queue,1)==0);
+    hsa_signal_t profiled{};
+    assert(hsa_signal_create(1,1,&gpu,&profiled)==0);
+    auto profiledState=mac_hsa::detail::findSignal(profiled);
+    mac_hsa_dispatch_timestamps_t stamp{};std::memset(&stamp,0xa5,sizeof(stamp));const auto savedStamp=stamp;
+    assert(mac_hsa_dispatch_timestamps(queue,profiled,&stamp,sizeof(stamp))==HSA_STATUS_ERROR);
+    assert(!std::memcmp(&stamp,&savedStamp,sizeof(stamp)));
+    profiledState->sharedABI->startTimestamp=1234;profiledState->sharedABI->endTimestamp=1300;
+    // Simulate CP's final SYSTEM-release completion publication.
+    std::atomic_ref<int64_t>(profiledState->sharedABI->value).store(0,std::memory_order_release);
+    assert(mac_hsa_dispatch_timestamps(queue,profiled,&stamp,sizeof(stamp))==0);
+    assert(stamp.start_ticks==1234 && stamp.end_ticks==1300 && stamp.frequency_hz==100000000 && stamp.valid_bits==64);
+    auto owner=profiledState->gpuConnection;
+    profiledState->gpuConnection=std::make_shared<mac_hsa::TestConnection>();
+    assert(mac_hsa_dispatch_timestamps(queue,profiled,&stamp,sizeof(stamp))==HSA_STATUS_ERROR_INVALID_SIGNAL);
+    profiledState->gpuConnection=owner;
+    profiledState->sharedABI->endTimestamp=1233;
+    assert(mac_hsa_dispatch_timestamps(queue,profiled,&stamp,sizeof(stamp))==HSA_STATUS_ERROR);
+    profiledState->sharedABI->startTimestamp=profiledState->sharedABI->endTimestamp=0;
+    assert(mac_hsa_dispatch_timestamps(queue,profiled,&stamp,sizeof(stamp))==HSA_STATUS_ERROR);
+    profiledState.reset();assert(hsa_signal_destroy(profiled)==0);
     hsa_agent_t queueAgent{};
     assert(hsa_amd_queue_get_info(queue,HSA_AMD_QUEUE_INFO_AGENT,&queueAgent)==0 && queueAgent.handle==gpu.handle);
     uint64_t doorbellID=0xabcdef;
     assert(hsa_amd_queue_get_info(queue,HSA_AMD_QUEUE_INFO_DOORBELL_ID,&doorbellID)==HSA_STATUS_ERROR_INVALID_ARGUMENT && doorbellID==0xabcdef);
     assert(creates==1 && hsa_queue_add_write_index_relaxed(queue,8)==0);
+    assert(hsa_amd_profiling_set_profiler_enabled(queue,0)==HSA_STATUS_ERROR);
     hsa_signal_store_screlease(queue->doorbell_signal,7);assert(kicks==1);
     assert(hsa_queue_load_write_index_scacquire(queue)==8);
-    auto *abi=reinterpret_cast<amd_queue_t *>(queue);abi->read_dispatch_id=8;
+    auto *abi=reinterpret_cast<amd_queue_t *>(queue);
+    abi->write_dispatch_id=0;abi->read_dispatch_id=0;
+    assert(hsa_amd_profiling_set_profiler_enabled(queue,0)==HSA_STATUS_ERROR); // ever submitted, even with reset indices
+    assert(hsa_amd_profiling_set_profiler_enabled(queue,1)==0); // idempotent
+    abi->write_dispatch_id=8;abi->read_dispatch_id=8;
     assert(hsa_queue_load_read_index_scacquire(queue)==8);
     assert(hsa_queue_inactivate(queue)==0 && destroys==1);
     assert(mac_hsa_shared_atomic_diagnostics(diagnosticMemory,queue,&diagnostic,sizeof(diagnostic))==HSA_STATUS_ERROR_INVALID_QUEUE);
