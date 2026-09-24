@@ -651,3 +651,29 @@ An offline binding test also kept all bindings within the current graph across
 contracts; they do not erase the model-level failure. Evidence:
 `build/tests/driver195-hardware/rms-repeatability-r3.log` and
 `build/perf-rms-cooperative/bindings-r3.log`.
+
+### Targeted logits isolate a near tie
+
+An isolated diagnostic retained the normal GPU argmax and read back its existing
+248,320-element logit row only after selection at generated index337 (ordinal338).
+Both requests had exactly 1,361 input-history tokens and identical history hash
+`17e3d44d0fadb600`. The GPU selected the true maximum in each row:
+
+| Request | Leading token | Leading logit | Runner-up | Margin |
+| --- | --- | ---: | --- | ---: |
+| 1 | 780 (` his`) | 18.6043835 | 440 (` with`) | 0.0000209808 |
+| 2 | 440 (` with`) | 18.6044197 | 780 (` his`) | 0.0000381470 |
+
+Neither row contained a nonfinite value. Their maximum absolute difference was
+0.0001716614 and relative L2 difference8.77543e-6. This establishes that a small
+numerical difference reverses a nearly tied greedy decision; it does not identify
+which upstream operation introduced the difference. The diagnostic preserves
+selection but extends the logits buffer's lifetime, so it is not a timing run.
+
+An existing `LSE_KV_PREALLOC=1` control returned equal400-token continuations,
+but its rows still differed (maximum absolute0.0002918243, relative L2 1.63052e-5).
+Both selected token780, with margins0.0001411438 and0.0000152588. Therefore
+preallocation does not establish a numerical fix and is not promoted as one.
+Artifacts: `qwen-rms-logit-diagnostic`, `rms-logits-337/comparison.json`,
+`qwen-rms-logit-prealloc`, and `rms-logits-prealloc/comparison.json` under
+`build/tests/driver195-hardware`. Stable source/default binaries remain restored.
