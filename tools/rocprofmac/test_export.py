@@ -26,6 +26,9 @@ class ExportTest(unittest.TestCase):
         with self.assertRaises(ValueError):export.convert(rows)
         rows=self.records();rows[0]['timestamp_frequency_hz_present']=False
         with self.assertRaises(ValueError):export.convert(rows)
+    def test_metadata_only_is_not_a_gpu_profile(self):
+        with self.assertRaises(ValueError):
+            export.convert([r for r in self.records() if r["record_type"] != "dispatch_event"])
     def test_join_label_without_changing_timing(self):
         labels=export.label_map('[dispatch-profile] count=32 lse_loom_42 anchor=quant_linear phase=0 grid=4')
         self.assertIn('anchor=quant_linear',labels['lse_loom_42'])

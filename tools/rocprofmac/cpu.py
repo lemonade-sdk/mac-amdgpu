@@ -56,7 +56,7 @@ def main():
     try:
         completed = subprocess.run(argv, timeout=args.seconds + 60, check=False)
     except subprocess.TimeoutExpired:
-        print("xctrace exceeded recording deadline; trace may be incomplete", file=sys.stderr)
+        print("xctrace exceeded recording deadline; trace may be incomplete; target startup/retirement is unconfirmed", file=sys.stderr)
         return 3
     return completed.returncode
 
