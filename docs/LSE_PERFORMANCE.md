@@ -6,6 +6,38 @@ llama.cpp has not been demonstrated.** The current measurements establish a
 working baseline and identify work to profile; they are not a matched benchmark
 against another engine.
 
+**Current accurate-default benchmark:** rebuilt server `77e4047b` measured
+**88.8185 PP/s and 16.6747 TPS** on 512 input / 129 output tokens, KV1024,
+MTP disabled, flush64 and 64 µs polling. This is one measured request after two
+warmups, with zero measured compilations, three identical responses and clean
+shutdown. The two M256 FFN shapes use the original FP32 path. The same server
+with the older HSA library separately measured **88.6795 PP/s and 16.6764 TPS**.
+
+The matched profiling-capable HSA `7d9b8af9` off/on comparison preserved all six
+responses. Profile-on measured **87.9418 PP/s and 16.0818 TPS**, an elapsed-time
+increase of **0.997% prefill / 3.687% decode**. These are sequential single
+measured requests, not a randomized overhead guarantee. An initial attempt
+using older HSA `244f3943` failed before model loading: its compiled profiling
+entry point unconditionally rejects hardware queues. The newer library passed
+four unused-queue profiling lifetimes; no driver change was needed.
+
+The current trace validates all per-export counts against the independent host
+summary and separates three requests by embedding shapes. After excluding two
+warmups and two setup dispatches, the measured request contains:
+
+| Phase | Dispatches | GPU envelope | Sum of dispatch durations | Gaps between captured dispatches |
+| --- | ---: | ---: | ---: | ---: |
+| Prefill | 3,334 | 5,776.744 ms | 5,751.681 ms | 25.063 ms |
+| Decode, 128 steps | 213,632 | 7,927.043 ms | 6,553.070 ms | 1,373.973 ms |
+
+Prefill FFN up/gate accounts for **44.64%** of summed kernel durations and down
+for **22.67%**. Decode FFN up/gate is **32.57%**, down **15.30%**, and attention
+**10.35%**. These identify optimization priorities, not utilization or occupancy.
+Uncaptured gaps may contain submission, copies, harvesting or other work;
+host and GPU clocks are not correlated. Evidence, frozen binaries, source and
+runtime identities: `build/rocprofmac-fp32-default/{manifest.json,comparison.json,
+phases.json,profile-ready-off/result.json,profile-ready-on/result.json}`.
+
 **Current qualification correction:** the M256 residual-two-product vector
 BF16 profile is withdrawn from automatic selection. A newly matched reference
 changes only those two Q6 projections back to their original FP32 contraction,

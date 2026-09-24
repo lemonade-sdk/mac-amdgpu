@@ -74,37 +74,31 @@ Cooperative RMS normalization and four-column Q6 decode use shared HIP/Loom code
 and policy. GPU inference passes repeated-text and clean-shutdown checks,
 including full **1,024-input/1,024-output** requests.
 
-The M256 residual-two-product BF16 prefill profile is currently withheld from
-automatic selection: a new matched FP32 reference measured **0.005030228**
-logit relative error, above the unchanged **0.005** limit. Those shapes use
-the FP32 fallback in current source. The centered replacement passed the story
-and math checks but failed the code prompt (0.029523 relative error against the
-same 0.005 limit), so it also remains experimental.
-The following rates were measured with the withdrawn prefill profile and are
-preserved as experimental results, not current-default throughput claims.
+The rebuilt default, using FP32 for the two M256 projection shapes whose BF16
+profile failed accuracy qualification, measured:
 
 | Workload | Prompt processing | Decode |
 | --- | ---: | ---: |
-| 512 input / 129 output, KV1024 | **143.38 tokens/s** | **16.70 tokens/s** |
-| 1,024 input / 1,024 output, KV2048 | **139.36 tokens/s** | **14.83 tokens/s** |
+| 512 input / 129 output, KV1024 | **88.82 tokens/s** | **16.67 tokens/s** |
 
-All rows use MTP disabled, flush64 and 64 µs polling. Short-run rows are medians
-of three measured requests after two warmups; the long row is one measured
-request after two warmups. Compiler counters confirm zero new compilations in
-every measured request. Output token counts include the first token from
-prefill, so the rows contain 128 or 1,023 decode steps respectively.
+This is one measured request after two warmups, with MTP disabled, flush64 and
+64 µs polling. All three responses matched, the measured request compiled no new
+shaders, and the server shut down cleanly. Output count includes the first token
+from prefill, leaving 128 timed decode steps. A separate run using the prior HSA
+library measured 88.68 PP/s and 16.68 TPS on the same rebuilt server.
 
-Before the profile was withdrawn, the rebuilt server separately confirmed
-**143.29 PP/s and 16.70 TPS** on the same short workload, with text matching the
-frozen candidate.
-Vector prefill previously improved the matched 512-input/33-output fixture
-by **61%**. Four-column decode improves the matched short workload by **4.65%**
-and the separate long comparison by about **4.2%**, with unchanged generated text.
+**rocprofmac works on this model.** A matched GPU timestamp capture preserved
+all generated text and added about 1.0% prefill time and 3.7% decode time in this
+comparison. The two feed-forward projection shapes account for 67.3% of summed
+prefill kernel time, making matrix-kernel optimization the main prefill priority.
 
-These measurements do not establish matched llama.cpp parity. Closing the
-remaining throughput gap is active work. See
-[conditions and evidence](docs/LSE_PERFORMANCE.md) and the
-[reproduction command](LOCAL_RUN.md#experimental-resident-benchmark).
+Experimental prefill kernels reached higher throughput but failed the unchanged
+accuracy limit; they are withheld from automatic selection. The four-column
+INT8 decode candidate passes its GPU numerical suite and remains experimental
+pending full-model quality and performance checks. Historical measurements,
+profiling conditions, and [current evidence](docs/LSE_PERFORMANCE.md) are kept
+separately. Matched llama.cpp performance parity remains an active goal.
+See the [reproduction command](LOCAL_RUN.md#experimental-resident-benchmark).
 
 ## Current scope
 

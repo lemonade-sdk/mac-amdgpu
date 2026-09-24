@@ -13669,10 +13669,10 @@ index ea1b7ed..7a8d079 100644
      LSE_EXPECT_OK(o.eval());
      LSE_EXPECT_OK(s_out.eval());
 diff --git a/README.md b/README.md
-index 30ec016..c441e83 100644
+index 30ec016..0fc87f5 100644
 --- a/README.md
 +++ b/README.md
-@@ -6,6 +6,92 @@ interleaved with gated GQA, dense or sparse-MoE feed-forward -- running on the
+@@ -6,6 +6,79 @@ interleaved with gated GQA, dense or sparse-MoE feed-forward -- running on the
  are generated at run time from the model's own shapes rather than selected from
  a library.
 
@@ -13703,51 +13703,38 @@ index 30ec016..c441e83 100644
 +but its log and exact model, context and MTP settings still need to be recovered
 +for a matched comparison. It is not a measured macOS Loom result.
 +
-+**Cooperative RMS normalization is now the default shared HIP/Loom kernel**
-+for supported shapes. On macOS, the R9700 resident server completed two identical
-+greedy requests with **1,024 input and 1,024 output tokens**, with clean shutdown.
-+The second request measured **14.28 decode tokens/s**, versus **11.18** for the
-+prior control (about 28% higher): Qwen3.8-27B Q6, 1,023 decode steps, KV2048,
-+no MTP, flush64 and 64 µs polling. This is a long-context qualification result,
-+not a median across many runs.
++**The current macOS Loom default generates at 16.67 tokens/s**, with prompt
++processing at **88.82 tokens/s**, on the local Qwen3.8-27B-MLX-6bit checkpoint.
++The workload is 512 input / 129 output tokens, KV1024, MTP disabled, flush64 and
++64 µs polling: one measured request after two warmups. All three texts matched,
++the measured request compiled no new shaders, and shutdown completed cleanly.
++An independent run of the same server with the prior HSA library measured
++88.68 PP/s and 16.68 TPS. These are current-default measurements; they do not
++establish matched llama.cpp parity.
 +
-+**The M256 residual-two-product BF16 prefill profile is quarantined.** A new
-+matched comparison with the current cooperative-RMS model measured logit relative
-+L2 error **0.005030228**, above the **0.005** acceptance limit. Its earlier
-+0.004085221 result used a different RMS context. The profile now remains a
-+candidate with failed model quality, and the shared HIP/Loom selector uses the
-+FP32 fallback for those M256 shapes until a replacement qualifies.
++Working shared HIP/Loom optimizations include cooperative RMS normalization,
++Q6 activation reuse across four output columns, and buffer-lifetime planning
++based on the final fused kernel groups. Four-column decode preserves each
++output's FP32 arithmetic order. The two M256 feed-forward projections currently
++use FP32: their experimental BF16 profile exceeded the unchanged model accuracy
++limit, and a centered replacement also failed the expanded code-prompt check.
++Faster experimental prefill rates are documented in the linked measurement
++report rather than presented as current-default throughput.
 +
-+Historical measurements with that withdrawn profile were **143.26 prompt tokens/s
-+and 15.84 decode tokens/s** for a matched 512-input/33-output run, and **139.85
-+prompt tokens/s and 14.23 decode tokens/s** for the final request of a three-request
-+1,024-input/1,024-output run. They document the experiment, not the current default
-+prefill rate or an accepted accuracy result.
++**GPU profiling is working through rocprofmac.** The matched timestamp capture
++preserved all six profile-off/on responses and added about 1.0% prefill time and
++3.7% decode time in this sequential comparison. The two feed-forward projection
++shapes account for 67.3% of summed prefill kernel durations; this guides ongoing
++matrix-kernel optimization. Those sums and the gaps between dispatches are not
++GPU utilization measurements.
 +
-+**Q6 decode now shares activation loads across four output columns** on the
-+qualified gfx1201 layout, preserving each output's FP32 arithmetic order.
-+A matched 512-input/129-output comparison improved median decode from
-+**15.96 to 16.70 tokens/s**, with prefill unchanged at about **143.4 tokens/s**.
-+All ten texts matched, with zero new compilations in all six measured requests.
-+The separate three-request 1,024-input/1,024-output gate also passed: all text
-+matched the previous implementation, and the warmed final request measured
-+**139.36 prompt tokens/s and 14.83 decode tokens/s**, versus 14.23 decode
-+tokens/s in the prior long run. The long comparison uses one measured request
-+per implementation, not a multi-run median. Broader throughput parity remains
-+active work. Those four-column performance runs also used the now-quarantined
-+M256 prefill profile; their prompt rates are historical, not current-default
-+throughput claims. The four-column decode arithmetic is unchanged.
++The opt-in Q6 INT8 candidate has passed its GPU numerical suite but remains
++experimental: full-shape timing improves one projection and regresses the two
++main feed-forward shapes. It is not part of the released INT8 policy.
 +
 +KV capacity growth can create additional prefill specializations on the second
 +request. Warm up the resident workload twice and check the HTTP JIT timing
 +counters before reporting steady-state prompt throughput.
-+
-+The repeatability investigation found a shared activation-slot lifetime bug:
-+fused normalization could overwrite an input still read by another wave. The
-+planner now uses the final submitted kernel groups. The focused GPU diagnostic
-+then matched all 62 captured first-layer operands exactly across requests, and
-+the long cooperative-RMS repeat passed. This qualification covers the stated
-+model and fixtures; it is not a guarantee of bitwise equality for every model.
 +
 +HIP and Loom share packed-Q6 interpretation, tiling, operand selection, and
 +FP8/BF8 conversion. R9700 tests verify native OCP FP8/BF8 operations, including
@@ -13765,7 +13752,7 @@ index 30ec016..c441e83 100644
  ## Models
 
  The architecture is what a checkpoint is loaded as, not its name, so a family
-@@ -17,7 +103,7 @@ shares one kernel. `--list-models` prints what a build registers.
+@@ -17,7 +90,7 @@ shares one kernel. `--list-models` prints what a build registers.
  | `qwen3.5-moe` | The A3B-style MoE variants of the same families | MLX's SwitchGLU layout, experts stacked as one plane per projection |
  | `lemonseed` | [lemonseed-1.5b-base](https://huggingface.co/lemonade-sdk/lemonseed-1.5b-base) | Adds Mixture-of-Depths |
 
@@ -13774,7 +13761,7 @@ index 30ec016..c441e83 100644
  multi-token-prediction module is used when the checkpoint has one, which is
  what `--mtp` names and `--no-mtp` declines; the text tower loads on its own
  where a checkpoint also ships a vision tower, which this build does not run.
-@@ -26,8 +112,8 @@ where a checkpoint also ships a vision tower, which this build does not run.
+@@ -26,8 +99,8 @@ where a checkpoint also ships a vision tower, which this build does not run.
 
  Ops are lazy: they record into a DAG and execute only when a host-visible read
  demands a value. On demand the graph is partitioned into fusion groups, each
@@ -13785,7 +13772,7 @@ index 30ec016..c441e83 100644
  (`hrx_stream_dispatch`) — not through HIP. Every extension seam (backend,
  transport, quantization scheme, layer, sampler) is a CRTP base that owns the
  shared algorithms and calls into the derived type for the primitives.
-@@ -38,6 +124,36 @@ Releases are built by the **Build & Release** workflow in the Actions tab and
+@@ -38,6 +111,36 @@ Releases are built by the **Build & Release** workflow in the Actions tab and
  carry ahead-of-time kernels for the architectures selected for that build,
  which the release notes list.
 
@@ -13822,7 +13809,7 @@ index 30ec016..c441e83 100644
  ```bash
  # Pick the asset from https://github.com/Geramy/LSE/releases
  curl -LO https://github.com/Geramy/LSE/releases/download/<tag>/lse-<tag>-linux-x86_64.tar.gz
-@@ -83,6 +199,35 @@ prediction module, or point at one:
+@@ -83,6 +186,35 @@ prediction module, or point at one:
  ./lse -m mlx-community/Qwen3.8-27B-4bit --mtp <path-or-repo-id> -n 256 "..."
  ```
 
@@ -13858,7 +13845,7 @@ index 30ec016..c441e83 100644
  ### `lse` options
 
  | Option | Default | |
-@@ -133,6 +278,8 @@ works by changing the base URL.
+@@ -133,6 +265,8 @@ works by changing the base URL.
  | `--no-mtp` | off | Decode one token per pass, ignoring any MTP module |
  | `--tokenizer REPO` | `Qwen/Qwen3.6-27B` | HF repo for `tokenizer.json` when the model directory has none |
  | `--kv-len N` | from the config | Allocate the KV cache for N tokens |
@@ -13867,7 +13854,7 @@ index 30ec016..c441e83 100644
 
  Binding beyond localhost gives anyone who can reach the machine use of the
  GPU, so pair `--host 0.0.0.0` with `--api-key`:
-@@ -430,3 +577,14 @@ warnings under the full warning set.
+@@ -430,3 +564,14 @@ warnings under the full warning set.
  Non-commercial use is free for everyone; commercial use requires a separate
  license, with exceptions for the organizations listed in Exhibit A. See
  **[LICENSE.md](LICENSE.md)**.

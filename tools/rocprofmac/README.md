@@ -99,6 +99,22 @@ Three sequential profile-off requests followed by three profile-on requests, usi
 
 The corresponding decode time increase is 2.96%. This includes capture buffering/export work at existing synchronization boundaries. Run order and thermal drift were not randomized, so these are observed results rather than a universal overhead guarantee. Evidence is under `build/tests/driver195-hardware/rocprofmac-model`, `rocprofmac-model-off`, and `rocprofmac-model-on3`; the first model's raw capture, JSONL, summary and server log support the count/clock audit. No hardware counters, memory-bandwidth attribution or occupancy measurements are provided.
 
+A newer capture of the accurate FP32-M256 default on 512 input / 129 output
+tokens passed with all six profile-off/on responses identical. After two warmups,
+the single measured request changed from **88.82 PP/s / 16.67 TPS** to
+**87.94 PP/s / 16.08 TPS**, or **1.00% / 3.69%** more elapsed time. The trace
+separates 3,334 prefill dispatches from 213,632 decode dispatches and verifies
+every export count against the host summary. See [current results and phase
+rankings](../../docs/LSE_PERFORMANCE.md). These observations are workload-specific.
+
+Use a profiling-capable HSA build in both arms. The older local
+`build/hsa-wait-perf` binary with SHA prefix `244f3943` predates hardware queue
+profiling and rejects enablement even though the current source implements it.
+That failure was reproduced on an unused queue, without submitting a kernel.
+The qualified `7d9b8af9` build supports the unused-queue operation and preserves
+the 64 µs polling override. Keep the selected libraries frozen through the
+comparison; do not rebuild between its off/on arms.
+
 ```sh
 # Explicit hardware command for the small HRX correctness workload first:
 DYLD_LIBRARY_PATH="$PWD/build/rocprofmac-build" \
