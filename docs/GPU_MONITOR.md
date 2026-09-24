@@ -9,14 +9,12 @@ interfaces, sysfs and process fdinfo. The new backend enumerates every
 
 ## Implemented and pending
 
-Build 176 integrates one-shot firmware collection and cached observer reads.
-Live firmware validation is pending; no periodic collection is enabled.
-
-The first build-176 hardware request returned unsupported before issuing a
-metrics command: the installed SMU firmware is **104.76.0, interface 0x33**,
-while the verified table layout is associated with driver interface **0x2e**.
-This is a compatibility gate, not evidence that firmware crashed. Dynamic
-statistics on this card remain unavailable until that layout is established.
+Build 193 adds software counters and graphs, current clocks and AC DPM ranges,
+and a bounded one-second sensor sampler for an already-initialized GPU. The first live collection and concurrent-workload check passed; independent
+sensor accuracy and an initialized idle/load comparison remain pending. Earlier build 176 rejected the
+installed **104.76.0 / interface 0x33** before sending a metrics command. Build
+193 supports an explicitly labeled Linux-compatible profile for that exact
+release; it does not claim to establish a new 0x33 firmware schema.
 
 | Statistic | Current monitor | Required source |
 | --- | --- | --- |
@@ -28,7 +26,8 @@ statistics on this card remain unavailable until that layout is established.
 | UMC activity | Implemented; hardware validation pending | SMU AverageUclkActivity, percent |
 | Media activity | Implemented; hardware validation pending | Maximum of two SMU VCN activity percentages |
 | GFX/memory/fabric clocks | Implemented; hardware validation pending | SMU pre/post-deep-sleep averages, MHz |
-| SOC clock | Implemented; hardware validation pending | SMU CurrClock[PPCLK_SOCCLK], MHz |
+| Current GFX/SOC/memory/fabric clocks | Implemented; hardware validation pending | SMU CurrClock[PPCLK_*], MHz |
+| AC DPM minimum / maximum clocks | Implemented; hardware validation pending | Read-only GetMinDpmFreq / GetMaxDpmFreq replies, MHz; not active throttling caps |
 | Socket power | Implemented; hardware validation pending | SMU AverageSocketPower, whole watts |
 | Board power | Implemented; hardware validation pending | SMU AverageTotalBoardPower; confirm board reporting on hardware |
 | Edge/hotspot/memory temperature | Implemented; hardware validation pending | SMU AvgTemperature, degrees Celsius |
@@ -43,6 +42,143 @@ allocated and not a measured bandwidth in GB/s. Similarly, a current GRBM busy b
 is not a time-averaged GPU utilization percentage. The monitor keeps those
 concepts separate. Total VRAM in QueryInfo is the driver's usable capacity after
 firmware reservation and may be less than the board's marketed capacity.
+
+## Build 193 first hardware capture
+
+`build/tests/driver193-hardware/monitor-mailbox.jsonl` records 163 dashboard
+samples, 156 fresh cached sensor reads and **16 distinct firmware captures**.
+Capture intervals were 1.025–1.058 seconds (median 1.041), independently of the
+100 ms UI refresh. Firmware version was 0x00684c00 and profile 0x33 throughout
+fresh samples. Concurrent `mailbox-1024.log` records all 1024 operations passing
+for the one-shot baseline and each active/hybrid DMA-mailbox batch size, with
+completion retired and guards intact. Most of the sensor window covers the
+15.65-second one-shot baseline; the subsequent persistent mailbox variants are
+too short to treat these 16 captures as measurements of each variant.
+
+The decoded sequence is internally plausible: edge/hotspot/memory temperatures
+rose 40/54/38→60/83/56 C, selected average GFX rose 2721→3299 then fell to 3229 MHz,
+socket/board power rose 196→about 300 W, and fan readings varied 872–938 RPM.
+DPM queries independently returned GFX 500–3600 MHz, SOC 417–1476, memory 96–1258
+and fabric 313–2400. These values support a working transfer and a coherent
+Linux-compatible interpretation; they do not independently calibrate sensors.
+
+Raw `CurrClock[]` remained GFX 1000/SOC 548/memory 96/fabric 1108 MHz. Linux's
+`smu_v14_0_2_get_smu_metrics_data` exposes these raw fields, but
+`smu_v14_0_2_get_gpu_metrics` explicitly assigns `current_gfxclk` from the
+selected **average** GFX clock instead. The raw/average difference is therefore
+not itself evidence of a shifted layout. The dashboard consequently presents selected average first, then **SMU raw**
+and **raw peak**; JSON calls this field `raw_current_mhz`. Raw GFX must not be
+presented as an independently verified instantaneous operating frequency. Socket and board power
+were identical in all 16 captures; retain their firmware field names without
+claiming independent board/socket measurement. The firmware metrics counter
+varied around 1014–1048 rather than increasing monotonically; neither liveness
+nor elapsed time is inferred from that counter.
+
+GFX activity reported 96% initially then 100%, with UMC 0%. GFX activity is not
+CU occupancy or shader throughput; the observed work alone does not validate
+its percentage. A continuous nonzero activity reading after all owned queues
+finish would merit initialization/firmware-idle investigation rather than
+silently interpreting it as useful compute load. One transitional stage 12 read
+was labeled unsupported before profile qualification; it had NotReady status,
+not a failed table transfer.
+
+A subsequent owner-retained idle/load check is recorded in
+`monitor-idle-load-retry.jsonl` and `queue-idle-load-retry.log`. It held two empty
+initialized queues for 12 seconds, then passed 192 dispatches with shared signals
+and multiple producers. Sensor GFX remained 100% and power about 300 W even during
+the empty-queue interval; average GFX drifted 3249→3189 MHz while thermal/fan
+readings rose. This **does not establish good idle/load correlation**. The cause
+remains unresolved: initialization could leave an engine busy, or the compatible
+profile's activity/power semantics could differ. Do not claim independently
+validated activity percentage or useful-compute utilization from these readings.
+
+### Further acceptance design
+
+Keep one owner initialized across the entire comparison; closing the final
+owner resets the GPU and cannot provide an initialized-idle baseline. Record
+at least 20 distinct one-second samples with no queued work, 20 under a sustained
+known compute workload, then 20 after observed completion while retaining the
+owner. Separately exercise a large known memory/copy workload to test UMC
+response. Deduplicate by registry, reservation generation and sample sequence,
+not UI refresh count. Mark exact workload start/finish timestamps and retain
+raw/profile metadata. Compare medians and transitions in activity, selected
+average clocks, power and temperatures; expect temperature lag, not immediate
+step response. Do not require raw GFX `CurrClock` to equal its average, or infer
+sensor correctness solely from broad plausibility. A persistent 100% idle GFX
+reading, stationary power under substantially different workloads, or implausible
+cross-field changes warrants investigation. Independent power/thermal evidence
+or a matching Linux run would strengthen unit/accuracy qualification.
+
+## Software work counters and graphs (build 193)
+
+Selector **61**, with no input or scalar output, returns the version-1
+456-byte `software_stats::Snapshot` from `amdgpu_software_stats.h`. It is an
+observer endpoint: it never opens PCI, polls a GPU fence, submits work or sends
+SMU messages. All access runs on the serialized lifecycle queue. For mapped
+persistent AQL queues it reads only the pinned host metadata `read_dispatch_id`
+with an acquire load; that mapping cannot be freed concurrently on this queue.
+
+The snapshot includes a counter generation, sampling timestamp, epoch start
+(`sessionStartNs`, despite totals spanning individual sessions), readiness flags,
+participant count, mapped AQL queue count and queued/published/consumed/retired
+packet counts. Each of SDMA0, SDMA1, GFX and bounded AQL dispatch has submitted,
+observed-completed, failed, pending and retired work counts, cumulative software
+pending time, and completed payload bytes by host→device, device→host,
+device→device, host→host or unknown direction. Successful client BAR writes and
+readbacks have separate CPU payload byte counters.
+
+Instrumentation counts successful publication, not rejected API calls. Linear
+SDMA copies are counted inside the shared copy implementation, including general
+BO copies and transfer smoke tests. GFX EOP and smoke fence submissions are
+counted at their actual publication/completion points; raw CS completion is
+counted by the existing owner's fence poll. The observer does not cause that
+poll. Unknown raw packets do not receive invented payload byte counts. SDMA
+direction classification requires complete source/destination ranges inside
+known VRAM/GART bounds; legacy physical DMA addresses can remain unknown.
+These are tracked work submissions, not every firmware control message or
+every bootstrap ring test.
+
+Completion means the relevant fence was observed. Copy payload totals do not
+claim independent data verification or measure all PCIe traffic. Failure is
+recorded once for a published operation that times out or loses readback;
+repeated waits do not repeatedly count the same failure. Failed work remains
+pending until a later verified completion or a verified shutdown retires it.
+A failure can therefore later also have an observed completion. Retired means
+completion was not observed before tracking ended; it is never counted as a
+successful completion.
+
+Counters persist for the entire bound driver lifetime, so a short-lived HSA
+client's completed work is still visible after it closes. Successful Stop GPU
+or last-participant reset closes pending intervals, records outstanding work as
+retired and clears active queue tracking while preserving all totals and the
+generation. Failed reset preserves outstanding state. Reattaching the driver
+creates a new registry identity/counter epoch. Read indices going backwards or
+beyond the published index mark queue sampling incomplete instead of wrapping
+or manufacturing a huge rate. Counter overflow saturates and is flagged.
+
+Pending time measures the union of software outstanding intervals per engine.
+It includes time waiting for an owner to observe completion and is **not GPU
+hardware utilization**. AQL read index advancement means packet consumption,
+not kernel completion; persistent packet counts remain separate from bounded
+AQL dispatch completion counters. Producer-writable shared metadata is not an
+independent hardware measurement. Unmapped queues retire their last unobserved
+packet range rather than claiming it completed.
+
+The dashboard plots software submission/transfer rates, pending work and VRAM
+allocator use. Its 60-second histories use monotonic sample times and fixed time
+buckets; changing refresh cadence does not change the time axis. Press **h** to
+switch between **Slow 500 ms** (default) and **Fast 100 ms**, or use `--slow` /
+`--fast`. These refresh intervals apply only to observers and cached data, never
+to SMU collection. Missing samples and generation changes cannot create a
+negative or cross-session throughput spike. Hardware power, thermal, clock and
+utilization fields retain their separate source/validity rules.
+
+Offline verification: `scripts/test-software-stats.sh` exercises the real
+observer RPC/queue snapshot and production SDMA copy body, plus saturation,
+union intervals, queue reuse, direction classification and epoch reset. The
+existing CP, raw-CS, BAR transfer and shutdown tests also assert their counter
+effects, including preserved totals across verified reset and retention after
+failed reset. None of these tests accesses GPU hardware.
 
 ## VRAM accounting (build 178)
 
@@ -72,8 +208,8 @@ caller must invoke the helper on the same queue as allocator mutations.
 Used bytes are the allocator's charged sizes, including alignment rounding.
 They include client BOs and driver allocations such as rings, writeback storage,
 MQDs and smoke-test storage in that pool. Retained failed-work storage remains
-charged until actually freed or the allocator is reset. A failed free due to
-free-list metadata exhaustion also remains charged. These are allocation
+charged until actually freed or the allocator is reset. Build 194 reserves free-list metadata against a live-allocation bound so valid
+frees cannot exhaust it; see [BUFFER_CAPACITY.md](BUFFER_CAPACITY.md). These are allocation
 accounts, not a measure of GPU accesses, resident host memory, bandwidth or
 total hardware occupancy. Per-client attribution is not part of this ABI.
 
@@ -98,7 +234,7 @@ the old `vram_used_bytes` stays null because it represented unmeasured total
 occupancy. UMC activity is unchanged and remains separately gated telemetry.
 
 `scripts/test-vram-accounting.sh` checks rounding, >4 GiB allocations, fragmented
-free ranges, coalescing, duplicate frees, metadata-exhausted frees, full-BAR
+free ranges, coalescing, duplicate frees, allocation metadata bounds, full-BAR
 layouts, invalid bounds and stopped-state suppression under ASan/UBSan. The
 monitor's synthetic renderer test checks real zero versus null and does not
 connect to hardware.
@@ -108,7 +244,9 @@ connect to hardware.
 `dext/amdgpu/amdgpu_metrics.h` is a pure decoder; it issues no commands and does
 not map or access GPU memory. It accepts exactly 412 bytes matching the pinned
 Linux `SmuMetricsExternal_t`, SMU IP **14.0.3**, and driver interface **0x2e**.
-Different interface versions are rejected until their layouts are verified.
+The additional Linux-compatible profile requires interface **0x33** and live
+firmware version **0x00684c00**, with separate profile flag and plausibility
+filters. Other mismatches are rejected before table transfer.
 `smu_smc_hw_setup` now accepts an optional `SMUMetricsContext` to retain the
 firmware interface and staging coordinates before programming either address
 half. Build 176 passes the per-device context from the SMU bringup stage.
@@ -133,20 +271,55 @@ contains the same metrics fields used by this decoder. The reviewed interface
 history advances 0x26 to 0x2e; it does not establish a separate 0x33 layout.
 
 Linux's `smu_cmn_check_fw_version` reads and logs the driver and firmware
-interface versions, then returns success without requiring equality. Thus a
-working Linux driver with newer firmware is evidence of intended compatibility,
-but the version comparison alone is not a field-layout guarantee. No reviewed
-primary schema or explicit compatibility statement establishes that interface
-0x33 exports this exact 412-byte table with unchanged offsets and units.
+interface versions, then returns success without requiring equality. The older
+[Linux v6.18 SMU14 implementation](https://github.com/torvalds/linux/blob/v6.18/drivers/gpu/drm/amd/pm/swsmu/smu14/smu_v14_0.c#L253-L266)
+explicitly states that newer firmware is designed for backward compatibility;
+the newer common implementation no longer includes that explanation. This is
+primary-source evidence of intended compatibility, not evidence that the
+version mismatch itself represents an error. It corrects the earlier assessment
+that no explicit compatibility statement had been found. The reviewed statement
+does not specifically name interface 0x33, table 5, or individual metrics-field
+offsets and units. An exact 0x33 metrics schema or table-specific compatibility
+guarantee remains unverified.
 
-The implementation therefore keeps 0x33 unsupported. Decoder and collection
-tests explicitly reject it, verify zero mailbox requests/VRAM reads, and retain
-the actual interface in the cached snapshot. Compatibility rejection does not
-set the firmware-transaction fault flag in subsequent builds. The monitor
-reports `unsupported_firmware_interface`, the firmware's actual version and the
-verified version instead of labeling this rejection as a crashed GPU. A future
-change requires a verified schema/compatibility reference and corresponding
-layout tests; changing the accepted version number alone is insufficient.
+The 2026-09-23 offline review also confirmed that the vendored
+`firmware/smu_14_0_3.bin` matches the local linux-firmware copy byte-for-byte:
+333236 bytes, header microcode version `0x00684c00` (104.76.0), SHA-256
+`3221ef2ddb341570eeb727e1e16f170bfb2ea1230be4a7eb248d0b183fbfbf15`.
+The firmware binary header identifies the release, not the SMU metrics layout;
+WHENCE lists the file without declaring a 0x33 table schema. Neither is used
+as a substitute for layout validation.
+
+Build 193 follows that source-backed compatibility behavior for one pinned
+profile, not for arbitrary newer firmware. Before any table transfer it reads
+`GetSmuVersion` (**0x02**) once per initialized context. SMU IP must be 14.0.3;
+interface 0x33 must return **0x00684c00**. A different release remains unsupported
+and no table request is sent. A failed version request latches collection off.
+Successful samples carry `kSMUMetricsLinuxCompatible` (bit 3) separately from
+normal validity; consumers must preserve that qualification in their output.
+The firmware release is exposed in selector62's clock metadata.
+
+The collection reuses the retained 64 KiB staging reservation, sends one
+`TransferTableSmu2Dram` (**0x12**, parameter **5**), waits for acknowledgement,
+and reads exactly 412 bytes via 103 BAR0 dword reads. It never changes the
+staging address while collecting. The table keeps Linux's documented field
+layout and units. The compatible profile additionally suppresses implausible
+clocks above 10000 MHz, temperatures above 150 C, power above 2000 W, fan speed
+above 30000 RPM and voltage above 2500 mV. GFX activity/average clock, edge
+temperature and socket power must remain valid independent anchors. These
+broad checks catch malformed data; they are not proof of a separately verified
+schema. No live result is claimed by the offline tests.
+
+Current clocks are the table's uint32 `CurrClock[]`, in order GFX, SOC, UCLK,
+FCLK; they are distinct from the pre/post-deep-sleep averages. Clock limits use
+Linux `smu_v14_0_get_dpm_ultimate_freq`'s **GetMinDpmFreq 0x1d** and
+**GetMaxDpmFreq 0x1e**, each parameter `PPCLK << 16`, once per initialized
+context. The maximum is explicitly the firmware-advertised **AC DPM maximum**,
+not an inferred AC/DC state, active cap, observed peak or guaranteed boost.
+Each valid range requires `0 < minimum <= maximum <= 10000` MHz. Unsupported
+queries leave that range unavailable; a timeout stops further commands and
+latches all collection off. `GetDpmFreqByIndex(... | 0xff)` is a DPM level-count
+query and is not used as a current-clock measurement.
 
 The decoder reads little-endian bytes without unaligned casts. It uses Linux's
 5% busy threshold to select pre/post-deep-sleep averages. It converts whole-watt
@@ -193,11 +366,11 @@ attachment state. A blocked/erroring card must not erase other cards' results.
 
 `amdgpu_metrics.cpp` implements `smu_collect_metrics`, `smu_metrics_snapshot`
 and `smu_metrics_invalidate`. Build 176 connects them to the per-device context,
-owner selector 46, observer selector 47 and lifecycle invalidation. Collection
-is explicit: neither initialization nor the standalone monitor triggers it.
+owner selector 46, observer selector 47 and lifecycle invalidation. Initialization does not collect. Build 193's monitor uses selector63 at most
+once per second, while selectors47/62 remain cached CPU-only reads.
 
-Collection validates runtime readiness, retained VRAM staging, exact firmware
-interface, previous mailbox completion and BAR bounds before its single table-5
+Collection validates runtime readiness, retained VRAM staging, qualified firmware
+profile, previous mailbox completion and BAR bounds before its single table-5
 request. It waits for firmware acknowledgement through the existing bounded SMU
 mailbox primitive. It then reads exactly 103 dwords through `MemoryRead32`, with
 a 100 ms elapsed readback budget. The budget cannot interrupt a single PCI API
@@ -217,7 +390,7 @@ Errors clear validity and values while preserving the last success timestamp.
 | Field | Meaning |
 | --- | --- |
 | version / size | Both must match the consumer's ABI |
-| status / flags | Last operation status and valid/faulted/stale bits |
+| status / flags | Last operation status and valid/faulted/stale/Linux-compatible-profile bits |
 | generation / sequence | Reservation's uptime timestamp and successful collection count |
 | collectedAtNs / attemptedAtNs | Last successful snapshot and attempted collection, CLOCK_UPTIME_RAW nanoseconds |
 | driverInterface / firmwareCounter | Firmware ABI and raw metrics counter |
@@ -228,7 +401,7 @@ hardware serial number. Cached samples should be keyed by registry ID and
 generation. The monitor also independently checks version, size, validity flags
 and sample age before displaying values.
 
-## Build 176 driver API and lifecycle
+## Driver API and lifecycle
 
 `BringupContext.metrics` retains the state, and SMU initialization passes it to
 `smu_smc_hw_setup(ctx.device, ctx.psp, &ctx.metrics)`.
@@ -254,16 +427,36 @@ allows the enclosing PSP arena to be released after reset or completed detach.
 Failed shutdown leaves the cached sample unavailable and retains the backing.
 An observer closing does not invalidate or stop the owner's session.
 
-`amdgpu_mtop` reads 47 on driver build 176+ and shows unavailable for missing,
-invalid, failed or stale samples. It never sends 46. The host's Sample Metrics
-button performs a one-shot 46 call and immediately reads 47, preserving valid
-values in its log. A standalone monitor must read within 2.5 seconds to show a
-fresh sample; refreshing its UI does not implicitly refresh firmware.
+- **62 — ClockSnapshot (build193):** no inputs/scalar outputs, 96-byte version-1
+  `SMUClockSnapshot`. It contains status/profile flags, generation, collection
+  timestamp, interface/firmware version, current/range validity masks and four
+  MHz values each for current/minimum/AC maximum. Current clocks expire with
+  the metrics sample; static ranges remain available while the session stays
+  ready. Shutdown suppresses both. This endpoint never accesses hardware.
+- **63 — SampleCachedSensors (build193):** same arguments and three output
+  scalars as46, but available to observers only as an operation on an existing
+  initialized session. It never opens PCI, claims ownership, initializes,
+  resets or changes power policy. It returns Busy for tracked pending raw
+  submissions without polling their fences. Readiness and shutdown checks run
+  before every firmware request; the collector and teardown share the existing
+  serialized dispatch queue. Closing this observer cannot stop the GPU.
 
-First hardware validation should use one owner collection and inspect the
-returned firmware interface, status, validity and values before any periodic
-sampling is introduced. A genuine unsupported interface remains unsupported;
-do not loosen layout gating to make numbers appear.
+The monitor attempts63 at most once per second per registry identity while
+stage15 is reported, then reads47 and62. The driver also shares a one-second
+success cache across observers. UI Fast100/Slow500ms affects the cache/software
+refresh cadence only. The first sample may include one firmware-version query,
+one table transfer and up to eight DPM range queries; each mailbox command has
+the existing two-second bound. Subsequent samples issue only the table transfer.
+An individual synchronous PCI read cannot be interrupted by the 100 ms copy
+budget. A timeout or invalid table latches collection off until verified reset,
+preventing repeated mailbox timeouts during refresh. A busy sample retains
+cached values until their normal2.5s expiry. Sensor unavailability does not hide
+software counters or allocator accounting.
+
+The host's Sample Metrics button still performs one owner46 call then47 and
+retains results in its log. Hardware acceptance should inspect that first
+sample's profile, status, validity and plausible values before relying on the
+continuous monitor. No hardware verification was performed by the offline tests.
 
 ## Timer integration audit (not implemented)
 
@@ -285,8 +478,8 @@ Root `Stop` and owner-client close currently have separate teardown paths.
 Both must account for a telemetry timer in their completion/drain barriers;
 adding only a timer pointer to the driver and freeing it in `Stop` is insufficient.
 The cancelled source cannot be reactivated; a new session creates a new one.
-Until those barriers are implemented and tested, explicit one-shot collection
-is the supported integration path.
+No timer is added. The bounded selector63 sampler uses the already serialized
+RPC path, so there are no telemetry timer callbacks to drain during teardown.
 
 The collection, decoder, reservation and actual selector tests passed under
 ASan/UBSan. Admission tests verify that cached observers do not open PCI and

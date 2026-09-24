@@ -204,6 +204,11 @@ hsa_status_t hsa_queue_create(hsa_agent_t agent,uint32_t size,hsa_queue_type32_t
     if (info.build<mac_hsa::kQueueResourceDriverBuild &&
         ((privateBytes && privateBytes!=UINT32_MAX) || (groupBytes && groupBytes!=UINT32_MAX)))
         return HSA_STATUS_ERROR_INVALID_QUEUE_CREATION;
+    // Internal signal acceleration yields its slot before public queue creation.
+    // Existing requests finish under the service mutex; no published RMW retries.
+    std::shared_ptr<void> signalServiceLease;
+    status=reclaimGPUSignalService(connection,&signalServiceLease);
+    if (status!=HSA_STATUS_SUCCESS) return status;
     try {
         auto queue=std::make_shared<RuntimeQueue>();
         queue->connection=connection;queue->agent=agent;queue->errorCallback=callback;queue->errorData=data;

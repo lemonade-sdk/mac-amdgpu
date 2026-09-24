@@ -14,6 +14,16 @@ static uint64_t now = 1, readCost = 100;
 static unsigned commands = 0, reads = 0;
 static kern_return_t commandResult = kIOReturnSuccess;
 static bool populate = true;
+static unsigned versions = 0, clockQueries = 0;
+static uint32_t versionReply = metrics::kCompatibleFirmware;
+static kern_return_t versionResult = 0, clockResult = 0;
+static kern_return_t smu_get_version(const struct DeviceContext &, uint32_t *out) {
+    ++versions; *out = versionReply; return versionResult;
+}
+static kern_return_t smu_send_msg_with_param(const struct DeviceContext &, uint32_t msg, uint32_t param, uint32_t *out) {
+    assert((msg == 0x1d || msg == 0x1e) && !(param & 0xffff) && (param >> 16) < 4);
+    ++clockQueries; *out = msg == 0x1d ? 100 : 3000; return clockResult;
+}
 struct FakePCI {
     uint8_t bytes[65536]{};
     void MemoryRead32(uint8_t, uint64_t offset, uint32_t *word) {
@@ -58,7 +68,8 @@ static SMUMetricsContext ready() {
     ctx.driverInterface = 0x2e;
     assert(smu_metrics_reserve(ctx, 0, 0, 65536, 0, 65536, true, 19));
     ctx.addressProgrammed = ctx.setupComplete = true;
-    commands = reads = 0;
+    commands = reads = versions = clockQueries = 0;
+    versionReply = metrics::kCompatibleFirmware; versionResult = clockResult = 0;
     now = 1;
     readCost = 100;
     commandResult = kIOReturnSuccess;
@@ -103,12 +114,31 @@ int main() {
     ctx = ready(); ctx.driverInterface = 0x2f;
     assert(smu_collect_metrics(dev, ctx, true) == kIOReturnUnsupported && !commands);
     assert(!ctx.faulted && ctx.snapshot.flags == 0 && !reads);
-    ctx = ready(); ctx.driverInterface = 0x33; // Installed 104.76.0 firmware.
-    assert(smu_collect_metrics(dev, ctx, true) == kIOReturnUnsupported && !commands && !reads);
+    ctx = ready(); ctx.driverInterface = 0x33;
+    assert(smu_collect_metrics(dev, ctx, true) == 0 && commands == 1 && reads == 103);
+    assert(versions == 1 && clockQueries == 8 && !ctx.collecting);
     smu_metrics_snapshot(ctx, true, snap);
-    assert(snap.driverInterface == 0x33 && snap.status == kIOReturnUnsupported && !snap.flags);
-    assert(snap.attemptedAtNs == 0 && snap.sequence == 0 && !snap.validFields);
-    assert(smu_collect_metrics(dev, ctx, true) == kIOReturnUnsupported && !commands && !reads);
+    assert(snap.driverInterface == 0x33 && (snap.flags & kSMUMetricsLinuxCompatible));
+    assert(smu_metrics_profile_supported(snap) && snap.validFields);
+    SMUClockSnapshot clocks{};
+    smu_clock_snapshot(ctx, true, clocks);
+    assert(clocks.size == 96 && clocks.firmwareVersion == metrics::kCompatibleFirmware);
+    assert(clocks.currentValid == 15 && clocks.limitsValid == 15 && clocks.maximumACMHz[0] == 3000);
+    assert(smu_collect_metrics(dev, ctx, true) == 0 && versions == 1 && clockQueries == 8);
+    now += kSMUMetricsStaleAfterNs + 1;
+    smu_clock_snapshot(ctx, true, clocks);
+    assert(!clocks.currentValid && clocks.limitsValid == 15); // Limits do not expire with activity.
+    smu_clock_snapshot(ctx, false, clocks);
+    assert(!clocks.currentValid && !clocks.limitsValid);
+    ctx = ready(); ctx.driverInterface = 0x33; versionReply++;
+    assert(smu_collect_metrics(dev, ctx, true) == kIOReturnUnsupported && versions == 1 && !commands && !reads);
+    assert(smu_collect_metrics(dev, ctx, true) == kIOReturnUnsupported && versions == 1 && !clockQueries);
+    ctx = ready(); ctx.driverInterface = 0x33; versionResult = kIOReturnTimeout;
+    assert(smu_collect_metrics(dev, ctx, true) == kIOReturnTimeout && versions == 1 && !commands && ctx.faulted);
+    assert(smu_collect_metrics(dev, ctx, true) == kIOReturnTimeout && versions == 1);
+    ctx = ready(); clockResult = kIOReturnTimeout;
+    assert(smu_collect_metrics(dev, ctx, true) == kIOReturnTimeout && ctx.faulted && clockQueries == 1);
+    assert(smu_collect_metrics(dev, ctx, true) == kIOReturnTimeout && commands == 1 && clockQueries == 1);
     ctx = ready(); ctx.vramBacked = false;
     assert(smu_collect_metrics(dev, ctx, true) == kIOReturnUnsupported && !commands);
     ctx = ready(); ctx.addressProgrammed = false;
@@ -118,7 +148,7 @@ int main() {
     ctx = ready(); ctx.collecting = true;
     assert(smu_collect_metrics(dev, ctx, true) == kIOReturnBusy && !commands);
     ctx = ready();
-    assert(smu_collect_metrics(dev, ctx, false) == kIOReturnNotReady && !commands);
+    assert(smu_collect_metrics(dev, ctx, false) == kIOReturnNotReady && !commands && !versions && !clockQueries);
     dev.pci = nullptr;
     assert(smu_collect_metrics(dev, ctx, true) == kIOReturnNotAttached && !commands);
     dev.pci = &pci;

@@ -11,6 +11,27 @@ index 95e8bbf2..a5e6218f 100644
  _hrx_stream_retain
  _hrx_stream_release
  _hrx_stream_synchronize
+diff --git a/libhrx/src/libhrx/buffer.c b/libhrx/src/libhrx/buffer.c
+index a8848b0d..2c52bfe7 100644
+--- a/libhrx/src/libhrx/buffer.c
++++ b/libhrx/src/libhrx/buffer.c
+@@ -78,8 +78,16 @@ hrx_status_t hrx_buffer_allocate(hrx_stream_t stream, size_t size,
+   };
+
+   iree_status_t status = iree_ok_status();
++#if !defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
+   status = hrx_iree_exact_pool_create(stream->device->allocator.hal_allocator,
+                                       params, &buf->hal_pool);
++#endif
++  // The macOS adapter uses the device's existing TLSF/oversized pool set.
++  // A NULL explicit pool selects that set. The transient buffer owns its
++  // reservation; the HRX buffer retains the device that owns the default pools,
++  // and hrx_buffer_release releases the buffer before dropping that device.
++  // An exact pool per tensor would consume a driver BO for every small state.
++
+   if (iree_status_is_ok(status)) {
+     status = iree_hal_device_queue_alloca(
+         stream->device->hal_device,
 diff --git a/runtime/src/iree/hal/drivers/amdgpu/access_policy.c b/runtime/src/iree/hal/drivers/amdgpu/access_policy.c
 index 48b80aa0..605ae8ee 100644
 --- a/runtime/src/iree/hal/drivers/amdgpu/access_policy.c
@@ -164,7 +185,7 @@ index fae2b3ee..c9958e0b 100644
 -  out_info->svm.supported = 1;
 +#endif
 +  out_info->svm.supported = svm_supported ? 1 : 0;
- 
+
    bool svm_accessible_by_default = false;
    IREE_RETURN_AND_END_ZONE_IF_ERROR(
 @@ -110,6 +112,7 @@ iree_status_t iree_hal_amdgpu_system_info_query(
@@ -178,7 +199,7 @@ index fae2b3ee..c9958e0b 100644
 @@ -118,6 +121,8 @@ iree_status_t iree_hal_amdgpu_system_info_query(
                  "(HSA_AMD_SYSTEM_INFO_VIRTUAL_MEM_API_SUPPORTED == true)"));
    }
- 
+
 +#endif
 +
    IREE_RETURN_AND_END_ZONE_IF_ERROR(

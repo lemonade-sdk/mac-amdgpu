@@ -24,6 +24,7 @@ struct IODispatchQueue { void release() {} };
 #define OSDynamicCast(type, value) static_cast<type *>(value)
 #define IOSafeDeleteNULL(value, type, count) do { delete value; value = nullptr; } while (0)
 #include "../dext/amdgpu/amdgpu_client_lifecycle.h"
+#include "../dext/amdgpu/amdgpu_software_stats.h"
 static std::vector<std::string> events;
 static bool metricsInvalidated;
 struct IOPCIDevice {
@@ -111,6 +112,8 @@ static void smu_metrics_invalidate(bool &valid, int status) {
 }
 struct ClientState;
 struct DriverState {
+    amdgpu::software_stats::Counters softwareStats;
+    amdgpu::software_stats::QueueProgress softwareQueues[7];
     bool shutdownInProgress = false, shutdownBlocked = false, pciOpen = true;
     uint32_t connectedClients = 1;
     amdgpu::ClientSessions sessions;
@@ -120,7 +123,9 @@ struct DriverState {
     amdgpu::ClientSubmission submission;
     ClientState *quarantinedClient = nullptr;
 };
+static void mac_amdgpu_observe_software_queues(DriverState &) {} // tested independently
 struct MacAMDGPU : IOService { DriverState *ivars; };
+constexpr uint32_t MACAMDGPU_MAX_BO = 2;
 struct ClientState {
     MacAMDGPU *ownerDriver;
     bool claimed = false;
@@ -129,11 +134,19 @@ struct ClientState {
     void *pendingInterruptNotify = nullptr;
     void *interruptSources[2] = {};
     CS cs[2];
-    BO bos[2];
+    struct TestBOTable {
+        BO entries[2];
+        explicit operator bool() const { return true; }
+        BO &operator[](size_t index) { return entries[index]; }
+    } bos;
     IODispatchQueue *stopQueue = nullptr;
     IOService *stopProvider = nullptr;
 };
 using MacAMDGPUUserClient_IVars = ClientState;
+static BO *mac_amdgpu_bo_entry(ClientState *state, uint32_t index) {
+    return state && index < MACAMDGPU_MAX_BO ? &state->bos[index] : nullptr;
+}
+
 struct MacAMDGPUUserClient : IOService {
     ClientState *ivars;
     void FinishStop(IOService *provider);
@@ -175,6 +188,7 @@ struct Fixture {
         driver.ivars = &state; client.ivars = &clientState;
         clientState.ownerDriver = &driver;
         state.retainedPCI = &pci; pci.expectedOwner = &driver;
+        state.softwareStats.reset(timeNS);
         assert(state.sessions.attach(&client, clientState.claimed, true));
         retireSucceeds = true;
     }
@@ -189,7 +203,12 @@ int main() {
     {
         // Observers do not count as reset-blocking application participants.
         Fixture f; f.state.connectedClients = 20;
+        const auto generation = f.state.softwareStats.data.generation;
+        assert(f.state.softwareStats.begin(amdgpu::software_stats::GFX, timeNS));
         assert(f.stop() == 0 && f.state.sessions.participants == 0);
+        assert(f.state.softwareStats.data.generation == generation &&
+               f.state.softwareStats.data.engines[amdgpu::software_stats::GFX].pending == 0 &&
+               f.state.softwareStats.data.engines[amdgpu::software_stats::GFX].retired == 1);
     }
     // An explicit experiment is restored after DMA drain, before the reset
     // saves PCI configuration. Reset readback must verify the original bit.
@@ -323,10 +342,14 @@ int main() {
         f.pci.failsReset = resetFails;
         assert(f.state.sessions.claimExclusive(&f.client, f.client.ivars->claimed));
         f.state.submission.pending = true;
+        const auto generation = f.state.softwareStats.data.generation;
+        assert(f.state.softwareStats.begin(amdgpu::software_stats::GFX, timeNS));
         f.client.FinishStop(&f.driver);
         assert(f.client.ivars == nullptr && f.state.connectedClients == 0);
         assert(f.pci.closed && !f.state.pciOpen);
         if (resetFails) {
+            assert(f.state.softwareStats.data.generation == generation &&
+                   f.state.softwareStats.data.engines[amdgpu::software_stats::GFX].pending == 1);
             assert(f.state.shutdownBlocked && f.state.quarantinedClient);
             assert(std::find(events.begin(), events.end(), "free client") == events.end());
             // A fresh client can retry reset; only then is old backing released.

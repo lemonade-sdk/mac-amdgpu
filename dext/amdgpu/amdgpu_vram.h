@@ -31,8 +31,8 @@
 //    - Singly-linked list of [offset, size) FREE ranges, sorted by
 //      offset. The list lives in a fixed-capacity pool of nodes (no
 //      kernel allocations in the alloc/free hot path).
-//    - First-fit. RDNA4 driver bringup BO sets are tiny (< 1024 BOs)
-//      and short-lived; first-fit's O(n) scan is fine.
+//    - First-fit with bounded metadata; no allocation can consume the
+//      bookkeeping capacity required to return all live ranges later.
 //    - Coalesce on free: merge with the previous and next free node
 //      if adjacent in offset space.
 //    - Single-threaded by construction: DriverKit external-method
@@ -61,6 +61,10 @@ struct VRAMAllocation {
 //
 class VRAMBumpAllocator {
 public:
+    // For disjoint live allocations, coalesced free ranges <= live count+1.
+    // Keeping one more node than the maximum live count guarantees that every
+    // trusted free can insert or coalesce without allocating metadata.
+    static constexpr uint32_t kMaxAllocations = 8191;
     VRAMBumpAllocator() = default;
 
     void init(uint64_t base, uint64_t size, void *cpu_base = nullptr) {
@@ -110,7 +114,8 @@ public:
     // amdgpu::kASPageSize = 16 KB to keep DART happy on any future
     // re-export of these allocations).
     bool alloc(uint64_t bytes, uint64_t alignment, VRAMAllocation *out) {
-        if (!m_inited || bytes == 0 || out == nullptr) return false;
+        if (!m_inited || bytes == 0 || out == nullptr ||
+            m_alloc_count >= kMaxAllocations) return false;
         if (alignment && (alignment & (alignment - 1))) return false;
         if (alignment < 16384) alignment = 16384;
         if (bytes > UINT64_MAX - (alignment - 1)) return false;
@@ -215,7 +220,7 @@ public:
         } else if (!merged_prev) {
             // Allocate a new node.
             uint16_t fresh = pool_take();
-            if (fresh == kInvalid) return;  // pool full — leak the range
+            if (fresh == kInvalid) return;  // unreachable for trusted alloc/free pairs
             m_pool[fresh].offset = offset;
             m_pool[fresh].length = length;
             m_pool[fresh].next   = cur;
@@ -227,7 +232,7 @@ public:
     }
 
 private:
-    static constexpr uint16_t kMaxNodes = 256;  // up to 256 free ranges
+    static constexpr uint16_t kMaxNodes = kMaxAllocations + 1;
     static constexpr uint16_t kInvalid  = 0xFFFF;
 
     struct FreeNode {

@@ -229,7 +229,7 @@ kern_return_t mockMethod(mach_port_t, uint32_t selector, const uint64_t *in, uin
 
 int main() {
     {
-        mac_hsa::IOKitConnection connection; connection.service = 123; connection.registryID = 456;
+        mac_hsa::IOKitConnection connection({}); connection.service = 123; connection.registryID = 456;
         mac_hsa::DeviceSnapshot snapshot;
         assert(connection.read(snapshot) == 0 && snapshot.stage == 15);
         assert(opens == closes && resets == 0 && uploads == 0);
@@ -270,7 +270,7 @@ int main() {
         driverBuild = 181;
         assert(connection.exportBuffer(device, token) == 0 && token.registryID == 456 && token.size == device.size);
         {
-            mac_hsa::IOKitConnection importer; importer.service = 123; importer.registryID = 456;
+            mac_hsa::IOKitConnection importer({}); importer.service = 123; importer.registryID = 456;
             mac_hsa::DeviceBuffer imported;
             const auto beforeResets = resets, beforeUploads = uploads;
             assert(importer.importBuffer(token, imported) == 0 && imported.address == device.address && imported.size == device.size);
@@ -278,7 +278,7 @@ int main() {
             assert(importer.freeBuffer(imported) == 0);
         }
         {
-            mac_hsa::IOKitConnection stopped; stopped.service = 123; stopped.registryID = 456;
+            mac_hsa::IOKitConnection stopped({}); stopped.service = 123; stopped.registryID = 456;
             stage = 0; const auto beforeResets = resets;
             mac_hsa::DeviceBuffer imported;
             assert(stopped.importBuffer(token, imported) == HSA_STATUS_ERROR_INVALID_ARGUMENT && resets == beforeResets);
@@ -340,7 +340,7 @@ int main() {
     assert(opens == closes);
     {
         driverBuild = 182;
-        mac_hsa::IOKitConnection connection; connection.service = 123; connection.registryID = 456;
+        mac_hsa::IOKitConnection connection({}); connection.service = 123; connection.registryID = 456;
         mac_hsa::SharedBuffer shared;
         assert(connection.allocateSharedBuffer(16384, shared) == 0);
         atomicTimeout = true;
@@ -351,7 +351,7 @@ int main() {
     }
     assert(opens == closes && sharedMaps == sharedUnmaps);
     for (computeFault = 1; computeFault <= 5; ++computeFault) {
-        mac_hsa::IOKitConnection connection; connection.service = 123; connection.registryID = 456;
+        mac_hsa::IOKitConnection connection({}); connection.service = 123; connection.registryID = 456;
         mac_hsa::DeviceBuffer code;
         assert(connection.allocateBuffer(16384, code) == 0);
         amdgpu::ComputeDispatchRequest request{};
@@ -365,7 +365,7 @@ int main() {
         assert(connection.dispatch(request, fence) == HSA_STATUS_ERROR);
     }
     for (aqlFault=0;aqlFault<=7;++aqlFault) {
-        mac_hsa::IOKitConnection connection; connection.service=123; connection.registryID=456;
+        mac_hsa::IOKitConnection connection({}); connection.service=123; connection.registryID=456;
         mac_hsa::DeviceBuffer code,args;
         assert(connection.allocateBuffer(16384,code)==0 && connection.allocateBuffer(16384,args)==0);
         amdgpu::AQLDispatchRequest r{};
@@ -391,7 +391,7 @@ int main() {
         }
     }
     for (queueFault=0;queueFault<=9;++queueFault) {
-        mac_hsa::IOKitConnection connection;connection.service=123;connection.registryID=456;
+        mac_hsa::IOKitConnection connection({});connection.service=123;connection.registryID=456;
         mac_hsa::SharedBuffer ring,metadata;
         driverBuild=186;
         assert(connection.allocateSharedBuffer(16384,ring)==0 && connection.allocateSharedBuffer(16384,metadata)==0);
@@ -434,7 +434,7 @@ int main() {
     assert(opens==closes);
     {
         driverBuild=190;queueFault=0;
-        mac_hsa::IOKitConnection connection;connection.service=123;connection.registryID=456;
+        mac_hsa::IOKitConnection connection({});connection.service=123;connection.registryID=456;
         mac_hsa::SharedBuffer ring,metadata;
         assert(connection.allocateSharedBuffer(16384,ring)==0 && connection.allocateSharedBuffer(16384,metadata)==0);
         mac_hsa::DeviceProperties properties;
@@ -452,7 +452,7 @@ int main() {
     }
     {
         driverBuild=190;queueFault=0;serviceFault=3;
-        mac_hsa::IOKitConnection connection;connection.service=123;connection.registryID=456;
+        mac_hsa::IOKitConnection connection({});connection.service=123;connection.registryID=456;
         mac_hsa::SharedBuffer ring,metadata;
         assert(connection.allocateSharedBuffer(16384,ring)==0 && connection.allocateSharedBuffer(16384,metadata)==0);
         uint64_t handle=0,inactive=99;

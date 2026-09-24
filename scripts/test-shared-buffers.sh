@@ -5,6 +5,15 @@ mkdir -p build/tests
 python3 - <<'PY'
 from pathlib import Path
 s = Path('dext/MacAMDGPU.cpp').read_text()
+a=s.index('static inline uint64_t\nmac_amdgpu_bo_make_handle(')
+b=s.index('//\n// CS handle helpers',a)
+Path('build/tests/bo_table_under_test.inc').write_text(s[a:b])
+assert 'BOEntry  *boPages[amdgpu::kMaxBOPages];' in s
+assert 'const auto tableStatus = mac_amdgpu_bo_find_free_slot(ivars, idx);' in s
+assert 'if (!entry) return kIOReturnNotReady;' in s[s.index('// v0.1.27 — per-BO mapping'): ]
+a=s.index('    case kMacAMDGPUMethodBOAlloc:')
+b=s.index('    case kMacAMDGPUMethodBOExport:',a)
+Path('build/tests/bo_alloc_under_test.inc').write_text(s[a:b])
 a = s.index('    case kMacAMDGPUMethodBOExport:')
 b = s.index('    case kMacAMDGPUMethodBOGetInfo:', a)
 Path('build/tests/shared_buffer_rpc_under_test.inc').write_text(s[a:b])

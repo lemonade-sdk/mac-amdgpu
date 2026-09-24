@@ -8,6 +8,7 @@
 //
 
 #include <os/log.h>
+#include <new>
 #include "amdgpu_init.h"
 
 #define INIT_LOG(fmt, ...) \
@@ -55,7 +56,11 @@ void bringup_release_resources(BringupContext &ctx)
 
     // Firmware views and VRAM allocations are borrowed pointers/offsets;
     // clearing them also removes stale stage and initialized flags.
-    ctx = {};
+    // Reinitialize in place: assignment from {} would put the enlarged VRAM
+    // metadata arena in a large temporary on the lifecycle queue's stack.
+    static_assert(__is_trivially_destructible(BringupContext));
+    ctx.~BringupContext();
+    new (&ctx) BringupContext{};
     INIT_LOG("released shared bringup resources after PCI/client teardown");
 }
 

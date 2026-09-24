@@ -4,6 +4,7 @@
 #include <cstring>
 #include "amdgpu_aql_packets.h"
 #include "amdgpu_vram.h"
+#include "amdgpu_software_stats.h"
 #include "amdgpu_ip.h"
 #include "../upstream/linux/drivers/gpu/drm/amd/include/v12_structs.h"
 #include "../upstream/linux/drivers/gpu/drm/amd/include/asic_reg/gc/gc_12_0_0_sh_mask.h"
@@ -47,7 +48,7 @@ struct PCI {
     }
 };
 namespace amdgpu {
-struct DeviceContext { PCI *pci; uint64_t bar0Size=16384,bar2Size=0x200000; unsigned bar0MemIndex=0,bar2MemIndex=1; IPBaseTable ip{}; };
+struct DeviceContext { PCI *pci; uint64_t bar0Size=16384,bar2Size=0x200000; unsigned bar0MemIndex=0,bar2MemIndex=1; IPBaseTable ip{}; software_stats::Counters *softwareStats=nullptr; };
 struct GMCContext { uint64_t vram_start=0x8000000000; VRAMBumpAllocator vram_alloc,device_vram_alloc; };
 struct MESInstance { bool enabled=true,inited=true,submission_pending=false; };
 struct MESContext { bool uni_mes_active=true; MESInstance pipe[2]; };

@@ -67,6 +67,14 @@ int main() {
     assert(s.value[MemoryTemperatureMillicelsius] == 57000);
     assert(s.value[FanRPM] == 1120 && s.value[FanPWMPercent] == 25);
     assert(s.value[GfxVoltageMillivolts] == 900 && s.value[SocVoltageMillivolts] == 1000);
+    assert(decode(&wire, sizeof(wire), 14, 0, 3, 0x33, s, kCompatibleFirmware));
+    assert(!decode(&wire, sizeof(wire), 14, 0, 3, 0x33, s, kCompatibleFirmware + 1));
+    m.AvgTemperature[TEMP_EDGE] = 200;
+    assert(!decode(&wire, sizeof(wire), 14, 0, 3, 0x33, s, kCompatibleFirmware) && !s.valid);
+    m.AvgTemperature[TEMP_EDGE] = 45;
+    m.AverageTotalBoardPower = 3000;
+    assert(decode(&wire, sizeof(wire), 14, 0, 3, 0x33, s, kCompatibleFirmware) && !s.has(BoardPowerMilliwatts));
+    m.AverageTotalBoardPower = 96;
     m.AverageGfxActivity = 5;
     m.AverageUclkActivity = 0;
     assert(read() && s.value[GfxClockMHz] == 300 && s.value[MemoryClockMHz] == 96);

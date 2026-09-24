@@ -33,7 +33,7 @@ index 8143b41..8d237af 100644
    "LINKER:--whole-archive,$<TARGET_FILE:lse_communication>,--no-whole-archive")
 +endif()
  lse_apply_common_flags(lse_communication)
- 
+
  # ---------------------------------------------------------------------------
 @@ -139,8 +148,12 @@ add_library(lse_dist
  add_library(lse::dist ALIAS lse_dist)
@@ -47,7 +47,7 @@ index 8143b41..8d237af 100644
    "LINKER:--whole-archive,$<TARGET_FILE:lse_dist>,--no-whole-archive")
 +endif()
  lse_apply_common_flags(lse_dist)
- 
+
  # ---------------------------------------------------------------------------
 @@ -231,16 +244,24 @@ add_library(lse::kernels ALIAS lse_kernels)
  target_link_libraries(lse_kernels PUBLIC lse_core lse_ir lse_graph)
@@ -61,7 +61,7 @@ index 8143b41..8d237af 100644
    "LINKER:--whole-archive,$<TARGET_FILE:lse_kernels>,--no-whole-archive")
 +endif()
  lse_apply_common_flags(lse_kernels)
- 
+
  # No backend edge here, in either direction of the build: lse_backend_hrx links
  # lse_graph because it implements graph's emitter and compiler seams, so an edge
  # back would be a cycle. Executables link lse_backends to make one selectable.
@@ -73,7 +73,7 @@ index 8143b41..8d237af 100644
 +  target_link_options(lse_graph INTERFACE
    "LINKER:--whole-archive,$<TARGET_FILE:lse_graph>,--no-whole-archive")
 +endif()
- 
+
  lse_apply_common_flags(lse_graph)
  # Review copies of generated HIP land in ${CMAKE_BINARY_DIR}/hip/.
 @@ -307,8 +328,12 @@ add_library(lse_model
@@ -89,7 +89,7 @@ index 8143b41..8d237af 100644
 +endif()
  target_link_libraries(lse_model PUBLIC lse_core lse_graph lse_ops)
  lse_apply_common_flags(lse_model)
- 
+
 @@ -335,8 +360,12 @@ target_compile_definitions(lse_place PRIVATE
    LSE_CONFIGURED_ROCM_PATH="${LSE_ROCM_PATH}")
  # The set registers itself as graph's device-set factory from a TU with no
@@ -102,15 +102,87 @@ index 8143b41..8d237af 100644
    "LINKER:--whole-archive,$<TARGET_FILE:lse_place>,--no-whole-archive")
 +endif()
  lse_apply_common_flags(lse_place)
- 
+
  # ---------------------------------------------------------------------------
+diff --git a/include/lse/backend/backend.hpp b/include/lse/backend/backend.hpp
+index 44a7e55..51287a1 100644
+--- a/include/lse/backend/backend.hpp
++++ b/include/lse/backend/backend.hpp
+@@ -1337,10 +1337,16 @@ using StableRefResolver =
+ // Backends self-register from their own TU: linking one in is all that makes
+ // it selectable by name.
+ using BackendFactory = std::unique_ptr<IBackend> (*)();
++using RuntimePreparer = void (*)();
++
++// Load runtime dependencies and register teardown before static device owners
++// are constructed. This must not initialize devices or submit GPU work.
++void prepare_backend_runtimes();
+
+ void register_backend(std::string_view name, BackendFactory factory,
+                       DeviceEnumerator enumerator = nullptr,
+-                      StableRefResolver stable_ref_resolver = nullptr);
++                      StableRefResolver stable_ref_resolver = nullptr,
++                      RuntimePreparer runtime_preparer = nullptr);
+ Result<std::unique_ptr<IBackend>> create_backend(std::string_view name);
+
+ // What a stable reference names, before any of it is opened. nullopt when the
+@@ -1379,8 +1385,9 @@ std::vector<std::string> default_backend_order();
+ struct BackendRegistrar {
+   BackendRegistrar(std::string_view name, BackendFactory factory,
+                    DeviceEnumerator enumerator,
+-                   StableRefResolver stable_ref = nullptr) {
+-    register_backend(name, factory, enumerator, stable_ref);
++                   StableRefResolver stable_ref = nullptr,
++                   RuntimePreparer runtime_preparer = nullptr) {
++    register_backend(name, factory, enumerator, stable_ref, runtime_preparer);
+   }
+ };
+
+@@ -1410,6 +1417,15 @@ template <typename Derived>
+   }
+ }
+
++template <typename Derived>
++[[nodiscard]] constexpr RuntimePreparer runtime_preparer_for() noexcept {
++  if constexpr (requires { RuntimePreparer{&Derived::prepare_runtime}; }) {
++    return &Derived::prepare_runtime;
++  } else {
++    return nullptr;
++  }
++}
++
+ // No token pasting: Type may be a qualified name. One registration per TU.
+ #define LSE_REGISTER_BACKEND(name, Type)                                  \
+   namespace {                                                             \
+@@ -1418,7 +1434,8 @@ template <typename Derived>
+         return std::make_unique<::lse::backend::BackendAdapter<Type>>();  \
+       },                                                                  \
+       ::lse::backend::device_enumerator_for<Type>(),                      \
+-      ::lse::backend::stable_ref_resolver_for<Type>()};                   \
++      ::lse::backend::stable_ref_resolver_for<Type>(),                    \
++      ::lse::backend::runtime_preparer_for<Type>()};                   \
+   }  // namespace
+
+ }  // namespace lse::backend
+diff --git a/include/lse/backends/hrx/hrx_backend.hpp b/include/lse/backends/hrx/hrx_backend.hpp
+index 660b044..cfd5be5 100644
+--- a/include/lse/backends/hrx/hrx_backend.hpp
++++ b/include/lse/backends/hrx/hrx_backend.hpp
+@@ -30,6 +30,7 @@ namespace lse::backend {
+ class HrxBackend : public Backend<HrxBackend> {
+  public:
+   static constexpr std::string_view kName = "hrx";
++  static void prepare_runtime();
+
+   ~HrxBackend();
+
 diff --git a/include/lse/communication/poller.hpp b/include/lse/communication/poller.hpp
 index e51c708..fdf066f 100644
 --- a/include/lse/communication/poller.hpp
 +++ b/include/lse/communication/poller.hpp
 @@ -73,7 +73,7 @@ class Poller {
    Poller() = default;
- 
+
    int epoll_fd_ = -1;
 -  int wake_fd_ = -1;
 +  [[maybe_unused]] int wake_fd_ = -1; // kqueue uses an EVFILT_USER event.
@@ -128,7 +200,7 @@ index 37e1df9..d3a715c 100644
 -#error "kernel_args.hpp needs P2996 reflection (g++-16 -std=c++26 -freflection)"
 +#define LSE_PORTABLE_AGGREGATE_ARGS 1
  #endif
- 
+
  #include <cstddef>
  #include <cstdint>
  #include <span>
@@ -140,20 +212,20 @@ index 37e1df9..d3a715c 100644
 +#include <type_traits>
 +#include <utility>
 +#endif
- 
+
  #include "lse/core/dtype.hpp"
  #include "lse/ir/env.hpp"
 @@ -100,14 +106,53 @@ struct arg_traits<InOut<T, Emit>> {
    using elem = T;
  };
- 
+
 +#ifndef LSE_PORTABLE_AGGREGATE_ARGS
  template <class A>
  consteval auto members() {
    return std::define_static_array(std::meta::nonstatic_data_members_of(
        ^^A, std::meta::access_context::current()));
  }
- 
+
 +#else
 +// The portable path supports plain aggregate parameter bundles only. Member
 +// order comes from C++ structured binding, retaining the reflected ABI order.
@@ -192,7 +264,7 @@ index 37e1df9..d3a715c 100644
 +#endif
 +
  }  // namespace detail
- 
+
 +#ifndef LSE_PORTABLE_AGGREGATE_ARGS
  template <class A>
  consteval std::size_t input_count() {
@@ -200,7 +272,7 @@ index 37e1df9..d3a715c 100644
 @@ -132,6 +177,20 @@ consteval std::size_t output_count() {
    return n;
  }
- 
+
 +#else
 +template<class A, bool Inputs> consteval std::size_t count_arguments() {
 +  using Fields=decltype(detail::member_refs(std::declval<A&>()));
@@ -263,7 +335,7 @@ index 6d62302..a4ee4fa 100644
 --- a/src/backends/cpu/CMakeLists.txt
 +++ b/src/backends/cpu/CMakeLists.txt
 @@ -9,7 +9,11 @@ target_link_libraries(lse_backend_cpu PUBLIC lse_core lse_backend_registry)
- 
+
  # The registrar is a static initializer in a TU with no referenced symbols;
  # without whole-archive the linker drops it and the backend silently vanishes.
 -target_link_options(lse_backend_cpu INTERFACE
@@ -281,7 +353,7 @@ index 2f05ce3..49d3d0a 100644
 +++ b/src/backends/hrx/CMakeLists.txt
 @@ -80,7 +80,11 @@ else()
  endif()
- 
+
  # See the cpu backend: self-registration requires whole-archive linking.
 -target_link_options(lse_backend_hrx INTERFACE
 +if(APPLE)
@@ -290,13 +362,90 @@ index 2f05ce3..49d3d0a 100644
 +  target_link_options(lse_backend_hrx INTERFACE
    "LINKER:--whole-archive,$<TARGET_FILE:lse_backend_hrx>,--no-whole-archive")
 +endif()
- 
+
  lse_apply_common_flags(lse_backend_hrx)
 diff --git a/src/backends/hrx/hrx_backend.cpp b/src/backends/hrx/hrx_backend.cpp
-index 76bb223..d1b7916 100644
+index 76bb223..6631e02 100644
 --- a/src/backends/hrx/hrx_backend.cpp
 +++ b/src/backends/hrx/hrx_backend.cpp
-@@ -702,9 +702,17 @@ Status accelerator_up() {
+@@ -154,9 +154,14 @@ class HsaRuntime {
+   // preload_gpu_runtime already loaded rather than a second runtime. The hot
+   // path keeps load_if_missing=false, so it behaves exactly as before.
+   explicit HsaRuntime(bool load_if_missing = false) noexcept {
+-    lib_ = dlopen("libhsa-runtime64.so.1", RTLD_LAZY | RTLD_NOLOAD);
++#if defined(__APPLE__)
++    constexpr const char* soname = "libhsa-runtime64.dylib";
++#else
++    constexpr const char* soname = "libhsa-runtime64.so.1";
++#endif
++    lib_ = dlopen(soname, RTLD_LAZY | RTLD_NOLOAD);
+     if (lib_ == nullptr && load_if_missing) {
+-      lib_ = dlopen("libhsa-runtime64.so.1", RTLD_LAZY);
++      lib_ = dlopen(soname, RTLD_LAZY);
+     }
+     if (lib_ == nullptr) return;
+     init_ = reinterpret_cast<InitFn>(dlsym(lib_, "hsa_init"));
+@@ -287,10 +292,11 @@ class HsaRuntime {
+       // an interrupt round trip is the same order as the transfer.
+       constexpr int kConditionLt = 2;
+       constexpr int kWaitActive = 1;
+-      (void)signal_wait_(shared_signal_, kConditionLt, 1, UINT64_MAX,
+-                         kWaitActive);
++      // Negative completion is an asynchronous transfer failure, not success.
++      return signal_wait_(shared_signal_, kConditionLt, 1, UINT64_MAX,
++                          kWaitActive) == 0;
+     }
+-    return issued;
++    return false;
+   }
+
+   // Pins a host range so the copy engine can reach it, returning the address
+@@ -673,26 +679,26 @@ StreamCapabilities derive_stream_capabilities(const DeviceInfo& info,
+ // exactly what enumerating devices before binding one would otherwise cause.
+ std::atomic<bool> g_accelerator_up{false};
+
+-// Registered during this translation unit's dynamic initialization — before
+-// main, and so before any object that can own a backend exists. Exit handlers
+-// run in reverse registration order, which is what puts the global teardown
+-// AFTER the last HrxBackend has released its streams and device.
+-//
+-// Registering it lazily on first bring-up does NOT achieve that, however early
+-// the bring-up is: the first one happens from inside whatever owns the backends
+-// (place::Devices, a Scheduler, a test fixture), whose own handler is therefore
+-// registered first and runs last — leaving hrx_gpu_shutdown to run while those
+-// backends are still holding streams and a device reference.
+-[[maybe_unused]] const bool kTeardownRegistered = [] {
+-  std::atexit([] {
+-    if (g_accelerator_up.load(std::memory_order_acquire)) {
+-      hrx_status_ignore(hrx_gpu_shutdown());
+-    }
+-  });
+-  return true;
+-}();
++// The runtime is dlopened, so its global destructors are registered at load
++// time. Register shutdown after that load but before a static device owner is
++// constructed: owner -> HRX shutdown -> HSA globals. A pre-main atexit callback
++// runs too late on Darwin and calls hsa_shut_down with already-destroyed locks.
++void prepare_accelerator_runtime() {
++  static const HsaRuntime lifetime(true);
++  if (!lifetime.reachable()) return;
++  static const bool registered = [] {
++    std::atexit([] {
++      if (g_accelerator_up.exchange(false, std::memory_order_acq_rel)) {
++        hrx_status_ignore(hrx_gpu_shutdown());
++      }
++    });
++    return true;
++  }();
++  (void)registered;
++}
+
+ Status accelerator_up() {
++  prepare_accelerator_runtime();
+   static std::mutex mu;
+   const std::lock_guard lock(mu);
+   if (g_accelerator_up.load(std::memory_order_relaxed)) return OkStatus();
+@@ -702,9 +708,17 @@ Status accelerator_up() {
    // for here because bringing the accelerator up is once per process and the
    // topology is fixed at that moment.
    const std::string group = backend::requested_device_group("hrx");
@@ -314,6 +463,155 @@ index 76bb223..d1b7916 100644
    if (hrx_status_is_ok(status)) {
      g_accelerator_up.store(true, std::memory_order_release);
      return OkStatus();
+@@ -720,6 +734,12 @@ Status accelerator_up() {
+
+ }  // namespace
+
++void HrxBackend::prepare_runtime() {
++#if LSE_HRX_LINKED
++  prepare_accelerator_runtime();
++#endif
++}
++
+ bool HrxBackend::available() noexcept {
+ #if LSE_HRX_LINKED
+   return true;
+diff --git a/src/backends/hrx/loomc/loom_print.cpp b/src/backends/hrx/loomc/loom_print.cpp
+index 50b9aef..7de7540 100644
+--- a/src/backends/hrx/loomc/loom_print.cpp
++++ b/src/backends/hrx/loomc/loom_print.cpp
+@@ -112,8 +112,9 @@ class Printer {
+   // has `index` for the first and `i32` for the second and no unsigned type
+   // for either. A word is born in a memory read of an unsigned buffer or in a
+   // bit-manipulation row, and it stays a word through the arithmetic it feeds.
+-  // Everything else is an address. Nothing is guessed: a value that would have
+-  // to be both is a decline, not a silent choice.
++  // Bind aliases retain their source's role. Roles flow forward from word
++  // producers; shared constants remain indices and are cast at word uses.
++  // Back-propagating through constants would misclassify unrelated loop bounds.
+   void classify_words() {
+     word_.assign(b_.value_count(), 0);
+     auto seed = [&](OpId id) {
+@@ -136,6 +137,9 @@ class Printer {
+         bool any = o.result != kNoValue && o.type.elem == Scalar::kU32 &&
+                    word_[o.result] != 0;
+         for (ValueId v : o.operands) {
++          // Bind aliases print as their original definition. Classify the
++          // same value that operand() will read, including e.let(load).
++          v = resolve(v);
+           if (v < word_.size() && b_.value(v).type.elem == Scalar::kU32 &&
+               word_[v] != 0) {
+             any = true;
+@@ -147,13 +151,7 @@ class Printer {
+           word_[o.result] = 1;
+           changed = true;
+         }
+-        for (ValueId v : o.operands) {
+-          if (v < word_.size() && b_.value(v).type.elem == Scalar::kU32 &&
+-              word_[v] == 0) {
+-            word_[v] = 1;
+-            changed = true;
+-          }
+-        }
++
+       });
+     }
+   }
+@@ -244,6 +242,10 @@ class Printer {
+       for (OpId id : users_[at]) {
+         const Operation& u = b_.op(id);
+         switch (u.kind) {
++          // collect_subs resolves every operand through binds, so all real
++          // users already attach to the source. Naming an index cannot make
++          // its wrapped value observable on its own.
++          case OpKind::kBind:
+           case OpKind::kSubscript:
+           case OpKind::kLoadVec:
+           case OpKind::kStoreVec:
+@@ -513,22 +515,28 @@ class Printer {
+     if (a == nullptr || b == nullptr) {
+       return unsupported("operand of '" + o.key + "' was never defined");
+     }
+-    // C has one u32 for an address and a packed word; Loom has `index` and
+-    // `i32`. Converting the odd one out here is not enough: the quantized
+-    // codecs carry the same value through both roles for a dozen lines, and a
+-    // per-operator conversion leaves every OTHER use of it in the role the
+-    // classifier picked. Measured — coercing at this site turns the decline
+-    // into `TYPE/001` on a value the store hook then writes as f32. The role
+-    // has to be decided for the whole body, which is what classify_words does
+-    // not yet do for a codec, so this stays a decline.
++    // The IR's u32 is used both for packed words and indices. A shared
++    // constant may feed both without changing its definition's role. Convert
++    // only that operand to the unsigned word domain for this operation;
++    // loop bounds and address uses retain their index definitions.
++    std::string lhs = name(o.operands[0]);
++    std::string rhs = name(o.operands[1]);
++    Typed converted;
+     if (a->type != b->type) {
+-      return unsupported("'" + o.key + "' mixes " + a->type + " and " +
+-                         b->type +
+-                         "; the u32 index and word roles cannot both be one "
+-                         "value");
++      const bool a_index = a->cls == Cls::kIndex && a->elem == Scalar::kU32;
++      const bool b_index = b->cls == Cls::kIndex && b->elem == Scalar::kU32;
++      const bool a_word = a->cls == Cls::kUnsignedInt && a->type == "i32" && a->elem == Scalar::kU32;
++      const bool b_word = b->cls == Cls::kUnsignedInt && b->type == "i32" && b->elem == Scalar::kU32;
++      if ((a_index && b_word) || (b_index && a_word)) {
++        const std::string cast = fresh("word");
++        line(depth, cast + " = index.cast " + (a_index ? lhs : rhs) + " : index to i32");
++        converted = Typed{"i32", Scalar::kU32, Cls::kUnsignedInt, true};
++        if (a_index) { lhs = cast; a = &converted; }
++        else { rhs = cast; b = &converted; }
++      } else {
++        return unsupported("'" + o.key + "' mixes " + a->type + " and " + b->type);
++      }
+     }
+-    const std::string lhs = name(o.operands[0]);
+-    const std::string rhs = name(o.operands[1]);
+     const std::string res = name(o.result);
+     const std::string& k = o.key;
+
+diff --git a/src/backends/registry.cpp b/src/backends/registry.cpp
+index afeb740..ecf962d 100644
+--- a/src/backends/registry.cpp
++++ b/src/backends/registry.cpp
+@@ -19,6 +19,7 @@ struct Entry {
+   BackendFactory factory = nullptr;
+   DeviceEnumerator enumerator = nullptr;
+   StableRefResolver stable_ref_resolver = nullptr;
++  RuntimePreparer runtime_preparer = nullptr;
+ };
+
+ struct Registry {
+@@ -54,11 +55,26 @@ DeviceIndex next_device_index() noexcept {
+
+ void register_backend(std::string_view name, BackendFactory factory,
+                       DeviceEnumerator enumerator,
+-                      StableRefResolver stable_ref_resolver) {
++                      StableRefResolver stable_ref_resolver,
++                      RuntimePreparer runtime_preparer) {
+   Registry& r = registry();
+   std::lock_guard lock(r.mu);
+   r.factories.emplace(std::string(name),
+-                      Entry{factory, enumerator, stable_ref_resolver});
++                      Entry{factory, enumerator, stable_ref_resolver, runtime_preparer});
++}
++
++void prepare_backend_runtimes() {
++  std::vector<RuntimePreparer> callbacks;
++  {
++    Registry& r = registry();
++    std::lock_guard lock(r.mu);
++    for (const auto& [name, entry] : r.factories) {
++      (void)name;
++      if (entry.runtime_preparer) callbacks.push_back(entry.runtime_preparer);
++    }
++  }
++  // dlopen may itself register backends; never hold the registry lock here.
++  for (const auto callback : callbacks) callback();
+ }
+
+ namespace {
 diff --git a/src/communication/socket.cpp b/src/communication/socket.cpp
 index 3ad7a35..0abc576 100644
 --- a/src/communication/socket.cpp
@@ -323,7 +621,7 @@ index 3ad7a35..0abc576 100644
  #include <sys/un.h>
  #include <unistd.h>
 +#include <fcntl.h>
- 
+
  #include <algorithm>
  #include <array>
 @@ -91,7 +92,7 @@ Result<Address> inet_address(std::string_view authority) {
@@ -357,7 +655,7 @@ index 3ad7a35..0abc576 100644
 @@ -151,9 +155,34 @@ Result<Address> address_of(const Endpoint& ep) {
    return inet_address(ep.authority());
  }
- 
+
 +#ifdef __APPLE__
 +bool configure_socket(int fd) {
 +  const int flags=::fcntl(fd,F_GETFL,0);
@@ -427,7 +725,7 @@ index 3ad7a35..0abc576 100644
    std::string text = std::string(requested.scheme()) + "://" + authority;
    bool first = true;
 @@ -564,8 +593,12 @@ constexpr std::uint64_t kAcceptRetryNs = 50'000'000ull;
- 
+
  void SocketListener::accept_ready() {
    for (;;) {
 +#ifdef __APPLE__
@@ -439,20 +737,197 @@ index 3ad7a35..0abc576 100644
      if (fd < 0) {
        // Out of descriptors: the connection stays queued and the listening
        // socket stays readable, so waiting on it again would report ready
+diff --git a/src/graph/scheduler.cpp b/src/graph/scheduler.cpp
+index e5045ed..fdfc394 100644
+--- a/src/graph/scheduler.cpp
++++ b/src/graph/scheduler.cpp
+@@ -1677,8 +1677,18 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
+         ran.push_back(g);
+         continue;
+       }
+-      // Not a hard failure: a group the emitter cannot express falls to the
+-      // host, which is the documented behaviour. Record why.
++      // Inference qualification must not quietly turn a missing GPU kernel
++      // into a CPU result. Drain prior work before reporting the exact gap.
++      if (const char* strict = std::getenv("LSE_REQUIRE_DEVICE_KERNELS");
++          strict != nullptr && std::string_view(strict) == "1") {
++        for (std::size_t member = 0; member < devices_.size(); ++member) {
++          LSE_RETURN_IF_ERROR(devices_.device(member).synchronize());
++        }
++        return LSE_ERROR(kUnimplemented, "GPU-only execution required: ",
++                         dispatched.message());
++      }
++      // A group the emitter cannot express otherwise falls to the host,
++      // which is the default behaviour. Record why.
+       ++trace_.host_groups;
+       trace_.host_group_reasons.push_back(dispatched.message());
+     }
+@@ -1691,6 +1701,12 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
+       launched = false;
+     }
+
++    if (const char* strict = std::getenv("LSE_REQUIRE_DEVICE_KERNELS");
++        strict != nullptr && std::string_view(strict) == "1") {
++      return LSE_ERROR(kUnimplemented,
++                       "GPU-only execution required: no device kernel backend selected");
++    }
++
+     // Host-only mode reaches here without passing the device-first arm above,
+     // so nothing had counted this group. Leaving it uncounted printed
+     // `groups device=0 host=0` beside a five-figure launch count, which reads
+@@ -1870,6 +1886,9 @@ ScopedMember::ScopedMember(std::size_t member) noexcept
+ ScopedMember::~ScopedMember() { g_preferred_member = previous_; }
+
+ Scheduler* default_scheduler() {
++  // Without place linked, this scheduler owns the backend itself. Arrange
++  // runtime dependencies before its destructor is registered as well.
++  if (g_device_set_factory == nullptr) backend::prepare_backend_runtimes();
+   static DefaultScheduler d;
+   return d.scheduler.get();
+ }
+diff --git a/src/ir/lower.cpp b/src/ir/lower.cpp
+index f1cd6cf..1c63ecd 100644
+--- a/src/ir/lower.cpp
++++ b/src/ir/lower.cpp
+@@ -211,7 +211,13 @@ std::string ssa_name(const Body& body, ValueId v) {
+   }
+   if (v == kNoValue || v >= body.value_count()) return {};
+   const ValueDef& def = body.value(v);
+-  return def.name.empty() ? "%v" + std::to_string(v) : "%" + def.name;
++  // Named C temporaries use a different counter from ValueId. Combining
++  // their names with anonymous %v<ValueId> names can alias an accumulator
++  // onto an unrelated index. Only external symbols retain their spelling;
++  // every SSA definition is identified by its stable value id.
++  if (def.def != kNoOp && body.op(def.def).kind == OpKind::kSymbol)
++    return "%" + def.name;
++  return "%v" + std::to_string(v);
+ }
+
+ std::string render(const Body& body, ValueId v) {
+diff --git a/src/model/layer.cpp b/src/model/layer.cpp
+index 4281d0e..7c81eb5 100644
+--- a/src/model/layer.cpp
++++ b/src/model/layer.cpp
+@@ -4,6 +4,7 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdio>
++#include <cstdlib>
+ #include <chrono>
+ #include <cstring>
+ #include <mutex>
+@@ -70,7 +71,17 @@ Result<backend::DeviceBuffer> slab_window(std::size_t bytes,
+   // 4 KiB keeps every window page-aligned, which is the strictest alignment
+   // any kernel here asks of a binding.
+   constexpr std::size_t kAlign = 4096;
+-  constexpr std::size_t kSlab = std::size_t{512} << 20;
++  std::size_t kSlab = std::size_t{512} << 20;
++#if defined(__APPLE__)
++  // Device-only VRAM slabs have no individual host-DMA descriptor limit.
++  // Bound each slab to 1/16 of reported VRAM and at most 2 GiB so a large
++  // checkpoint does not exhaust the transport's BO slots merely on weights.
++  // CPU and small/unknown-capacity devices retain the original 512 MiB slab.
++  if (be.name() == "hrx") {
++    const std::size_t budget = be.device_info().total_memory / 16;
++    kSlab = std::clamp(budget & ~(kAlign - 1), kSlab, std::size_t{2} << 30);
++  }
++#endif
+   static std::mutex mu;
+   static std::vector<WeightSlab> slabs;
+   const std::size_t need = (bytes + kAlign - 1) & ~(kAlign - 1);
+@@ -96,6 +107,15 @@ Result<backend::DeviceBuffer> slab_window(std::size_t bytes,
+     made.base = got.release();
+     slabs.push_back(std::move(made));
+     use = &slabs.back();
++    if (std::getenv("LSE_TIME_LOAD") != nullptr) {
++      std::size_t total = 0;
++      for (const WeightSlab& slab : slabs) total += slab.base.size_bytes;
++      std::fprintf(stderr, "lse weights: %zu live slabs, %.3f GiB reserved; "
++                           "new slab %.1f MiB\n",
++                   slabs.size(), double(total) / double(std::size_t{1} << 30),
++                   double(want) / double(std::size_t{1} << 20));
++      std::fflush(stderr);
++    }
+   }
+   // A view: same allocation, same residency and member, its own window. This
+   // is the shape DeviceBuffer already documents for a reshape's alias.
+diff --git a/src/place/devices.cpp b/src/place/devices.cpp
+index 82f522d..c9926d2 100644
+--- a/src/place/devices.cpp
++++ b/src/place/devices.cpp
+@@ -485,7 +485,10 @@ struct DefaultSet {
+   }
+ };
+
++void prepare_device_runtime();
++
+ DefaultSet& default_set() {
++  prepare_device_runtime();
+   static DefaultSet d;
+   return d;
+ }
+@@ -523,7 +526,11 @@ void raise_fd_limit() {
+
+ void preload_gpu_runtime() {
+   namespace fs = std::filesystem;
++#if defined(__APPLE__)
++  constexpr const char* kHsaSoname = "libhsa-runtime64.dylib";
++#else
+   constexpr const char* kHsaSoname = "libhsa-runtime64.so.1";
++#endif
+
+   // Somebody already put it in the process. That somebody may be a profiler
+   // that intends to intercept every HSA call, and loading a second copy beside
+@@ -547,6 +554,12 @@ void preload_gpu_runtime() {
+     if (ok) return;
+   }
+
++#if defined(__APPLE__)
++  // Honor dyld's configured library search, matching the HRX adapter's name.
++  if (void* native = dlopen(kHsaSoname, RTLD_NOW | RTLD_GLOBAL); native != nullptr) {
++    if (dlsym(native, "hsa_amd_vmem_address_reserve_align") != nullptr) return;
++  }
++#endif
+   std::vector<std::string> roots;
+   if (const char* env = std::getenv("ROCM_PATH"); env != nullptr && *env != 0) {
+     roots.emplace_back(env);
+@@ -585,15 +598,19 @@ void preload_gpu_runtime() {
+   }
+ }
+
+-}  // namespace
+-
+-Status open_default_devices(std::string_view selector) {
++void prepare_device_runtime() {
+   static const bool preloaded = [] {
+     raise_fd_limit();
+     preload_gpu_runtime();
++    backend::prepare_backend_runtimes();
+     return true;
+   }();
+   (void)preloaded;
++}
++
++}  // namespace
++
++Status open_default_devices(std::string_view selector) {
+   DefaultSet& d = default_set();
+   std::lock_guard lock(d.mu);
+   if (d.built) {
 diff --git a/src/trace/record.cpp b/src/trace/record.cpp
 index 9f17d38..35db5ad 100644
 --- a/src/trace/record.cpp
 +++ b/src/trace/record.cpp
 @@ -1,6 +1,9 @@
  #include "lse/trace/record.hpp"
- 
+
  #include <ctime>
 +#ifdef __APPLE__
 +#include <mach/mach_time.h>
 +#endif
- 
+
  #include <algorithm>
- 
+
 @@ -20,7 +23,16 @@ std::uint64_t clock_ns(clockid_t id) noexcept {
  HostClockPair read_host_clocks() noexcept {
    HostClockPair pair;
@@ -469,20 +944,60 @@ index 9f17d38..35db5ad 100644
 +#endif
    return pair;
  }
- 
+
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index a787603..236f61d 100644
+index a787603..2d44e74 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
-@@ -35,7 +35,7 @@ endif()
- 
+@@ -19,6 +19,13 @@ lse_add_test(test_reflect)
+ # deliberately does not link any of them, so nothing arrives transitively.
+ lse_add_test(test_kernel_env lse_graph lse_backends)
+ lse_add_test(test_ir lse_ir lse_graph lse_backends)
++# The Loom text printer only needs kernel IR; keep these regressions usable
++# without libhrx, the Loom compiler, or a GPU.
++lse_add_test(test_loom_print lse_ir)
++target_sources(test_loom_print PRIVATE
++  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
++  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
++  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
+ lse_add_test(test_quant)
+ lse_add_test(test_shape)
+ lse_add_test(test_server lse_server lse_tokenizer lse_model lse_backends)
+@@ -35,7 +42,7 @@ endif()
+
  if(LSE_ENABLE_CPU)
    lse_add_test(test_backend_cpu lse_backend_cpu)
 -  lse_add_test(test_graph lse_graph lse_backends)
 +  lse_add_test(test_graph lse_graph lse_kernels lse_backends)
    lse_add_test(test_primitive lse_graph lse_backends)
  endif()
- 
+
+diff --git a/tests/test_ir.cpp b/tests/test_ir.cpp
+index 56fefa9..c44258f 100644
+--- a/tests/test_ir.cpp
++++ b/tests/test_ir.cpp
+@@ -900,3 +900,21 @@ LSE_TEST(alias_separates_lds_from_a_global_buffer_without_an_oracle) {
+   LSE_EXPECT(ir::alias_of(w, r) == ir::Alias::kNo);
+   LSE_EXPECT(ir::may_reorder(w, r));
+ }
++
++LSE_TEST(loom_ssa_names_cannot_alias_named_temporaries_with_anonymous_values) {
++  ir::Body body(kTypes,kTable);
++  const auto index=body.constant("1u",ir::scalar_type(ir::Scalar::kU32),1,true);
++  const auto zero=body.constant("0.0f",ir::scalar_type(ir::Scalar::kF32),0,false);
++  ir::Operation accumulator;
++  accumulator.kind=ir::OpKind::kMutable;
++  accumulator.type=ir::scalar_type(ir::Scalar::kF32);
++  accumulator.operands={zero};
++  const auto value=body.add_value(std::move(accumulator),"v"+std::to_string(index));
++  LSE_EXPECT(ir::ssa_name(body,index)!=ir::ssa_name(body,value));
++  const auto external=body.symbol("input",ir::scalar_type(ir::Scalar::kU32));
++  LSE_EXPECT(ir::ssa_name(body,external)=="%input");
++  ir::Operation bind;
++  bind.kind=ir::OpKind::kBind;bind.type=ir::scalar_type(ir::Scalar::kF32);bind.operands={value};
++  const auto alias=body.add_value(std::move(bind),"snapshot");
++  LSE_EXPECT(ir::ssa_name(body,alias)==ir::ssa_name(body,value));
++}
 diff --git a/src/communication/poller_kqueue.cpp b/src/communication/poller_kqueue.cpp
 new file mode 100644
 index 0000000..c492dcd
@@ -607,3 +1122,134 @@ index 0000000..c492dcd
 +  ::kevent(epoll_fd_, &event, 1, nullptr, 0, nullptr);
 +}
 +} // namespace lse::comm
+diff --git a/tests/test_loom_print.cpp b/tests/test_loom_print.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test_loom_print.cpp
+@@ -0,0 +1,54 @@
++// Source-only regressions: no Loom compiler, HRX library or GPU is required.
++#include "harness.hpp"
++#include "lse/backends/hrx/loomc/loom_print.hpp"
++#include "lse/backends/hrx/loomc/loom_types.hpp"
++#include "lse/graph/kernel_env.hpp"
++
++namespace ir = lse::ir;
++namespace env = lse::ir::env;
++namespace {
++const ir::TypeTable types = lse::backend::loom_types();
++const ir::DialectSourceTable intrinsics{std::span<const ir::PrimitiveSource>{}};
++}
++
++LSE_TEST(guarded_index_subtraction_remains_address_only_through_bind_aliases) {
++  ir::KernelBody body(types, intrinsics);
++  env::Emit e{&body};
++  ir::Buffer<ir::f32> input(&body, &types, "input");
++  const auto t = e.let(e.thread_id() % 8u);
++  const auto source = e.let(t - 3u);
++  const auto alias = e.let(source);
++  auto result = e.var(0.0f);
++  if (auto valid = e.when(t >= 3u)) result = input[alias];
++  e.ret(result.read());
++  lse::backend::LoomPrintOptions options;
++  options.buffers.emplace("input", lse::backend::LoomBufferView{
++      ir::Scalar::kF32, 64, "%input_view"});
++  auto printed = lse::backend::loom_print(body.ir(), options);
++  LSE_EXPECT(printed.ok());
++  if (printed.ok()) {
++    LSE_EXPECT(printed->text.find("index.max") != std::string::npos);
++    LSE_EXPECT(printed->text.find("view.load") != std::string::npos);
++  }
++}
++
++LSE_TEST(index_subtraction_wrap_observed_through_aliases_still_declines) {
++  for (int consumer = 0; consumer < 4; ++consumer) {
++    ir::KernelBody body(types, intrinsics);
++    env::Emit e{&body};
++    const auto source = e.let(e.thread_id() - 3u);
++    const auto alias = e.let(source);
++    if (consumer == 0) e.ret(alias < 16u);
++    if (consumer == 1) e.ret(ir::cast<ir::f32>(alias));
++    if (consumer == 2) e.ret(alias);
++    if (consumer == 3) e.ret(e.let(alias + 7u) < 16u);
++    auto printed = lse::backend::loom_print(body.ir(), {});
++    LSE_EXPECT(!printed.ok());
++    if (!printed.ok()) {
++      LSE_EXPECT(printed.status().message().find("wrapped value is observable") !=
++                 std::string::npos);
++    }
++  }
++}
++
++LSE_TEST_MAIN()
+diff --git a/src/cli/server_main.cpp b/src/cli/server_main.cpp
+index 6d27355..d16cdf0 100644
+--- a/src/cli/server_main.cpp
++++ b/src/cli/server_main.cpp
+@@ -7,6 +7,8 @@
+ #include <string>
+ #include <thread>
+ 
++#include "lse/graph/graph.hpp"
++#include "lse/graph/jit.hpp"
+ #include "lse/model/config.hpp"
+ #include "lse/model/mtp.hpp"
+ #include "lse/model/registry.hpp"
+@@ -66,6 +68,8 @@ void usage() {
+       "      --tokenizer REPO HF repo for tokenizer.json when the model\n"
+       "                       directory has none\n"
+       "      --kv-len N       allocate the KV cache for N tokens\n"
++      "      --pool LIST      device pool, for example hrx:0 or cpu:0\n"
++      "      --dialect NAME   source dialect: hip or loom\n"
+       "  -h, --help           this message\n"
+       "\n"
+       "Endpoints: GET /health, GET /v1/models, POST /v1/chat/completions,\n"
+@@ -88,6 +92,7 @@ int main(int argc, char** argv) {
+   std::string tokenizer_repo{tokenizer::kQwen36TokenizerRepo};
+   std::string served_name;
+   std::string pool;
++  std::string dialect;
+   std::int32_t kv_len = 0;
+ 
+   for (int i = 1; i < argc; ++i) {
+@@ -111,6 +116,14 @@ int main(int argc, char** argv) {
+     else if (a == "--tokenizer") tokenizer_repo = value("--tokenizer");
+     else if (a == "--kv-len") kv_len = std::atoi(value("--kv-len").c_str());
+     else if (a == "--pool") pool = value("--pool");
++    else if (a == "--dialect") {
++      dialect = value("--dialect");
++      if (!graph::dialect_from_name(dialect).has_value()) {
++        std::fprintf(stderr, "lse-server: no dialect is spelled '%s'\n",
++                     dialect.c_str());
++        return 2;
++      }
++    }
+     else {
+       std::fprintf(stderr, "lse-server: unknown option '%s'\n", a.c_str());
+       return 2;
+@@ -149,6 +162,26 @@ int main(int argc, char** argv) {
+                  std::string(first_device.name()).c_str());
+   }
+ 
++  graph::Scheduler* sched = graph::default_scheduler();
++  if (sched == nullptr) {
++    return fail(LSE_ERROR(kDeviceError, "no scheduler could be built"),
++                "selecting the kernel dialect");
++  }
++  if (!dialect.empty()) {
++    const graph::Dialect want = *graph::dialect_from_name(dialect);
++    sched->set_dialect(want);
++    for (std::size_t i = 0; i < devices->size(); ++i) {
++      const graph::KernelToolchain* tc = sched->toolchain(i);
++      if (tc == nullptr) continue;
++      std::fprintf(stderr, "lse-server: %s generates %s%s\n",
++                   std::string(devices->device(i).name()).c_str(),
++                   std::string(to_string(tc->dialect)).c_str(),
++                   tc->dialect == want
++                       ? ""
++                       : " -- it does not declare the one asked for");
++    }
++  }
++
+   std::fprintf(stderr, "lse-server: loading %s\n", model.c_str());
+   auto paths = model::resolve_model(model);
+   if (!paths.ok()) return fail(paths.status(), "resolving the model");

@@ -13,6 +13,7 @@
 #include "amdgpu_gfx.h"
 #include "amdgpu_mes.h"
 #include "amdgpu_vram_io.h"
+#include "amdgpu_software_stats.h"
 
 #define CP_LOG(fmt, ...) \
     os_log(OS_LOG_DEFAULT, "mac.amdgpu.cp: " fmt, ##__VA_ARGS__)
@@ -464,11 +465,13 @@ cp_submit_eop_test(const DeviceContext &dev, CPContext &cp,
 
     const uint64_t start_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     uint64_t elapsed = 0, observed = 0;
+    software_stats::PublishedWork work(dev.softwareStats, software_stats::GFX, start_ns);
     while (elapsed < timeout_us) {
         r = cp_read_fence(cp, &observed);
         if (r != kIOReturnSuccess) return r;
         // Linux uses a 32-bit fence in the low half on simple paths.
         if ((observed & 0xFFFFFFFFu) == fence) {
+            work.complete(clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
             if (outFence) *outFence = fence;
             CP_LOG("EOP fence %u observed after %llu µs", fence, elapsed);
             return kIOReturnSuccess;
@@ -608,6 +611,8 @@ cp_kiq_smoke_test(DeviceContext &dev,
     }
     CP_LOG("cp_kiq_smoke: doorbell rung (slot=%#x new_wptr=%llu doorbell_works=%d)",
            cp.doorbell_index, cp.wptr, dev.doorbell_works ? 1 : 0);
+    software_stats::PublishedWork work(dev.softwareStats, software_stats::GFX,
+        clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
 
     uint64_t elapsed_us = 0;
     uint32_t observed = 0;
@@ -616,6 +621,7 @@ cp_kiq_smoke_test(DeviceContext &dev,
         if (readResult != kIOReturnSuccess) return readResult;
         elapsed_us = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start_ns) / 1000;
         if (observed == expected_fence_value) {
+            work.complete(clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
             if (out_observed_fence) *out_observed_fence = observed;
             if (out_elapsed_us) *out_elapsed_us = elapsed_us;
             CP_LOG("GFX queue fence expected=%#x observed=%#x in %llu us",

@@ -55,6 +55,26 @@ hsa_status_t mac_hsa_executable_dispatch_aql(hsa_executable_symbol_t symbol,
 __attribute__((visibility("default")))
 hsa_status_t mac_hsa_memory_allocate_shared(hsa_agent_t agent, size_t size, void **out);
 
+enum {
+    MAC_HSA_SYNC_CPU_LOCAL_ATOMICS = 1u << 0,
+    MAC_HSA_SYNC_GPU_LOCAL_ATOMICS = 1u << 1,
+    MAC_HSA_SYNC_OWNERSHIP_TRANSFER = 1u << 2,
+    MAC_HSA_SYNC_GPU_MEDIATED_SIGNALS = 1u << 3,
+    MAC_HSA_SYNC_NATIVE_CPU_GPU_RMW = 1u << 4,
+    MAC_HSA_SYNC_MAILBOX_IRQ_WAKE = 1u << 5
+};
+// Query a tracked allocation and its actual GPU mapping path. LOCAL flags allow
+// atomics within one agent domain, not simultaneous CPU/GPU RMW on one word.
+// OWNERSHIP_TRANSFER permits the tested release/acquire ownership protocol; it
+// does not make the pool fine-grained. GPU_MEDIATED_SIGNALS describes HSA signal
+// API routing, not automatic interception of arbitrary pointer atomics. Neither
+// native mixed RMW nor mailbox IRQ wake is qualified by the current profiles.
+// No device initialization, config writes, or submission. Output unchanged on
+// failure; pass its GPU agent for GPU allocations, CPU agent for host-only ones.
+__attribute__((visibility("default")))
+hsa_status_t mac_hsa_memory_get_sync_capabilities(hsa_agent_t agent,
+    const void *pointer, uint32_t *flags);
+
 // Driver190+: read-only snapshot for the aligned 64-bit word at shared_pointer
 // and an owned live hardware queue on the same GPU. This does not submit work,
 // initialize the device or change mappings/PCIe/MQD policy. Caller keeps the

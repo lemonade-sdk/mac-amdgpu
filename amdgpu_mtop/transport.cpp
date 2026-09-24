@@ -2,6 +2,8 @@
 #include <IOKit/IOKitLib.h>
 #include <mach/mach.h>
 #include <cstdio>
+#include <map>
+#include <time.h>
 
 namespace mtop {
 namespace {
@@ -50,6 +52,41 @@ void read(io_service_t service, Device &d) {
     for (unsigned i = 0; i < 3; ++i) d.gfx[i] = uint32_t(gfx[i]);
     d.visible = vram[0];
     d.total = vram[1];
+    if (d.build >= 193 && d.stage == 15) {
+        // Per-registry rate limiting is independent of the dashboard refresh.
+        // The driver also shares a one-second cache across all observers.
+        static std::map<uint64_t, uint64_t> attempts;
+        const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        auto &last = attempts[d.registry];
+        if (!last || now < last || now - last >= 1000000000ull) {
+            last = now;
+            uint64_t result[3]{};
+            uint32_t count = 3;
+            // Errors remain in the cached sensor snapshot; Busy simply skips
+            // this sample. Never affect the independent software counters.
+            (void)IOConnectCallScalarMethod(connection.value, 63, nullptr, 0, result, &count);
+        }
+    }
+    if (d.build >= amdgpu::software_stats::kMinimumBuild) {
+        size_t bytes = sizeof(d.software);
+        kr = IOConnectCallStructMethod(connection.value, amdgpu::software_stats::kSelector,
+                                        nullptr, 0, &d.software, &bytes);
+        if (kr != KERN_SUCCESS) d.softwareError = failure("Software counters", kr);
+        else if (bytes != sizeof(d.software) || !amdgpu::software_stats::valid(d.software))
+            d.softwareError = "Invalid software counter ABI";
+        else d.softwareSupported = true;
+    }
+    if (d.build >= 193) {
+        size_t bytes = sizeof(d.clocks);
+        kr = IOConnectCallStructMethod(connection.value, amdgpu::kSMUClockSelector,
+                                        nullptr, 0, &d.clocks, &bytes);
+        if (kr != KERN_SUCCESS) d.clocksError = failure("Clock snapshot", kr);
+        else if (bytes != sizeof(d.clocks) || d.clocks.version != 1 ||
+                 d.clocks.size != sizeof(d.clocks) ||
+                 (d.clocks.currentValid & ~15u) || (d.clocks.limitsValid & ~15u))
+            d.clocksError = "Invalid clock snapshot ABI";
+        else d.clocksSupported = true;
+    }
     if (d.build >= 178) {
         tag = 5;
         uint32_t count = amdgpu::vram_accounting::Count;

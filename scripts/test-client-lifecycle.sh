@@ -19,6 +19,9 @@ Path('build/tests/client_pm_cap_under_test.inc').write_text(source[start:end])
 start = source.index('static kern_return_t\nmac_amdgpu_ensure_open(')
 end = source.index('    uint16_t cmd = 0;', start)
 Path('build/tests/client_open_under_test.inc').write_text(source[start:end] + '    return kIOReturnSuccess;\n}\n')
+a = source.index('static void mac_amdgpu_raw_work_completed(')
+b = source.index('//\n// BO helpers', a)
+Path('build/tests/client_software_raw_under_test.inc').write_text(source[a:b])
 sections = []
 for name, next_name in [('WaitInterrupt', 'SetIRQMask'), ('WaitFence', 'CSCreate'),
                         ('SubmitTestPM4', 'CPKIQSmoke'), ('CPKIQSmoke', 'SDMACopyTest'),

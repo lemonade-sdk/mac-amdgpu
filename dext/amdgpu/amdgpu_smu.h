@@ -167,6 +167,8 @@ kern_return_t smu_smc_hw_setup(DeviceContext &dev, struct PSPContext &psp,
 // runtimeReady must include initialized lifecycle and PCI ownership checks.
 kern_return_t smu_collect_metrics(const DeviceContext &dev,
     SMUMetricsContext &metrics, bool runtimeReady);
+void smu_clock_snapshot(const SMUMetricsContext &metrics,
+    bool runtimeReady, SMUClockSnapshot &snapshot);
 void smu_metrics_snapshot(const SMUMetricsContext &metrics,
     bool runtimeReady, SMUMetricsSnapshot &snapshot);
 // Call before Stop/reset/detach; this never releases firmware-owned staging.

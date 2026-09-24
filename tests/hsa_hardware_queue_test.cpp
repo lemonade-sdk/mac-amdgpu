@@ -162,6 +162,24 @@ int main() {
     },nullptr,UINT32_MAX,UINT32_MAX,&queue)==0 && queue);
     void *diagnosticMemory=nullptr;
     assert(mac_hsa_memory_allocate_shared(gpu,16384,&diagnosticMemory)==0);
+    uint32_t syncFlags=0;
+    assert(mac_hsa_memory_get_sync_capabilities(gpu,diagnosticMemory,&syncFlags)==0);
+    assert(syncFlags==(MAC_HSA_SYNC_CPU_LOCAL_ATOMICS|MAC_HSA_SYNC_GPU_LOCAL_ATOMICS|
+        MAC_HSA_SYNC_GPU_MEDIATED_SIGNALS));
+    driverBuild=190;
+    assert(mac_hsa_memory_get_sync_capabilities(gpu,diagnosticMemory,&syncFlags)==0 &&
+        (syncFlags&MAC_HSA_SYNC_OWNERSHIP_TRANSFER));
+    driverBuild=187;
+    // A successful requester experiment and MQD firmware atomics bit cannot
+    // elevate this allocation to native mixed CPU/GPU RMW or IRQ notification.
+    assert(!(syncFlags&(MAC_HSA_SYNC_NATIVE_CPU_GPU_RMW|MAC_HSA_SYNC_MAILBOX_IRQ_WAKE)));
+    uint32_t unchangedFlags=0xfeed;
+    assert(mac_hsa_memory_get_sync_capabilities(gpu,diagnosticMemory,nullptr)==HSA_STATUS_ERROR_INVALID_ARGUMENT);
+    assert(mac_hsa_memory_get_sync_capabilities(gpu,static_cast<char *>(diagnosticMemory)+16384,&unchangedFlags)==HSA_STATUS_ERROR_INVALID_ALLOCATION);
+    assert(unchangedFlags==0xfeed);
+    gfxRevision=2;
+    assert(mac_hsa_memory_get_sync_capabilities(gpu,diagnosticMemory,&syncFlags)==0 && !syncFlags);
+    gfxRevision=1;
     mac_hsa_shared_atomic_diagnostics_t diagnostic{};
     assert(mac_hsa_shared_atomic_diagnostics(static_cast<char *>(diagnosticMemory)+16376,queue,&diagnostic,sizeof(diagnostic))==0);
     assert(diagnostic.gpu_address==reinterpret_cast<uintptr_t>(diagnosticMemory)+16376 &&

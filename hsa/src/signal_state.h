@@ -35,6 +35,7 @@ struct Signal {
     std::shared_ptr<void> sharedStorage;
     uint64_t ipcToken[4]{};
     std::function<bool(unsigned,int64_t,int64_t,int64_t &)> gpuAtomic;
+    std::function<bool()> gpuHealthy;
     std::function<void(int64_t)> storeHook; // Runtime-owned queue doorbell.
     std::atomic<bool> alive{true};
     std::mutex waitMutex;
@@ -43,7 +44,12 @@ struct Signal {
     struct AtomicValue {
         Signal &signal;
         auto host() const { return std::atomic_ref<int64_t>(signal.address()->value); }
-        int64_t load(std::memory_order order=std::memory_order_seq_cst) const {return host().load(order);}
+        int64_t load(std::memory_order order=std::memory_order_seq_cst) const {
+            if (signal.gpuHealthy && !signal.gpuHealthy()) {
+                signal.alive=false;signal.changed.notify_all();
+            }
+            return host().load(order);
+        }
         int64_t gpu(unsigned operation,int64_t value,int64_t compare=0) const {
             int64_t result=INT64_MIN;
             if (!signal.alive.load() || !signal.gpuAtomic(operation,value,compare,result)) {

@@ -1,5 +1,6 @@
 #include "runtime_state.h"
 #include "mac_hsa.h"
+#include "synchronization_policy.h"
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -192,6 +193,29 @@ hsa_status_t copyBytes(void *dst, const void *src, size_t size,
 
 using namespace mac_hsa::detail;
 extern "C" {
+HSA_API_EXPORT hsa_status_t mac_hsa_memory_get_sync_capabilities(hsa_agent_t handle,
+    const void *pointer,uint32_t *flags) {
+    std::shared_ptr<Allocation> allocation;
+    {
+        std::lock_guard lock(runtimeMutex);
+        if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+        if (!pointer || !flags) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        const auto *agent=findAgent(handle);
+        if (!agent) return HSA_STATUS_ERROR_INVALID_AGENT;
+        allocation=findAllocation(pointer);
+        if (!allocation || allocation->connection!=agent->connection)
+            return HSA_STATUS_ERROR_INVALID_ALLOCATION;
+    }
+    mac_hsa::DeviceSnapshot snapshot;
+    if (allocation->connection) {
+        const auto status=allocation->connection->read(snapshot);
+        if (status!=HSA_STATUS_SUCCESS) return status;
+    }
+    const auto path=!allocation->connection ? mac_hsa::MemoryPath::HostOnly :
+        allocation->shared.host ? mac_hsa::MemoryPath::DriverKitShared : mac_hsa::MemoryPath::DeviceVRAM;
+    *flags=mac_hsa::synchronizationCapabilities(path,allocation->connection ? &snapshot : nullptr);
+    return HSA_STATUS_SUCCESS;
+}
 hsa_status_t mac_hsa_memory_allocate_shared(hsa_agent_t agent, size_t size, void **out) {
     if (!out) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
     *out = nullptr;

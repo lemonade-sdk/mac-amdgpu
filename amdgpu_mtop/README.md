@@ -1,30 +1,21 @@
 # amdgpu_mtop
 
-A native macOS terminal monitor for GPUs bound to MacAMDGPU. The dashboard uses
-the familiar device list, GPU activity, memory, clock and sensor groups from
-[amdgpu_top](https://github.com/Umio-Yasuno/amdgpu_top), with a new IOKit backend.
-It does not depend on Linux DRM, sysfs, Rust, HSA, or a graphics runtime.
+A native macOS terminal monitor for GPUs bound to MacAMDGPU. Its GPU-only
+layout takes inspiration from [amdgpu_top](https://github.com/Umio-Yasuno/amdgpu_top):
+device selection, activity histories, memory, clocks and sensors, with a native
+IOKit backend. It does not require Linux DRM, sysfs, Rust, HSA or a graphics
+runtime.
 
-The monitor reads the responding driver build, initialization stage and VRAM
-capacities. It also supports the build-176 cached metrics endpoint for
-GPU/UMC activity, clocks, power, temperatures and fan speed. The host app’s Sample Metrics button requests one firmware snapshot; live
-firmware validation is still pending. Automatic collection is not enabled. Older drivers, absent samples,
-failed requests and stale samples are explicitly **unavailable**; it does not
-show fabricated zero load, temperature, power or memory use.
+Build 193 adds software counters, 60-second graph histories and bounded live
+sensor sampling. **A live build-193 run recorded 156 fresh sensor reads in 163 monitor samples
+while the 1024-operation mailbox test passed concurrently.** Those reads represent
+16 distinct firmware captures; cached dashboard refreshes are not independent
+sensor measurements. Independent sensor accuracy and an initialized idle/load
+comparison remain pending. Older drivers still provide the fields
+they support. Missing, failed, stale or unsupported values appear as
+unavailable/null rather than fabricated zero readings.
 
-The tested R9700 currently reports SMU interface **0x33**; the independently
-verified decoder targets **0x2e**. Its statistics remain unavailable pending
-layout verification. The monitor names this compatibility mismatch explicitly
-and includes both interface versions in JSON; it does not treat it as proof of
-a firmware crash.
-
-Build 178 adds live CPU-side VRAM accounting independently of the SMU metrics
-layout. The memory panel separates CPU-visible and GPU-only allocator capacity,
-used bytes, free bytes and largest contiguous free span. Used bytes include
-rounded allocations for client buffers and driver resources, including retained
-allocations after unsuccessful work. “Outside pools” identifies fixed
-reservations and gaps excluded from both allocators; it is not a measurement of
-firmware memory consumption. UMC activity remains a separate load statistic.
+## Build and controls
 
 ```sh
 cmake -S amdgpu_mtop -B build/amdgpu_mtop -DCMAKE_BUILD_TYPE=Release
@@ -32,48 +23,120 @@ cmake --build build/amdgpu_mtop --parallel 4
 build/amdgpu_mtop/amdgpu_mtop
 ```
 
-In a terminal, refresh is once per second. Press `n` or `p` to switch GPUs and
-`q` to quit. `Ctrl-C` also restores normal terminal input.
+- `h`: toggle **Slow 500 ms** (default) and **Fast 100 ms** dashboard refresh.
+- `n` / `p`: select the next / previous GPU.
+- `q` or `Ctrl-C`: quit and restore normal terminal input.
+
+The dashboard adapts to terminal size. Histories cover the last 60 seconds with
+peak values per time bucket; changing refresh speed does not change their time
+axis. Dots identify missing samples. Software rates use actual monotonic elapsed
+time and reset their baseline when the counter generation changes.
 
 ```sh
+build/amdgpu_mtop/amdgpu_mtop --fast
 build/amdgpu_mtop/amdgpu_mtop --list
-build/amdgpu_mtop/amdgpu_mtop --device 0x10033939d
+build/amdgpu_mtop/amdgpu_mtop --device 0x10033939d --slow
 build/amdgpu_mtop/amdgpu_mtop --json
-build/amdgpu_mtop/amdgpu_mtop --json --watch
+build/amdgpu_mtop/amdgpu_mtop --json --watch --fast
 ```
 
-Use a registry ID from `--list`; the example ID is not a fixed GPU identifier.
-Selection follows the registry entry rather than the enumeration index. Removal
-leaves that selection disconnected until the user chooses another card. A
-replugged device receives a new registry ID. All matching devices appear in JSON;
-`selected_registry_id` identifies the dashboard selection.
+Use a registry ID from `--list`; the example ID is not a permanent GPU identity.
+Selection follows that registry entry rather than its enumeration index. Removal
+leaves it disconnected until another card is selected; replugging creates a new
+registry ID. JSON includes all matching devices and `selected_registry_id`.
+Non-terminal output and `--json` default to one snapshot; `--watch` repeats at
+the selected 100/500 ms cadence. Firmware sampling remains at most once per
+second regardless of output cadence.
 
-Non-terminal output and `--json` default to a single snapshot. `--watch` emits
-one snapshot per second. JSON uses `null` for unsupported statistics, byte units
-for capacities, and explicit unit suffixes for dynamic statistics.
-Zero-sized capacities before initialization are also shown as unavailable.
-The `vram_accounting` JSON object contains the corresponding named byte/count
-fields and status. A valid empty pool reports zero; unavailable accounting
-reports null. The legacy `vram_used_bytes` remains null because total hardware
-occupancy, including firmware-private storage, is not measured. Accounting is
-hidden while stopped or after failed shutdown, even if allocations are retained.
+## What the values mean
 
-The tool requires driver build 172 or newer and permission to open its user
-client. It only invokes observer selectors 43 (runtime build), 21 (cached
-information), and 47 (cached metrics, build 176+). It never initializes the GPU,
-claims the hardware session, sends SMU messages, changes power policy, submits
-work, or resets the device. Closing
-its observer connection does not stop another client's session. Cards bound to
-Apple’s driver, or not bound to any driver, are outside this backend's coverage.
+The software panel shows driver-observed submissions, completions, failures,
+pending work, AQL packet publication/consumption, and known completed copy
+payload bytes by engine/direction. Successful CPU BAR uploads/readbacks have
+separate byte counters. These counters persist across clean GPU stops for the
+bound driver's lifetime, so short jobs remain visible after their client exits.
+Unobserved outstanding work is retired on verified shutdown rather than counted
+as completed; failed shutdown preserves it. Rejected calls do not count as
+submissions. Copy bytes describe tracked payload, not all PCIe traffic.
 
-Offline checks:
+Software pending time and submission rates are **not hardware GPU utilization**.
+Persistent AQL packet consumption is also distinct from kernel completion.
+Hardware GPU/UMC activity, when available, comes from the SMU metrics table.
+UMC activity measures memory-controller work; it is not allocated VRAM or a
+measured bandwidth value.
+
+The memory panel separates CPU-visible and GPU-only allocator capacity, used,
+free and largest contiguous free span. Used bytes include rounded client and
+driver allocations, including retained failed-work storage. “Outside pools”
+identifies fixed reservations and gaps, not measured firmware memory use.
+Allocator accounting is independent of the sensor profile and is unavailable
+while the GPU is stopped. A valid empty pool reports zero.
+
+Clock fields distinguish:
+
+- **Raw/current MHz:** the firmware table's `CurrClock[]` for GFX, SOC, memory
+  and fabric. Raw GFX stayed at 1000 MHz in the first run while its selected
+  average changed; Linux's exported GPU-metrics `current_gfxclk` deliberately
+  uses the selected average instead. Treat raw GFX as a firmware field, not an
+  independently validated instantaneous clock.
+- **Average MHz:** Linux's pre/post-deep-sleep GFX, memory and fabric averages.
+- **Raw peak:** the highest sampled raw clock field seen by this monitor, not
+  an independently measured maximum.
+- **DPM minimum / AC DPM maximum:** firmware-advertised clock ranges, queried
+  once per initialized session; these are not current throttling caps or a
+  guarantee that the GPU will sustain the maximum.
+
+Power, temperatures, fan speed and activity retain per-field validity. The
+installed SMU 14.0.3 firmware reports interface **0x33**, while Linux's published
+consumer uses **0x2e**. Build 193 implements an explicitly labeled Linux-compatible
+profile only for live firmware version **0x00684c00 (104.76.0)**, using Linux's
+backward-compatibility behavior and conservative plausibility checks. It does
+not claim a newly verified 0x33 schema. Other firmware mismatches remain
+unsupported before table transfer.
+
+JSON uses explicit units and `null` for unavailable values. `software_stats`,
+`vram_accounting` and `clocks` expose their separate counters, values and status.
+Legacy top-level `gfx_clock_mhz`, `memory_clock_mhz` and `fabric_clock_mhz` are
+averages; the nested `clocks` object uses `raw_current_mhz` and separate DPM limit keys.
+`vram_used_bytes` remains null because total hardware occupancy, including
+firmware-private memory, is not measured.
+
+## Sampling and lifecycle
+
+The tool requires driver build 172+ and permission to open its user client.
+Cached information uses selectors 43/21, firmware metrics 47 (build 176+), software
+counters 61 and clocks 62 (build 193+). On build 193+, the monitor requests bounded
+sensor sampling through selector 63 at most once per second for each already
+initialized device. The driver shares a one-second success cache across
+observers. Fast 100 / Slow 500 ms refreshes read that cache and CPU-side counters;
+they do not increase firmware request frequency.
+
+The first qualified sample reads the firmware release, transfers metrics table 5
+into retained staging and queries clock ranges. Subsequent samples transfer only
+the metrics table. The existing mailbox operations have two-second timeouts and
+BAR readback has an elapsed-time budget; a slow first request can delay a UI
+refresh. A timeout or invalid table latches sampling off until verified reset,
+preventing repeated timeout loops. Samples older than 2.5 seconds become stale.
+
+The monitor never opens a new PCI hardware session, claims GPU ownership,
+initializes, changes power policy, submits compute work or resets the device.
+Sampling runs on the driver's existing serialized lifecycle queue, reuses its
+reserved staging buffer and skips tracked pending raw submissions. Closing an
+observer does not stop another client's session. Cards bound to Apple's driver,
+or not bound to any driver, are outside this backend's coverage.
+
+## Offline checks
 
 ```sh
 bash scripts/test-amdgpu-mtop.sh
+bash scripts/test-software-stats.sh
 bash scripts/test-metrics.sh
+bash scripts/test-metrics-rpc.sh
+bash scripts/test-client-lifecycle.sh
 bash scripts/test-vram-accounting.sh
 ```
 
-The decoder test also requires this repository's local `upstream/linux` reference
-tree. Integration requirements and field semantics are in
+The decoder tests require this repository's local `upstream/linux` reference.
+These tests do not access the GPU. Driver integration, exact ABI details,
+firmware provenance and validity rules are in
 [GPU_MONITOR.md](../docs/GPU_MONITOR.md).

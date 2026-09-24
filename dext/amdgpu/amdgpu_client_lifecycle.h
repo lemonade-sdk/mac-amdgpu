@@ -89,6 +89,8 @@ struct ClientSubmission {
     void *sdmaReaderContext = nullptr;
     bool (*cpReader)(void *, uint64_t *) = nullptr;
     void *cpReaderContext = nullptr;
+    void (*completionObserver)(void *) = nullptr; // CPU accounting only, no ownership.
+    void *completionObserverContext = nullptr;
 
     bool poll() {
         if (pending && usesCP && cpReader) {
@@ -110,6 +112,9 @@ struct ClientSubmission {
             if (usesCP) completedCPFence = expected;
             else completed = uint32_t(expected);
             pending = false;
+            auto callback = completionObserver;
+            completionObserver = nullptr;
+            if (callback) callback(completionObserverContext);
         }
         return !pending;
     }

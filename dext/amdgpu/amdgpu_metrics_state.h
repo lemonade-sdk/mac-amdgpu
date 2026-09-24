@@ -8,6 +8,7 @@ enum SMUMetricsFlags : uint32_t {
     kSMUMetricsValid = 1u << 0,
     kSMUMetricsFaulted = 1u << 1,
     kSMUMetricsStale = 1u << 2,
+    kSMUMetricsLinuxCompatible = 1u << 3,
 };
 
 // Fixed-width observer payload. The caller must validate version and size.
@@ -28,6 +29,23 @@ struct SMUMetricsSnapshot {
 };
 static_assert(sizeof(SMUMetricsSnapshot) == 192);
 
+// Selector62, observer-only. MHz; index order matches Linux PPCLK 0..3.
+// Limits are firmware-advertised AC DPM limits, not active throttling caps.
+struct SMUClockSnapshot {
+    uint32_t version, size, status, flags;
+    uint64_t generation, collectedAtNs;
+    uint32_t driverInterface, firmwareVersion;
+    uint32_t currentValid, limitsValid;
+    uint32_t currentMHz[4], minimumMHz[4], maximumACMHz[4];
+};
+static_assert(sizeof(SMUClockSnapshot) == 96);
+constexpr uint32_t kSMUClockSelector = 62;
+inline bool smu_metrics_profile_supported(const SMUMetricsSnapshot &s) {
+    return metrics::verified_interface(s.driverInterface) ||
+        (s.driverInterface == metrics::kCompatibleInterface &&
+         (s.flags & kSMUMetricsLinuxCompatible));
+}
+
 struct SMUMetricsContext {
     // Reserved inside PSP's persistent firmware arena, not separately owned.
     // Keep these coordinates after partial address programming or a timeout.
@@ -35,6 +53,10 @@ struct SMUMetricsContext {
     uint64_t tableVRAMOffset;
     uint64_t tableBytes;
     uint32_t driverInterface;
+    uint32_t firmwareVersion;
+    bool firmwareVersionRead;
+    bool clockLimitsAttempted;
+    SMUClockSnapshot clocks;
     bool reserved;
     bool vramBacked;
     bool addressProgrammed;

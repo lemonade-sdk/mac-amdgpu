@@ -23,6 +23,8 @@ struct PersistentAQLQueue {
     uint32_t packets, slot;
     bool mapped, retained, published;
 };
+// Reads only the pinned host metadata mapping; caller serializes teardown.
+bool aql_queue_cpu_read_index(const PersistentAQLQueue &, uint64_t &index);
 kern_return_t aql_queue_open(DeviceContext &, GMCContext &, MESContext &, const GFXConfig &,
     PersistentAQLQueue &, uint64_t ringVA, uint64_t metadataVA, void *metadataCPU,
     uint32_t packets, uint32_t slot);

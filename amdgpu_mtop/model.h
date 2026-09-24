@@ -6,6 +6,7 @@
 #include <vector>
 #include "../dext/amdgpu/amdgpu_metrics_state.h"
 #include "../dext/amdgpu/amdgpu_vram_accounting.h"
+#include "../dext/amdgpu/amdgpu_software_stats.h"
 
 namespace mtop {
 struct Device {
@@ -18,7 +19,18 @@ struct Device {
     bool accountingSupported = false;
     std::string accountingError;
     amdgpu::vram_accounting::Snapshot accounting{};
+    bool softwareSupported = false;
+    std::string softwareError;
+    amdgpu::software_stats::Snapshot software{};
+    bool clocksSupported = false;
+    std::string clocksError;
+    amdgpu::SMUClockSnapshot clocks{};
 };
+
+inline bool hasSoftware(const Device &d) {
+    return d.error.empty() && d.softwareSupported && d.softwareError.empty() &&
+        amdgpu::software_stats::valid(d.software);
+}
 
 inline bool hasAccounting(const Device &d) {
     return d.error.empty() && d.accountingSupported && d.accountingError.empty() &&
@@ -28,7 +40,7 @@ inline bool hasAccounting(const Device &d) {
 
 inline bool validSnapshot(const amdgpu::SMUMetricsSnapshot &s) {
     constexpr uint32_t flags = amdgpu::kSMUMetricsValid | amdgpu::kSMUMetricsFaulted |
-                               amdgpu::kSMUMetricsStale;
+                               amdgpu::kSMUMetricsStale | amdgpu::kSMUMetricsLinuxCompatible;
     constexpr uint64_t fields = (uint64_t(1) << amdgpu::metrics::Count) - 1;
     return s.version == amdgpu::kSMUMetricsSnapshotVersion && s.size == sizeof(s) &&
            !(s.flags & ~flags) && !(s.validFields & ~fields) &&
@@ -39,15 +51,30 @@ inline bool validSnapshot(const amdgpu::SMUMetricsSnapshot &s) {
 
 inline bool fresh(const Device &d, uint64_t now) {
     return d.telemetrySupported && d.telemetryError.empty() && validSnapshot(d.metrics) &&
-        amdgpu::metrics::verified_interface(d.metrics.driverInterface) &&
+        amdgpu::smu_metrics_profile_supported(d.metrics) &&
         (d.metrics.flags & amdgpu::kSMUMetricsValid) && now >= d.metrics.collectedAtNs &&
         now - d.metrics.collectedAtNs <= amdgpu::kSMUMetricsStaleAfterNs;
+}
+
+inline bool validClocks(const Device &d) {
+    const auto &s=d.clocks;
+    return d.error.empty() && d.clocksSupported && d.clocksError.empty() &&
+        s.version==1 && s.size==sizeof(s) &&
+        !(s.currentValid & ~15u) && !(s.limitsValid & ~15u);
+}
+
+inline bool freshClocks(const Device &d, uint64_t now) {
+    const auto &s=d.clocks;
+    return validClocks(d) &&
+        (s.flags & amdgpu::kSMUMetricsValid) &&
+        !(s.flags & (amdgpu::kSMUMetricsFaulted | amdgpu::kSMUMetricsStale)) &&
+        now>=s.collectedAtNs && now-s.collectedAtNs<=amdgpu::kSMUMetricsStaleAfterNs;
 }
 
 inline bool interfaceMismatch(const Device &d) {
     return d.telemetrySupported && validSnapshot(d.metrics) &&
         d.metrics.driverInterface != 0 &&
-        !amdgpu::metrics::verified_interface(d.metrics.driverInterface);
+        !amdgpu::smu_metrics_profile_supported(d.metrics);
 }
 
 // Selection survives enumeration reordering and removal. Never silently

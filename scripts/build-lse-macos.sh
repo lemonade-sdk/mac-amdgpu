@@ -42,15 +42,17 @@ cmake -S "$lse_copy" -B "$lse_build" "${lse_common_args[@]}" \
   "-DLSE_HRX_LIBRARY=$hrx_build/libhrx/src/libhrx/libhrx.dylib" \
   "-DLSE_LOOMC_INCLUDE_DIR=$hrx_copy/loom/binding/c/include" \
   "-DLSE_LOOMC_LIBRARY=$hrx_build/loom/binding/c/libloomc.dylib"
-cmake --build "$lse_build" --target lse --parallel "${LSE_BUILD_JOBS:-4}"
+cmake --build "$lse_build" --target lse lse-server --parallel "${LSE_BUILD_JOBS:-4}"
 # --help exits before backend initialization: this does not access the GPU.
 "$lse_build/lse" --help > "$lse_build/help.txt"
+python3 scripts/test-lse-server-cli.py "$lse_build/lse-server"
 cmake -S "$lse_copy" -B "$lse_tests" "${lse_common_args[@]}" \
   -DLSE_ENABLE_HRX=OFF -DLSE_BUILD_TESTS=ON
 lse_test_targets=(test_kernel_env test_ir test_dtype test_shape test_quant test_backend_cpu test_primitive test_trace)
 cmake --build "$lse_tests" --target "${lse_test_targets[@]}" lse_communication --parallel "${LSE_BUILD_JOBS:-4}"
 ctest --test-dir "$lse_tests" --output-on-failure \
   -R '^test_(kernel_env|ir|dtype|shape|quant|backend_cpu|primitive|trace)$'
+bash scripts/test-lse-runtime-lifetime.sh
 "$llvm_bin/clang++" -std=c++26 -Wall -Wextra -Werror \
   -I"$lse_copy/include" tests/lse_macos_poller_test.cpp \
   "$lse_tests/liblse_core.a" \

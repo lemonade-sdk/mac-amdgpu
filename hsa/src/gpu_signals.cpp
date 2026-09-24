@@ -1,8 +1,12 @@
 #include "runtime_state.h"
 #include "code_object.h"
 #include "signal_operations_code.h"
+#include "synchronization_policy.h"
+#include "gpu_signal_service.h"
 #include <array>
 #include <map>
+#include <system_error>
+#include <cstdio>
 
 namespace mac_hsa::detail {
 namespace {
@@ -11,12 +15,14 @@ struct GPUSignalContext {
     DeviceBuffer code,arguments;
     SharedBuffer result,arena;
     CodeObject object;
+    std::unique_ptr<GPUSignalService> service;
     std::mutex slotsMutex,operationsMutex;
     std::array<bool,256> used{};
     std::atomic<bool> faulted{false};
     std::array<std::weak_ptr<Signal>,256> signals;
     explicit GPUSignalContext(std::shared_ptr<Connection> c):connection(std::move(c)) {}
     ~GPUSignalContext() {
+        if (service && !service->shutdown()) return; // retain arena/code if retirement is uncertain
         if (arguments.handle) connection->freeBuffer(arguments);
         if (code.handle) connection->freeBuffer(code);
         if (result.host) connection->freeSharedBuffer(result);
@@ -26,7 +32,8 @@ struct GPUSignalContext {
         DeviceSnapshot snapshot;
         auto status=connection->read(snapshot);
         if (status!=HSA_STATUS_SUCCESS) return status;
-        if (!supportsPersistentQueues(snapshot))
+        if (!(synchronizationCapabilities(MemoryPath::DriverKitShared,&snapshot) &
+              MAC_HSA_SYNC_GPU_MEDIATED_SIGNALS))
             return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
         if (!parseCodeObject(kSignalOperationsCodeObject,object) || object.kernels.size()!=1)
             return HSA_STATUS_ERROR_INVALID_CODE_OBJECT;
@@ -47,6 +54,10 @@ struct GPUSignalContext {
         if (!arena.host || arena.device.size<16384 || arena.device.address!=reinterpret_cast<uintptr_t>(arena.host) ||
             !result.host || result.device.size<8 || result.device.address!=reinterpret_cast<uintptr_t>(result.host))
             return HSA_STATUS_ERROR;
+        const char *backend=std::getenv("MAC_HSA_SIGNAL_BACKEND");
+        if (useSignalMailbox(MemoryPath::DriverKitShared,snapshot,backend))
+            try {service=std::make_unique<GPUSignalService>(connection,arena);}
+            catch (const std::system_error &) { /* Worker unavailable: keep bounded one-shot executor. */ }
         return HSA_STATUS_SUCCESS;
     }
     bool fail() {
@@ -66,6 +77,13 @@ struct GPUSignalContext {
     bool execute(unsigned slot,unsigned operation,int64_t value,int64_t compare,int64_t &old) {
         std::lock_guard lock(operationsMutex);
         if (faulted || operation<1 || operation>8) return false;
+        if (service) {
+            const auto status=service->execute(slot,operation,value,compare,old);
+            if (status==SignalServiceResult::Success) return true;
+            if (status==SignalServiceResult::Failed) return fail();
+            // Unavailable means no request was published (e.g. all seven
+            // application queues are occupied). Reserved queue0 remains valid.
+        }
         const uint64_t address=arena.device.address+slot*sizeof(SignalABI)+offsetof(SignalABI,value);
         std::array<uint8_t,36> args{};
         std::memcpy(args.data(),&address,8);std::memcpy(args.data()+8,&result.device.address,8);
@@ -81,6 +99,11 @@ struct GPUSignalContext {
         uint64_t completion=UINT64_MAX;
         status=connection->dispatchAQL(request,completion);
         if (status!=HSA_STATUS_SUCCESS || completion) return fail();
+        if (service) {
+            const auto *trace=std::getenv("MAC_HSA_SIGNAL_TRACE");
+            if (trace && std::strcmp(trace,"1")==0)
+                std::fprintf(stderr,"signal-mailbox: backend=one-shot fallback-completed\n");
+        }
         std::atomic_thread_fence(std::memory_order_seq_cst);
         std::memcpy(&old,result.host,8);return true;
     }
@@ -93,6 +116,26 @@ struct SignalSlot {
     SignalSlot(std::shared_ptr<GPUSignalContext> c,unsigned i):context(std::move(c)),index(i) {}
     ~SignalSlot() {std::lock_guard lock(context->slotsMutex);context->signals[index].reset();context->used[index]=false;}
 };
+}
+hsa_status_t reclaimGPUSignalService(const std::shared_ptr<Connection> &connection,std::shared_ptr<void> *lease) {
+    std::shared_ptr<GPUSignalContext> context;
+    {
+        std::lock_guard lock(contextsMutex);
+        const auto found=contexts.find(connection.get());
+        if (found!=contexts.end()) context=found->second.lock();
+    }
+    if (!context || !context->service) return HSA_STATUS_SUCCESS;
+    struct Lease {
+        std::shared_ptr<GPUSignalContext> context;
+        std::unique_lock<std::mutex> lock;
+        explicit Lease(std::shared_ptr<GPUSignalContext> c):context(std::move(c)),lock(context->operationsMutex) {}
+    };
+    try {
+        auto held=std::make_shared<Lease>(context);
+        if (!context->service->reclaim()) {context->fail();return HSA_STATUS_ERROR;}
+        if (lease) *lease=std::move(held);
+        return HSA_STATUS_SUCCESS;
+    } catch (const std::bad_alloc &) {return HSA_STATUS_ERROR_OUT_OF_RESOURCES;}
 }
 void invalidateGPUSignals(const std::shared_ptr<Connection> &connection) {
     std::shared_ptr<GPUSignalContext> context;
@@ -130,6 +173,7 @@ hsa_status_t createGPUSignalBacking(const std::shared_ptr<Connection> &connectio
     signal->gpuAtomic=[context,slot](unsigned op,int64_t value,int64_t compare,int64_t &old) {
         return context->execute(slot,op,value,compare,old);
     };
+    signal->gpuHealthy=[context] {return !context->faulted && (!context->service || context->service->healthy());};
     signal->sharedStorage=std::move(backing);signal->sharedABI=abi;
     {
         std::lock_guard publish(context->slotsMutex);

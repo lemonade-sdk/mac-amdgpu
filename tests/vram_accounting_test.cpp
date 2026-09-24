@@ -59,17 +59,38 @@ int main() {
     bad = s; bad.values[ExcludedBytes]++; assert(!valid(bad));
     bad = s; bad.values[VisibleCount] = 1; assert(!valid(bad));
 
-    // A failed free when metadata is exhausted must remain charged. No
-    // optimistic subtraction or inference from BO handles is allowed.
+    // Metadata must accommodate every later free, not silently lose a range
+    // when inference caches thousands of independent code BOs.
     VRAMBumpAllocator fragmented;
-    fragmented.init(base, 514 * page);
-    VRAMAllocation allocations[513]{};
+    constexpr uint32_t count = VRAMBumpAllocator::kMaxAllocations;
+    fragmented.init(base, (uint64_t(count) + 2) * page);
+    VRAMAllocation allocations[count]{};
     for (auto &allocation : allocations) assert(fragmented.alloc(page, page, &allocation));
-    for (unsigned i = 0; i < 510; i += 2) fragmented.free(allocations[i]);
-    const auto retained = fragmented.bytes_used();
-    fragmented.free(allocations[510]);
-    assert(fragmented.bytes_used() == retained && fragmented.largest_free_span() == page);
-    fragmented.free(allocations[509]); // Adjacent coalescing needs no spare node.
-    assert(fragmented.bytes_used() == retained - page);
+    const auto fullUsed = fragmented.bytes_used();
+    VRAMAllocation rejected{123, nullptr, 456, 789};
+    assert(!fragmented.alloc(page, page, &rejected));
+    assert(rejected.gpu_va == 123 && rejected.size == 456 && fragmented.bytes_used() == fullUsed);
+    // 4096 nonadjacent frees exercise the old 256-node leak directly.
+    uint32_t freed = 0;
+    for (uint32_t i = 0; i < count; i += 2) { fragmented.free(allocations[i]); ++freed; }
+    assert(fragmented.alloc_count() == count - freed);
+    assert(fragmented.bytes_used() == uint64_t(count - freed) * page);
+    assert(fragmented.largest_free_span() == 3 * page);
+    VRAMAllocation reused{};
+    assert(fragmented.alloc(page, page, &reused) && reused.gpu_va == allocations[0].gpu_va);
+    fragmented.free(reused);
+    for (uint32_t i = 1; i < count; i += 2) fragmented.free(allocations[i]);
+    assert(fragmented.alloc_count() == 0 && fragmented.bytes_used() == 0);
+    assert(fragmented.bytes_free() == fragmented.size() && fragmented.largest_free_span() == fragmented.size());
+    assert(fragmented.alloc(fragmented.size(), page, &reused));
+    fragmented.free(reused);
+    assert(fragmented.largest_free_span() == fragmented.size());
+    // Alignment splits create free gaps too; all must coalesce on release.
+    fragmented.init(base + page, (uint64_t(count) * 2 + 4) * page);
+    for (uint32_t i = 0; i < 1024; ++i) assert(fragmented.alloc(page, 2 * page, &allocations[i]));
+    for (uint32_t i = 0; i < 1024; i += 2) fragmented.free(allocations[i]);
+    for (uint32_t i = 1; i < 1024; i += 2) fragmented.free(allocations[i]);
+    assert(!fragmented.bytes_used() && !fragmented.alloc_count());
+    assert(fragmented.largest_free_span() == fragmented.size());
     puts("VRAM accounting tests passed");
 }

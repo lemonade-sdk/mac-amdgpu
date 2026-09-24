@@ -4,6 +4,7 @@
 #include <memory>
 #include <vector>
 #include <string>
+#include "atomic_path.h"
 #include "../../dext/amdgpu/amdgpu_dispatch_abi.h"
 #include "../../dext/amdgpu/amdgpu_aql_abi.h"
 #include "../../dext/amdgpu/amdgpu_atomic_diagnostics.h"
@@ -21,6 +22,7 @@ struct DeviceSnapshot {
     uint64_t visibleVRAM = 0;
     uint64_t totalVRAM = 0;
     uint32_t gfxMajor = 0, gfxMinor = 0, gfxRevision = 0;
+    OriginalAtomicCaps originalAtomicCaps{};
 };
 
 inline bool supportsPersistentQueues(const DeviceSnapshot &snapshot) {

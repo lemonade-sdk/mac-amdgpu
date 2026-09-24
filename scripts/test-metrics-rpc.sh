@@ -5,7 +5,7 @@ mkdir -p build/tests
 python3 - <<'PY'
 from pathlib import Path
 s = Path('dext/MacAMDGPU.cpp').read_text()
-a = s.index('    case kMacAMDGPUMethodCollectMetrics:')
+a = s.index('    case kMacAMDGPUMethodSampleCachedSensors:')
 b = s.index('    case kMacAMDGPUMethodRuntimeBuild:', a)
 Path('build/tests/metrics_rpc_under_test.inc').write_text(s[a:b])
 a = s.index('    if (driver->ivars->shutdownBlocked &&')

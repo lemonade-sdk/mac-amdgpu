@@ -87,6 +87,7 @@ void clearSystemEvents();
 hsa_status_t deliverSystemEvent(const hsa_amd_event_t &event);
 hsa_status_t createGPUSignalBacking(const std::shared_ptr<Connection> &, int64_t, const std::shared_ptr<Signal> &);
 void invalidateGPUSignals(const std::shared_ptr<Connection> &);
+hsa_status_t reclaimGPUSignalService(const std::shared_ptr<Connection> &,std::shared_ptr<void> *lease=nullptr);
 hsa_status_t createIPCSignal(hsa_signal_value_t initial, uint32_t count, const hsa_agent_t *consumers, hsa_signal_t *out);
 
 template<typename T> hsa_status_t writeValue(void *output, T value) {

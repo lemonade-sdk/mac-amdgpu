@@ -1,5 +1,6 @@
 #include "device_init.h"
 #include <IOKit/IOKitLib.h>
+#include <CoreFoundation/CoreFoundation.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <atomic>
@@ -13,6 +14,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <thread>
 
 namespace mac_hsa {
@@ -27,10 +29,66 @@ private:
     io_object_t value_;
 };
 
+std::optional<uint64_t> registryNumber(io_registry_entry_t entry,CFStringRef name) {
+    const auto value=IORegistryEntryCreateCFProperty(entry,name,kCFAllocatorDefault,0);
+    if (!value) return {};
+    std::optional<uint64_t> result;
+    if (CFGetTypeID(value)==CFNumberGetTypeID()) {
+        int64_t number=0;
+        if (CFNumberGetValue(static_cast<CFNumberRef>(value),kCFNumberSInt64Type,&number) && number>=0)
+            result=uint64_t(number);
+    } else if (CFGetTypeID(value)==CFDataGetTypeID()) {
+        const auto data=static_cast<CFDataRef>(value);const auto size=CFDataGetLength(data);
+        if (size>0 && size<=8) {
+            uint64_t number=0;const auto *bytes=CFDataGetBytePtr(data);
+            for (CFIndex i=0;i<size;++i) number|=uint64_t(bytes[i])<<(i*8);
+            result=number;
+        }
+    }
+    CFRelease(value);return result;
+}
+
+OriginalAtomicCaps captureOriginalAtomicCaps(io_service_t service) {
+    OriginalAtomicCaps audit{};audit.captured=true;
+    io_registry_entry_t entry=service;IOObjectRetain(entry);
+    bool complete=false;
+    for (unsigned depth=0;entry && depth<64;++depth) {
+        const auto vendor=registryNumber(entry,CFSTR("vendor-id"));
+        const auto flags=registryNumber(entry,CFSTR("IOPCIExpressCapabilities"));
+        if (vendor || flags || IOObjectConformsTo(entry,"IOPCIDevice")) {
+            if (audit.count==audit.functions.size()) {IOObjectRelease(entry);entry=0;break;}
+            auto &node=audit.functions[audit.count++];
+            IORegistryEntryGetRegistryEntryID(entry,&node.registryID);
+            node.vendorID=uint32_t(vendor.value_or(0));
+            node.deviceID=uint32_t(registryNumber(entry,CFSTR("device-id")).value_or(0));
+            const auto caps=registryNumber(entry,CFSTR("IOPCIExpressDeviceCapabilities2"));
+            const auto control=registryNumber(entry,CFSTR("IOPCIExpressDeviceControl2"));
+            node.expressKnown=flags && *flags<UINT16_MAX;
+            node.capabilities2Known=caps && *caps<UINT32_MAX;
+            node.control2Known=control && *control<UINT16_MAX;
+            if(node.expressKnown) node.expressCapabilities=uint16_t(*flags);
+            if(node.capabilities2Known) node.capabilities2=uint32_t(*caps);
+            if(node.control2Known) node.control2=uint16_t(*control);
+            if(node.expressKnown && ((node.expressCapabilities>>4)&15)==4) {
+                complete=true;IOObjectRelease(entry);entry=0;break;
+            }
+        }
+        io_registry_entry_t parent=0;
+        const auto status=IORegistryEntryGetParentEntry(entry,kIOServicePlane,&parent);
+        IOObjectRelease(entry);entry=0;
+        if(status!=KERN_SUCCESS) break;
+        entry=parent;
+    }
+    if(entry) IOObjectRelease(entry);
+    assessOriginalAtomicCaps(audit,complete);return audit;
+}
+
 class IOKitConnection final : public Connection, private InitializationRPC {
 public:
+    explicit IOKitConnection(OriginalAtomicCaps audit):originalAtomicCaps(std::move(audit)) {}
     io_service_t service = IO_OBJECT_NULL;
     uint64_t registryID = 0;
+    const OriginalAtomicCaps originalAtomicCaps;
     ~IOKitConnection() override {
         // FinishStop resets or quarantines resources before releasing backing.
         for (const auto &[handle, buffer] : sharedBuffers) {
@@ -637,6 +695,7 @@ public:
             vram[0] > vram[1]) return HSA_STATUS_ERROR;
         snapshot = {registryID, identity[2], stage, vram[0], vram[1],
                     uint32_t(gfx[0]), uint32_t(gfx[1]), uint32_t(gfx[2])};
+        snapshot.originalAtomicCaps=originalAtomicCaps;
         return HSA_STATUS_SUCCESS;
     }
 };
@@ -652,7 +711,7 @@ hsa_status_t discover(std::vector<std::shared_ptr<Connection>> &connections) {
     try {
         for (io_service_t service; (service = IOIteratorNext(iterator));) {
             IOObject serviceOwner(service);
-            auto connection = std::make_shared<IOKitConnection>();
+            auto connection = std::make_shared<IOKitConnection>(captureOriginalAtomicCaps(service));
             if (IORegistryEntryGetRegistryEntryID(service, &connection->registryID) != KERN_SUCCESS)
                 return HSA_STATUS_ERROR;
             IOObjectRetain(service);

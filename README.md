@@ -1,5 +1,11 @@
 # Status
 
+This driver and HSA runtime connect AMD GPUs on Apple Silicon to
+[Lemon Seed Engine (LSE)](https://github.com/Geramy/LSE/tree/main) through native HRX/Loom.
+See the [LSE reproduction guide](docs/LSE_QUICKSTART.md) for pinned dependencies,
+build commands and GPU validation, or the shorter [local run guide](LOCAL_RUN.md).
+Full model token generation is still being qualified.
+
 ## Working
 
 - GPU discovery, firmware loading and initialization on the Radeon AI PRO R9700 (`gfx1201`) over Thunderbolt.
@@ -7,29 +13,33 @@
 - Verified SDMA transfers, VRAM allocations and cross-process GPU-buffer sharing.
 - Loading linked gfx1201 HSA code objects, freezing executables and resolving kernel descriptors.
 - Actual HRX initialization, streams, 64 KiB copy/fill, 4,093-result FP32 vector compute and 16×16 FP32 matrix multiplication, with exact results and full input/output guards.
+- Actual LSE→Loom→HRX affine Q6 projection: 51 exact outputs, four unchanged input buffers/guards, no CPU fallback and clean runtime shutdown.
+- Actual LSE causal convolution: six zero-padding/history cases passed 680 exact GPU outputs with unchanged input guards and no CPU fallback.
+- Large allocation workloads: 1,024 simultaneous VRAM buffers passed full data and fragmentation/reuse checks. HRX passed 96 pooled buffers alongside a guarded 2 GiB allocation. Driver buffer bookkeeping grows and shrinks in 64-entry pages, with a 4,096-handle limit per client; see [capacity and lifetime limits](docs/BUFFER_CAPACITY.md).
 - Native synchronous compute: HSA-loaded kernels passed with 128 and 256 results in both VRAM and shared host memory, including every byte of the input/output guards.
 - Bounded hardware AQL dispatch: kernels passed in VRAM and shared host memory, with firmware-acknowledged queue removal and recreation between launches.
 - Persistent HSA compute queues: all seven slots, ring wraparound, four CPU producers, shared completion/barrier signals and two processes sharing the GPU passed hardware tests. One process can exit while the other continues on its existing queues.
 - Scratch/LDS compute on gfx1201: two independent queues passed full data/guard checks through initial scratch allocation, growth and reuse.
 - Public CPU-owned coarse/kernarg HSA pools with GPU access and identical CPU/GPU addresses. CPU access is allowed between completed GPU operations.
 - Experimental CPU↔GPU release/acquire ownership transfer: **1,000,000 round trips / 2,000,000 transfers** passed with every 512-byte payload checked both ways, no errors, intact guards and completed dispatch. This validates the tested mapping; it does not advertise general fine-grained atomic support.
-- GPU-backed HSA signal operations: stores, arithmetic, bitwise operations, exchange, compare-and-swap and waits passed hardware checks. CPU HSA updates execute GPU atomics; earlier native CPU/GPU contention tests lost updates, so that interoperability is not advertised.
+- GPU-mediated HSA signals use the validated persistent DMA mailbox by default on the qualified gfx1201 shared-memory path. Stores, arithmetic, bitwise operations, exchange, CAS, waits, concurrent callers, idle restart and all seven application queue slots passed hardware checks. `MAC_HSA_SIGNAL_BACKEND=one-shot` retains the bounded fallback. Native mixed CPU/GPU RMW remains unsupported; see the [service policy](docs/ATOMIC_MAILBOX_SERVICE.md).
+- Atomic mailbox benchmark: individual requests reached about 43,000 operations/s; batches of 64 reached 162,000 operations/s, including exact return-value and guard validation. Production synchronous signal calls use individual requests. IRQ wakeup is not implemented.
 - HSA host services, CPU signals and software queues. All 119 entry points required by LSE’s pinned HRX resolve; the [behavior status](hsa/API_STATUS.md) explains their limits.
-- [amdgpu_mtop](amdgpu_mtop/README.md) terminal dashboard, device enumeration/switching, driver status, VRAM allocator accounting and JSON output. It detects the installed driver; memory accounting requires an initialized GPU.
+- [amdgpu_mtop](amdgpu_mtop/README.md) terminal dashboard with history graphs, device switching, driver work counters, VRAM accounting and JSON output. `h` toggles Fast (0.1 s) and Slow (0.5 s). Hardware testing received fresh clocks, load, power, temperatures and fan readings while the atomic workload passed; sensor sampling is limited to 1 Hz.
 - Stop/Restart GPU through transaction draining and verified reset; recovery still depends on a responsive device and link.
 
 ## Not working yet
 
 - General fine-grained CPU/GPU atomic interoperability. The controlled staggered test returned **6,131,574 with Requester Enable OFF** and **6,133,395 with it ON**, versus **11,000,000 expected**. Single-agent controls passed, the bit change was read back and the original value was restored. This result applies to the tested mapping and queue configuration; see the [experiment details](docs/PCIE_ATOMIC_TEST_POLICY.md).
-- HRX/LSE model inference. No end-to-end AI workload has run.
+- End-to-end HRX/LSE token generation. The local Qwen 27B Q6 text model loaded 1,847 tensors in about 33 seconds. The convolution compiler fix passes GPU checks; the next model run stopped because `repeat` has no Loom template. No valid inference PP/s or TP/s result is available yet.
 - Full HSA conformance and general executable linking. The gfx12-generic HRX helper loader passes software tests. Hardware profiling and some platform-specific APIs explicitly return errors.
-- Live firmware telemetry in amdgpu_mtop: usage, clocks, temperature and power need a verified firmware metrics layout.
+- General firmware telemetry support beyond the tested SMU 14.0.3 firmware profile; independent sensor accuracy and idle/load behavior need further validation.
 - Larger PCIe BAR allocation through a public Apple API, and Mesa/Vulkan integration.
 
 ## Upcoming
 
-- Build on the verified ownership-transfer path while keeping concurrent cross-agent RMW unsupported.
-- Add driver-side activity counters and history graphs to amdgpu_mtop, with `h` toggling Fast (0.1 s) and Slow (0.5 s).
+- Measure signal-service batching and IRQ-assisted wakeup options while keeping concurrent native cross-agent RMW unsupported.
+- Extend idle/load and concurrent-client validation of the monitor.
 - Extend the [combined HRX validation suite](docs/HRX_MACOS_VALIDATION.md) beyond the verified small compute workloads.
 - Validate LSE model execution through the tested HRX compute path, then verify a real inference workload.
 - Finish the firmware telemetry path for amdgpu_mtop.

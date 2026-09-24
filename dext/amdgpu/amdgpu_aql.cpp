@@ -4,6 +4,7 @@
 #include "amdgpu_mes.h"
 #include "amdgpu_gfx.h"
 #include "amdgpu_vram_io.h"
+#include "amdgpu_software_stats.h"
 #include <DriverKit/IOLib.h>
 #include <time.h>
 
@@ -49,6 +50,8 @@ kern_return_t aql_launch(DeviceContext &dev, GMCContext &gmc, MESContext &mes,
     amdgpu_hdp_flush(dev);
     // ROCr's 64-bit AQL doorbell receives the last published packet index.
     dev.pci->MemoryWrite64(dev.bar2MemIndex,uint64_t(kAQLDoorbell)*4,0);
+    software_stats::PublishedWork work(dev.softwareStats, software_stats::AQL,
+        clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
     const uint64_t deadline=clock_gettime_nsec_np(CLOCK_UPTIME_RAW)+uint64_t(request.timeoutUS)*1000;
     do {
         status=vram_read_fence64(dev,base-gmc.vram_start+kAQLCompletionOffset+8,&result.completion);
@@ -61,6 +64,7 @@ kern_return_t aql_launch(DeviceContext &dev, GMCContext &gmc, MESContext &mes,
         IOSleep(1);
     } while (clock_gettime_nsec_np(CLOCK_UPTIME_RAW)<deadline);
     if (result.completion) return kIOReturnTimeout;
+    work.complete(clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
     result.stage=4;
     status=mes_unmap_legacy_queue(dev,mes,1,0,0,kAQLDoorbell);
     if (status!=kIOReturnSuccess) return status;
@@ -158,6 +162,13 @@ kern_return_t aql_queue_open(DeviceContext &dev,GMCContext &gmc,MESContext &mes,
     if (status==kIOReturnSuccess) {q.mapped=true;q.retained=false;}
     return status;
 }
+bool aql_queue_cpu_read_index(const PersistentAQLQueue &q, uint64_t &index) {
+    if (!q.mapped || !q.metadataCPU) return false;
+    const auto &metadata = *static_cast<const amd_queue_t *>(q.metadataCPU);
+    index = __atomic_load_n(&metadata.read_dispatch_id, __ATOMIC_ACQUIRE);
+    return true;
+}
+
 kern_return_t aql_queue_kick(DeviceContext &dev,PersistentAQLQueue &q,uint64_t lastPacket) {
     if (!q.mapped || q.retained || !q.metadataCPU || !dev.pci) return kIOReturnNotReady;
     if (lastPacket==UINT64_MAX) return kIOReturnBadArgument;

@@ -11,7 +11,8 @@ enum { kMacAMDGPUMethodRuntimeBuild, kMacAMDGPUMethodPing,
        kMacAMDGPUMethodQueryInfo, kMacAMDGPUMethodShutdownGPU,
        kMacAMDGPUMethodWaitFence, kMacAMDGPUMethodBOGetInfo,
        kMacAMDGPUMethodBOFree, kMacAMDGPUMethodSubmitIB, kMacAMDGPUMethodMESAddQueue,
-       kMacAMDGPUMethodCollectMetrics, kMacAMDGPUMethodMetricsSnapshot,
+       kMacAMDGPUMethodClockSnapshot, kMacAMDGPUMethodSampleCachedSensors,
+       kMacAMDGPUMethodCollectMetrics, kMacAMDGPUMethodMetricsSnapshot, kMacAMDGPUMethodSoftwareSnapshot,
        kMacAMDGPUMethodLoadFirmware, kMacAMDGPUMethodSetIPBase,
        kMacAMDGPUMethodLoadDiscoveryBin, kMacAMDGPUMethodResetDevice,
        kMacAMDGPUMethodSetupInterrupts, kMacAMDGPUMethodAtomicRequesterExperiment };
@@ -121,6 +122,8 @@ int main() {
         return mac_amdgpu_admit_external(&client, &driver, &pci, selector);
     };
     assert(call(observer, kMacAMDGPUMethodMESAddQueue) == kIOReturnUnsupported && openCalls == 0);
+    assert(call(observer, kMacAMDGPUMethodSampleCachedSensors) == 0 && openCalls == 0);
+    assert(call(observer, kMacAMDGPUMethodClockSnapshot) == 0 && openCalls == 0);
     assert(call(observer, kMacAMDGPUMethodRuntimeBuild) == 0 && openCalls == 0);
     assert(call(observer, kMacAMDGPUMethodMetricsSnapshot) == 0 && openCalls == 0);
     assert(call(owner, kMacAMDGPUMethodCollectMetrics) == kIOReturnNotOpen && openCalls == 0);
@@ -138,6 +141,8 @@ int main() {
     before = openCalls;
     assert(call(owner, kMacAMDGPUMethodCollectMetrics) == kIOReturnBusy && openCalls == before);
     assert(call(observer, kMacAMDGPUMethodMetricsSnapshot) == 0 && state.submission.pending);
+    assert(call(observer, kMacAMDGPUMethodSampleCachedSensors) == kIOReturnBusy && state.submission.pending && openCalls == before);
+    assert(call(observer, kMacAMDGPUMethodSoftwareSnapshot) == 0 && state.submission.pending && openCalls == before);
     assert(state.submission.beginSDMA(&fence) == 0); // no overlapping submission
     assert(call(owner, kMacAMDGPUMethodBOFree) == kIOReturnBusy);
     assert(call(owner, kMacAMDGPUMethodSubmitIB) == kIOReturnBusy);

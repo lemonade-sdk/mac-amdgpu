@@ -2114,3 +2114,23 @@ successfully after cleanup. No hardware AQL queue or HRX inference is claimed.
   validation/polling). No config changes; Requester Enable remained off.
   Driver returned to stage 0. This supports the tested ownership-transfer
   path, without advertising fine-grained pools or concurrent native RMW.
+
+
+## GPU-owned atomic mailbox and monitor candidate
+
+R9700/gfx1201 hardware runs on driver 192 passed both 128- and 1,024-operation streams through all six persistent DMA mailbox configurations (active/hybrid polling; batch 1/8/64). All old-value checks, final values, completion sequences, dispatch retirement and guards passed. The longer run measured 42,708 operations/s for active individual requests and 162,426 operations/s at batch 64; existing one-shot HSA measured 66 operations/s with exact validation. These measurements exclude startup and do not compare IRQ delivery. The original PCIe capability audit correctly selected the fallback based on absent Intel bridge routing and Apple root completion. The native mixed RMW capability remains disabled.
+
+Actual LSE→Loom→HRX Q6 projection produced 51 exact outputs with four unchanged input buffers/guards and zero host groups/fallbacks. Process teardown subsequently aborted in a recursive_mutex operation; this is not yet a clean end-to-end pass. The identified destruction-order issue is being corrected before model inference.
+
+Monitor candidate 193 builds and passes signature verification. It adds persistent software counters, bounded 1 Hz firmware sampling for the exact qualified SMU 14.0.3/0x33 firmware profile, current clocks and AC DPM limits. The terminal dashboard has 60-second graphs and h toggles 100 ms/500 ms refresh. Driver-side and four monitor offline test suites pass; live sensor values await installation and hardware validation.
+
+Driver 193 hardware follow-up: mailbox 1,024 passed all six variants with the monitor concurrently sampling; 156 fresh sensor snapshots were collected in 163 dashboard samples. Firmware reported 0x00684c00/interface 0x33; current clocks, AC DPM limits, load, power, temperature and fan fields populated, and software counters recorded completed work. Independent sensor accuracy remains unverified. The LSE shutdown-order fix then passed the actual Q6 workload and normal process exit (status 0): 51 exact outputs, all four input guards unchanged, one GPU kernel and zero host fallbacks. The observed evaluation time was 0.027 s, not an inference throughput measurement. Logs are under `build/tests/driver193-hardware/`.
+
+
+## Paged buffer metadata and LSE model qualification
+
+Driver 195 replaces the one-time 4096-entry BO table allocation with 64-entry pages. Empty pages are reclaimed only after backing release; live entries never move, and client-wide handle generations survive page recreation. Hardware validation passed three rounds with 1024 simultaneous 16 KiB device buffers, every byte checked, 512 alternating frees/reallocations, 128 consecutive frees/reallocations and clean teardown. Allocator regression tests verify the 8,191-live-allocation bound and full span recovery after fragmentation, fixing the old silent free-range loss.
+
+Actual HRX pooling passed 96 simultaneously live small buffers with boundary canaries, reuse and a 2 GiB allocation tested at 0, 1 GiB and 2 GiB-4 KiB. Actual LSE Q6 still passes 51 exact outputs with no host fallback. Six LSE causal convolution cases passed 680 exact outputs across short/long sequences, zero padding and nonzero history; input guards and normal shutdown passed. The focused Loom Bind-alias fix and source-only regressions were committed to Geramy/LSE main as efee3fb.
+
+The actual Qwen 27B 6-bit text path loaded 1,847 tensors (20.355 GiB payload; 11 slabs reserving 21.731 GiB). The first load took 33.2 seconds; a cache-warm retry took 14.2 seconds. 333 vision tensors are intentionally excluded by LSE's text-only path. After the convolution fix, strict GPU execution stopped at the next missing Loom template, repeat. No model token or PP/s/TP/s qualification is claimed. Both failed inference attempts exited normally and left the driver at clean stage 0. Logs are in build/tests/driver194-hardware and driver195-hardware.

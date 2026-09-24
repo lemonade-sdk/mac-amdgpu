@@ -9,7 +9,7 @@ constexpr int kIOReturnSuccess = 0, kIOReturnBadArgument = 1, kIOReturnNoMemory 
 enum { kMacAMDGPUMethodRuntimeBuild, kMacAMDGPUMethodPing, kMacAMDGPUMethodQueryInfo,
     kMacAMDGPUMethodShutdownGPU, kMacAMDGPUMethodGetBARInfo,
     kMacAMDGPUMethodCollectMetrics = 46, kMacAMDGPUMethodMetricsSnapshot = 47,
-    kMacAMDGPUMethodAtomicRequesterExperiment = 60 };
+    kMacAMDGPUMethodAtomicRequesterExperiment = 60, kMacAMDGPUMethodSampleCachedSensors = 63, kMacAMDGPUMethodClockSnapshot = 62, kMacAMDGPUMethodSoftwareSnapshot = 61 };
 namespace amdgpu {
 enum class BringupStage { None, SDMAInit };
 static unsigned collections, snapshots;
@@ -27,12 +27,18 @@ static void smu_metrics_snapshot(const SMUMetricsContext &ctx, bool ready, SMUMe
     out.size = sizeof(out); out.version = 1;
     if (!ready) { out.validFields = 0; out.status = kIOReturnNotReady; }
 }
+static void smu_clock_snapshot(const SMUMetricsContext &ctx, bool ready, SMUClockSnapshot &out) {
+    ++snapshots; lastReady = ready;
+    out = ctx.clocks; out.version = 1; out.size = sizeof(out);
+    if (!ready) out.currentValid = out.limitsValid = 0;
+}
+
 }
 static bool allocationFails;
 struct OSData {
     uint8_t bytes[sizeof(amdgpu::SMUMetricsSnapshot)];
     static OSData *withBytes(const void *bytes, size_t length) {
-        assert(length == sizeof(amdgpu::SMUMetricsSnapshot));
+        assert(length == sizeof(amdgpu::SMUMetricsSnapshot) || length == sizeof(amdgpu::SMUClockSnapshot));
         if (allocationFails) return nullptr;
         auto *data = new OSData;
         memcpy(data->bytes, bytes, length);
@@ -116,4 +122,15 @@ int main() {
         if (mode < 2) assert(lifecycle(&driver, 46) == kIOReturnNotReady);
     }
     assert(amdgpu::collections == collected); // All cached reads stayed CPU-only.
+    args = {}; args.scalarOutput = out; args.scalarOutputCount = 3;
+    state = {}; amdgpu::collectionResult = 0;
+    assert(call(&driver, 63, &args) == 0 && amdgpu::lastReady && out[1] == 42);
+    state.pciOpen = false;
+    assert(call(&driver, 63, &args) == 0 && !amdgpu::lastReady && !out[2]);
+    args = {}; args.structureOutputMaximumSize = sizeof(amdgpu::SMUClockSnapshot);
+    assert(call(&driver, 62, &args) == 0 && !amdgpu::lastReady && args.structureOutput);
+    delete args.structureOutput; args.structureOutput = nullptr;
+    --args.structureOutputMaximumSize;
+    assert(call(&driver, 62, &args) == kIOReturnBadArgument);
+
 }

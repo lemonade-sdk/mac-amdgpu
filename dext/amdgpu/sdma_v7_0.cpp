@@ -23,6 +23,7 @@
 #include "amdgpu_psp.h"
 #include "amdgpu_gmc.h"
 #include "amdgpu_vram_io.h"
+#include "amdgpu_software_stats.h"
 
 #define SDMA_LOG(fmt, ...) \
     os_log(OS_LOG_DEFAULT, "mac.amdgpu.sdma: " fmt, ##__VA_ARGS__)
@@ -513,11 +514,15 @@ sdma_copy_linear_test(const DeviceContext &dev, SDMAInstance &inst,
 
     const uint64_t start_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     uint64_t elapsed_us = 0;
+    software_stats::PublishedWork work(dev.softwareStats,
+        inst.instance == 0 ? software_stats::SDMA0 : software_stats::SDMA1, start_ns);
     do {
         elapsed_us = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start_ns) / 1000;
         r = sdma_read_fence(dev, inst, 0x80, &observed);
         if (r != kIOReturnSuccess) return r;
         if (observed == fence_value) {
+            work.complete(clock_gettime_nsec_np(CLOCK_UPTIME_RAW), byte_count,
+                dev.softwareStats ? dev.softwareStats->direction(src_bus, dst_bus, byte_count) : software_stats::Unknown);
             SDMA_LOG("copy_linear_test fence complete: %u bytes %#llx -> %#llx after %llu us",
                      byte_count, (unsigned long long)src_bus,
                      (unsigned long long)dst_bus, (unsigned long long)elapsed_us);

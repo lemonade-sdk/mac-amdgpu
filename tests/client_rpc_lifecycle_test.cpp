@@ -5,6 +5,7 @@
 #include <vector>
 using kern_return_t = int;
 #include "../dext/amdgpu/amdgpu_client_lifecycle.h"
+#include "../dext/amdgpu/amdgpu_software_stats.h"
 constexpr int kIOReturnSuccess = 0, kIOReturnBusy = 1, kIOReturnBadArgument = 2,
               kIOReturnNotReady = 3, kIOReturnTimeout = 4, kIOReturnUnsupported = 5,
               kIOReturnNotOpen = 6, kIOReturnNoSpace = 7, kIOReturnNoResources = 8;
@@ -41,6 +42,9 @@ struct ClientState {
     struct { uint64_t address = 0; } dmaSegments[1];
 };
 struct DriverState {
+    amdgpu::software_stats::Counters softwareStats;
+    amdgpu::software_stats::Engine rawStatsEngine{};
+    bool rawStatsFailureRecorded=false;
     amdgpu::ClientSubmission submission;
     bool pciOpen = true, shutdownBlocked = false;
     struct {
@@ -152,6 +156,8 @@ static void IOSleep(unsigned ms) {
 #endif
 #define CLOCK_UPTIME_RAW 0
 #define MACAMDGPU_LOG(...) do {} while (0)
+using MacAMDGPU_IVars = DriverState;
+#include "client_software_raw_under_test.inc"
 struct Client {
     ClientState *ivars;
     Driver *driver;
@@ -218,11 +224,13 @@ int main() {
     // Submit through the actual GFX CS RPC, then wait on its CS handle.
     // A CPU shadow alone must not complete a GPU-owned fence.
     state.submission = {}; cpFence = 99; gpuCPFence = 0;
+    nowNS = 0; state.softwareStats.reset(nowNS);
     uint32_t pm4[] = {0xc0001000, 0};
     clientState.cs = {0, kMacAMDGPUCSIPTypeGFX, 0, pm4, 2};
     input[0] = 1; input[1] = 2000000; output = 99;
     assert(client.call(kMacAMDGPUMethodSubmitIB, &args) == 0);
     assert(output == 1 && kicks == 1 && state.submission.pending);
+    assert(state.softwareStats.data.engines[amdgpu::software_stats::GFX].submitted == 1);
     assert(submittedWords == std::vector<uint32_t>({0xc0001000, 0}));
     const auto firstGFX = clientState.cs.last_fence;
     assert(firstGFX == 1 && state.submission.expected == firstGFX);
@@ -236,6 +244,9 @@ int main() {
     cpReadOK = true;
     assert(client.call(kMacAMDGPUMethodWaitFence, &args) == 0 && output == 0);
     assert(!state.submission.pending && state.submission.completedCPFence == firstGFX);
+    const auto &firstCounts = state.softwareStats.data.engines[amdgpu::software_stats::GFX];
+    assert(firstCounts.completed == 1 && firstCounts.failed == 1 && firstCounts.pending == 0);
+    // Three timed-out polls counted one failed operation, then one completion.
 
     // New jobs reuse WB storage without erasing an older handle's completion.
     auto oldCS = clientState.cs;
@@ -255,6 +266,7 @@ int main() {
 
     // Failures never publish a success handle and retain submission ownership.
     for (int failure = 0; failure < 3; ++failure) {
+        const auto priorSubmissions = state.softwareStats.data.engines[amdgpu::software_stats::GFX].submitted;
         state.submission = {}; output = 99; kicks = 0;
         appendOK = failure != 0; emitOK = failure != 1;
         kickResult = failure == 2 ? kIOReturnTimeout : 0;
@@ -262,6 +274,7 @@ int main() {
                (failure == 2 ? kIOReturnTimeout : kIOReturnNoSpace));
         assert(state.submission.pending && output == 99);
         assert(kicks == (failure == 2 ? 1u : 0u));
+        assert(state.softwareStats.data.engines[amdgpu::software_stats::GFX].submitted == priorSubmissions);
     }
     state.submission = {}; appendOK = emitOK = true; kickResult = 0; kicks = 0;
     clientState.cs.ip_instance = 1;

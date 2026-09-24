@@ -55,5 +55,6 @@ bash scripts/test-hrx-access-policy.sh
   -L"$hrx_lib" -lhrx -Wl,-rpath,"$hrx_lib" \
   -o "$hrx_build/mac-hrx-smoke"
 "$hrx_build/mac-hrx-smoke" --check-library
+bash scripts/build-hrx-allocation-stress.sh
 printf 'Built HRX %s. Hardware test (explicit opt-in):\n' "$hrx_revision"
 printf 'DYLD_LIBRARY_PATH=%q %q --run\n' "$repo_root/build/hsa" "$hrx_build/mac-hrx-smoke"

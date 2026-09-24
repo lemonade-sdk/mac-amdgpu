@@ -1,4 +1,5 @@
 #include "amdgpu_buffer_io.h"
+#include "amdgpu_software_stats.h"
 #include "amdgpu_dispatch_abi.h"
 #define MACAMDGPU_LOG(...) ((void)0)
 #include <cassert>
@@ -69,6 +70,7 @@ static BO *mac_amdgpu_bo_lookup(int *,uint64_t handle) {
     return handle>=1 && handle<=3 && entries[handle-1].used ? &entries[handle-1] : nullptr;
 }
 struct State {
+    amdgpu::software_stats::Counters softwareStats;
     bool shutdownBlocked=false;
     struct {
         amdgpu::DeviceContext device;
@@ -87,6 +89,7 @@ struct Args {
     uint64_t structureOutputMaximumSize=0;
 };
 static int call(Driver *driver,PCI *pci,int *ivars,uint64_t selector,Args *arguments) {
+    auto &stats = driver->ivars->softwareStats;
     switch(selector) {
 #include "buffer_rpc_under_test.inc"
     default:return kIOReturnBadArgument;
@@ -123,9 +126,11 @@ int main() {
     input[0]=1;input[1]=0;input[2]=4096;
     args={};args.scalarInput=input;args.scalarInputCount=3;args.structureInput=upload;
     assert(call(&driver,&pci,&client,49,&args)==0 && pci.writes==1024 && pci.reads==1024);
+    assert(state.softwareStats.data.cpuUploadBytes==4096);
     args.structureInput=nullptr;args.structureOutputMaximumSize=4096;
     assert(call(&driver,&pci,&client,50,&args)==0 && args.structureOutput);
     assert(memcmp(args.structureOutput->getBytesNoCopy(),words.data(),4096)==0);
+    assert(state.softwareStats.data.cpuReadbackBytes==4096);
     delete args.structureOutput; args.structureOutput=nullptr;
     const auto reads=pci.reads;
     input[0]=3;
@@ -135,6 +140,7 @@ int main() {
     input[1]=0;input[2]=4097;
     assert(call(&driver,&pci,&client,50,&args)==kIOReturnBadArgument);
     delete upload;
+    assert(state.softwareStats.data.cpuUploadBytes==4096 && state.softwareStats.data.cpuReadbackBytes==4096);
     amdgpu::ComputeDispatchRequest request{};
     request.version=1;request.codeHandle=1;request.codeBytes=64;request.timeoutUS=100000;
     request.groups[0]=4; request.groups[1]=request.groups[2]=1;

@@ -46,12 +46,14 @@
       (reg##__##field##_MASK)))
 
 namespace amdgpu {
+namespace software_stats { struct Counters; }
 
 //============================================================
 // Per-device runtime state — owned by the driver instance,
 // passed by pointer into the bringup orchestration.
 //============================================================
 struct DeviceContext {
+    software_stats::Counters *softwareStats; // Per-device CPU accounting; lifecycle queue only.
 #ifdef __APPLE__
     IOPCIDevice *pci;
     uint8_t      bar0MemIndex;

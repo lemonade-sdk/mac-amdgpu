@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include "amdgpu_vram.h"
+#include "amdgpu_software_stats.h"
 #include "amdgpu_client_lifecycle.h"
 #include "amdgpu_cp_firmware.h"
 #include "amdgpu_cp_registers.h"
@@ -57,6 +58,7 @@ struct DeviceContext {
     uint32_t bar0MemIndex=0, bar2MemIndex=1;
     uint64_t bar0Size=0x40000, bar2Size=0x200000;
     bool doorbell_works=false;
+    software_stats::Counters *softwareStats=nullptr;
 };
 #include "amdgpu_vram_io.h"
 struct IOAddressSegment { uint64_t address = 0, length = 0; };
@@ -261,13 +263,21 @@ int main() {
     gpuFence=8;
     assert(submission.poll() && submission.completedCPFence==8);
     // Actual fence emission/polling: delayed success, timeout, and removal.
+    software_stats::Counters accounting;
+    dev.softwareStats = &accounting;
     for (bool complete : {false,true}) {
         rptr=uint32_t(cp.wptr); gpuFence=0; now=0; completeFence=complete;
+        accounting.reset(now);
         uint32_t observed=0;
         assert(cp_submit_eop_test(dev,cp,100000,&observed)==(complete?0:kIOReturnTimeout));
         assert(now==(complete?3000000:100000000));
         assert(observed==(complete?cp.fence_counter:0));
+        const auto &counts = accounting.data.engines[software_stats::GFX];
+        assert(counts.submitted == 1 && counts.completed == unsigned(complete));
+        assert(counts.failed == unsigned(!complete) && counts.pending == unsigned(!complete));
+        assert(software_stats::valid(accounting.snapshot(now, true)));
     }
+    dev.softwareStats = nullptr;
     completeFence=false;
     MESContext mes;
     uint64_t elapsed=0;

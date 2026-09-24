@@ -1,3 +1,4 @@
+#include "mac_hsa.h"
 #include <hsa/hsa.h>
 #include <hsa/hsa_ext_amd.h>
 #include <stdio.h>
@@ -22,13 +23,59 @@ static int check(hsa_status_t status, const char *step) {
     if (status == HSA_STATUS_SUCCESS) return 1;
     fprintf(stderr, "%s failed: HSA status 0x%x\n", step, (unsigned)status); return 0;
 }
+static int capacity_test(void) {
+    enum { count = 1024, words = 4096 };
+    void *buffers[count];
+    uint32_t input[words], output[words];
+    memset(buffers, 0, sizeof(buffers));
+    int passed = 0;
+    if (!check(hsa_iterate_agents(agent, NULL), "enumerate agents") || !gpu.handle) goto cleanup;
+    mac_hsa_device_info_t info = {0};
+    if (!check(mac_hsa_agent_get_driver_info(gpu, &info, sizeof(info)), "driver identity") || info.driver_build < 194) {
+        fprintf(stderr, "Capacity test requires driver 194 or newer.\n"); goto cleanup;
+    }
+    if (hsa_amd_agent_iterate_memory_pools(gpu, pool, NULL) != HSA_STATUS_INFO_BREAK) goto cleanup;
+    for (unsigned round = 0; round < 3; ++round) {
+        for (unsigned i = 0; i < count; ++i) {
+            if (buffers[i]) continue;
+            if (!check(hsa_amd_memory_pool_allocate(device_pool, sizeof(input), 0, &buffers[i]), "allocate capacity buffer")) {
+                fprintf(stderr, "Allocation failed at slot %u, round %u\n", i, round); goto cleanup;
+            }
+            for (unsigned j = 0; j < words; ++j) input[j] = 0x957ac301u ^ (i * 31337u) ^ (j * 65537u);
+            if (!check(hsa_memory_copy(buffers[i], input, sizeof(input)), "upload capacity canaries")) goto cleanup;
+        }
+        for (unsigned i = 0; i < count; ++i) {
+            if (!check(hsa_memory_copy(output, buffers[i], sizeof(output)), "read capacity canaries")) goto cleanup;
+            for (unsigned j = 0; j < words; ++j) if (output[j] != (0x957ac301u ^ (i * 31337u) ^ (j * 65537u))) {
+                fprintf(stderr, "Capacity canary mismatch: round %u slot %u word %u\n", round, i, j); goto cleanup;
+            }
+        }
+        printf("PASS round %u: %u live device buffers, all %u bytes per buffer verified\n", round, count, (unsigned)sizeof(input));
+        if (round < 2) {
+            const unsigned begin = round == 0 ? 0 : 256;
+            const unsigned end = round == 0 ? count : 384;
+            const unsigned step = round == 0 ? 2 : 1;
+            for (unsigned i = begin; i < end; i += step) {
+                if (!check(hsa_amd_memory_pool_free(buffers[i]), "free capacity buffer")) goto cleanup;
+                buffers[i] = NULL;
+            }
+        }
+    }
+    passed = 1;
+cleanup:
+    for (unsigned i = count; i > 0; --i) if (buffers[i-1] && !check(hsa_amd_memory_pool_free(buffers[i-1]), "release capacity buffer")) passed = 0;
+    if (!check(hsa_shut_down(), "capacity shutdown")) passed = 0;
+    if (passed) puts("PASS: 1024 live VRAM buffers, 512 alternating plus 128 consecutive frees/reallocations, exact data and clean teardown");
+    return passed ? 0 : 1;
+}
 int main(int argc, char **argv) {
-    if (argc != 2 || (strcmp(argv[1], "--run") && strcmp(argv[1], "--hold"))) {
-        fprintf(stderr, "Usage: %s --run|--hold\nBuild179 requires Host Stop first. Build180 can share an initialized GPU.\n", argv[0]);
+    if (argc != 2 || (strcmp(argv[1], "--run") && strcmp(argv[1], "--hold") && strcmp(argv[1], "--capacity"))) {
+        fprintf(stderr, "Usage: %s --run|--hold|--capacity\nCapacity mode requires driver194; all modes explicitly submit GPU work.\n", argv[0]);
         return 2;
     }
     setvbuf(stdout, NULL, _IONBF, 0);
     if (!check(hsa_init(), "initialize runtime")) return 1;
+    if (!strcmp(argv[1], "--capacity")) return capacity_test();
     void *a = NULL, *b = NULL;
     hsa_signal_t completed = {0};
     int passed = 0;

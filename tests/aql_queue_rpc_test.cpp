@@ -41,6 +41,7 @@ struct State {
         amdgpu::PersistentAQLQueue aqlQueues[7];
     } bringup;
 };
+static void mac_amdgpu_observe_software_queues(State &) {} // separately exercised by software RPC tests
 struct Driver {State *ivars;};
 struct Args {
     uint64_t *scalarInput,*scalarOutput;uint32_t scalarInputCount=3,scalarOutputCount=2;
