@@ -8,8 +8,9 @@ against another engine.
 
 The earlier **HIPC** (`--dialect hip`) throughput is reported at approximately
 **34 decode tokens/s**. Current **macOS Loom** (`--dialect loom`) with cooperative
-RMS reaches **15.91 decode tokens/s** on the 512-input/33-output fixture and
-**14.28 decode tokens/s** on the 1,024-input/1,024-output fixture. Cooperative
+RMS and four-column Q6 reaches **16.70 decode tokens/s** on the
+512-input/129-output fixture and **14.83 decode tokens/s** on the
+1,024-input/1,024-output fixture. Cooperative
 RMS is now the default after a fused-kernel buffer-lifetime fix resolved the
 long-request repeatability failure. The combined vector-prefill implementation passes
 the long fixture at **139.85 prompt tokens/s and 14.23 decode tokens/s**, with
@@ -1054,7 +1055,11 @@ down-projection from 5.916 to 4.738 ms (host eval plus retirement, not GPU
 timestamps). Both implementations exactly match the original FP32 reference
 on these inputs. This distribution exercises the matrix path; it does not
 measure the fallback-heavy mixed-sign-bias case or model throughput. Full-model
-logit qualification remains pending. Evidence:
+logit comparison against the existing vector BF16 implementation subsequently
+failed the 0.005 threshold at 0.00661439, despite zero repeat noise and matching
+argmax. The candidate remains experimental; a matched M256-only scalar reference
+is required to assess error against the original FP32 contraction, since the
+vector control is itself approximate. Evidence:
 `q6-centered-affine-{baseline,candidate}-{up256,down256}.log`.
 
 A separate four-column decode candidate shares activation loads across four
@@ -1063,10 +1068,30 @@ same frozen cooperative-RMS/vector-prefill inputs, both variants completed five
 512-input/129-output requests (two warmups, three measured, KV1024, no MTP).
 All ten generated texts match exactly, and all measured requests have zero JIT
 compilations. Median decode improved from 15.958 to 16.700 TPS, about 4.65%,
-while prefill remained 143.39 versus 143.38 PP/s. This is a sequential comparison;
-the candidate still needs the long-generation gate before promotion. Evidence:
+while prefill remained 143.39 versus 143.38 PP/s. The separate long-generation
+gate also passed three identical 1,024-input/1,024-output requests, all matching
+the prior implementation. Its third request measured 139.362 PP/s and
+14.829 TPS, with zero new compilations, versus the prior long run's 14.230 TPS.
+These are sequential comparisons. The implementation is now the default for
+the qualified layout. Evidence:
 `four-column-current-pp512-tg128-comparison.json` and the
-`qwen-four-column-current-{baseline,candidate}-pp512-tg128` result directories.
+`four-column-current-1k1k-comparison.json` and matching result directories.
+
+The rebuilt default four-column server separately completed three short
+requests with identical output matching the qualified candidate; the warmed
+request measured 143.287 PP/s and 16.696 TPS, zero JIT compilations and clean
+shutdown. Evidence: `qwen-four-column-production-pp512-tg128/result.json`;
+server/source/object identity is recorded in
+`build/four-column-integration/manifest.json`.
+
+The next vector-LDS-store candidate reduces 96 scalar stores to 12 vector
+stores and VGPR usage from 141 to 132, preserving the WMMA/conversion sequence,
+LDS allocation and zero scratch. Full-size guarded GPU checks passed nine
+identical repeats with exact control output hashes. Timing was mixed: the
+up-projection decreased from 6.277 to 5.480 ms, while down-projection increased
+from 4.614 to 5.000 ms (host eval plus retirement). It remains experimental
+until a matched model comparison demonstrates a benefit. Evidence:
+`q6-vector-store-{baseline,candidate}-{up256,down256}.log`.
 
 ### FP32 subnormal descriptor correction
 

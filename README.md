@@ -70,17 +70,17 @@ its log, model, quantization, context and MTP settings still need to be recovere
 for a matched comparison. It is not a measured macOS Loom result.
 
 The local Qwen3.8-27B-MLX-6bit checkpoint runs through GPU kernels using **Loom**.
-Cooperative RMS normalization and the qualified vector BF16 prefill kernels are
-selected automatically for supported shapes through the shared HIP/Loom policy.
+Cooperative RMS normalization, qualified vector BF16 prefill and four-column Q6
+decode are selected automatically for supported shapes through shared HIP/Loom
+code and policy.
 The rebuilt default server passes GPU inference with identical repeated text
 and clean shutdown. The combined implementation also passed three full
 **1,024-input/1,024-output** requests.
 
-| Workload | Implementation | Prompt processing | Decode |
-| --- | --- | ---: | ---: |
-| 512 input / 129 output, KV1024 | RMS + vector prefill, qualified control | **143.39 tokens/s** | **15.96 tokens/s** |
-| 1,024 input / 1,024 output, KV2048 | RMS + vector prefill | **139.85 tokens/s** | **14.23 tokens/s** |
-| 512 input / 129 output, KV1024 | Experimental four-column decode | **143.38 tokens/s** | **16.70 tokens/s** |
+| Workload | Prompt processing | Decode |
+| --- | ---: | ---: |
+| 512 input / 129 output, KV1024 | **143.38 tokens/s** | **16.70 tokens/s** |
+| 1,024 input / 1,024 output, KV2048 | **139.36 tokens/s** | **14.83 tokens/s** |
 
 All rows use MTP disabled, flush64 and 64 µs polling. Short-run rows are medians
 of three measured requests after two warmups; the long row is one measured
@@ -88,11 +88,11 @@ request after two warmups. Compiler counters confirm zero new compilations in
 every measured request. Output token counts include the first token from
 prefill, so the rows contain 128 or 1,023 decode steps respectively.
 
-The rebuilt default server separately confirmed **143.69 PP/s and 15.93 TPS**
-on the same short workload, with text matching the frozen qualified control.
+The rebuilt default server separately confirmed **143.29 PP/s and 16.70 TPS**
+on the same short workload, with text matching the frozen qualified candidate.
 Vector prefill previously improved the matched 512-input/33-output fixture
-by **61%**. Four-column decode improves the current short workload by **4.65%**;
-its long-generation qualification is still in progress before promotion.
+by **61%**. Four-column decode improves the matched short workload by **4.65%**
+and the separate long comparison by about **4.2%**, with unchanged generated text.
 
 These measurements do not establish matched llama.cpp parity. Closing the
 remaining throughput gap is active work. See
