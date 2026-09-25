@@ -123,6 +123,21 @@ public:
              uint32_t(values[8]),uint32_t(values[9])};
         return HSA_STATUS_SUCCESS;
     }
+    hsa_status_t spec(std::array<uint64_t, kDeviceSpecDwords> &out) override {
+        // Observer QueryInfo tag 8: raw register-level spec from the driver
+        // (GC_INFO geometry + harvest masks + SH-block registers). Requires
+        // the driver build that serves it; older drivers return
+        // kIOReturnNotReady, which maps to an invalid-argument decline here.
+        std::lock_guard lock(sessionMutex);
+        auto status=ensureReady();
+        if (status!=HSA_STATUS_SUCCESS) return status;
+        std::array<uint64_t,3> build{};
+        status=scalar(43,{},build);
+        if (status!=HSA_STATUS_SUCCESS) return status;
+        if (build[2]<kDeviceSpecDriverBuild) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        const uint64_t tag=8;std::array<uint64_t,1> input{tag};
+        return scalar(21,input,out);
+    }
     bool supportsSharedBuffers() const override { return true; }
     hsa_status_t sharedMemoryCapacity(uint64_t &bytes) override {
         std::lock_guard lock(sessionMutex);

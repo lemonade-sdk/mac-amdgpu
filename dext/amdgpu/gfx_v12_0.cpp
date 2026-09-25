@@ -498,6 +498,82 @@ gfx_constants_init(const DeviceContext &dev)
     return gfx_constants_init(dev, s_cfg);
 }
 
+//------------------------------------------------------------------
+// gfx_get_spec — observer snapshot of the device-spec surface.
+//
+// Mirrors the register reads Linux's KFD info ioctl answers
+// (amdgpu_info_device in amdgpu_drv.c: num_shader_engines / arrays /
+// cu_bitmap from gfx_v12_0_get_cu_info, wave_front_size and the CU /
+// SH geometry from the GC_INFO discovery table, LDS size from the same
+// table) and adds the SH-block register facts that ioctl does not
+// expose: the programmed SH_MEM_CONFIG / SH_MEM_BASES of VMID 0, the
+// raw shader-array config words, and the SA disable masks.
+//
+// Read-only except the GRBM select/deselect around the per-(SE, SH) SA
+// reads (the exact sequence gfx_v12_0_get_cu_info performs); the
+// function finishes broadcast-deselected, so it leaves no register
+// scope in force. Safe for observer clients once bringup has resolved
+// the GC IP; before that it reports kIOReturnNotReady with zeros.
+//------------------------------------------------------------------
+kern_return_t
+gfx_get_spec(const DeviceContext &dev, const GFXConfig &cfg, GFXSpecSnapshot &out)
+{
+    out = {};
+    if (!dev.ip.isResolved(IPBlock::GC)) return kIOReturnNotReady;
+
+    auto reg = [&](GFXRegs::Register r) {
+        return SOC15_REG_OFFSET_BIDX(dev, IPBlock::GC, r.baseIndex, r.offset);
+    };
+
+    const auto &physical = dev.ip.gfx;
+    out.max_shader_engines = physical.max_shader_engines;
+    out.max_sh_per_se = physical.max_sh_per_se;
+    out.max_backends_per_se = physical.max_backends_per_se;
+    out.max_cu_per_sh = physical.max_cu_per_sh;
+    out.wave_front_size = physical.wave_front_size;
+    out.max_waves_per_simd = physical.max_waves_per_simd;
+    out.max_scratch_slots_per_cu = physical.max_scratch_slots_per_cu;
+    out.lds_size_bytes = physical.lds_size_kib * 1024;
+
+    // Harvested state, from the config bringup populated (the same figures
+    // dispatch uses), plus the live disable masks read straight off the
+    // registers so a post-bringup user mask change is visible.
+    out.num_active_cus = cfg.num_active_cus;
+    for (uint32_t i = 0; i < 4; i++)
+        for (uint32_t j = 0; j < 2; j++)
+            out.active_cu_bitmap[i * 2 + j] = cfg.active_cu_bitmap[i][j];
+
+    const uint32_t cc_dis =
+        (RREG32(dev, reg(GFXRegs::GRBM_CC_GC_SA_UNIT_DISABLE))
+         & GRBM_CC_GC_SA_UNIT_DISABLE__SA_DISABLE_MASK)
+        >> GRBM_CC_GC_SA_UNIT_DISABLE__SA_DISABLE__SHIFT;
+    const uint32_t user_dis =
+        (RREG32(dev, reg(GFXRegs::GRBM_GC_USER_SA_UNIT_DISABLE))
+         & GRBM_GC_USER_SA_UNIT_DISABLE__SA_DISABLE_MASK)
+        >> GRBM_GC_USER_SA_UNIT_DISABLE__SA_DISABLE__SHIFT;
+    const uint32_t sa_mask = cfg.max_sh_per_se * cfg.max_shader_engines;
+    out.sa_disable_cc = cc_dis;
+    out.sa_disable_user = user_dis;
+    out.sa_active_bitmap = gfx_create_bitmask(sa_mask) & ~(cc_dis | user_dis);
+    out.rb_active_bitmap = cfg.active_rb_bitmap;
+    out.num_rbs = cfg.num_rbs;
+
+    // SH-block facts Linux's info ioctl does not publish. No select /
+    // deselect is needed here: GRBM scope only applies to per-SE/SH
+    // instance registers, and SH_MEM_CONFIG / SH_MEM_BASES / the array-
+    // config words are read in the default (unselected) scope, the same way
+    // bringup reads them before its per-VMID program loop. Ends without
+    // leaving any scope in force.
+    out.cc_shader_array_config = RREG32(dev, reg(GFXRegs::CC_GC_SHADER_ARRAY_CONFIG));
+    out.gc_user_shader_array_config = RREG32(dev, reg(GFXRegs::GC_USER_SHADER_ARRAY_CONFIG));
+    out.sh_mem_config = RREG32(dev, reg(GFXRegs::SH_MEM_CONFIG));
+    out.sh_mem_bases = RREG32(dev, reg(GFXRegs::SH_MEM_BASES));
+    out.grbm_gfx_cntl = RREG32(dev, reg(GFXRegs::GRBM_GFX_CNTL));
+
+    out.header = 1;
+    return kIOReturnSuccess;
+}
+
 //==================================================================
 // MQD builders — port the field math from gfx_v12_0_compute_mqd_init
 // and gfx_v12_0_gfx_mqd_init.  Audit-7 #9.

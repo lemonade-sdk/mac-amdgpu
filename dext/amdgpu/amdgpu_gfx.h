@@ -211,6 +211,46 @@ kern_return_t gfx_setup_rb(const DeviceContext &dev, GFXConfig &cfg);
 kern_return_t gfx_get_cu_info(const DeviceContext &dev, GFXConfig &cfg);
 
 //
+// Observer device-spec snapshot for driver QueryInfo. Reads the same
+// harvest/geometry facts the KFD info ioctl (DRM_IOCTL_AMDGPU_INFO,
+// amdgpu_info_device in upstream amdgpu_drv.c) reports on Linux, plus the
+// SH-block register facts it does not: the per-VMID SH_MEM_CONFIG / SH_MEM_BASES
+// contents, the raw CC_GC_SHADER_ARRAY_CONFIG + GC_USER_SHADER_ARRAY_CONFIG
+// words, and the SA disable masks. All reads are read-only MMIO through the
+// BAR5 register window (RREG32); the only writes are the GRBM select /
+// deselect around the per-(SE, SH) SA reads, exactly the sequence
+// gfx_v12_0_get_cu_info performs, and no register is left selected when the
+// function returns (broadcast-deselected at the end).
+//
+// The output is a fixed 32-dword block (28 named fields + 4 reserved); the
+// field list is versioned by the QueryInfo info tag so a driver build change
+// never reinterprets an old reader. Fields are 0 until the GC IP is resolved
+// and the config is inited.
+struct GFXSpecSnapshot {
+    // Header: 0 = not yet resolved (GC IP base or config missing).
+    uint32_t header;
+    // Discovery (GC_INFO table, amdgpu_discovery) — the physical geometry
+    // before harvesting.
+    uint32_t max_shader_engines, max_sh_per_se, max_backends_per_se, max_cu_per_sh;
+    uint32_t wave_front_size, max_waves_per_simd, max_scratch_slots_per_cu, lds_size_bytes;
+    // Harvested state (GFXConfig + live disable masks).
+    uint32_t num_active_cus, active_cu_bitmap[8]; // KFD 4x4 layout, [se%4][j+(i/4)*2]
+    uint32_t sa_active_bitmap, sa_disable_cc, sa_disable_user;
+    uint32_t rb_active_bitmap, num_rbs;
+    uint32_t sh_mem_config, sh_mem_bases;         // VMID 0 (the HSA queue VMID)
+    uint32_t cc_shader_array_config, gc_user_shader_array_config; // raw words
+    uint32_t grbm_gfx_cntl;                        // readback (0 after deselect)
+    uint32_t reserved[4];
+};
+
+// Observes the device into `out`. Returns kIOReturnSuccess once the GC IP is
+// resolved; kIOReturnNotReady before discovery / before gfx_constants_init has
+// populated the config (fields left 0 in that case). `cfg` is the same config
+// bringup used, so the harvest figures agree with the ones dispatch uses.
+kern_return_t gfx_get_spec(const DeviceContext &dev, const GFXConfig &cfg,
+                           GFXSpecSnapshot &out);
+
+//
 // Port of gfx_v12_0_init_compute_vmid (gfx_v12_0.c:1766). For each
 // KFD VMID, GRBM-select it and program SH_MEM_CONFIG, SH_MEM_BASES,
 // and SPI_GDBG_PER_VMID_CNTL.TRAP_EN = 1.  Audit-7 #8.

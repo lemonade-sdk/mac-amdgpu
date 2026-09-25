@@ -160,6 +160,9 @@ enum {
     kMacAMDGPUInfoVRAMSizes      = 2, // out[0]=visible, [1]=total (bytes)
     kMacAMDGPUInfoIPVersions     = 3, // out[0]=GMC pack, [1]=SDMA pack, [2]=PSP pack, [3]=SMU pack
     kMacAMDGPUInfoBringupReached = 4, // out[0]=BringupStage (highest reached)
+    // 8 — observer device-spec snapshot: GFXSpecSnapshot as 32 scalar outputs.
+    // Read-only MMIO; kIOReturnNotReady before GC discovery /
+    // gfx_constants_init.
 };
 
 // Firmware type tags used by LoadFirmware. Pre-SOS components route
@@ -4350,6 +4353,22 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         case kMacAMDGPUInfoBringupReached:
             arguments->scalarOutput[0] = static_cast<uint64_t>(b.reached);
             return kIOReturnSuccess;
+        case 8: { // Observer device-spec snapshot (GFXSpecSnapshot, 32 dwords).
+            if (arguments->scalarOutputCount < 32) return kIOReturnBadArgument;
+            if (!driver->ivars->pciOpen || driver->ivars->shutdownBlocked ||
+                driver->ivars->shutdownInProgress ||
+                b.reached < amdgpu::BringupStage::GFXInit || !b.gfx.inited)
+                return kIOReturnNotReady;
+            amdgpu::GFXSpecSnapshot spec{};
+            const auto r = amdgpu::gfx_get_spec(b.device, b.gfx, spec);
+            if (r != kIOReturnSuccess) return r;
+            const auto *words = reinterpret_cast<const uint32_t *>(&spec);
+            static_assert(sizeof(spec) == 32 * sizeof(uint32_t),
+                          "GFXSpecSnapshot is a 32-dword block");
+            for (unsigned i = 0; i < 32; ++i) arguments->scalarOutput[i] = words[i];
+            arguments->scalarOutputCount = 32;
+            return kIOReturnSuccess;
+        }
         case 6: { // Owned initialized session: hardware topology and ATOM clock.
             if (arguments->scalarOutputCount<10) return kIOReturnBadArgument;
             if (!ivars->claimed || !driver->ivars->pciOpen || driver->ivars->shutdownBlocked ||
