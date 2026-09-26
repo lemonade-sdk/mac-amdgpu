@@ -25,18 +25,25 @@ final class GPUSampler: ObservableObject {
     private let history = SampleHistory()
     private let queue = DispatchQueue(label: "amdgpu_mtopg.sampler", qos: .userInitiated)
     private var selectedRegistry: UInt64?
+    private var running = false
 
     static let umcDefaultLabel = "no UMC sample yet (fresh SMU UmcActivityPercent, or MMHUB PERFCTR on driver build 198+)"
 
     func start() {
+        guard !running else { return }
+        running = true
         queue.async { [weak self] in
             self?.loop()
         }
     }
 
     func stop() {
-        // Close the IOKit iterator off the main thread; the connection is
-        // already per-sample open/close so no IOConnect leaks.
+        // Stop the sampler loop first so it cannot call into the driver while
+        // the app is tearing the IOKit service down (a read racing the
+        // teardown traps in the struct decode). Then close the transport off
+        // the main thread; the connection is already per-sample open/close so
+        // no IOConnect leaks.
+        running = false
         queue.async { [weak self] in
             self?.transport.close()
         }
@@ -44,8 +51,10 @@ final class GPUSampler: ObservableObject {
 
     private func loop() {
         // 10 Hz: charts want a per-second sample; faster polling burns IOKit
-        // calls for identical counter values.
-        while true {
+        // calls for identical counter values. The loop exits when stop() clears
+        // `running`, so app shutdown does not leave a sampler thread reading a
+        // half-torn-down driver connection.
+        while running {
             let loopStart = Date()
             let (devices, error) = transport.refresh()
             var snap = makeSnapshot(device: nil, history: history,

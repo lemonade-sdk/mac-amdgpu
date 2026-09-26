@@ -10,6 +10,27 @@
 // sizes (192 / 96 / 456, see dext/amdgpu static_asserts) and decoded with
 // explicit offsets, because Swift's layout of C++ mirror structs is not
 // reliable (arrays in structs change padding).
+
+// Bounds-checked little-endian readers for the raw struct buffers. The raw
+// pointer load the previous code used (baseAddress!.advanced(by:).load(as:))
+// traps with a Swift brk#1 when the buffer is empty or shorter than the read
+// offset, which happens when a struct call lands while the driver service is
+// being torn down at app quit. These read the bytes explicitly (no pointer
+// arithmetic, no force-unwrap) and return 0 for any out-of-range read, so a
+// partial/empty response decodes to a zeroed snapshot instead of crashing.
+enum SafeLE {
+    static func u32(_ b: [UInt8], _ offset: Int) -> UInt32 {
+        guard offset >= 0, offset + 4 <= b.count else { return 0 }
+        return UInt32(b[offset]) | UInt32(b[offset + 1]) << 8
+             | UInt32(b[offset + 2]) << 16 | UInt32(b[offset + 3]) << 24
+    }
+    static func u64(_ b: [UInt8], _ offset: Int) -> UInt64 {
+        guard offset >= 0, offset + 8 <= b.count else { return 0 }
+        var v: UInt64 = 0
+        for i in 0..<8 { v |= UInt64(b[offset + i]) << (8 * i) }
+        return v
+    }
+}
 //
 // MIT License — see the repository LICENSE.
 
@@ -90,12 +111,11 @@ struct SMUMetricsSnapshot {
 
     init(bytes: [UInt8]) {
         // C layout: 4 x u32, 4 x u64, 2 x u32, u64, u64[17].
-        func le(_ offset: Int) -> UInt32 {
-            bytes.withUnsafeBufferPointer { buf in UnsafeRawPointer(buf.baseAddress!.advanced(by: offset)).load(as: UInt32.self) }
-        }
-        func lu(_ offset: Int) -> UInt64 {
-            bytes.withUnsafeBufferPointer { buf in UnsafeRawPointer(buf.baseAddress!.advanced(by: offset)).load(as: UInt64.self) }
-        }
+        // Bounds-checked little-endian reads: a struct call that returns a
+        // short/empty buffer (driver being torn down) must read back zero, not
+        // trap on an out-of-range or nil-based raw load.
+        func le(_ offset: Int) -> UInt32 { SafeLE.u32(bytes, offset) }
+        func lu(_ offset: Int) -> UInt64 { SafeLE.u64(bytes, offset) }
         version = le(0); size = le(4); status = le(8); flags = le(12)
         generation = lu(16); sequence = lu(24); collectedAtNs = lu(32); attemptedAtNs = lu(40)
         driverInterface = le(48); firmwareCounter = le(52)
@@ -124,12 +144,8 @@ struct SMUClockSnapshot {
 
     init(bytes: [UInt8]) {
         // C layout: 4 x u32, 2 x u64, 4 x u32, 3 x u32[4].
-        func le(_ offset: Int) -> UInt32 {
-            bytes.withUnsafeBufferPointer { buf in UnsafeRawPointer(buf.baseAddress!.advanced(by: offset)).load(as: UInt32.self) }
-        }
-        func lu(_ offset: Int) -> UInt64 {
-            bytes.withUnsafeBufferPointer { buf in UnsafeRawPointer(buf.baseAddress!.advanced(by: offset)).load(as: UInt64.self) }
-        }
+        func le(_ offset: Int) -> UInt32 { SafeLE.u32(bytes, offset) }
+        func lu(_ offset: Int) -> UInt64 { SafeLE.u64(bytes, offset) }
         version = le(0); size = le(4); status = le(8); flags = le(12)
         generation = lu(16); collectedAtNs = lu(24)
         driverInterface = le(32); firmwareVersion = le(36)
@@ -150,9 +166,7 @@ struct SoftwareEngineSnapshot {
 
     init(bytes: [UInt8]) {
         // C layout: 5 x u64 + u64[5].
-        func lu(_ offset: Int) -> UInt64 {
-            bytes.withUnsafeBufferPointer { buf in UnsafeRawPointer(buf.baseAddress!.advanced(by: offset)).load(as: UInt64.self) }
-        }
+        func lu(_ offset: Int) -> UInt64 { SafeLE.u64(bytes, offset) }
         submitted = lu(0); completed = lu(8); failed = lu(16); pending = lu(24); retired = lu(32)
         pendingNs = lu(40)
         for i in 0..<5 { self.bytes[i] = lu(48 + 8 * i) }
@@ -186,12 +200,8 @@ struct SoftwareStatsSnapshot {
 
     init(bytes: [UInt8]) {
         // C layout: 4 x u32, 11 x u64, then 4 x EngineSnapshot (96 B each).
-        func le(_ offset: Int) -> UInt32 {
-            bytes.withUnsafeBufferPointer { buf in UnsafeRawPointer(buf.baseAddress!.advanced(by: offset)).load(as: UInt32.self) }
-        }
-        func lu(_ offset: Int) -> UInt64 {
-            bytes.withUnsafeBufferPointer { buf in UnsafeRawPointer(buf.baseAddress!.advanced(by: offset)).load(as: UInt64.self) }
-        }
+        func le(_ offset: Int) -> UInt32 { SafeLE.u32(bytes, offset) }
+        func lu(_ offset: Int) -> UInt64 { SafeLE.u64(bytes, offset) }
         version = le(0); size = le(4); flags = le(8); reserved = le(12)
         generation = lu(16); sampledAtNs = lu(24); sessionStartNs = lu(32)
         participants = lu(40); activeQueues = lu(48); queuedPackets = lu(56)
@@ -211,15 +221,14 @@ struct MmhubPerfStatus {
     var collectedAtNs: UInt64 = 0
     var valid = false
 
-    /// The PERFSTATUS register reads 0xFFFFFFFF (all bits set) when the MMIO
-    /// hit an unmapped/unsupported register slot. The driver's selector 68
-    /// still reports status 0 in that case (the read itself succeeded), so
-    /// consumers must reject an all-ones raw register as a live source: the
-    /// upper 8 bits carry only the low byte of the 20-bit UMC-busy count and
-    /// never advance, so any delta window computed from it is noise. Verified
-    /// on the R9700 (driver 198): the register is all-ones both at idle and
-    /// under an active LSE decode, i.e. this ASIC does not map the UMC
-    /// PERFSTATUS set the driver samples.
+    /// The MMHUB UMC-busy PERFSTATUS register (offset 0x04c18) does not exist
+    /// on this ASIC (gfx1201 / RDNA4): no such register is defined in any AMD
+    /// header. Driver build 199+ reports the source unavailable (status != 0,
+    /// zeroed data) instead of reading the unmapped slot; pre-199 read back
+    /// 0xFFFFFFFF (all-ones) at both idle and under an active LSE decode. The
+    /// usable check therefore rejects any non-zero status (unavailable) or an
+    /// all-ones raw (the pre-199 unmapped-register read), falling back to the
+    /// SMU firmware average.
     var usable: Bool {
         valid && status == 0 && raw != 0xFFFFFFFF
     }
@@ -419,13 +428,29 @@ final class DriverTransport {
         }
 
         // MMHUB PERFSTATUS UMC busy (selector 68, build 198+; observer only).
+        // Driver build 199+ reports the source unavailable on ASICs with no
+        // MMHUB UMC-busy counter (gfx1201 / RDNA4) by returning KERN_SUCCESS
+        // with the low 32 bits of scalarOutput[0] set to kIOReturnUnsupported
+        // (0xe00002c7) as a sentinel. We must check that sentinel BEFORE
+        // narrowing to UInt32: the driver sign-extends the negative
+        // kern_return_t to the full 64 bits (0xffffffffe00002c7), which does
+        // not fit a UInt32 and would trap. Treat any non-zero low-32-bit status
+        // (or an all-ones raw, the pre-199 unmapped read) as "no live counter"
+        // and leave device.mmhub invalid so the UI falls back to the SMU
+        // firmware average.
         if device.build >= DriverABI.mmhubMinimumBuild {
             var result = [UInt64](repeating: 0, count: 4)
             if scalar(DriverABI.selMmhub, [], into: &result) == KERN_SUCCESS, result.count == 4 {
-                device.mmhub = MmhubPerfStatus(status: UInt32(result[0]), raw: UInt32(result[1]),
-                                               umcBusyQ8: result[2] & kMMHUBPerfStatusMaxQ8,
-                                               collectedAtNs: result[3])
-                device.mmhub.valid = true
+                let statusLow32 = UInt32(result[0] & 0xFFFFFFFF)
+                let raw = UInt32(result[1] & 0xFFFFFFFF)
+                let unavailable = (statusLow32 & 0xFFFF) == 0x2c7 && (statusLow32 & 0xE000_0000) != 0
+                if !unavailable, statusLow32 == 0, raw != 0xFFFFFFFF {
+                    device.mmhub = MmhubPerfStatus(status: statusLow32, raw: raw,
+                                                   umcBusyQ8: result[2] & kMMHUBPerfStatusMaxQ8,
+                                                   collectedAtNs: result[3])
+                    device.mmhub.valid = true
+                }
+                // else: no live UMC-busy counter on this ASIC — leave invalid.
             }
         }
 

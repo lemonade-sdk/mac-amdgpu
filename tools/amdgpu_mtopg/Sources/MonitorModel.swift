@@ -295,8 +295,13 @@ func makeSnapshot(device: Device?, history: SampleHistory,
     // verified idle and reads 0 under real traffic (the opposite of a memory
     // busy counter). State both facts rather than implying the MMHUB source
     // is merely not ready yet.
+    // The driver reports the MMHUB UMC-busy source unavailable (status != 0,
+    // driver build 199+) on this ASIC, or - on the pre-199 binary - the
+    // fabricated 0x04c18 register read back 0xFFFFFFFF. Either way: there is
+    // no hardware UMC-busy counter on gfx1201, so surface the SMU fallback and
+    // say so plainly rather than implying the MMHUB source is merely not ready.
     let mmhubDead = device.map { d in
-        d.stage == 15 && d.mmhub.valid && d.mmhub.status == 0 && d.mmhub.raw == 0xFFFFFFFF
+        d.stage == 15 && (d.mmhub.status != 0 || (d.mmhub.valid && d.mmhub.raw == 0xFFFFFFFF))
     } ?? false
     let hwAvailable = history.lastUmhubReliable
     snap.umcReliable = hwAvailable && !mmhubDead
@@ -304,7 +309,7 @@ func makeSnapshot(device: Device?, history: SampleHistory,
     if mmhubDead {
         umcLabel = hwAvailable
             ? "MMHUB PERFSTATUS UMC busy (hardware PERFCTR delta, selector 68; 0-100%)"
-            : "UNRELIABLE — SMU UmcActivityPercent firmware average (offset 126); NOT a memory-busy counter. MMHUB PERFSTATUS (selector 68, offset 0x04c18) does not exist in the RDNA4 register map (verified: reads 0xFFFFFFFF idle + load; surrounding 0x04c7/0x0564/0x05cf registers are live), so there is no hardware UMC-busy counter on this ASIC."
+            : "UNRELIABLE — SMU UmcActivityPercent firmware average (offset 126); NOT a memory-busy counter. MMHUB PERFSTATUS (selector 68, offset 0x04c18) does not exist in the RDNA4 register map - driver build 199+ reports it unavailable (pre-199 read back 0xFFFFFFFF idle + load), so there is no hardware UMC-busy counter on this ASIC."
     }
     snap.umcSourceLabel = umcLabel
     snap.coreCurrent = history.coreCurrent
