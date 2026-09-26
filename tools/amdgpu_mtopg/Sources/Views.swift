@@ -256,7 +256,7 @@ struct ContentView: View {
                     TimeSeriesChart(samples: snap.umcActivity, windowSeconds: 60,
                                     color: Palette.umc, fill: Palette.umcFill,
                                     hasData: snap.umcActivity.contains { $0.value != nil },
-                                    emptyCaption: "no UMC samples: SMU table incoherent and MMHUB PERFCTR needs driver build 198+")
+                                    emptyCaption: "no UMC samples yet (waiting for a fresh SMU UmcActivityPercent; MMHUB PERFCTR arrives with driver build 198+)")
                         .frame(height: 150)
                     Text("source: " + (snap.umcSourceLabel ?? "none"))
                         .font(.system(size: 9, design: .monospaced))
