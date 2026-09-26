@@ -228,6 +228,20 @@ namespace MMHUBRegs {
     constexpr uint32_t kFBBaseMask = 0x00FFFFFFu;  // low 24 bits
     constexpr uint32_t kFBBaseShift = 24;          // <<24 to get MC addr
 
+    // UMC PERFSTATUS counter set — LOW MMHUB-cfg block, in the register
+    // hole between MMMC_VM_NB_MMIOLIMIT (0x04c1) and MMVM_L2_CNTL (0x04e4)
+    // in mmhub_4_1_0_offset.h (no name in the vendored header; names follow
+    // the NBIO UMC convention). PERFCTR0 bits [23:0] select which engine's
+    // busy time integrates into PERFSTATUS bits [23:0] (20-bit saturating
+    // cumulative counter, 0.25% steps); PERFCTR1 selects bits [31:24].
+    constexpr uint32_t MM_PERFSTATUS = 0x04c18;
+    constexpr uint32_t MM_PERFCTR0   = 0x04c1c;
+    constexpr uint32_t MM_PERFCTR1   = 0x04c20;
+    // PERFCTR0 source-select field (bits [23:0]); 0x01000000 enables the
+    // UMC busy-time source without touching the low bits of the field.
+    constexpr uint32_t MM_PERFCTR0_UMC_BUSY_SELECT = 0x01000000u;
+    constexpr uint32_t kMmhubPerfStatusCountMask   = 0xFFFFFu;  // 20-bit count
+
     // GART setup registers from mmhub_4_1_0_offset.h (RDNA4 NBIO 7_11
     // family). All BASE_IDX 0 — same IP base as MMMC_VM_FB_LOCATION_BASE.
     // Used by gart_enable to point the GPU's GMC at our page table and

@@ -132,6 +132,7 @@ enum {
     kMacAMDGPUMethodHostWindow        = 54, // establish/query common CPU/GPU GART address range
     kMacAMDGPUMethodClockSnapshot = 62,
     kMacAMDGPUMethodSampleCachedSensors = 63,
+    kMacAMDGPUMethodReadMmhubPerfStatus = 68, // UMC busy accumulator, observer only
 };
 
 // v0.1.28 — IP types accepted by CSCreate. Match the upstream
@@ -359,6 +360,15 @@ struct MacAMDGPU_IVars {
     amdgpu::software_stats::QueueProgress softwareQueues[amdgpu::kPersistentAQLQueues];
     amdgpu::software_stats::Engine rawStatsEngine;
     bool rawStatsFailureRecorded;
+    // Selector 68 sensor cache — one PERFCTR0 write + PERFSTATUS read per
+    // interval, taken on the serialized lifecycle queue.
+    static constexpr uint64_t kMmhubPerfStatusSampleIntervalNs = 1000000000ull; // ~1 Hz MMIO
+    struct MmhubPerfStatusCache {
+        uint64_t lastSampleNs = 0;   // CLOCK_UPTIME_RAW of last MMIO sample
+        uint32_t status = 0;         // 0 = kIOReturnSuccess once sampled
+        uint32_t raw = 0;            // full PERFSTATUS register value
+        uint64_t collectedAtNs = 0;  // CLOCK_UPTIME_RAW of last sample
+    } mmhubPerfStatus{};
     uint64_t nextAQLHandle; // Never reset with the bringup arena.
     uint16_t deviceID;
     uint16_t pciBDF;
@@ -867,7 +877,8 @@ mac_amdgpu_admit_external(IOService *client, MacAMDGPU *driver,
         !driver->ivars->bringup.device.smuOnline) return kIOReturnNotReady;
     if (selector == kMacAMDGPUMethodMESAddQueue) return kIOReturnUnsupported;
     if (selector == kMacAMDGPUMethodAtomicRequesterExperiment) return kIOReturnSuccess; // transition owns admission
-    if (selector == kMacAMDGPUMethodSampleCachedSensors) {
+    if (selector == kMacAMDGPUMethodSampleCachedSensors ||
+        selector == kMacAMDGPUMethodReadMmhubPerfStatus) {
         // Observer sampling never opens PCI, claims ownership or polls fences.
         return driver->ivars->submission.pending ? kIOReturnBusy : kIOReturnSuccess;
     }
@@ -1841,6 +1852,7 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         selector != kMacAMDGPUMethodClockSnapshot &&
         selector != kMacAMDGPUMethodSampleCachedSensors &&
         selector != kMacAMDGPUMethodSoftwareSnapshot &&
+        selector != kMacAMDGPUMethodReadMmhubPerfStatus &&
         selector != kMacAMDGPUMethodShutdownGPU &&
         selector != kMacAMDGPUMethodAtomicRequesterExperiment &&
         selector != kMacAMDGPUMethodPing && selector != kMacAMDGPUMethodQueryInfo)
@@ -1855,6 +1867,7 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         selector != kMacAMDGPUMethodMetricsSnapshot &&
         selector != kMacAMDGPUMethodClockSnapshot &&
         selector != kMacAMDGPUMethodSampleCachedSensors &&
+        selector != kMacAMDGPUMethodReadMmhubPerfStatus &&
         selector != kMacAMDGPUMethodSoftwareSnapshot &&
         selector != kMacAMDGPUMethodShutdownGPU &&
         selector != kMacAMDGPUMethodPing &&
@@ -2020,6 +2033,54 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         const auto snapshot = state.softwareStats.snapshot(clock_gettime_nsec_np(CLOCK_UPTIME_RAW), ready);
         arguments->structureOutput = OSData::withBytes(&snapshot, sizeof(snapshot));
         return arguments->structureOutput ? kIOReturnSuccess : kIOReturnNoMemory;
+    }
+
+    case kMacAMDGPUMethodReadMmhubPerfStatus: {
+        // Observer read of the driver's MMHUB PERFSTATUS sensor cache.
+        // Output: [status, raw PERFSTATUS register, cumulative busy Q8
+        // (20-bit, raw>>24), collectedAtNs CLOCK_UPTIME_RAW].
+        if (arguments->scalarInputCount != 0 || arguments->scalarOutput == nullptr ||
+            arguments->scalarOutputCount < 4 || arguments->structureInput ||
+            arguments->structureInputDescriptor || arguments->structureOutputDescriptor ||
+            arguments->structureOutputMaximumSize != 0)
+            return kIOReturnBadArgument;
+        auto &state = *driver->ivars;
+        auto &cache = state.mmhubPerfStatus;
+        if (!(state.pciOpen && !state.stopping && !state.shutdownBlocked &&
+              !state.shutdownInProgress &&
+              state.bringup.reached == amdgpu::BringupStage::SDMAInit &&
+              state.bringup.device.ip.isResolved(amdgpu::IPBlock::MMHUB))) {
+            // Cache never primed: report the source as unavailable rather
+            // than publishing a stale value from a previous session.
+            cache = {};
+        } else if (cache.lastSampleNs == 0 ||
+                   clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - cache.lastSampleNs
+                       >= MacAMDGPU_IVars::kMmhubPerfStatusSampleIntervalNs) {
+            // ExternalMethod already runs on the driver's serialized
+            // lifecycle (default) queue, so the MMIO below is ordered with
+            // every bringup/teardown mutation. Cache at ~1 Hz to bound
+            // MMIO frequency, like selector 63's SMU sensor cache.
+            const uint32_t mmhub_base = state.bringup.device.ip.get(amdgpu::IPBlock::MMHUB);
+            const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            auto &bdev = state.bringup.device;
+            bdev.pci->MemoryWrite32(bdev.bar5MemIndex,
+                static_cast<uint64_t>(mmhub_base + amdgpu::MMHUBRegs::MM_PERFCTR0) * 4ULL,
+                amdgpu::MMHUBRegs::MM_PERFCTR0_UMC_BUSY_SELECT);
+            uint32_t raw = 0xFFFFFFFFu;
+            bdev.pci->MemoryRead32(bdev.bar5MemIndex,
+                static_cast<uint64_t>(mmhub_base + amdgpu::MMHUBRegs::MM_PERFSTATUS) * 4ULL,
+                &raw);
+            cache.lastSampleNs = now;
+            cache.raw = raw;
+            cache.collectedAtNs = now;
+            cache.status = 0;
+        }
+        arguments->scalarOutput[0] = cache.status;
+        arguments->scalarOutput[1] = cache.raw;
+        arguments->scalarOutput[2] = (cache.raw >> 24) & amdgpu::MMHUBRegs::kMmhubPerfStatusCountMask;
+        arguments->scalarOutput[3] = cache.collectedAtNs;
+        arguments->scalarOutputCount = 4;
+        return kIOReturnSuccess;
     }
 
     case kMacAMDGPUMethodPing: {
