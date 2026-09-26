@@ -431,12 +431,68 @@ void dashboard(const std::vector<mtop::Device> &devices, const mtop::Selection &
             for (auto it = history.points.rbegin(); it != history.points.rend(); ++it) {
                 if (it->umcPercent && !it->umcSource.empty()) { umcSourceLabel = it->umcSource; break; }
             }
-            if (umcSourceLabel.empty()) umcSourceLabel = "SMU UmcActivityPercent (firmware table offset 126; UMC busy 0-100%)";
+            if (umcSourceLabel.empty())
+                umcSourceLabel = mtop::fresh(*d, now) &&
+                        (d->metrics.validFields & (uint64_t(1) << UmcActivityPercent)) &&
+                        d->metrics.values[UmcActivityPercent] <= 100u
+                    ? "SMU UmcActivityPercent (firmware table offset 126; UMC busy 0-100%)"
+                    : "MMHUB PERFSTATUS UMC busy (hardware PERFCTR delta, selector 68; 0-100%)";
             const auto copyBuckets=history.buckets(60,now,&mtop::ActivityPoint::transferMiBPerSecond);
+            // Y-axis labels for a chart of `rows` text rows: each quarter
+            // (100/75/50/25/0) labels the row nearest its position, so the
+            // five labels never overflow the row budget. 5+ rows show all
+            // five; 4 rows show only 100%/0% (the middle quarters would sit
+            // a row apart with 50% dropped, which reads as a broken axis);
+            // a single row shows 0% (the baseline). Matches the original
+            // 20-row chart's nearest-quarter convention.
+            const auto ylabels=[&](size_t rows)->std::vector<std::optional<unsigned>>{
+                std::vector<std::optional<unsigned>> out(rows);
+                if (!rows) return out;
+                const double denom=double(rows-1);
+                const std::array<unsigned,5> quarters{100u,75u,50u,25u,0u};
+                // 4-row charts: only 100% and 0% (middle quarters would be
+                // misplaced). 1-row: only 0% (the baseline). 5+ rows: all five.
+                const unsigned skip = (rows==4) ? 3u : 0u; // skip 75/50/25
+                for (unsigned i=0;i<5;++i) {
+                    if (skip && i>0 && i<4) continue;
+                    const unsigned q=quarters[i];
+                    const double target=(100.0-double(q))*denom/100.0;
+                    const size_t r=std::min<size_t>(rows-1,size_t(std::lround(target)));
+                    out[r]=q; // last quarter wins a tie; with 1 row only 0%
+                }
+                return out;
+            };
+            // Adaptive chart budget: the charts must fit the terminal, not
+            // vice versa. `rows` covers everything the dashboard renders
+            // (measured from the actual render at 40x100):
+            //   device-list header (3 rows single GPU, 4+ multi) + GPU CORE
+            //   LOAD chart block + SMU MEMORY ACTIVITY chart block + VRAM /
+            //   POWER block (8 rows) + GRBM block (17 rows, 16 hidden) +
+            //   processes block (8 rows) + footer (1 row) + blank separators
+            //   (4 rows, 3 hidden). Charts get what is left, split between
+            //   the two, clamped to a floor of 4 text rows (one braille cell
+            //   row: still a chart) and a ceiling of 20 (five braille cell
+            //   rows: the full 5-row axis).
+            const unsigned blankSep = engines ? 4u : 3u;
+            const unsigned grbmRows = engines ? 17u : 16u;
+            const unsigned headerRows = devices.size() > 1u ? 4u : 3u;
+            const unsigned vramRows = 8u;
+            const unsigned procRows = 8u;
+            const unsigned otherRows = headerRows + vramRows + grbmRows + procRows + 1u + blankSep;
+            const unsigned chartBudget = rows > otherRows ? rows - otherRows : 0u;
+            unsigned chartRows = chartBudget / 2u;
+            // Floor: 4 text rows = one braille cell row, the smallest thing
+            // that still reads as a chart. The floor may consume terminal
+            // rows on very short terminals; the interactive frame resize
+            // below absorbs the overflow so the footer is never clipped.
+            if (chartRows > 20u) chartRows = 20u;
+            if (chartRows < 4u) chartRows = 4u;
             // One labeled Braille activity chart (same treatment as GPU CORE
-            // LOAD): 5-row Y-axis, Braille matrix, X-axis caption, and a
-            // min/max/avg footer computed from the plotted window. `title` is
-            // the top border text; `source` is a dim caption citing the field.
+            // LOAD): adaptive-height Y-axis, Braille matrix, X-axis caption,
+            // and a min/max/avg footer computed from the plotted window.
+            // `title` is the top border text; `source` is a dim caption
+            // citing the field. Y-axis labels degrade gracefully on short
+            // charts: all five quarters at 5+ rows, 100/0% at 4 rows.
             const auto activityChart=[&](std::vector<std::optional<double>> buckets,
                                          const std::string &title,const std::string &source){
                 const std::optional<double> current=buckets.empty()?std::optional<double>{}:buckets.back();
@@ -445,10 +501,10 @@ void dashboard(const std::vector<mtop::Device> &devices, const mtop::Selection &
                 const size_t n=std::min<size_t>(buckets.size(),chCells*2);
                 std::vector<std::optional<double>> plot;
                 for(size_t i=0;i<n;++i) plot.push_back(buckets[buckets.size()-n+i]);
-                const auto br=braille(plot,5,100.0);
+                const auto br=braille(plot,(chartRows+3)/4,100.0);
+                const auto labels=ylabels(br.rows.size());
                 for(size_t r=0;r<br.rows.size();++r) {
-                    const unsigned percent=100u-(unsigned)(r*100/br.rows.size());
-                    const std::string label=(percent%25==0 ? std::to_string(percent)+"%" : std::string(4,' '));
+                    const std::string label=labels[r] ? std::to_string(*labels[r])+"%" : std::string(4,' ');
                     line(cell(columns,palette.label(label)+"  "+palette.label(br.rows[r])));
                 }
                 line(cell(columns,palette.label(xaxis(chCells))));
@@ -507,10 +563,10 @@ void dashboard(const std::vector<mtop::Device> &devices, const mtop::Selection &
             std::vector<std::optional<double>> plot;
             for(size_t i=0;i<xCount;++i)
                 plot.push_back(utilizationBuckets[utilizationBuckets.size()-xCount+i]);
-            auto br=braille(plot,5,100.0);
+            auto br=braille(plot,(chartRows+3)/4,100.0);
+            const auto labels=ylabels(br.rows.size());
             for(size_t r=0;r<br.rows.size();++r) {
-                const unsigned percent=100u-(unsigned)(r*100/br.rows.size());
-                const std::string label=(percent%25==0 ? std::to_string(percent)+"%" : std::string(4,' '));
+                const std::string label=labels[r] ? std::to_string(*labels[r])+"%" : std::string(4,' ');
                 line(cell(columns,palette.label(label)+"  "+palette.label(br.rows[r])));
             }
             line(cell(columns,palette.label(xaxis(cells))));

@@ -92,18 +92,32 @@ int main() {
     assert(visible.find("build 195") != std::string::npos);
     assert(visible.find("initialized") != std::string::npos);
 
-    // Section 2: GPU CORE LOAD with Braille chart.
+    // Section 2: GPU CORE LOAD with Braille chart. At 50 rows the chart
+    // budget is small (4 text rows), so the Y-axis degrades to 100%/0%.
     assert(visible.find("GPU CORE LOAD") != std::string::npos);
     assert(visible.find("100%") != std::string::npos);
-    assert(visible.find("75%") != std::string::npos);
-    assert(visible.find("50%") != std::string::npos);
-    assert(visible.find("25%") != std::string::npos);
     assert(visible.find("0%") != std::string::npos);
     assert(visible.find("1m") != std::string::npos);
     assert(visible.find("45s") != std::string::npos);
     assert(visible.find("30s") != std::string::npos);
     assert(visible.find("15s") != std::string::npos);
     assert(visible.find("0s") != std::string::npos);
+
+    // Tall terminal: charts grow back to the full 5-cell-row height and the
+    // Y-axis shows all quarter labels (100/75/50/25/0%).
+    captured.str(""); captured.clear();
+    previous = std::cout.rdbuf(captured.rdbuf());
+    mtop::Frame tallLayout;
+    dashboard({d}, selected, {}, false, false, &histories, {}, 120, 100, now,
+              mtop::Graphics::Text, &tallLayout, false, &ui);
+    std::cout.rdbuf(previous);
+    auto tallVisible = strip(captured.str());
+    assert(tallVisible.find("GPU CORE LOAD") != std::string::npos);
+    assert(tallVisible.find("100%") != std::string::npos);
+    assert(tallVisible.find("75%") != std::string::npos);
+    assert(tallVisible.find("50%") != std::string::npos);
+    assert(tallVisible.find("25%") != std::string::npos);
+    assert(tallVisible.find("0%") != std::string::npos);
 
     // SMU MEMORY ACTIVITY (UMC) chart: a real memory-side 0-100% counter,
     // not gfx activity and not a bare n/a. The chart is labeled and cites the
@@ -204,19 +218,55 @@ int main() {
 
     assert(visible.find("n/a (no in-flight sample window yet)") != std::string::npos);
 
-    // --- Interactive mode: footer is the last row, hotkeys work ---
+    // --- Interactive mode at 50 rows: the full dashboard must fit without
+    //     clipping. This is the user-visible regression from c5b0313 (40-row
+    //     charts pushed every panel below the fold on a normal terminal).
+    //     Both charts are present (adaptive height >= 4 text rows), and every
+    //     panel from the e8e7c49 rework is visible in the 50-row frame. ---
     captured.str(""); captured.clear();
     previous = std::cout.rdbuf(captured.rdbuf());
-    mtop::Frame interactive;
+    mtop::Frame fit50;
     ui.sort.kind = mtop::tui::Sort::Vram;
     dashboard({d}, selected, {}, true, false, &histories, mtop::RefreshMode{true},
-              120, 80, now, mtop::Graphics::Text, &interactive, false, &ui);
+              120, 50, now, mtop::Graphics::Text, &fit50, false, &ui);
     std::cout.rdbuf(previous);
-    auto interactiveVisible = strip(interactive.previous.back());
-    assert(interactiveVisible.find("[q] Quit") != std::string::npos);
-    assert(interactiveVisible.find("Interval: 10ms") != std::string::npos);
+    auto fit50Visible = strip(captured.str());
+    // Frame is exactly 50 lines, footer last.
+    assert(fit50.previous.size() == 50);
+    assert(strip(fit50.previous.back()).find("[q] Quit") != std::string::npos);
+    assert(strip(fit50.previous.back()).find("Interval: 10ms") != std::string::npos);
     // Sort label reflects the ui state.
-    assert(strip(captured.str()).find("sort: VRAM") != std::string::npos);
+    assert(fit50Visible.find("sort: VRAM") != std::string::npos);
+    // Both charts are present with their axis captions.
+    assert(fit50Visible.find("GPU CORE LOAD") != std::string::npos);
+    assert(fit50Visible.find("SMU MEMORY ACTIVITY (UMC)") != std::string::npos);
+    assert(fit50Visible.find("100%") != std::string::npos);
+    assert(fit50Visible.find("0%") != std::string::npos);
+    assert(fit50Visible.find("0s") != std::string::npos);
+    // Every panel below the charts is still on screen.
+    assert(fit50Visible.find("VRAM USAGE") != std::string::npos);
+    assert(fit50Visible.find("POWER & SENSOR STATE") != std::string::npos);
+    assert(fit50Visible.find("PERFORMANCE COUNTERS (GRBM / GRBM2)") != std::string::npos);
+    assert(fit50Visible.find("[GRBM2 Status]") != std::string::npos);
+    assert(fit50Visible.find("Primitive Assembly (PA)") != std::string::npos);
+    assert(fit50Visible.find("GPU PROCESSES (fdinfo)") != std::string::npos);
+
+    // --- Tall terminal (80 rows): charts grow back toward the ceiling, all
+    //     panels remain present, footer is the last row. ---
+    captured.str(""); captured.clear();
+    previous = std::cout.rdbuf(captured.rdbuf());
+    mtop::Frame fit80;
+    dashboard({d}, selected, {}, true, false, &histories, mtop::RefreshMode{true},
+              120, 80, now, mtop::Graphics::Text, &fit80, false, &ui);
+    std::cout.rdbuf(previous);
+    auto fit80Visible = strip(captured.str());
+    assert(fit80.previous.size() == 80);
+    assert(strip(fit80.previous.back()).find("[q] Quit") != std::string::npos);
+    assert(fit80Visible.find("GPU CORE LOAD") != std::string::npos);
+    assert(fit80Visible.find("SMU MEMORY ACTIVITY (UMC)") != std::string::npos);
+    assert(fit80Visible.find("VRAM USAGE") != std::string::npos);
+    assert(fit80Visible.find("PERFORMANCE COUNTERS (GRBM / GRBM2)") != std::string::npos);
+    assert(fit80Visible.find("GPU PROCESSES (fdinfo)") != std::string::npos);
 
     // --- Engine toggle: 'r' hides the GRBM section ---
     ui.enginesVisible = false;
