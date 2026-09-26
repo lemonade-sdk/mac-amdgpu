@@ -112,6 +112,25 @@ final class SampleHistory {
     // the GFX engine). The caption states the scale is adaptive, not a fixed
     // busy percentage, so it is not read as CU occupancy.
     private var peakGfxRatePerSec: Double = 0
+    // Last computed GPU-load value, forward-filled across the driver's ~1 Hz
+    // sample repeats (the TUI polls at 10 Hz) so the chart is continuous.
+    private var lastCoreValue: Double?
+    // Wall-clock time (nowNs) of the last fresh GPU-load sample; used to expire
+    // the held value once the driver stops reporting new work.
+    private var lastCoreNs: UInt64?
+    // Driver sample time of the last work advance (informational / for expiry).
+    private var lastWorkNs: UInt64 = 0
+    // Consecutive below-peak samples before the reference eases down. During a
+    // steady decode the per-sample rate fluctuates, so we require a sustained
+    // run of low samples (not a single one) before decaying the peak, keeping a
+    // saturated decode reading near 100 instead of deflating to ~50.
+    private var gfxLowStreak: Int = 0
+    private let gfxLowStreakThreshold: Int = 3
+    // How long (wall clock) to hold the last GPU-load value after the driver
+    // stops reporting new work before it decays to 0. ~1.5s is long enough to
+    // bridge the driver's 1 Hz sample gap, short enough that a finished decode
+    // drops to 0 promptly instead of staying stuck.
+    private let coreHoldMaxNs: UInt64 = 1_500_000_000
     // When the current rate is below the reference, decay the reference toward
     // it by this fraction each sample (a ~1 Hz driver cadence, so 0.05 gives a
     // ~20-sample / ~20s time-constant). When the current rate exceeds it, the
@@ -173,24 +192,43 @@ final class SampleHistory {
         if d.softwareSupported, !d.software.saturated {
             let gfxSubmitted = d.software.engines[2].submitted  // Engine::GFX
             var ratio: Double?
+            let sampledNow = d.software.sampledAtNs
+            // The driver re-samples the software stats at its own ~1 Hz cadence,
+            // but the TUI polls at 10 Hz. Several consecutive polls return the
+            // SAME cached snapshot (identical sampledAtNs). Only an advancing
+            // sampledAtNs carries new counter data. On a real advance compute
+            // the fresh rate; otherwise hold/decay the last value (see below).
+            var sawFreshData = false
             if let prev = previousBusy,
                prev.generation == d.software.generation,
-               prev.timeNs < d.software.sampledAtNs,
+               prev.timeNs < sampledNow,
                prev.gfxSubmitted <= gfxSubmitted,
-               d.software.sampledAtNs - prev.timeNs <= 2_000_000_000 {
+               sampledNow - prev.timeNs <= 2_000_000_000 {
                 let delta = gfxSubmitted - prev.gfxSubmitted
-                let elapsed = d.software.sampledAtNs - prev.timeNs
+                let elapsed = sampledNow - prev.timeNs
                 if elapsed > 0 {
                     let ratePerSec = Double(delta) / Double(elapsed) * 1e9   // packets / sec
                     if ratePerSec > 0, ratePerSec.isFinite {
-                        // Fast up, slow down: calibrate instantly on a new
-                        // burst, otherwise decay the reference toward the
-                        // current rate so lighter work reads higher and the
-                        // number tracks current load instead of freezing.
+                        sawFreshData = true
+                        lastWorkNs = sampledNow
+                        // The reference tracks the peak rate. It rises
+                        // instantly on a new burst (fast calibration). It only
+                        // decays when the current rate stays below it for a
+                        // sustained run of samples, NOT on every low sample:
+                        // during a steady decode the per-sample rate fluctuates
+                        // (a decode step may land between 1 Hz samples), and
+                        // decaying on each low sample deflated the reference
+                        // mid-decode, making a saturated run read ~50 instead
+                        // of ~100. We require `gfxLowStreak` consecutive
+                        // below-peak samples before the reference eases down.
                         if ratePerSec > peakGfxRatePerSec {
                             peakGfxRatePerSec = ratePerSec
+                            gfxLowStreak = 0
                         } else {
-                            peakGfxRatePerSec += (ratePerSec - peakGfxRatePerSec) * gfxRateDecay
+                            gfxLowStreak += 1
+                            if gfxLowStreak >= gfxLowStreakThreshold {
+                                peakGfxRatePerSec += (ratePerSec - peakGfxRatePerSec) * gfxRateDecay
+                            }
                         }
                         if peakGfxRatePerSec > 0 {
                             ratio = min(max(ratePerSec / peakGfxRatePerSec * 100.0, 0.0), 100.0)
@@ -198,14 +236,40 @@ final class SampleHistory {
                     }
                 }
             }
-            previousBusy = (d.software.generation, d.software.sampledAtNs,
+            previousBusy = (d.software.generation, sampledNow,
                             d.software.publishedPackets, 0, [0, 0, 0, 0], gfxSubmitted)
             if let value = ratio {
-                core = value
+                lastCoreValue = value
+                lastCoreNs = now
                 lastCoreSource = "GFX dispatch-rate proxy (adaptive scale, decays toward current) - tracks real GFX compute work; NOT a busy % (no working busy counter on gfx1201)"
+                core = value
+            } else {
+                // No fresh rate this poll (stale repeat, first sample, or the
+                // driver re-sampled but the counter did not advance = idle).
+                // Hold the last value across stale repeats so the line is
+                // continuous at the driver's ~1 Hz rate, but EXPIRE it once the
+                // driver stops reporting new work: after `coreHoldMaxNs` with no
+                // fresh data the held value decays to 0, so the bar drops when
+                // the decode finishes instead of staying stuck at the last %.
+                if let held = lastCoreValue, let heldNs = lastCoreNs {
+                    let stale = now - heldNs
+                    if sawFreshData == false && stale <= coreHoldMaxNs {
+                        core = held
+                    } else if stale > coreHoldMaxNs {
+                        // Expired: no new work for > the hold window -> 0.
+                        core = 0
+                        lastCoreValue = nil
+                        lastCoreNs = nil
+                    }
+                    if core != nil, lastCoreSource == nil {
+                        lastCoreSource = "GFX dispatch-rate proxy (adaptive scale, decays toward current) - tracks real GFX compute work; NOT a busy % (no working busy counter on gfx1201)"
+                    }
+                }
             }
         } else {
             previousBusy = nil
+            lastCoreValue = nil
+            lastCoreNs = nil
         }
 
         // ---- UMC MEMORY ACTIVITY: same source priority as the terminal TUI ----
@@ -307,6 +371,10 @@ final class SampleHistory {
         lastUmhubReliable = false
         lastCoreSource = nil
         peakGfxRatePerSec = 0
+        lastCoreValue = nil
+        lastCoreNs = nil
+        lastWorkNs = 0
+        gfxLowStreak = 0
         peakEngineRatePerSec = [0, 0, 0, 0]
         previousEngineSubmitted = nil
         previousEngineTimeNs = nil
