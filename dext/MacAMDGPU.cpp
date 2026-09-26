@@ -2036,30 +2036,53 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
     }
 
     case kMacAMDGPUMethodReadMmhubPerfStatus: {
-        // Observer read of the driver's MMHUB PERFSTATUS sensor cache.
-        // Output: [status, raw PERFSTATUS register, cumulative busy Q8
-        // (20-bit, raw>>24), collectedAtNs CLOCK_UPTIME_RAW].
+        // Observer read of the MMHUB UMC-busy PERFSTATUS sensor.
+        //
+        // This ASIC (gfx1201 / RDNA4) has NO working MMHUB UMC-busy counter.
+        // The offset the previous build read (0x04c18, "MM_PERFSTATUS") is a
+        // fabrication: no MMHUB PERFSTATUS/PERFCTR register exists in any
+        // upstream AMD register header, and the read returned 0xFFFFFFFF
+        // (all-ones) at both idle and under verified memory-traffic load —
+        // i.e. an unmapped MMIO address, not a slow-to-arrive counter. The only
+        // firmware UMC-activity field (SMU AverageUclkActivity, table offset
+        // 126) reads ~0-1% even under a verified copy sweep, so it is not a
+        // useful memory-busy proxy on this host either (see
+        // dext/amdgpu/amdgpu_ip.h and docs/GPU_MONITOR.md).
+        //
+        // We therefore report a distinct "unavailable" status rather than
+        // publishing 0xFFFFFFFF as if it were a live counter. Output keeps the
+        // 4-scalar ABI: [status, raw, umcBusyQ8, collectedAtNs], where status
+        // is kIOReturnUnsupported (iokit_common_err(0x2c7)) when the source is
+        // unavailable (the only case on this ASIC today) so consumers can tell
+        // "no counter" from "counter read 0".
         if (arguments->scalarInputCount != 0 || arguments->scalarOutput == nullptr ||
             arguments->scalarOutputCount < 4 || arguments->structureInput ||
             arguments->structureInputDescriptor || arguments->structureOutputDescriptor ||
             arguments->structureOutputMaximumSize != 0)
             return kIOReturnBadArgument;
         auto &state = *driver->ivars;
+        const bool available =
+            amdgpu::MMHUBRegs::kMmhubPerfStatusSupported &&
+            state.pciOpen && !state.stopping && !state.shutdownBlocked &&
+            !state.shutdownInProgress &&
+            state.bringup.reached == amdgpu::BringupStage::SDMAInit &&
+            state.bringup.device.ip.isResolved(amdgpu::IPBlock::MMHUB);
+        if (!available) {
+            // No hardware UMC-busy counter on this ASIC. Report unavailable
+            // with zeroed data so no consumer misreads 0xFFFFFFFF as a value.
+            arguments->scalarOutput[0] = static_cast<uint64_t>(kIOReturnUnsupported);
+            arguments->scalarOutput[1] = 0;
+            arguments->scalarOutput[2] = 0;
+            arguments->scalarOutput[3] = 0;
+            arguments->scalarOutputCount = 4;
+            return kIOReturnSuccess;
+        }
+        // (Unsupported on gfx1201 today; retained for a future ASIC that
+        // exposes a real MMHUB UMC-busy PERFSTATUS.)
         auto &cache = state.mmhubPerfStatus;
-        if (!(state.pciOpen && !state.stopping && !state.shutdownBlocked &&
-              !state.shutdownInProgress &&
-              state.bringup.reached == amdgpu::BringupStage::SDMAInit &&
-              state.bringup.device.ip.isResolved(amdgpu::IPBlock::MMHUB))) {
-            // Cache never primed: report the source as unavailable rather
-            // than publishing a stale value from a previous session.
-            cache = {};
-        } else if (cache.lastSampleNs == 0 ||
-                   clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - cache.lastSampleNs
-                       >= MacAMDGPU_IVars::kMmhubPerfStatusSampleIntervalNs) {
-            // ExternalMethod already runs on the driver's serialized
-            // lifecycle (default) queue, so the MMIO below is ordered with
-            // every bringup/teardown mutation. Cache at ~1 Hz to bound
-            // MMIO frequency, like selector 63's SMU sensor cache.
+        if (cache.lastSampleNs == 0 ||
+            clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - cache.lastSampleNs
+                >= MacAMDGPU_IVars::kMmhubPerfStatusSampleIntervalNs) {
             const uint32_t mmhub_base = state.bringup.device.ip.get(amdgpu::IPBlock::MMHUB);
             const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
             auto &bdev = state.bringup.device;

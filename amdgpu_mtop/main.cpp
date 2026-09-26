@@ -183,7 +183,7 @@ void json(const std::vector<mtop::Device> &devices, const mtop::Selection &selec
                   << ",\"umc_activity_percent\":" << metric(d, UmcActivityPercent, 1, "", true)
                   << ",\"umc_activity_source\":\"" << (mtop::validMmhub(d, clock_gettime_nsec_np(CLOCK_UPTIME_RAW))
                       ? "MMHUB PERFSTATUS UMC busy (hardware PERFCTR delta, selector 68)"
-                      : "SMU UmcActivityPercent (firmware table offset 126); absent while the SMU table is incoherent") << "\""
+                      : "SMU UmcActivityPercent (firmware offset 126); low-sensitivity on this host (~0-1% even under real memory traffic; no MMHUB UMC-busy counter on gfx1201)") << "\""
                   << ",\"media_activity_percent\":" << metric(d, MediaActivityPercent, 1, "", true)
                   << ",\"vram_used_bytes\":null,\"gtt_used_bytes\":null"
                   << ",\"gfx_clock_mhz\":" << metric(d, GfxClockMHz, 1, "", true)
@@ -205,14 +205,18 @@ std::optional<double> hardwareValue(const mtop::Device &d,amdgpu::metrics::Field
     return double(d.metrics.values[field]);
 }
 // UMC (memory-controller) busy percentage for one sample. The SMU table's
-// UmcActivityPercent (firmware offset 126) is used when it is fresh and
-// plausible (0..100); otherwise the hardware MMHUB PERFCTR delta (selector
-// 68, build 198+) is the live source. On this host the SMU table is known to
-// be incoherent for the activity fields (AverageGfxActivity reads ~100% at
-// verified idle; UMC reads 0% under real traffic, per the build 193
-// idle/load capture in docs/GPU_MONITOR.md), so the hardware counter is
-// preferred there. The provenance label follows the value that was actually
-// used; a fake SMU value is never shown.
+// UmcActivityPercent (firmware offset 126) is the primary and, on this ASIC
+// (gfx1201), the only usable source: it is the firmware's own UMC-activity
+// field. The MMHUB PERFSTATUS register the previous build read (0x04c18) is
+// a fabrication - no such register exists in any AMD header, and it read
+// 0xFFFFFFFF at both idle and under verified memory traffic, so selector 68
+// now reports "unavailable" (see dext/MacAMDGPU.cpp). The SMU field is
+// low-sensitivity on this host (~0-1% even under a real copy sweep, build 193
+// idle/load capture, docs/GPU_MONITOR.md), so the UMC row understates true
+// memory-controller busyness; it is still the only honest value, and the
+// provenance label follows the source actually used. mmhubUmcPercent remains
+// for a future ASIC that exposes a real MMHUB UMC-busy counter; on gfx1201 it
+// always returns {} because the driver reports the source unavailable.
 std::optional<double> umcValue(const mtop::Device &d, uint64_t now,
                                std::string &source,
                                uint64_t previousUmcQ8 = 0, uint64_t previousUmcAtNs = 0) {

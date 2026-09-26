@@ -228,17 +228,27 @@ namespace MMHUBRegs {
     constexpr uint32_t kFBBaseMask = 0x00FFFFFFu;  // low 24 bits
     constexpr uint32_t kFBBaseShift = 24;          // <<24 to get MC addr
 
-    // UMC PERFSTATUS counter set — LOW MMHUB-cfg block, in the register
-    // hole between MMMC_VM_NB_MMIOLIMIT (0x04c1) and MMVM_L2_CNTL (0x04e4)
-    // in mmhub_4_1_0_offset.h (no name in the vendored header; names follow
-    // the NBIO UMC convention). PERFCTR0 bits [23:0] select which engine's
-    // busy time integrates into PERFSTATUS bits [23:0] (20-bit saturating
-    // cumulative counter, 0.25% steps); PERFCTR1 selects bits [31:24].
+    // UMC-busy PERFSTATUS counter: NOT AVAILABLE on this ASIC (gfx1201 /
+    // RDNA4). The previous build targeted MM_PERFSTATUS at 0x04c18, but that
+    // offset is a fabrication — no MMHUB PERFSTATUS/PERFCTR register exists in
+    // any upstream AMD register header (mmhub_4_1_0_offset.h and the full
+    // asic_reg tree define nothing at 0x04c18, and the only PERF* registers
+    // in the MMHUB block are DAGB0_PERFCOUNTER at 0x00a6, a different IP). The
+    // 0x04c18 read returned 0xFFFFFFFF (all-ones) at both idle and under a
+    // verified memory-traffic load, confirming it is an unmapped MMIO address,
+    // not a slow-to-arrive counter. The only firmware UMC-activity field (SMU
+    // AverageUclkActivity, table offset 126) reads ~0-1% even under a verified
+    // copy sweep (build 193 idle/load capture, docs/GPU_MONITOR.md), so it is
+    // not a useful memory-busy proxy either. Selector 68 therefore reports a
+    // distinct "unavailable" status rather than publishing 0xFFFFFFFF as data.
+    constexpr bool kMmhubPerfStatusSupported = false;
+    // Placeholder offsets for a FUTURE ASIC that exposes a real MMHUB UMC-busy
+    // PERFSTATUS. NOT valid on gfx1201 — kept only so the retained (currently
+    // unreachable, gated by kMmhubPerfStatusSupported) read path in
+    // MacAMDGPU.cpp still compiles. Do not read these on this ASIC.
     constexpr uint32_t MM_PERFSTATUS = 0x04c18;
     constexpr uint32_t MM_PERFCTR0   = 0x04c1c;
     constexpr uint32_t MM_PERFCTR1   = 0x04c20;
-    // PERFCTR0 source-select field (bits [23:0]); 0x01000000 enables the
-    // UMC busy-time source without touching the low bits of the field.
     constexpr uint32_t MM_PERFCTR0_UMC_BUSY_SELECT = 0x01000000u;
     constexpr uint32_t kMmhubPerfStatusCountMask   = 0xFFFFFu;  // 20-bit count
 
