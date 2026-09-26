@@ -39,6 +39,15 @@ struct DeviceProperties {
     uint64_t timestampFrequency=0;
     uint32_t maxWavesPerCU=0, wavefrontSize=0;
 };
+// Raw register-level device spec, one block of 32 dwords read by the driver's
+// observer QueryInfo (info tag 8). The driver fills it from the GC_INFO
+// discovery table (physical geometry before harvesting) and the live
+// harvest/disable-mask/SH-block register reads; header==0 means the driver has
+// not resolved the GC IP yet. The field layout travels with the driver build
+// that produced it; the HSA runtime never interprets individual words beyond
+// the validity check in spec().
+constexpr uint64_t kDeviceSpecDwords = 32;
+constexpr uint64_t kDeviceSpecDriverBuild = 197; // first driver build serving tag 8
 struct SharedBuffer { DeviceBuffer device; void *host = nullptr; uint32_t memoryType = 0; };
 struct BufferToken { uint64_t registryID = 0, token[2]{}, size = 0; };
 static_assert(sizeof(BufferToken) == 32);
@@ -49,6 +58,9 @@ public:
     virtual hsa_status_t read(DeviceSnapshot &snapshot) = 0;
     virtual bool supportsBuffers() const { return false; }
     virtual hsa_status_t properties(DeviceProperties &) { return HSA_STATUS_ERROR_INVALID_ARGUMENT; }
+    virtual hsa_status_t spec(std::array<uint64_t, kDeviceSpecDwords> &) {
+        return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    }
     virtual hsa_status_t serviceQueue(uint64_t, uint64_t &inactive) { inactive=0;return HSA_STATUS_SUCCESS; }
     virtual bool supportsSharedBuffers() const { return false; }
     virtual hsa_status_t sharedMemoryCapacity(uint64_t &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }

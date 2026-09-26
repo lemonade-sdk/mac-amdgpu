@@ -14,11 +14,17 @@ static hsa_status_t readStatus = HSA_STATUS_SUCCESS;
 static bool present = true;
 static hsa_status_t propertyStatus=HSA_STATUS_SUCCESS;
 static uint64_t gpuTimestampFrequency=100000000;
+static hsa_status_t specStatus=HSA_STATUS_SUCCESS;
+static uint64_t specWords[32];
 namespace mac_hsa {
 struct TestConnection final : Connection {
     hsa_status_t properties(DeviceProperties &properties) override {
         properties={0x7551,0xc0,0x500,0,64,4,1,gpuTimestampFrequency,32,32};
         return propertyStatus;
+    }
+    hsa_status_t spec(std::array<uint64_t, kDeviceSpecDwords> &out) override {
+        for (unsigned i = 0; i < kDeviceSpecDwords; ++i) out[i] = specWords[i];
+        return specStatus;
     }
     ~TestConnection() override { ++closed; }
     hsa_status_t read(DeviceSnapshot &snapshot) override {
@@ -144,6 +150,29 @@ int main() {
     for (char byte:productName) assert(byte=='!');
     assert(mac_hsa_agent_get_driver_info(gpu, &info, sizeof(info)) == readStatus);
     readStatus = HSA_STATUS_SUCCESS;
+    // Raw register-level spec: the 32-dword block passes through untouched,
+    // and a transport decline (older driver build, or NotReady) propagates.
+    mac_hsa_device_spec_t spec{};
+    std::memset(&spec, 0xff, sizeof(spec));
+    assert(mac_hsa_agent_get_device_spec(gpu, &spec, sizeof(spec) - 1) == HSA_STATUS_ERROR_INVALID_ARGUMENT);
+    assert(mac_hsa_agent_get_device_spec(cpu, &spec, sizeof(spec)) == HSA_STATUS_ERROR_INVALID_AGENT);
+    specWords[0] = 1; specWords[1] = 4; specWords[2] = 2; specWords[3] = 16; specWords[4] = 16;
+    specWords[5] = 32; specWords[6] = 16; specWords[7] = 128 * 1024; specWords[9] = 64;
+    specWords[10] = 0xf; specWords[23] = 0xc00c; specWords[24] = 0x3; specWords[25] = 0x100f;
+    assert(mac_hsa_agent_get_device_spec(gpu, &spec, sizeof(spec)) == HSA_STATUS_SUCCESS);
+    assert(spec.words[0] == 1 && spec.words[1] == 4 && spec.words[4] == 16 && spec.words[7] == 128 * 1024
+           && spec.words[9] == 64 && spec.words[10] == 0xf && spec.words[23] == 0xc00c
+           && spec.words[24] == 3 && spec.words[25] == 0x100f);
+    // A transport decline (older driver build, or driver NotReady) propagates and never
+    // leaves a plausible number standing: the buffer is zeroed before the call.
+    // A transport decline (older driver build, or driver NotReady) propagates
+    // and never leaves a plausible number standing: the buffer is zeroed
+    // before the call, and the runtime never writes on failure.
+    specStatus = HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    std::memset(&spec, 0, sizeof(spec));
+    assert(mac_hsa_agent_get_device_spec(gpu, &spec, sizeof(spec)) == specStatus);
+    for (auto word : spec.words) assert(word == 0);  // declined: no number stands
+    specStatus = HSA_STATUS_SUCCESS;
     hsa_queue_t *queue = reinterpret_cast<hsa_queue_t *>(1);
     assert(hsa_queue_create(gpu, 64, HSA_QUEUE_TYPE_MULTI, nullptr, nullptr, 0, 0, &queue)
            == HSA_STATUS_ERROR_INVALID_QUEUE_CREATION && !queue);

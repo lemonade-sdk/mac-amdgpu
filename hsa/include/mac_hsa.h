@@ -24,6 +24,28 @@ hsa_status_t mac_hsa_agent_get_driver_info(hsa_agent_t agent,
                                           mac_hsa_device_info_t *info,
                                           size_t info_size);
 
+// Raw register-level device spec for the agent's GPU, read by the driver's
+// observer QueryInfo (info tag 8) from the GC_INFO discovery table and the
+// live harvest / disable-mask / SH-block registers. The block is 32 dwords:
+//   [0]  header, 0 when the driver has not resolved the GC IP yet
+//   [1..8]  physical geometry: shader engines, shader arrays/SE, backends/SE,
+//          CUs/array, wavefront size, max waves/SIMD, scratch slots/CU, LDS bytes
+//   [9]  active CU count (harvested), [10..17] KFD 4x4 CU bitmap
+//   [18] active SA bitmap, [19] CC SA disable, [20] user SA disable
+//   [21] active RB bitmap, [22] active RB count
+//   [23] SH_MEM_CONFIG (VMID 0), [24] SH_MEM_BASES (VMID 0)
+//   [25] CC_GC_SHADER_ARRAY_CONFIG raw, [26] GC_USER_SHADER_ARRAY_CONFIG raw
+//   [27] GRBM_GFX_CNTL readback (0 after deselect)
+//   [28..31] reserved
+// A driver that predates the tag declines with HSA_STATUS_ERROR_INVALID_ARGUMENT.
+typedef struct mac_hsa_device_spec_s {
+    uint32_t words[32];
+} mac_hsa_device_spec_t;
+__attribute__((visibility("default")))
+hsa_status_t mac_hsa_agent_get_device_spec(hsa_agent_t agent,
+                                           mac_hsa_device_spec_t *spec,
+                                           size_t spec_size);
+
 // Raw CP dispatch timestamps in this GPU's clock domain, NOT HSA system time.
 // Enable queue profiling before its first submission. Use a fresh completion
 // signal per dispatch, SYSTEM release scope, and retain it unchanged until readout.

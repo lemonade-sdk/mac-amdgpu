@@ -297,6 +297,24 @@ hsa_status_t mac_hsa_agent_get_driver_info(hsa_agent_t handle,
     return HSA_STATUS_SUCCESS;
 }
 
+hsa_status_t mac_hsa_agent_get_device_spec(hsa_agent_t handle,
+                                           mac_hsa_device_spec_t *spec, size_t size) {
+    std::lock_guard lock(runtimeMutex);
+    if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+    if (!spec || size != sizeof(*spec)) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    const auto agent = findAgent(handle);
+    if (!agent || !agent->connection) return HSA_STATUS_ERROR_INVALID_AGENT;
+    // Zero the buffer before the call: a decline must never leave a stale or
+    // garbage number standing as though it were an answer.
+    std::array<uint64_t, mac_hsa::kDeviceSpecDwords> words{};
+    std::memset(spec, 0, sizeof(*spec));
+    const auto status = agent->connection->spec(words);
+    if (status != HSA_STATUS_SUCCESS) return status;
+    for (unsigned i = 0; i < mac_hsa::kDeviceSpecDwords; ++i)
+        spec->words[i] = uint32_t(words[i]);
+    return HSA_STATUS_SUCCESS;
+}
+
 hsa_status_t hsa_system_get_info(hsa_system_info_t attribute, void *value) {
     std::lock_guard lock(runtimeMutex);
     if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;

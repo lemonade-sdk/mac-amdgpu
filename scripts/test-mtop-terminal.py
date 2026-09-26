@@ -26,7 +26,8 @@ for protocol,program in [('kitty','kitty'),('iterm','iTerm.app'),('text','Apple_
         if process.poll() is None:process.kill();process.wait()
         os.close(master)
     stream=bytes(data);(out/(protocol+'.ansi')).write_bytes(stream)
-    assert b'DEMO (synthetic)' in stream and b'SLOW 0.5 s' in stream
+    assert b'DEMO (synthetic)' in stream
+    assert b'Interval: 10ms' in stream
     assert b'\x1b[?25h' in stream and b'\x1b[?1049l' in stream
     assert stream.count(b'\x1b[2J')==1, 'full clear only on first frame'
     images=[]
@@ -43,7 +44,7 @@ for protocol,program in [('kitty','kitty'),('iterm','iTerm.app'),('text','Apple_
         assert len(images)>=2
     else:
         assert b'\x1b_G' not in stream and b'1337;File' not in stream
-        assert any(0x2800<=ord(c)<=0x28ff for c in stream.decode())
+        assert any(0x2580<=ord(c)<=0x2588 for c in stream.decode())
     for i,png in enumerate(images[:2]):
         assert png[:8]==b'\x89PNG\r\n\x1a\n'
         (out/f'{protocol}-chart-{i}.png').write_bytes(png)
