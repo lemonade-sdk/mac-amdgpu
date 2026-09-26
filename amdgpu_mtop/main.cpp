@@ -446,9 +446,11 @@ void dashboard(const std::vector<mtop::Device> &devices, const mtop::Selection &
                 std::vector<std::optional<double>> plot;
                 for(size_t i=0;i<n;++i) plot.push_back(buckets[buckets.size()-n+i]);
                 const auto br=braille(plot,5,100.0);
-                const std::string labels[]={"100%","75%","50%","25%","0%"};
-                for(size_t r=0;r<5;++r)
-                    line(cell(columns,palette.label(labels[r])+"  "+palette.label(br.rows[r])));
+                for(size_t r=0;r<br.rows.size();++r) {
+                    const unsigned percent=100u-(unsigned)(r*100/br.rows.size());
+                    const std::string label=(percent%25==0 ? std::to_string(percent)+"%" : std::string(4,' '));
+                    line(cell(columns,palette.label(label)+"  "+palette.label(br.rows[r])));
+                }
                 line(cell(columns,palette.label(xaxis(chCells))));
                 const auto s=mtop::stats(plot);
                 line(cell(columns,palette.label("  min ")+(s?palette.value(decimal(s->at(0),1)+"%  max "):nad("n/a  max "))+
@@ -506,9 +508,11 @@ void dashboard(const std::vector<mtop::Device> &devices, const mtop::Selection &
             for(size_t i=0;i<xCount;++i)
                 plot.push_back(utilizationBuckets[utilizationBuckets.size()-xCount+i]);
             auto br=braille(plot,5,100.0);
-            const std::string labels[]={"100%","75%","50%","25%","0%"};
-            for(size_t r=0;r<5;++r)
-                line(cell(columns,palette.label(labels[r])+"  "+palette.label(br.rows[r])));
+            for(size_t r=0;r<br.rows.size();++r) {
+                const unsigned percent=100u-(unsigned)(r*100/br.rows.size());
+                const std::string label=(percent%25==0 ? std::to_string(percent)+"%" : std::string(4,' '));
+                line(cell(columns,palette.label(label)+"  "+palette.label(br.rows[r])));
+            }
             line(cell(columns,palette.label(xaxis(cells))));
             line(cell(columns,palette.label(
                 "  source: driver dispatch-in-flight (selector 61); SMU AverageGfxActivity "

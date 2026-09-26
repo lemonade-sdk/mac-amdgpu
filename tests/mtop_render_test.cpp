@@ -210,7 +210,7 @@ int main() {
     mtop::Frame interactive;
     ui.sort.kind = mtop::tui::Sort::Vram;
     dashboard({d}, selected, {}, true, false, &histories, mtop::RefreshMode{true},
-              120, 50, now, mtop::Graphics::Text, &interactive, false, &ui);
+              120, 80, now, mtop::Graphics::Text, &interactive, false, &ui);
     std::cout.rdbuf(previous);
     auto interactiveVisible = strip(interactive.previous.back());
     assert(interactiveVisible.find("[q] Quit") != std::string::npos);
