@@ -9,13 +9,18 @@ Same driver, same telemetry, real vector drawing instead of braille.
   10 Hz) of driver dispatch-in-flight utilization (software_stats selector
   61), with grid, axis labels and the current % in the panel header.
   The SMU AverageGfxActivity field is incoherent on this host and is never
-  plotted.
-- **UMC MEMORY ACTIVITY** — second chart, same treatment. Source is the
-  MMHUB PERFSTATUS hardware PERFCTR delta (selector 68, driver build 198+).
-  The SMU UmcActivityPercent field is in the same unqualified firmware
-  table as AverageGfxActivity (incoherent: it moves at verified idle and
-  reads 0% under real traffic), so it is never plotted. Blank with a
-  caption while no coherent source has samples.
+  plotted. If the in-flight counter regresses between samples (driver
+  epoch change), the window re-baselines from the last published sample
+  instead of staying blank.
+- **UMC MEMORY ACTIVITY** — second chart, same treatment. Source priority
+  matches the terminal monitor: the MMHUB PERFSTATUS hardware PERFCTR delta
+  (selector 68, driver build 198+) when it has produced a sample, otherwise
+  the SMU UmcActivityPercent firmware field (offset 126) when fresh and
+  <= 100 — the only UMC source on a pre-198 build. That field sits in the
+  unqualified SMU table (it moves at verified idle and reads 0 under
+  traffic on this host), so it is plotted with an honest caption rather
+  than silently trusted. Blank with a caption only while no source has
+  samples.
 - **VRAM / GTT** — driver CPU allocator pools (query tag 5).
 - **Clocks (SMU)** — GFX/SOC/MEMORY/FABRIC current MHz with DPM min–max
   (selector 62).

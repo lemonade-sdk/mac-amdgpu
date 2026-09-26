@@ -26,7 +26,7 @@ final class GPUSampler: ObservableObject {
     private let queue = DispatchQueue(label: "amdgpu_mtopg.sampler", qos: .userInitiated)
     private var selectedRegistry: UInt64?
 
-    static let umcDefaultLabel = "no coherent UMC source (SMU UmcActivityPercent incoherent on this host; MMHUB PERFCTR needs driver build 198+)"
+    static let umcDefaultLabel = "no UMC sample yet (fresh SMU UmcActivityPercent, or MMHUB PERFCTR on driver build 198+)"
 
     func start() {
         queue.async { [weak self] in

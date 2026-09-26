@@ -6,14 +6,16 @@
 //    counter (software_stats selector 61). The SMU AverageGfxActivity field
 //    is incoherent on this host (reads ~100% at verified idle) and is never
 //    used for the core-load chart.
-//  - UMC MEMORY ACTIVITY uses the MMHUB PERFSTATUS hardware PERFCTR delta
-//    (selector 68, driver build 198+) when it has produced a sample. The SMU
-//    UmcActivityPercent field is NOT trusted for the chart on this host: the
-//    SMU metrics table is unqualified (telemetry profile "unqualified"), and
-//    its activity fields are known incoherent — UmcActivityPercent moves at
-//    verified idle while reading 0% under real traffic (build 193
-//    idle/load capture, docs/GPU_MONITOR.md). With no coherent source the
-//    chart stays blank with an explanation — no firmware noise is plotted.
+//  - UMC MEMORY ACTIVITY matches the terminal monitor: the MMHUB PERFSTATUS
+//    hardware PERFCTR delta (selector 68, driver build 198+) is preferred
+//    when it has produced a sample; otherwise the SMU UmcActivityPercent
+//    field is shown when fresh and plausible (0..100). That field lives in
+//    the same unqualified SMU table as AverageGfxActivity and is known
+//    incoherent on this host (it moves at verified idle and reads 0% under
+//    real traffic, per the build 193 idle/load capture in
+//    docs/GPU_MONITOR.md), so its caption says so. On a pre-198 build it is
+//    the only UMC source that exists; a permanently blank chart would hide a
+//    real firmware number, so it is plotted with the honest caption.
 //
 // MIT License — see the repository LICENSE.
 
@@ -85,6 +87,7 @@ final class SampleHistory {
 
     private(set) var points: [Point] = []
     private var previousBusy: (generation: UInt64, timeNs: UInt64, pendingNs: UInt64, engines: [UInt64])?
+    private var lastPublishedNs: (timeNs: UInt64, generation: UInt64, pendingNs: UInt64, engines: [UInt64])?
     private var previousUmc: (q8: UInt64, atNs: UInt64)?
 
     var lastUmhubSource: String?
@@ -117,6 +120,7 @@ final class SampleHistory {
             if overflow {
                 previousBusy = nil
             } else {
+                var ratio: Double?
                 if let prev = previousBusy,
                    prev.generation == d.software.generation,
                    prev.timeNs < d.software.sampledAtNs,
@@ -126,45 +130,83 @@ final class SampleHistory {
                     let delta = pendingNs - prev.pendingNs
                     let elapsed = d.software.sampledAtNs - prev.timeNs
                     if elapsed > 0 {
-                        let ratio = Double(delta) / Double(elapsed) * 100.0
-                        if ratio >= 0, ratio.isFinite {
-                            core = min(max(ratio, 0), 100)
+                        let candidate = Double(delta) / Double(elapsed) * 100.0
+                        if candidate >= 0, candidate.isFinite { ratio = min(candidate, 100) }
+                    }
+                }
+                // Counter regression (generation change, or the driver retired
+                // unobserved in-flight work at session teardown and the new
+                // epoch's union counter starts below the old one): re-baseline
+                // from the last *published* window instead of dropping the
+                // sample. The terminal TUI keeps plotting across the
+                // load -> idle -> load transitions this way; if the published
+                // baseline is from another epoch (or still ahead), the window
+                // is simply unavailable for one sample.
+                if ratio == nil, let last = lastPublishedNs,
+                   last.timeNs < d.software.sampledAtNs,
+                   d.software.sampledAtNs - last.timeNs <= 2_000_000_000,
+                   last.engines.count == engines.count {
+                    if last.generation == d.software.generation,
+                       last.pendingNs <= pendingNs {
+                        let elapsed = d.software.sampledAtNs - last.timeNs
+                        if elapsed > 0 {
+                            let candidate = Double(pendingNs - last.pendingNs) / Double(elapsed) * 100.0
+                            if candidate >= 0, candidate.isFinite { ratio = min(candidate, 100) }
                         }
+                    } else if previousBusy == nil ||
+                              previousBusy!.generation != last.generation ||
+                              previousBusy!.pendingNs > pendingNs {
+                        // The current baseline is itself stale (a retired
+                        // session's counters): reset to the published epoch.
+                        previousBusy = (last.generation, last.timeNs, last.pendingNs, last.engines)
                     }
                 }
                 previousBusy = (d.software.generation, d.software.sampledAtNs, pendingNs, engines)
+                if let value = ratio {
+                    core = value
+                    lastPublishedNs = (d.software.sampledAtNs, d.software.generation, pendingNs, engines)
+                }
             }
         } else {
             previousBusy = nil
         }
 
-        // ---- UMC MEMORY ACTIVITY: MMHUB PERFCTR delta; the SMU field is incoherent ----
-        // The SMU UmcActivityPercent field (firmware table offset 126) is in the
-        // same unqualified/incoherent table as AverageGfxActivity: it moves at
-        // verified idle and reads 0% under real traffic. It is therefore never
-        // plotted for the chart; the honest source is the MMHUB PERFSTATUS
-        // hardware PERFCTR delta (selector 68, driver build 198+). Until that
-        // counter exists the chart stays blank with a caption explaining why.
+        // ---- UMC MEMORY ACTIVITY: same source priority as the terminal TUI ----
+        // The MMHUB PERFSTATUS hardware PERFCTR delta (selector 68, build 198+)
+        // is preferred while it has produced a sample. Otherwise the SMU
+        // UmcActivityPercent field (firmware offset 126) is shown when fresh
+        // and plausible: it is the only UMC source that exists on a pre-198
+        // build, and although it sits in the unqualified SMU table (it moves
+        // at verified idle and reads 0% under real traffic on this host), it
+        // is a real firmware number — plotted with the honest caption, exactly
+        // as the terminal monitor does.
         var umcSource: String?
-        do {
-            // MMHUB PERFSTATUS (build 198+, stage 15 only, observer cached).
-            let m = d.mmhub
-            if m.valid, d.stage == 15, m.status == 0,
-               m.collectedAtNs <= now, now - m.collectedAtNs <= kSMUMetricsStaleAfterNs,
-               let prev = previousUmc, prev.atNs < m.collectedAtNs, prev.q8 <= m.umcBusyQ8 {
-                let elapsed = m.collectedAtNs - prev.atNs
-                if elapsed >= 1_000_000_000 && elapsed <= 2_000_000_000 {
-                    let ratio = Double(m.umcBusyQ8 - prev.q8) /
-                                (Double(kMMHUBPerfStatusMaxQ8) * Double(elapsed) / 1e9) * 100.0
-                    if ratio >= 0, ratio.isFinite {
-                        umc = min(max(ratio, 0), 100)
-                        umcSource = "MMHUB PERFSTATUS UMC busy (hardware PERFCTR delta, selector 68; 0-100%)"
-                    }
+        let m = d.mmhub
+        let mmhubValid = m.valid && d.stage == 15 && m.status == 0 &&
+            m.collectedAtNs <= now && now - m.collectedAtNs <= kSMUMetricsStaleAfterNs
+        if mmhubValid,
+           let prev = previousUmc, prev.atNs < m.collectedAtNs, prev.q8 <= m.umcBusyQ8 {
+            let elapsed = m.collectedAtNs - prev.atNs
+            if elapsed >= 1_000_000_000 && elapsed <= 2_000_000_000 {
+                let ratio = Double(m.umcBusyQ8 - prev.q8) /
+                            (Double(kMMHUBPerfStatusMaxQ8) * Double(elapsed) / 1e9) * 100.0
+                if ratio >= 0, ratio.isFinite {
+                    umc = min(max(ratio, 0), 100)
+                    umcSource = "MMHUB PERFSTATUS UMC busy (hardware PERFCTR delta, selector 68; 0-100%)"
                 }
             }
         }
-        previousUmc = d.mmhub.valid && d.stage == 15 && d.mmhub.status == 0
-            ? (d.mmhub.umcBusyQ8, d.mmhub.collectedAtNs) : nil
+        if umc == nil, let smu = d.smuValue(.umcActivityPercent), smu <= 100 {
+            // SMU fallback, matching the terminal TUI exactly: on a pre-198
+            // build this is the only UMC source that exists; on 198+ it
+            // bridges the first second while the MMHUB delta has no window
+            // yet. It is a real firmware number, just from the unqualified
+            // SMU table (moves at verified idle, reads 0 under traffic on
+            // this host), so the caption says so.
+            umc = smu
+            umcSource = "SMU UmcActivityPercent (firmware table offset 126; UMC busy 0-100%) — unqualified firmware field on this host (moves at idle, 0 under traffic)"
+        }
+        previousUmc = mmhubValid ? (m.umcBusyQ8, m.collectedAtNs) : nil
         if umc != nil, let s = umcSource { lastUmhubSource = s }
 
         points.append(Point(timeNs: now, core: core, umc: umc))
@@ -194,6 +236,7 @@ final class SampleHistory {
     func reset() {
         points.removeAll()
         previousBusy = nil
+        lastPublishedNs = nil
         previousUmc = nil
         lastUmhubSource = nil
     }
