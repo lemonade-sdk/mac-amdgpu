@@ -43,7 +43,7 @@ for protocol,program in [('kitty','kitty'),('iterm','iTerm.app'),('text','Apple_
         assert len(images)>=2
     else:
         assert b'\x1b_G' not in stream and b'1337;File' not in stream
-        assert any(0x2800<=ord(c)<=0x28ff for c in stream.decode())
+        assert any(0x2580<=ord(c)<=0x2588 for c in stream.decode())
     for i,png in enumerate(images[:2]):
         assert png[:8]==b'\x89PNG\r\n\x1a\n'
         (out/f'{protocol}-chart-{i}.png').write_bytes(png)
