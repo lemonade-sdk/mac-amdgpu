@@ -251,16 +251,20 @@ struct ContentView: View {
                         .foregroundStyle(Palette.dim)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                Panel(title: "UMC Memory Activity",
-                      right: snap.umcCurrent != nil ? "[ \(fmt(snap.umcCurrent, 0))% ]" : "[ n/a ]") {
+                Panel(title: snap.umcReliable ? "UMC Memory Activity"
+                                              : "UMC Memory Activity  ⚠ unreliable",
+                      right: snap.umcCurrent != nil
+                         ? "[ \(fmt(snap.umcCurrent, 0))% \(snap.umcReliable ? "" : "(firmware avg, not memory-busy)") ]"
+                         : "[ n/a ]") {
                     TimeSeriesChart(samples: snap.umcActivity, windowSeconds: 60,
                                     color: Palette.umc, fill: Palette.umcFill,
                                     hasData: snap.umcActivity.contains { $0.value != nil },
-                                    emptyCaption: "no UMC samples yet (waiting for a fresh SMU UmcActivityPercent; MMHUB PERFCTR arrives with driver build 198+)")
+                                    emptyCaption: "no UMC samples yet (waiting for a fresh SMU UmcActivityPercent; MMHUB PERFCTR is unavailable on this ASIC — the MMHUB PERFSTATUS register does not exist in the RDNA4 register map)")
                         .frame(height: 150)
+                        .opacity(snap.umcReliable ? 1.0 : 0.45)
                     Text("source: " + (snap.umcSourceLabel ?? "none"))
                         .font(.system(size: 9, design: .monospaced))
-                        .foregroundStyle(Palette.dim)
+                        .foregroundStyle(snap.umcReliable ? Palette.dim : .orange)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }

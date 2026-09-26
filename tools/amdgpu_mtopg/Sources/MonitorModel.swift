@@ -53,6 +53,11 @@ struct TelemetrySnapshot {
     var coreLoad: [(age: Double, value: Double?)] = []
     var umcActivity: [(age: Double, value: Double?)] = []
     var umcSourceLabel: String?   // label of the most recent plotted source
+    // False when the plotted UMC number is a known-incoherent firmware field
+    // (the SMU UmcActivityPercent average) rather than a true memory-busy
+    // counter. The panel dims the readout + chart and adds a marker so a
+    // user reading "UMC 0%" under load is not misled.
+    var umcReliable: Bool = false
     var coreCurrent: Double?      // latest published sample
 
     var selectedDeviceID: UInt64?
@@ -94,6 +99,7 @@ final class SampleHistory {
     private var previousUmc: (q8: UInt64, atNs: UInt64)?
 
     var lastUmhubSource: String?
+    var lastUmhubReliable: Bool = false
 
     // The plotted window as (age-from-`nowNs`-seconds, value), oldest ->
     // newest. Ages come from the sample timestamps, not the array index, so
@@ -201,6 +207,7 @@ final class SampleHistory {
         // is a real firmware number — plotted with the honest caption, exactly
         // as the terminal monitor does.
         var umcSource: String?
+        var umcReliable = false
         let m = d.mmhub
         // usable() additionally rejects an all-ones raw PERFSTATUS register
         // (unmapped MMIO; see MmhubPerfStatus.usable), which the driver
@@ -215,6 +222,7 @@ final class SampleHistory {
                             (Double(kMMHUBPerfStatusMaxQ8) * Double(elapsed) / 1e9) * 100.0
                 if ratio >= 0, ratio.isFinite {
                     umc = min(max(ratio, 0), 100)
+                    umcReliable = true
                     umcSource = "MMHUB PERFSTATUS UMC busy (hardware PERFCTR delta, selector 68; 0-100%)"
                 }
             }
@@ -227,10 +235,12 @@ final class SampleHistory {
             // SMU table (moves at verified idle, reads 0 under traffic on
             // this host), so the caption says so.
             umc = smu
+            umcReliable = false
             umcSource = "SMU UmcActivityPercent (firmware table offset 126; UMC busy 0-100%) — unqualified firmware field on this host (moves at idle, 0 under traffic)"
         }
         previousUmc = mmhubValid ? (m.umcBusyQ8, m.collectedAtNs) : nil
         if umc != nil, let s = umcSource { lastUmhubSource = s }
+        if umc != nil { lastUmhubReliable = umcReliable }
 
         points.append(Point(timeNs: now, core: core, umc: umc))
         while !points.isEmpty,
@@ -263,6 +273,7 @@ final class SampleHistory {
         lastPublishedNs = nil
         previousUmc = nil
         lastUmhubSource = nil
+        lastUmhubReliable = false
     }
 }
 
@@ -274,15 +285,26 @@ func makeSnapshot(device: Device?, history: SampleHistory,
     let nowNs = device?.nowNs ?? clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
     snap.coreLoad = history.series(\.core, nowNs: nowNs)
     snap.umcActivity = history.series(\.umc, nowNs: nowNs)
-    // On this host the MMHUB PERFSTATUS register (selector 68) is all-ones
-    // both at idle and under load, so the hardware PERFCTR delta has no
-    // window and the plotted UMC source is the SMU fallback. Explain that
-    // instead of implying the MMHUB source is merely not ready yet.
+    // Reliability: a plotted UMC value is trustworthy only when it came from
+    // the MMHUB hardware PERFCTR delta. On this ASIC (gfx1201 / RDNA4) the
+    // MMHUB "PERFSTATUS" register the driver reads (selector 68, offset
+    // 0x04c18) does not exist in the RDNA4 register map — it sits inside a
+    // contiguous run of defined VM/steering registers — so the read always
+    // returns the unmapped-register default 0xFFFFFFFF. The fallback, the
+    // SMU UmcActivityPercent firmware average, is uncalibrated: it moves at
+    // verified idle and reads 0 under real traffic (the opposite of a memory
+    // busy counter). State both facts rather than implying the MMHUB source
+    // is merely not ready yet.
+    let mmhubDead = device.map { d in
+        d.stage == 15 && d.mmhub.valid && d.mmhub.status == 0 && d.mmhub.raw == 0xFFFFFFFF
+    } ?? false
+    let hwAvailable = history.lastUmhubReliable
+    snap.umcReliable = hwAvailable && !mmhubDead
     var umcLabel = history.lastUmhubSource ?? umcDefaultLabel
-    if let d = device, d.stage == 15, d.mmhub.valid, d.mmhub.status == 0,
-       d.mmhub.raw == 0xFFFFFFFF {
-        umcLabel = history.lastUmhubSource ??
-            "SMU UmcActivityPercent fallback; MMHUB PERFSTATUS (selector 68) register reads 0xFFFFFFFF on this ASIC (verified idle + load), so no hardware UMC-busy counter"
+    if mmhubDead {
+        umcLabel = hwAvailable
+            ? "MMHUB PERFSTATUS UMC busy (hardware PERFCTR delta, selector 68; 0-100%)"
+            : "UNRELIABLE — SMU UmcActivityPercent firmware average (offset 126); NOT a memory-busy counter. MMHUB PERFSTATUS (selector 68, offset 0x04c18) does not exist in the RDNA4 register map (verified: reads 0xFFFFFFFF idle + load; surrounding 0x04c7/0x0564/0x05cf registers are live), so there is no hardware UMC-busy counter on this ASIC."
     }
     snap.umcSourceLabel = umcLabel
     snap.coreCurrent = history.coreCurrent
