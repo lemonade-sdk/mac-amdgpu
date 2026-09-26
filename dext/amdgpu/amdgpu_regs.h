@@ -59,8 +59,10 @@ struct DeviceContext {
     uint8_t      bar0MemIndex;
     uint8_t      bar2MemIndex;
     uint8_t      bar5MemIndex;
+    uint8_t      bar4MemIndex; // ReBAR (GART) aperture; 0 when absent
     uint64_t     bar0Size;
     uint64_t     bar2Size;            // doorbell aperture, not VRAM
+    uint64_t     bar4Size;            // GART aperture size (>= host window)
 #endif
     IPBaseTable  ip;
     bool         psoCAlive;

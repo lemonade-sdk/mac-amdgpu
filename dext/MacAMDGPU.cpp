@@ -133,6 +133,13 @@ enum {
     kMacAMDGPUMethodClockSnapshot = 62,
     kMacAMDGPUMethodSampleCachedSensors = 63,
     kMacAMDGPUMethodReadMmhubPerfStatus = 68, // UMC busy accumulator, observer only
+    // Observer read of the shared SQ busy-cycle slot. The workload process
+    // (the HRX LSE backend) publishes {seq, sq_busy, ref, clock_hz} from a
+    // real aqlprofile SQ performance counter into a GTT buffer it registered
+    // once via kMacAMDGPUMethodRegisterSqSlot (64); mtopg reads it here with
+    // no allocations of its own. Read-only, observer only.
+    kMacAMDGPUMethodRegisterSqSlot      = 64, // workload-owned shared slot registration
+    kMacAMDGPUMethodReadSqSlot          = 69, // SQ busy-cycle slot, observer only
 };
 
 // v0.1.28 — IP types accepted by CSCreate. Match the upstream
@@ -369,7 +376,15 @@ struct MacAMDGPU_IVars {
         uint32_t raw = 0;            // full PERFSTATUS register value
         uint64_t collectedAtNs = 0;  // CLOCK_UPTIME_RAW of last sample
     } mmhubPerfStatus{};
-    uint64_t nextAQLHandle; // Never reset with the bringup arena.
+    // Shared SQ busy-cycle observer slot: the workload process registers a
+    // GTT buffer (16 bytes: 4 x u32 little-endian {seq, sq_busy, ref, clock})
+    // that its CPU-side profiler thread writes; observer clients read it via
+    // kMacAMDGPUMethodReadSqSlot. cpuWords is the dext's own mapping of the
+    // same GART range (the HSA transport maps it identically for the writer).
+    struct SqSlot {
+        uint64_t boHandle = 0;
+        void *cpuWords = nullptr;  // 16 bytes, dext-mapped for observer reads
+    } sqSlot{};    uint64_t nextAQLHandle; // Never reset with the bringup arena.
     uint16_t deviceID;
     uint16_t pciBDF;
     uint8_t revision;
@@ -771,6 +786,18 @@ mac_amdgpu_ensure_open(IOService *opener, MacAMDGPU *driver,
 
     auto &bdev = driver->ivars->bringup.device;
     bdev.pci = pci;
+    // BAR4 (ReBAR aperture) is the dext-side window into the GART range:
+    // the shared SQ slot BO's GART address is read through it (see
+    // kMacAMDGPUMethodRegisterSqSlot). Its size equals the ReBAR size,
+    // which is at least the configured host window.
+    // Wire the BAR4 (ReBAR/GART) aperture before anything can use it: the
+    // shared SQ slot BO's GART address is read through this window.
+    {
+        uint8_t mi = 0; uint64_t sz = 0; uint8_t ty = 0;
+        if (pci->GetBARInfo(4, &mi, &sz, &ty) == kIOReturnSuccess && sz > 0) {
+            bdev.bar4MemIndex = mi; bdev.bar4Size = sz;
+        }
+    }
     bdev.softwareStats = &driver->ivars->softwareStats;
     bdev.psoCAlive = false;
     bdev.smuOnline = false;
@@ -878,7 +905,8 @@ mac_amdgpu_admit_external(IOService *client, MacAMDGPU *driver,
     if (selector == kMacAMDGPUMethodMESAddQueue) return kIOReturnUnsupported;
     if (selector == kMacAMDGPUMethodAtomicRequesterExperiment) return kIOReturnSuccess; // transition owns admission
     if (selector == kMacAMDGPUMethodSampleCachedSensors ||
-        selector == kMacAMDGPUMethodReadMmhubPerfStatus) {
+        selector == kMacAMDGPUMethodReadMmhubPerfStatus ||
+        selector == kMacAMDGPUMethodReadSqSlot) {
         // Observer sampling never opens PCI, claims ownership or polls fences.
         return driver->ivars->submission.pending ? kIOReturnBusy : kIOReturnSuccess;
     }
@@ -1853,6 +1881,7 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         selector != kMacAMDGPUMethodSampleCachedSensors &&
         selector != kMacAMDGPUMethodSoftwareSnapshot &&
         selector != kMacAMDGPUMethodReadMmhubPerfStatus &&
+        selector != kMacAMDGPUMethodReadSqSlot &&
         selector != kMacAMDGPUMethodShutdownGPU &&
         selector != kMacAMDGPUMethodAtomicRequesterExperiment &&
         selector != kMacAMDGPUMethodPing && selector != kMacAMDGPUMethodQueryInfo)
@@ -1869,6 +1898,7 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         selector != kMacAMDGPUMethodSampleCachedSensors &&
         selector != kMacAMDGPUMethodReadMmhubPerfStatus &&
         selector != kMacAMDGPUMethodSoftwareSnapshot &&
+        selector != kMacAMDGPUMethodReadSqSlot &&
         selector != kMacAMDGPUMethodShutdownGPU &&
         selector != kMacAMDGPUMethodPing &&
         selector != kMacAMDGPUMethodQueryInfo &&
@@ -2103,6 +2133,119 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         arguments->scalarOutput[2] = (cache.raw >> 24) & amdgpu::MMHUBRegs::kMmhubPerfStatusCountMask;
         arguments->scalarOutput[3] = cache.collectedAtNs;
         arguments->scalarOutputCount = 4;
+        return kIOReturnSuccess;
+    }
+
+    case kMacAMDGPUMethodRegisterSqSlot: {
+        // The workload process (HRX LSE backend) registers the GTT buffer its
+        // SQ busy-cycle profiler writes. The dext keeps its own CPU mapping of
+        // the same GART range so observer clients can read the slot without
+        // any of their own allocations. One slot per dext instance; the
+        // second registration replaces the first (a restarted server must not
+        // wedge the slot).
+        if (!arguments->scalarInput || arguments->scalarInputCount != 1 ||
+            !arguments->scalarOutput || arguments->scalarOutputCount < 1 ||
+            arguments->structureInput || arguments->structureInputDescriptor ||
+            arguments->structureOutputDescriptor ||
+            arguments->structureOutputMaximumSize != 0)
+            return kIOReturnBadArgument;
+        auto &state = *driver->ivars;
+        auto *bo = mac_amdgpu_bo_lookup(ivars, arguments->scalarInput[0]);
+        if (!bo || bo->size < 16 || bo->domain != kBODomainGTT)
+            return kIOReturnBadArgument;
+        auto *words = mac_amdgpu_bo_cpu_addr(ivars, bo);
+        if (!words) return kIOReturnNotReady;
+        // A slot registered by another workload (different BO) is refused:
+        // two writers into one slot would interleave sequences. A restarted
+        // server re-registering its own buffer replaces the stale mapping.
+        if (state.sqSlot.boHandle && state.sqSlot.boHandle != bo->handle)
+            return kIOReturnBusy;
+        state.sqSlot.cpuWords = words;
+        state.sqSlot.boHandle = bo->handle;
+        arguments->scalarOutput[0] = 0;
+        arguments->scalarOutputCount = 1;
+        return kIOReturnSuccess;
+    }
+
+    case kMacAMDGPUMethodReadSqSlot: {
+        // Observer read of the shared SQ busy-cycle slot published by the
+        // workload process: [status, seq, sq_busy, ref, clock_hz]. The values
+        // are real aqlprofile SQ performance-counter sums over a fixed window
+        // (see the LSE sq_profiler); status is kIOReturnUnsupported while no
+        // slot is registered so consumers can say "no source" instead of 0.
+        if (arguments->scalarInputCount != 0 || arguments->scalarOutput == nullptr ||
+            arguments->scalarOutputCount < 5 || arguments->structureInput ||
+            arguments->structureInputDescriptor || arguments->structureOutputDescriptor ||
+            arguments->structureOutputMaximumSize != 0)
+            return kIOReturnBadArgument;
+        auto &state = *driver->ivars;
+        if (!state.sqSlot.cpuWords) {
+            arguments->scalarOutput[0] = static_cast<uint64_t>(kIOReturnUnsupported);
+            arguments->scalarOutput[1] = 0;
+            arguments->scalarOutput[2] = 0;
+            arguments->scalarOutput[3] = 0;
+            arguments->scalarOutput[4] = 0;
+            arguments->scalarOutputCount = 5;
+            return kIOReturnSuccess;
+        }
+        // The slot lives in the GART range; the dext reaches it through the
+        // BAR4 (ReBAR) aperture: GART address = gartStart + (gpu_va -
+        // hostWindowBase). Read four dwords; this is a plain MMIO read, not a
+        // fence or a write — it cannot perturb the workload.
+        auto &b = state.bringup;
+        auto *pci = mac_amdgpu_pci(driver);
+        if (pci == nullptr || !state.pciOpen || b.device.bar4MemIndex == 0 ||
+            b.gart.gartStart == 0 || !b.gart.hostWindowConfigured) {
+            arguments->scalarOutput[0] = static_cast<uint64_t>(kIOReturnNotReady);
+            arguments->scalarOutput[1] = 0;
+            arguments->scalarOutput[2] = 0;
+            arguments->scalarOutput[3] = 0;
+            arguments->scalarOutput[4] = 0;
+            arguments->scalarOutputCount = 5;
+            return kIOReturnSuccess;
+        }
+        auto *slotBo = mac_amdgpu_bo_lookup(ivars, state.sqSlot.boHandle);
+        if (!slotBo) {
+            // The registering process released its buffer; clear the stale
+            // slot so the next registration is clean.
+            state.sqSlot = {};
+            arguments->scalarOutput[0] = static_cast<uint64_t>(kIOReturnUnsupported);
+            arguments->scalarOutput[1] = 0;
+            arguments->scalarOutput[2] = 0;
+            arguments->scalarOutput[3] = 0;
+            arguments->scalarOutput[4] = 0;
+            arguments->scalarOutputCount = 5;
+            return kIOReturnSuccess;
+        }
+        const uint64_t gpuVa = mac_amdgpu_bo_gpu_addr(ivars, slotBo);
+        const uint64_t gartBase = b.gart.gartStart;
+        // hostWindowBase is the gartStart of the window the HSA transport
+        // configured; gpuVa - gartBase is the offset within BAR4.
+        const uint64_t bar4Offset = gpuVa - gartBase;
+        if (bar4Offset + 16 > b.device.bar4Size) {
+            arguments->scalarOutput[0] = static_cast<uint64_t>(kIOReturnNotReady);
+            arguments->scalarOutput[1] = 0;
+            arguments->scalarOutput[2] = 0;
+            arguments->scalarOutput[3] = 0;
+            arguments->scalarOutput[4] = 0;
+            arguments->scalarOutputCount = 5;
+            return kIOReturnSuccess;
+        }
+        uint32_t words[4] = {0, 0, 0, 0};
+        for (int i = 0; i < 4; ++i) {
+            pci->MemoryRead32(b.device.bar4MemIndex, bar4Offset + i * 4, &words[i]);
+        }
+        // seq is written last by the producer (release), the data words first
+        // (relaxed): re-read seq and use the earlier value if the producer
+        // advanced mid-read, so the four words come from one window.
+        uint32_t seq1 = 0;
+        pci->MemoryRead32(b.device.bar4MemIndex, bar4Offset, &seq1);
+        arguments->scalarOutput[0] = 0;
+        arguments->scalarOutput[1] = seq1 < words[0] ? seq1 : words[0];
+        arguments->scalarOutput[2] = words[1];
+        arguments->scalarOutput[3] = words[2];
+        arguments->scalarOutput[4] = words[3];
+        arguments->scalarOutputCount = 5;
         return kIOReturnSuccess;
     }
 

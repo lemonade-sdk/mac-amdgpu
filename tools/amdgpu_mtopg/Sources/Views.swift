@@ -58,6 +58,8 @@ enum Palette {
     static let accentFill = Color(red: 0.35, green: 0.85, blue: 0.95).opacity(0.16)
     static let umc = Color(red: 0.55, green: 0.85, blue: 0.45)      // UMC green
     static let umcFill = Color(red: 0.55, green: 0.85, blue: 0.45).opacity(0.14)
+    static let sq = Color(red: 0.80, green: 0.55, blue: 0.95)        // SQ busy violet
+    static let sqFill = Color(red: 0.80, green: 0.55, blue: 0.95).opacity(0.14)
     static let warm = Color(red: 0.95, green: 0.62, blue: 0.35)
 }
 
@@ -274,6 +276,21 @@ struct ContentView: View {
                     Text("source: " + (snap.umcSourceLabel ?? "none"))
                         .font(.system(size: 9, design: .monospaced))
                         .foregroundStyle(snap.umcReliable ? Palette.dim : .orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                Panel(title: "SQ Busy % (hardware counter)",
+                      right: snap.sqBusyCurrent != nil
+                         ? "[ \(fmt(snap.sqBusyCurrent, 0))% ]"
+                         : "[ n/a ]") {
+                    TimeSeriesChart(samples: snap.sqBusy, windowSeconds: 60,
+                                    color: Palette.sq, fill: Palette.sqFill,
+                                    hasData: snap.sqBusy.contains { $0.value != nil },
+                                    emptyCaption: "no SQ busy-cycle windows yet (workload process must publish the shared slot, driver 200+)")
+                        .frame(height: 150)
+                    Text("source: " + (snap.sqBusySourceLabel ??
+                        "no shared SQ slot registered (the LSE server publishes aqlprofile SQ_BUSY_CYCLES sums when built with the SQ profiler; real hardware counter, NOT the dispatch-rate proxy)"))
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(Palette.dim)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }

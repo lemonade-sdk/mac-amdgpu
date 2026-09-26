@@ -704,11 +704,12 @@ diff --git a/src/backends/hrx/CMakeLists.txt b/src/backends/hrx/CMakeLists.txt
 index 2f05ce3..cb4b625 100644
 --- a/src/backends/hrx/CMakeLists.txt
 +++ b/src/backends/hrx/CMakeLists.txt
-@@ -23,10 +23,11 @@ add_library(lse_backend_hrx
+@@ -23,10 +23,12 @@ add_library(lse_backend_hrx
    hipc/hip_types.cpp
    kernels/dist_codec.cpp
    kernels/probe.cpp
 +  kernels/probe_loom.cpp
++  sq_profiler.cpp
  )
  add_library(lse::backend_hrx ALIAS lse_backend_hrx)
  

@@ -60,6 +60,12 @@ struct TelemetrySnapshot {
     // user reading "UMC 0%" under load is not misled.
     var umcReliable: Bool = false
     var coreCurrent: Double?      // latest published sample
+    // Real-hardware SQ busy % (aqlprofile SQ_BUSY_CYCLES via the LSE backend,
+    // published into the shared GART slot, selector 69). nil = no source
+    // registered / no fresh window yet; 0 = source says no work this window.
+    var sqBusy: [(age: Double, value: Double?)] = []
+    var sqBusyCurrent: Double?
+    var sqBusySourceLabel: String?
 
     var selectedDeviceID: UInt64?
 
@@ -89,6 +95,7 @@ final class SampleHistory {
         var timeNs: UInt64
         var core: Double?
         var umc: Double?
+        var sqBusy: Double?
     }
 
     private(set) var points: [Point] = []
@@ -115,6 +122,13 @@ final class SampleHistory {
     // Last computed GPU-load value, forward-filled across the driver's ~1 Hz
     // sample repeats (the TUI polls at 10 Hz) so the chart is continuous.
     private var lastCoreValue: Double?
+    // SQ busy % tracking: the slot publishes one window every ~500 ms (seq
+    // advances); we convert each fresh window to busy % and hold it until the
+    // next window. seq comparison handles driver clock gaps and restarts.
+    private var lastSqSeq: UInt32 = 0
+    private var lastSqValue: Double?
+    private var lastSqNs: UInt64?
+    private let sqHoldMaxNs: UInt64 = 2_500_000_000  // ~5 windows of silence
     // Wall-clock time (nowNs) of the last fresh GPU-load sample; used to expire
     // the held value once the driver stops reporting new work.
     private var lastCoreNs: UInt64?
@@ -155,11 +169,43 @@ final class SampleHistory {
     }
 
     var coreCurrent: Double? { points.last { $0.core != nil }?.core }
+    var sqBusyCurrent: Double? { points.last { $0.sqBusy != nil }?.sqBusy }
 
     func add(_ d: Device) {
         let now = d.nowNs
         var core: Double?
         var umc: Double?
+        var sq: Double?
+
+        // ---- SQ BUSY % (selector 69, driver 200+): real hardware counter ----
+        // The workload process (HRX LSE backend) sums aqlprofile SQ busy
+        // cycles over a fixed window and publishes {seq, sq_busy, ref, clock}
+        // into the shared GART slot. busy % = sq_busy / ref * 100, clamped;
+        // a fresh seq means a fresh window, so hold the last value across the
+        // ~500 ms gap and expire it after ~2.5 s of silence (the panel drops
+        // to a gap instead of showing a stale number).
+        if d.sqSlot.valid, d.sqSlot.seq != lastSqSeq {
+            lastSqSeq = d.sqSlot.seq
+            if d.sqSlot.refTicks > 0, d.sqSlot.sqBusy <= d.sqSlot.refTicks * 100 {
+                // sqBusy is a sum over ALL CUs, refTicks is per-dispatch tick
+                // range: the ratio is a per-CU average only when the driver
+                // normalizes. We clamp at 100 and label the panel honestly
+                // ("SQ busy cycles / reference cycles, all CUs").
+                let pct = Double(d.sqSlot.sqBusy) / Double(d.sqSlot.refTicks) * 100.0
+                lastSqValue = min(max(pct, 0), 100)
+            } else {
+                lastSqValue = d.sqSlot.sqBusy > 0 ? 100.0 : 0.0
+            }
+            lastSqNs = now
+        }
+        if let held = lastSqValue, let heldNs = lastSqNs {
+            if now - heldNs <= sqHoldMaxNs {
+                sq = held
+            } else {
+                lastSqValue = nil
+                lastSqNs = nil
+            }
+        }
 
         // The driver's selector 61 handler calls observe() on every AQL queue
         // before returning the snapshot. Queues whose read index can no longer
@@ -317,7 +363,7 @@ final class SampleHistory {
         if umc != nil, let s = umcSource { lastUmhubSource = s }
         if umc != nil { lastUmhubReliable = umcReliable }
 
-        points.append(Point(timeNs: now, core: core, umc: umc))
+        points.append(Point(timeNs: now, core: core, umc: umc, sqBusy: sq))
         while !points.isEmpty,
               now > points[0].timeNs, now - points[0].timeNs >= Self.windowNs {
             points.removeFirst()
@@ -370,6 +416,9 @@ final class SampleHistory {
         lastUmhubSource = nil
         lastUmhubReliable = false
         lastCoreSource = nil
+        lastSqSeq = 0
+        lastSqValue = nil
+        lastSqNs = nil
         peakGfxRatePerSec = 0
         lastCoreValue = nil
         lastCoreNs = nil
@@ -390,6 +439,8 @@ func makeSnapshot(device: Device?, history: SampleHistory,
     let nowNs = device?.nowNs ?? clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
     snap.coreLoad = history.series(\.core, nowNs: nowNs)
     snap.umcActivity = history.series(\.umc, nowNs: nowNs)
+    snap.sqBusy = history.series(\.sqBusy, nowNs: nowNs)
+    snap.sqBusyCurrent = history.sqBusyCurrent
     // Reliability: a plotted UMC value is trustworthy only when it came from
     // the MMHUB hardware PERFCTR delta. On this ASIC (gfx1201 / RDNA4) the
     // MMHUB "PERFSTATUS" register the driver reads (selector 68, offset
@@ -410,6 +461,9 @@ func makeSnapshot(device: Device?, history: SampleHistory,
     } ?? false
     let hwAvailable = history.lastUmhubReliable
     snap.umcReliable = hwAvailable && !mmhubDead
+    snap.sqBusySourceLabel = history.sqBusyCurrent != nil
+        ? "Real hardware SQ busy-cycle counter (aqlprofile SQ_BUSY_CYCLES, via the LSE workload process; all-CU sum over a ~0.5 s window) - NOT CU occupancy, NOT the dispatch-rate proxy"
+        : nil
     var umcLabel = history.lastUmhubSource ?? umcDefaultLabel
     if mmhubDead {
         umcLabel = hwAvailable

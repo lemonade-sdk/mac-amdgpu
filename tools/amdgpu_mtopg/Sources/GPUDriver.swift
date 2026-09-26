@@ -48,11 +48,13 @@ enum DriverABI {
     static let selClocks: UInt32 = 62       // struct out: SMUClockSnapshot (96 B)
     static let selSoftware: UInt32 = 61     // struct out: software_stats::Snapshot (456 B)
     static let selSensors: UInt32 = 63      // out: 3 u64 (bounded sensor cache)
+    static let selSqSlot: UInt32 = 69       // out: 5 u64 [status, seq, sq_busy, ref, clock]
     static let selMmhub: UInt32 = 68        // out: 4 u64 PERFSTATUS UMC busy
 
     static let minimumBuild: UInt32 = 172
     static let softwareMinimumBuild: UInt32 = 193
     static let mmhubMinimumBuild: UInt32 = 198
+    static let sqSlotMinimumBuild: UInt32 = 200
     static let magic: UInt64 = 0x414D444750554142 // "AMDGPUAB"
 
     // Struct payload sizes (C static_asserts in dext/amdgpu).
@@ -214,6 +216,19 @@ struct SoftwareStatsSnapshot {
     }
 }
 
+// The shared SQ busy-cycle slot as published by the workload process
+// (HRX LSE backend sq_profiler: aqlprofile SQ performance counter sums over a
+// fixed window) and read by the dext through the BAR4/GART window.
+// status != 0 means no slot registered / source unavailable (show n/a, not 0).
+struct SqSlotSample {
+    var status: UInt32 = 0     // 0 = fresh sample below
+    var seq: UInt32 = 0        // monotonic window counter (wraps)
+    var sqBusy: UInt32 = 0     // SQ busy cycles accumulated in the window
+    var refTicks: UInt32 = 0   // reference cycles (tick range) in the window
+    var clockHz: UInt32 = 0    // 0 = wall-clock-bounded window (ns in refTicks)
+    var valid = false
+}
+
 struct MmhubPerfStatus {
     var status: UInt32 = 0
     var raw: UInt32 = 0
@@ -261,6 +276,10 @@ final class Device {
     var accountingSupported = false
     var accountingError: String?
     var mmhub = MmhubPerfStatus()
+    // Shared SQ busy-cycle slot (selector 69, driver 200+): the workload
+    // process (HRX LSE backend) publishes real aqlprofile SQ counter sums
+    // into a GART slot; status != 0 means no slot is registered yet.
+    var sqSlot = SqSlotSample()
 
     var label: String {
         "0x" + String(registry, radix: 16)
@@ -373,6 +392,31 @@ final class DriverTransport {
                 }
             } else {
                 device.softwareError = krString("Software counters", kr)
+            }
+        }
+
+        // Shared SQ busy-cycle slot (selector 69, build 200+): five scalars
+        // [status, seq, sq_busy, ref, clock]. Observer-only, no allocation.
+        // A zeroed slot (seq 0, no data) is a legitimate "source says no
+        // work yet" reading once the workload has registered, so status==0
+        // with words present is valid even at seq == 0.
+        if device.build >= DriverABI.sqSlotMinimumBuild {
+            var words = [UInt64](repeating: 0, count: 5)
+            let kr = scalar(DriverABI.selSqSlot, [], into: &words)
+            if kr == KERN_SUCCESS, words[0] == 0 {
+                device.sqSlot = SqSlotSample(
+                    status: 0,
+                    seq: UInt32(words[1]),
+                    sqBusy: UInt32(words[2]),
+                    refTicks: UInt32(words[3]),
+                    clockHz: UInt32(words[4]))
+                device.sqSlot.valid = true
+            } else if kr == KERN_SUCCESS {
+                // status != 0 (no slot registered yet): leave invalid, the
+                // panel shows the honest n/a.
+                device.sqSlot.status = UInt32(words[0])
+            } else {
+                device.sqSlot.status = UInt32(kr)
             }
         }
 
