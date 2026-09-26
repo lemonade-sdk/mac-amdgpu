@@ -86,7 +86,10 @@ final class SampleHistory {
     }
 
     private(set) var points: [Point] = []
-    private var previousBusy: (generation: UInt64, timeNs: UInt64, pendingNs: UInt64, engines: [UInt64])?
+    // previousBusy carries publishedPackets because the driver can regress it
+    // between samples (queue-observer retire, see add()); the baseline must
+    // reject the sample rather than re-baseline, matching the reference TUI.
+    private var previousBusy: (generation: UInt64, timeNs: UInt64, published: UInt64, pendingNs: UInt64, engines: [UInt64])?
     private var lastPublishedNs: (timeNs: UInt64, generation: UInt64, pendingNs: UInt64, engines: [UInt64])?
     private var previousUmc: (q8: UInt64, atNs: UInt64)?
 
@@ -106,6 +109,20 @@ final class SampleHistory {
         var core: Double?
         var umc: Double?
 
+        // The driver's selector 61 handler calls observe() on every AQL queue
+        // before returning the snapshot. Queues whose read index can no longer
+        // be sampled (owner gone, BAR remap, ...) retire their pending
+        // publishes into retiredPackets and clear published, so a single
+        // unsampleable queue makes publishedPackets REGRESS between samples.
+        // The driver's own validation accepts the snapshot, and the reference
+        // terminal TUI (amdgpu_mtop main.cpp busyPercent) gates only on the
+        // pendingNs counters, so it still plots core load. The Swift model
+        // used publishedPackets as its baseline key, which meant the union
+        // baseline reset after every regression and a 2 s window never
+        // completed: the GPU Core Load chart and all four engine rows stayed
+        // blank. Key on generation + sampledAtNs + counters, same as the
+        // reference; a true counter regression (generation change, retired
+        // in-flight work) is caught by the existing monotonicity checks.
         // ---- GPU CORE LOAD: dispatch-in-flight delta (selector 61) ----
         if d.softwareSupported, !d.software.saturated {
             var pendingNs: UInt64 = 0
@@ -123,6 +140,7 @@ final class SampleHistory {
                 var ratio: Double?
                 if let prev = previousBusy,
                    prev.generation == d.software.generation,
+                   prev.published <= d.software.publishedPackets,
                    prev.timeNs < d.software.sampledAtNs,
                    prev.pendingNs <= pendingNs,
                    d.software.sampledAtNs - prev.timeNs <= 2_000_000_000,
@@ -158,10 +176,12 @@ final class SampleHistory {
                               previousBusy!.pendingNs > pendingNs {
                         // The current baseline is itself stale (a retired
                         // session's counters): reset to the published epoch.
-                        previousBusy = (last.generation, last.timeNs, last.pendingNs, last.engines)
+                        previousBusy = (last.generation, last.timeNs,
+                                        d.software.publishedPackets, last.pendingNs, last.engines)
                     }
                 }
-                previousBusy = (d.software.generation, d.software.sampledAtNs, pendingNs, engines)
+                previousBusy = (d.software.generation, d.software.sampledAtNs,
+                                d.software.publishedPackets, pendingNs, engines)
                 if let value = ratio {
                     core = value
                     lastPublishedNs = (d.software.sampledAtNs, d.software.generation, pendingNs, engines)
@@ -223,6 +243,7 @@ final class SampleHistory {
         guard d.softwareSupported, !d.software.saturated, index < 4 else { return nil }
         guard let prev = previousBusy,
               prev.generation == d.software.generation,
+              prev.published <= d.software.publishedPackets,
               prev.timeNs < d.software.sampledAtNs,
               d.software.engines[index].pendingNs >= prev.engines[index] else { return nil }
         let delta = d.software.engines[index].pendingNs - prev.engines[index]

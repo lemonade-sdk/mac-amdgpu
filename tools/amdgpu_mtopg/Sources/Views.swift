@@ -305,11 +305,30 @@ struct ContentView: View {
                 }
                 Panel(title: "Sensors (SMU)") {
                     VStack(alignment: .leading, spacing: 4) {
-                        sensorRow("Power", snap.powerWatts.map { String(format: "%.0f W", $0) } ?? "n/a",
-                                   snap.boardPowerWatts.map { " / \(Int($0)) W cap" } ?? "")
-                        sensorRow("Edge", snap.edgeCelsius.map { String(format: "%.0f °C", $0) } ?? "n/a",
-                                   snap.hotspotCelsius.map { " (Junc \(Int($0))°C)" } ?? "")
-                        sensorRow("Fan", snap.fanRPM.map { String(format: "%.0f RPM", $0) } ?? "n/a")
+                        // Power: board limit when the SMU exposes it, else a
+                        // sensible cap for the 300 W-class R9700 mobile GPU.
+                        Meter(label: "Power",
+                              value: snap.powerWatts,
+                              maxValue: snap.boardPowerWatts.map { $0 > 0 ? $0 : nil } ?? 300,
+                              text: (snap.powerWatts.map { String(format: "%.0f W", $0) } ?? "n/a")
+                                  + (snap.boardPowerWatts.map { " / \(Int($0)) W cap" } ?? ""),
+                              color: Palette.warm)
+                        Meter(label: "Edge",
+                              value: snap.edgeCelsius,
+                              maxValue: 100,
+                              text: snap.edgeCelsius.map { String(format: "%.0f °C", $0) } ?? "n/a",
+                              color: Palette.warm)
+                        // Junc (hotspot) is a separate sensor from Edge.
+                        Meter(label: "Junc",
+                              value: snap.hotspotCelsius,
+                              maxValue: 120,
+                              text: snap.hotspotCelsius.map { String(format: "%.0f °C", $0) } ?? "n/a",
+                              color: Palette.warm)
+                        Meter(label: "Fan",
+                              value: snap.fanRPM,
+                              maxValue: 5000,
+                              text: snap.fanRPM.map { String(format: "%.0f RPM", $0) } ?? "n/a",
+                              color: Palette.accent)
                     }
                 }
             }
@@ -409,15 +428,5 @@ struct ContentView: View {
                     .foregroundStyle(.red)
             }
         }
-    }
-
-    private func sensorRow(_ label: String, _ value: String, _ suffix: String = "") -> some View {
-        HStack {
-            Text(label).frame(width: 52, alignment: .leading)
-            Text(value + suffix)
-            Spacer()
-        }
-        .font(.system(size: 11, design: .monospaced))
-        .foregroundStyle(Palette.bright)
     }
 }
