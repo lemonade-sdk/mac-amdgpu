@@ -134,7 +134,16 @@ struct TimeSeriesChart: View {
             var area = Path()
             var last: CGPoint?
             for (age, value) in samples {
-                guard let v = value, v.isFinite, age <= windowSeconds else { continue }
+                // A nil / out-of-window sample is a gap (e.g. idle, when the
+                // dispatch-rate proxy emits nothing). Break the line there
+                // instead of drawing a segment straight across the gap, which
+                // reads as a glitch and makes the trace look like it jumps or
+                // restarts. Resetting `last` starts a fresh sub-path at the
+                // next real point.
+                guard let v = value, v.isFinite, age <= windowSeconds else {
+                    last = nil
+                    continue
+                }
                 let x = plot.maxX - plot.width * CGFloat(age / windowSeconds)
                 let y = plot.minY + plot.height * CGFloat(1.0 - min(max(v / 100.0, 0.0), 1.0))
                 let point = CGPoint(x: x, y: y)
@@ -246,7 +255,7 @@ struct ContentView: View {
                                     hasData: snap.coreLoad.contains { $0.value != nil },
                                     emptyCaption: "no GFX dispatch samples yet (driver idle or no work submitted)")
                         .frame(height: 150)
-                    Text("source: \(snap.coreSourceLabel ?? "GFX dispatch-rate, selector 61 (eng2 submitted delta); scale is auto-scaled to peak observed, NOT a busy %")")
+                    Text("source: \(snap.coreSourceLabel ?? "GFX dispatch-rate, selector 61 (eng2 submitted delta); adaptive scale, decays toward current - NOT a busy %")")
                         .font(.system(size: 9, design: .monospaced))
                         .foregroundStyle(Palette.dim)
                         .frame(maxWidth: .infinity, alignment: .leading)

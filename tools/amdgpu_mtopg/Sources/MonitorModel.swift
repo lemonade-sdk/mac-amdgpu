@@ -98,18 +98,25 @@ final class SampleHistory {
     private var previousBusy: (generation: UInt64, timeNs: UInt64, published: UInt64, pendingNs: UInt64, engines: [UInt64], gfxSubmitted: UInt64)?
     private var lastPublishedNs: (timeNs: UInt64, generation: UInt64, pendingNs: UInt64, engines: [UInt64])?
     private var previousUmc: (q8: UInt64, atNs: UInt64)?
-    // Peak GFX dispatch rate (packets/sec) observed so far, used to auto-scale
-    // the "GPU load" bar. The GPU load meter is a dispatch-rate proxy, not a
-    // busy %: there is no working busy counter on gfx1201 (SMU GfxActivity is
-    // pinned at 100 while the GPU is awake; GFX pendingNs is structurally 0
-    // because the driver publishes GFX work to the ring with no software-
-    // outstanding interval). The only signal that reliably tracks real GFX
-    // compute work is the per-second rate of GFX packets submitted (eng2 /
-    // the GFX engine). We normalize that rate against the peak seen so far,
-    // so a fully-saturated decode reads ~100 and idle reads 0, and the
-    // caption states the scale is adaptive-to-peak rather than a fixed busy
-    // percentage.
+    // Reference GFX dispatch rate (packets/sec) used to scale the "GPU load"
+    // bar. It is a decaying peak: it rises quickly to match a fresh burst of
+    // work (so a new decode calibrates within a second or two) but decays
+    // slowly toward the current rate when work drops, so the bar tracks
+    // CURRENT load and the number actually moves rather than freezing against
+    // a frozen all-time high. The GPU load meter is a dispatch-rate proxy,
+    // not a busy %: there is no working busy counter on gfx1201 (SMU
+    // GfxActivity is pinned at 100 while the GPU is awake; GFX pendingNs is
+    // structurally 0 because the driver publishes GFX work to the ring with no
+    // software-outstanding interval). The only signal that reliably tracks real
+    // GFX compute work is the per-second rate of GFX packets submitted (eng2 /
+    // the GFX engine). The caption states the scale is adaptive, not a fixed
+    // busy percentage, so it is not read as CU occupancy.
     private var peakGfxRatePerSec: Double = 0
+    // When the current rate is below the reference, decay the reference toward
+    // it by this fraction each sample (a ~1 Hz driver cadence, so 0.05 gives a
+    // ~20-sample / ~20s time-constant). When the current rate exceeds it, the
+    // reference jumps up to the current rate immediately (fast calibration).
+    private let gfxRateDecay: Double = 0.05
 
     var lastUmhubSource: String?
     var lastUmhubReliable: Bool = false
@@ -176,7 +183,15 @@ final class SampleHistory {
                 if elapsed > 0 {
                     let ratePerSec = Double(delta) / Double(elapsed) * 1e9   // packets / sec
                     if ratePerSec > 0, ratePerSec.isFinite {
-                        if ratePerSec > peakGfxRatePerSec { peakGfxRatePerSec = ratePerSec }
+                        // Fast up, slow down: calibrate instantly on a new
+                        // burst, otherwise decay the reference toward the
+                        // current rate so lighter work reads higher and the
+                        // number tracks current load instead of freezing.
+                        if ratePerSec > peakGfxRatePerSec {
+                            peakGfxRatePerSec = ratePerSec
+                        } else {
+                            peakGfxRatePerSec += (ratePerSec - peakGfxRatePerSec) * gfxRateDecay
+                        }
                         if peakGfxRatePerSec > 0 {
                             ratio = min(max(ratePerSec / peakGfxRatePerSec * 100.0, 0.0), 100.0)
                         }
@@ -187,7 +202,7 @@ final class SampleHistory {
                             d.software.publishedPackets, 0, [0, 0, 0, 0], gfxSubmitted)
             if let value = ratio {
                 core = value
-                lastCoreSource = "GFX dispatch-rate proxy (auto-scaled to peak observed) - tracks real GFX compute work; NOT a busy % (no working busy counter on gfx1201)"
+                lastCoreSource = "GFX dispatch-rate proxy (adaptive scale, decays toward current) - tracks real GFX compute work; NOT a busy % (no working busy counter on gfx1201)"
             }
         } else {
             previousBusy = nil
