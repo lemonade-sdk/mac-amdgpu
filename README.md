@@ -246,6 +246,10 @@ during the build and no manual selection is needed. The
 
 ## Build + install
 
+Full build guide — driver (dext) + required accessories, plus the
+`amdgpu_mtopg` / `amdgpu_mtop` monitors — is in
+[**`BUILD_INSTRUCTIONS.md`](BUILD_INSTRUCTIONS.md)**. Quick driver build:
+
 ```
 git clone git@github.com:lemonade-sdk/mac-amdgpu.git
 cd mac-amdgpu
