@@ -6,10 +6,14 @@
 //    counter (software_stats selector 61). The SMU AverageGfxActivity field
 //    is incoherent on this host (reads ~100% at verified idle) and is never
 //    used for the core-load chart.
-//  - UMC MEMORY ACTIVITY prefers the SMU UmcActivityPercent field when it is
-//    fresh and plausible; otherwise the MMHUB PERFSTATUS hardware PERFCTR
-//    delta (selector 68, driver build 198+). When neither has a value the
-//    chart stays blank with an explanation — no synthetic number.
+//  - UMC MEMORY ACTIVITY uses the MMHUB PERFSTATUS hardware PERFCTR delta
+//    (selector 68, driver build 198+) when it has produced a sample. The SMU
+//    UmcActivityPercent field is NOT trusted for the chart on this host: the
+//    SMU metrics table is unqualified (telemetry profile "unqualified"), and
+//    its activity fields are known incoherent — UmcActivityPercent moves at
+//    verified idle while reading 0% under real traffic (build 193
+//    idle/load capture, docs/GPU_MONITOR.md). With no coherent source the
+//    chart stays blank with an explanation — no firmware noise is plotted.
 //
 // MIT License — see the repository LICENSE.
 
@@ -134,13 +138,15 @@ final class SampleHistory {
             previousBusy = nil
         }
 
-        // ---- UMC MEMORY ACTIVITY: SMU field, else MMHUB PERFCTR delta ----
+        // ---- UMC MEMORY ACTIVITY: MMHUB PERFCTR delta; the SMU field is incoherent ----
+        // The SMU UmcActivityPercent field (firmware table offset 126) is in the
+        // same unqualified/incoherent table as AverageGfxActivity: it moves at
+        // verified idle and reads 0% under real traffic. It is therefore never
+        // plotted for the chart; the honest source is the MMHUB PERFSTATUS
+        // hardware PERFCTR delta (selector 68, driver build 198+). Until that
+        // counter exists the chart stays blank with a caption explaining why.
         var umcSource: String?
-        if let smu = d.smuValue(.umcActivityPercent), smu <= 100 {
-            umc = smu
-            umcSource = "SMU UmcActivityPercent (firmware table offset 126; UMC busy 0-100%)"
-        }
-        if umc == nil {
+        do {
             // MMHUB PERFSTATUS (build 198+, stage 15 only, observer cached).
             let m = d.mmhub
             if m.valid, d.stage == 15, m.status == 0,
@@ -159,7 +165,7 @@ final class SampleHistory {
         }
         previousUmc = d.mmhub.valid && d.stage == 15 && d.mmhub.status == 0
             ? (d.mmhub.umcBusyQ8, d.mmhub.collectedAtNs) : nil
-        if let s = umcSource { lastUmhubSource = s }
+        if umc != nil, let s = umcSource { lastUmhubSource = s }
 
         points.append(Point(timeNs: now, core: core, umc: umc))
         while !points.isEmpty,
