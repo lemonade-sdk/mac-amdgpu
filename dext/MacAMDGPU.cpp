@@ -2055,7 +2055,7 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             cache = {};
         } else if (cache.lastSampleNs == 0 ||
                    clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - cache.lastSampleNs
-                       >= kMmhubPerfStatusSampleIntervalNs) {
+                       >= MacAMDGPU_IVars::kMmhubPerfStatusSampleIntervalNs) {
             // ExternalMethod already runs on the driver's serialized
             // lifecycle (default) queue, so the MMIO below is ordered with
             // every bringup/teardown mutation. Cache at ~1 Hz to bound
