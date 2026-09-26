@@ -202,7 +202,10 @@ final class SampleHistory {
         // as the terminal monitor does.
         var umcSource: String?
         let m = d.mmhub
-        let mmhubValid = m.valid && d.stage == 15 && m.status == 0 &&
+        // usable() additionally rejects an all-ones raw PERFSTATUS register
+        // (unmapped MMIO; see MmhubPerfStatus.usable), which the driver
+        // reports with status 0 on the R9700.
+        let mmhubValid = m.usable && d.stage == 15 &&
             m.collectedAtNs <= now && now - m.collectedAtNs <= kSMUMetricsStaleAfterNs
         if mmhubValid,
            let prev = previousUmc, prev.atNs < m.collectedAtNs, prev.q8 <= m.umcBusyQ8 {
@@ -271,7 +274,17 @@ func makeSnapshot(device: Device?, history: SampleHistory,
     let nowNs = device?.nowNs ?? clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
     snap.coreLoad = history.series(\.core, nowNs: nowNs)
     snap.umcActivity = history.series(\.umc, nowNs: nowNs)
-    snap.umcSourceLabel = history.lastUmhubSource ?? umcDefaultLabel
+    // On this host the MMHUB PERFSTATUS register (selector 68) is all-ones
+    // both at idle and under load, so the hardware PERFCTR delta has no
+    // window and the plotted UMC source is the SMU fallback. Explain that
+    // instead of implying the MMHUB source is merely not ready yet.
+    var umcLabel = history.lastUmhubSource ?? umcDefaultLabel
+    if let d = device, d.stage == 15, d.mmhub.valid, d.mmhub.status == 0,
+       d.mmhub.raw == 0xFFFFFFFF {
+        umcLabel = history.lastUmhubSource ??
+            "SMU UmcActivityPercent fallback; MMHUB PERFSTATUS (selector 68) register reads 0xFFFFFFFF on this ASIC (verified idle + load), so no hardware UMC-busy counter"
+    }
+    snap.umcSourceLabel = umcLabel
     snap.coreCurrent = history.coreCurrent
     if let e = device?.error {
         // Device is bound but this read failed: show the specific failure so

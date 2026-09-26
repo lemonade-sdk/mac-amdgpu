@@ -210,6 +210,19 @@ struct MmhubPerfStatus {
     var umcBusyQ8: UInt64 = 0
     var collectedAtNs: UInt64 = 0
     var valid = false
+
+    /// The PERFSTATUS register reads 0xFFFFFFFF (all bits set) when the MMIO
+    /// hit an unmapped/unsupported register slot. The driver's selector 68
+    /// still reports status 0 in that case (the read itself succeeded), so
+    /// consumers must reject an all-ones raw register as a live source: the
+    /// upper 8 bits carry only the low byte of the 20-bit UMC-busy count and
+    /// never advance, so any delta window computed from it is noise. Verified
+    /// on the R9700 (driver 198): the register is all-ones both at idle and
+    /// under an active LSE decode, i.e. this ASIC does not map the UMC
+    /// PERFSTATUS set the driver samples.
+    var usable: Bool {
+        valid && status == 0 && raw != 0xFFFFFFFF
+    }
 }
 
 // MARK: - Device
