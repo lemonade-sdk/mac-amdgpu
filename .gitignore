@@ -34,3 +34,4 @@ DerivedData/
 
 # IDE / editor scratch dirs.
 .pi/
+build-tui/

@@ -13,6 +13,9 @@ struct RateCounters {
     uint64_t generation=0, timeNs=0, submitted=0, completedBytes=0;
     uint64_t pendingNs=0; // Cumulative in-flight interval union (busy counter).
     std::array<uint64_t,5> directions{};
+    // Per-engine dispatch-in-flight union counters (driver software_stats
+    // selector 61). Index order matches amdgpu::software_stats::Engine.
+    std::array<uint64_t,4> enginePendingNs{};
 };
 struct ActivityPoint {
     uint64_t timeNs=0;

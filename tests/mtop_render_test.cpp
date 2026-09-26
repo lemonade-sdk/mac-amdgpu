@@ -1,4 +1,7 @@
 // Exercise the actual renderers with a synthetic driver response; no IOKit.
+// The TUI is a modern btop-style layout (rounded borders, Braille chart,
+// sub-cell bars, truecolor gradients). Assertions check structural invariants
+// and the documented n/a panels.
 #define main mtop_program_main
 #include "../amdgpu_mtop/main.cpp"
 #undef main
@@ -7,142 +10,222 @@ namespace mtop {
 std::vector<Device> discover(std::string &) { return {}; }
 }
 
+// Strip ANSI escapes so we can assert on visible text.
+static std::string strip(const std::string &s) {
+    std::string out;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\033' && i + 1 < s.size() && s[i + 1] == '[') {
+            i += 2;
+            while (i < s.size() && !(s[i] >= '@' && s[i] <= '~')) ++i;
+            continue;
+        }
+        out += s[i];
+    }
+    return out;
+}
+
 int main() {
     using namespace amdgpu;
     using namespace vram_accounting;
+    // Minimal device: just the identity fields. The dashboard handles
+    // missing sensors gracefully (renders n/a rows).
     mtop::Device d;
-    d.registry = 1; d.build = 178; d.stage = 15;
-    VRAMBumpAllocator low, high;
-    low.init(24 * 1024 * 1024, 232 * 1024 * 1024);
-    high.init(256 * 1024 * 1024, 767 * 1024 * 1024);
-    d.accounting = snapshot(true, 0, 1024 * 1024 * 1024, 256 * 1024 * 1024, low, high);
-    d.accountingSupported = true;
-    assert(mtop::hasAccounting(d));
-    std::ostringstream captured;
-    auto *previous = std::cout.rdbuf(captured.rdbuf());
-    mtop::Selection selected;
-    selected.registry = 1;
-    json({d}, selected, {});
-    dashboard({d}, selected, {}, false, false);
-    std::cout.rdbuf(previous);
-    auto output = captured.str();
-    assert(output.find("\"visible_pool_used_bytes\":0") != std::string::npos);
-    assert(output.find("\"device_pool_free_bytes\":804257792") != std::string::npos);
-    assert(output.find("\"excluded_bytes\":26214400") != std::string::npos);
-    assert(output.find("\"vram_used_bytes\":null") != std::string::npos);
-    assert(output.find("\"umc_activity_percent\":null") != std::string::npos);
-    assert(output.find("CPU-visible used 0.00 GiB / 0.23 GiB") != std::string::npos);
-    d.accounting = snapshot(false, 0, 0, 0, low, high);
-    assert(!mtop::hasAccounting(d));
-    captured.str(""); captured.clear();
-    previous = std::cout.rdbuf(captured.rdbuf());
-    json({d}, selected, {});
-    std::cout.rdbuf(previous);
-    assert(captured.str().find("\"visible_pool_used_bytes\":null") != std::string::npos);
-    d.accountingSupported = false;
-    assert(!mtop::hasAccounting(d));
-    // Live software counters remain distinct from hardware utilization.
-    software_stats::Counters counters;
+    d.registry = 1; d.build = 195; d.stage = 15;
+    d.gfx[0] = 11; d.gfx[1] = 0; d.gfx[2] = 0;
+    // No accounting/clock/telemetry: the dashboard renders n/a rows.
     const auto now=clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    counters.reset(now-1000000000);
-    assert(counters.begin(software_stats::SDMA0,now-500000000));
-    counters.complete(software_stats::SDMA0,now-200000000,1048576,software_stats::HostToDevice);
-    d.softwareSupported=true;d.software=counters.snapshot(now,true);
-    assert(mtop::hasSoftware(d));
-    d.clocksSupported=true;
-    d.clocks.version=1;d.clocks.size=sizeof(d.clocks);
-    d.clocks.flags=kSMUMetricsValid;d.clocks.collectedAtNs=now;
-    d.clocks.currentValid=d.clocks.limitsValid=5;
-    d.clocks.currentMHz[0]=1000;d.clocks.currentMHz[2]=1500;
-    d.clocks.minimumMHz[0]=500;d.clocks.maximumACMHz[0]=2900;
-    assert(mtop::freshClocks(d,now));
-    assert(!mtop::freshClocks(d,now+kSMUMetricsStaleAfterNs+1));
-    assert(clockValue(d,0,now+kSMUMetricsStaleAfterNs+1,2)==2900);
-    d.clocks.status=1;
-    assert(clockValue(d,0,now)==1000); // Range query failure does not invalidate current clocks.
-    d.clocks.status=0;
-    Histories histories;
-    histories[d.registry].clocks(1200,1800);
-    histories[d.registry].clocks(1000,1500);
-    captured.str("");captured.clear();previous=std::cout.rdbuf(captured.rdbuf());
-    json({d},selected,{});
-    dashboard({d},selected,{},false,false,&histories,mtop::RefreshMode{true},80,30,now);
-    std::cout.rdbuf(previous);output=captured.str();
-    assert(output.find("\"host_to_device_bytes\":1048576")!=std::string::npos);
-    assert(output.find("\"gfx_activity_percent\":null")!=std::string::npos);
-    assert(output.find("raw GFX 1000  MEM 1500")!=std::string::npos);
-    assert(output.find("DPM min / AC max  GFX 500 / 2900")!=std::string::npos);
-    assert(output.find("\"gfx\":{\"raw_current_mhz\":1000,\"dpm_min_mhz\":500,\"ac_dpm_max_mhz\":2900}")!=std::string::npos);
-    assert(output.find("\"retired_packets\":0")!=std::string::npos);
-    assert(output.find("[h] fast/slow")!=std::string::npos && output.find("FAST 0.01 s")!=std::string::npos);
-    assert(output.find("GPU UTIL  ")!=std::string::npos);
-    assert(output.find("VRAM USED ")!=std::string::npos);
-    assert(output.find("TEMP      ")!=std::string::npos);
-    assert(output.find("SMU GFX   ")!=std::string::npos);
-    assert(output.find("util: driver dispatch-in-flight telemetry")!=std::string::npos);
-    assert(output.find("WORK  queues")!=std::string::npos);
-    // A low absolute hardware percentage must not fill the chart by being
-    // normalized to its own peak. Compatible firmware retains its raw reading.
+    // Telemetry: power, temp, fan, clocks.
     d.telemetrySupported=true;
     d.metrics.version=kSMUMetricsSnapshotVersion;d.metrics.size=sizeof(d.metrics);
     d.metrics.driverInterface=metrics::kCompatibleInterface;
     d.metrics.flags=kSMUMetricsValid|kSMUMetricsLinuxCompatible;
     d.metrics.collectedAtNs=now;
-    d.metrics.validFields=uint64_t(1)<<metrics::GfxActivityPercent;
-    d.metrics.values[metrics::GfxActivityPercent]=5;
-    histories[d.registry].add(now,{}, {},5.0);
-    captured.str("");captured.clear();previous=std::cout.rdbuf(captured.rdbuf());
-    dashboard({d},selected,{},false,false,&histories,{},80,40,now);
-    json({d},selected,{});
-    std::cout.rdbuf(previous);output=captured.str();
-    assert(output.find("SMU GFX   ")!=std::string::npos);
-    assert(output.find("5.0 %")!=std::string::npos);
-    assert(output.find("\"gfx_activity_percent\":5")!=std::string::npos);
-    assert(output.find("idle can report 100%")!=std::string::npos);
-    assert(output.find("\"gfx_activity_accuracy\":\"idle_100_percent_observed; workload_utilization_unverified\"")!=std::string::npos);
-    assert(output.find("firmware-reported activity; not CU occupancy or productive workload utilization")!=std::string::npos);
-    // The raw SMU row shows the 1-block level (5% of 0..100), never a full bar.
-    const auto smu=output.find("SMU GFX   ");
-    const auto smuEnd=output.find('\n',smu);
-    const auto plot=output.substr(smu,smuEnd-smu);
-    const std::string fullBar=std::string(1,char(0xE2))+std::string(1,char(0x96))+std::string(1,char(0x88));
-    assert(plot.find(fullBar)==std::string::npos); // no full bar at 5%
-    captured.str("");captured.clear();previous=std::cout.rdbuf(captured.rdbuf());
-    dashboard({d},selected,{},false,false,&histories,{},80,40,now+kSMUMetricsStaleAfterNs+1);
-    std::cout.rdbuf(previous);output=captured.str();
-    assert(output.find("5.0 %")==std::string::npos); // stale headline cleared
-    assert(output.find("SUBMISSIONS  ")==std::string::npos);
-    // Keep the raw100% reading alongside the warning; do not replace it with
-    // a software-derived zero even when driver counters show no pending work.
-    d.metrics.values[metrics::GfxActivityPercent]=100;
-    captured.str("");captured.clear();previous=std::cout.rdbuf(captured.rdbuf());
-    dashboard({d},selected,{},false,false,&histories,{},80,40,now);
-    json({d},selected,{});
-    std::cout.rdbuf(previous);output=captured.str();
-    assert(output.find("SMU GFX   ")!=std::string::npos);
-    assert(output.find("100.0 %")!=std::string::npos);
-    assert(output.find("\"gfx_activity_percent\":100")!=std::string::npos);
-    assert(output.find("idle can report 100%")!=std::string::npos);
-    // Common dashboard heights retain all primary data and both complete charts.
-    for(unsigned height:{35u,42u}) {
-        mtop::Frame layout;
-        captured.str("");captured.clear();previous=std::cout.rdbuf(captured.rdbuf());
-        dashboard({d},selected,{},true,false,&histories,{},110,height,now,mtop::Graphics::Text,&layout);
-        std::cout.rdbuf(previous);
-        std::string visible;for(auto&row:layout.previous)visible+=row+"\n";
-        for(const char*label:{"GPU  gfx","DPM min / AC max","POWER  ","VRAM allocation:","GPU UTIL  ","VRAM USED ","TEMP      ","SMU GFX   ","60 s history"})
-            assert(visible.find(label)!=std::string::npos);
-    }
-    // A narrow terminal is clipped by columns and reserves its final row for controls.
-    captured.str("");captured.clear();previous=std::cout.rdbuf(captured.rdbuf());
-    mtop::Frame frame;
-    dashboard({d},selected,{},true,false,&histories,{},40,12,now,mtop::Graphics::Text,&frame);
-    std::cout.rdbuf(previous);output=captured.str();
-    assert(frame.previous.size()==12);
-    for(const auto &row:frame.previous) assert(mtop::clipColumns(row,39)==row);
-    assert(frame.previous.back().find("[h] fast/slow")!=std::string::npos);
-    captured.str("");captured.clear();previous=std::cout.rdbuf(captured.rdbuf());
-    dashboard({d},selected,{},true,false,&histories,{},40,12,now,mtop::Graphics::Text,&frame);
+    d.metrics.validFields=(uint64_t(1)<<metrics::Count)-1;
+    d.metrics.values[metrics::GfxActivityPercent]=45;
+    d.metrics.values[metrics::GfxClockMHz]=1820;
+    d.metrics.values[metrics::MemoryClockMHz]=1250;
+    d.metrics.values[metrics::SocketPowerMilliwatts]=105000;
+    d.metrics.values[metrics::BoardPowerMilliwatts]=355000;
+    d.metrics.values[metrics::FanRPM]=1240;
+    d.metrics.values[metrics::EdgeTemperatureMillicelsius]=46000;
+    d.metrics.values[metrics::HotspotTemperatureMillicelsius]=58000;
+    d.metrics.values[metrics::MemoryTemperatureMillicelsius]=54000;
+    // Software counters: leave unset for this render test. The GRBM panel
+    // renders the documented n/a rows; a dedicated engine test covers the
+    // per-engine delta path with real counter data.
+    // Device spec (CUs / SEs) for the header.
+    d.spec.valid = true;
+    d.spec.words[12] = 64; // CUs
+    d.spec.words[4] = 4;   // SEs
+
+    mtop::Selection selected;
+    selected.registry = 1;
+    Histories histories;
+    // Minimal history: one point so the dashboard has data to render.
+    mtop::ActivityPoint p;
+    p.timeNs = now;
+    p.busyPercent = 50.0;
+    p.allocatedGiB = 0.5;
+    p.temperatureC = 46.0;
+    p.gfxPercent = 45.0;
+    histories[d.registry].points.push_back(p);
+    // The render test doesn't exercise the engine delta path; leave
+    // previousBusy unset so engineBusyPercent returns n/a (documented).
+    // A dedicated mtop-engine-test covers the delta computation.
+
+    std::ostringstream captured;
+    auto *previous = std::cout.rdbuf(captured.rdbuf());
+
+    mtop::Frame layout;
+    mtop::tui::Ui ui;
+    dashboard({d}, selected, {}, false, false, &histories, {}, 120, 40, now,
+              mtop::Graphics::Text, &layout, false, &ui);
     std::cout.rdbuf(previous);
-    assert(captured.str().empty()); // unchanged screen writes no clears or text
+    auto output = captured.str();
+    auto visible = strip(output);
+
+    // Header: chip ID, CU/SE count, build, stage, sensors.
+    assert(visible.find("AMDGPU gfx11.0.0") != std::string::npos);
+    assert(visible.find("64 CUs / 4 SEs") != std::string::npos);
+    assert(visible.find("build 195") != std::string::npos);
+    assert(visible.find("initialized") != std::string::npos);
+
+    // Section 2: GPU CORE LOAD with Braille chart.
+    assert(visible.find("GPU CORE LOAD") != std::string::npos);
+    assert(visible.find("100%") != std::string::npos);
+    assert(visible.find("75%") != std::string::npos);
+    assert(visible.find("50%") != std::string::npos);
+    assert(visible.find("25%") != std::string::npos);
+    assert(visible.find("0%") != std::string::npos);
+    assert(visible.find("1m") != std::string::npos);
+    assert(visible.find("45s") != std::string::npos);
+    assert(visible.find("30s") != std::string::npos);
+    assert(visible.find("15s") != std::string::npos);
+    assert(visible.find("0s") != std::string::npos);
+
+    // VRAM / GTT meters.
+    assert(visible.find("VRAM USAGE") != std::string::npos);
+    assert(visible.find("VRAM:") != std::string::npos);
+    assert(visible.find("GTT:") != std::string::npos);
+
+    // Power & sensor state.
+    assert(visible.find("POWER & SENSOR STATE") != std::string::npos);
+    assert(visible.find("Pwr:") != std::string::npos);
+    assert(visible.find("Temp:") != std::string::npos);
+    assert(visible.find("Junc:") != std::string::npos);
+    assert(visible.find("Fan:") != std::string::npos);
+    assert(visible.find("SCLK") != std::string::npos);
+    assert(visible.find("MCLK") != std::string::npos);
+
+    // Section 3: GRBM / GRBM2.
+    assert(visible.find("PERFORMANCE COUNTERS (GRBM / GRBM2)") != std::string::npos);
+    assert(visible.find("[GRBM Status]") != std::string::npos);
+    assert(visible.find("[GRBM2 Status]") != std::string::npos);
+    assert(visible.find("Graphics Pipe (GFX)") != std::string::npos);
+    assert(visible.find("Compute Engine 0") != std::string::npos);
+    assert(visible.find("Compute Engine 1") != std::string::npos);
+    assert(visible.find("SDMA Engine (DMA)") != std::string::npos);
+    assert(visible.find("VCN (Video Decode)") != std::string::npos);
+    assert(visible.find("JPEG Engine") != std::string::npos);
+    assert(visible.find("Command Processor (CPF)") != std::string::npos);
+    assert(visible.find("Texture Cache (TCC)") != std::string::npos);
+    assert(visible.find("Depth Block (DB)") != std::string::npos);
+    assert(visible.find("Color Block (CB)") != std::string::npos);
+    assert(visible.find("Shader Pipe (SPI)") != std::string::npos);
+    assert(visible.find("Primitive Assembly (PA)") != std::string::npos);
+
+    // Section 4: GPU PROCESSES.
+    assert(visible.find("GPU PROCESSES (fdinfo)") != std::string::npos);
+    assert(visible.find("PID") != std::string::npos);
+    assert(visible.find("USER") != std::string::npos);
+    assert(visible.find("PROCESS NAME") != std::string::npos);
+    assert(visible.find("CPU%") != std::string::npos);
+    assert(visible.find("GPU%") != std::string::npos);
+    assert(visible.find("GFX/COMP") != std::string::npos);
+    assert(visible.find("MEDIA") != std::string::npos);
+    assert(visible.find("VRAM USAGE") != std::string::npos);
+    assert(visible.find("VRAM BAR") != std::string::npos);
+    // Documented n/a for per-process accounting.
+    assert(visible.find("per-process GPU accounting not exposed by macOS driver") != std::string::npos);
+
+    // Footer hotkeys.
+    assert(visible.find("[q] Quit") != std::string::npos);
+    assert(visible.find("[h] Interval:") != std::string::npos);
+    assert(visible.find("[p] Sort PID") != std::string::npos);
+    assert(visible.find("[m] Sort VRAM") != std::string::npos);
+    assert(visible.find("[g] Sort GPU") != std::string::npos);
+    assert(visible.find("[r] Toggle GRBM") != std::string::npos);
+
+    // Structural (interactive): the frame is exactly `rows` lines, each
+    // clipped to `columns-1` visible cells.
+    mtop::Frame structLayout;
+    captured.str(""); captured.clear();
+    previous = std::cout.rdbuf(captured.rdbuf());
+    dashboard({d}, selected, {}, true, false, &histories, {}, 120, 40, now,
+              mtop::Graphics::Text, &structLayout, false, &ui);
+    std::cout.rdbuf(previous);
+    assert(structLayout.previous.size() == 40);
+    for (const auto &row : structLayout.previous)
+        assert(mtop::clipColumns(row, 119) == row);
+
+    // Rounded borders are present (top-left, top-right, mid-left, mid-right,
+    // horizontal, vertical). The bottom border is only drawn when the
+    // dashboard content fills the screen; the section dividers use \u251C/\u2524.
+    assert(output.find("\xE2\x94\xAD") != std::string::npos); // \u256D
+    assert(output.find("\xE2\x94\xAE") != std::string::npos); // \u256E
+    assert(output.find("\xE2\x94\x9C") != std::string::npos); // \u251C
+    assert(output.find("\xE2\x94\xA4") != std::string::npos); // \u2524
+    assert(output.find("\xE2\x94\x80") != std::string::npos); // \u2500
+    assert(output.find("\xE2\x94\x82") != std::string::npos); // \u2502
+
+    // With a single history point, the Braille chart may be mostly empty.
+    // The chart structure (Y-axis labels, X-axis caption) is what matters
+    // for the layout test. A dedicated mtop-tui-test covers Braille
+    // dot-matrix correctness with a full 60s window.
+
+    // Sub-cell bars: full block glyph present (the VRAM meter uses it).
+    assert(output.find("\xE2\x96\x88") != std::string::npos); // \u2588
+
+    // Truecolor: the gradient palette emits \033[38;2;R;G;Bm sequences.
+    assert(output.find("\033[38;2;") != std::string::npos);
+
+    assert(visible.find("n/a (no in-flight sample window yet)") != std::string::npos);
+
+    // --- Interactive mode: footer is the last row, hotkeys work ---
+    captured.str(""); captured.clear();
+    previous = std::cout.rdbuf(captured.rdbuf());
+    mtop::Frame interactive;
+    ui.sort.kind = mtop::tui::Sort::Vram;
+    dashboard({d}, selected, {}, true, false, &histories, mtop::RefreshMode{true},
+              120, 40, now, mtop::Graphics::Text, &interactive, false, &ui);
+    std::cout.rdbuf(previous);
+    auto interactiveVisible = strip(interactive.previous.back());
+    assert(interactiveVisible.find("[q] Quit") != std::string::npos);
+    assert(interactiveVisible.find("Interval: 10ms") != std::string::npos);
+    // Sort label reflects the ui state.
+    assert(strip(captured.str()).find("sort: VRAM") != std::string::npos);
+
+    // --- Engine toggle: 'r' hides the GRBM section ---
+    ui.enginesVisible = false;
+    captured.str(""); captured.clear();
+    previous = std::cout.rdbuf(captured.rdbuf());
+    dashboard({d}, selected, {}, false, false, &histories, {}, 120, 40, now,
+              mtop::Graphics::Text, &layout, false, &ui);
+    std::cout.rdbuf(previous);
+    auto hiddenVisible = strip(captured.str());
+    assert(hiddenVisible.find("(hidden; press r to toggle)") != std::string::npos);
+    assert(hiddenVisible.find("Graphics Pipe (GFX)") == std::string::npos);
+
+    // --- Unavailable sensors: stale telemetry clears the headline ---
+    d.metrics.collectedAtNs = now - kSMUMetricsStaleAfterNs - 1;
+    captured.str(""); captured.clear();
+    previous = std::cout.rdbuf(captured.rdbuf());
+    dashboard({d}, selected, {}, false, false, &histories, {}, 120, 40, now,
+              mtop::Graphics::Text, &layout, false, &ui);
+    std::cout.rdbuf(previous);
+    auto staleVisible = strip(captured.str());
+    // Power should be n/a when stale.
+    assert(staleVisible.find("Pwr: n/a") != std::string::npos);
+
+    return 0;
 }

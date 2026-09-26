@@ -1,6 +1,7 @@
 #include "model.h"
 #include "history.h"
 #include "render.h"
+#include "tui.h"
 #include "sampler.h"
 #include <memory>
 #include <fstream>
@@ -35,6 +36,29 @@ struct Terminal {
         if (active) std::cout<<"\033[?1049h\033[?25l";
     }
     ~Terminal() { if (active) {std::cout<<"\033[0m\033[?25h\033[?1049l"<<std::flush;tcsetattr(STDIN_FILENO, TCSANOW, &original);} }
+    // Read one logical key. Plain bytes are returned as-is (Ctrl-C=3,
+    // Ctrl-D=4); ESC sequences (arrows) are consumed with a short timeout
+    // so a bare ESC never hangs the refresh loop.
+    int readKey() {
+        unsigned char first{};
+        if (read(STDIN_FILENO, &first, 1) != 1) return -1;
+        if (first != 27) return first;
+        unsigned char buffer[2]{};
+        size_t used = 0;
+        for (int i = 0; i < 2; ++i) {
+            fd_set waiters;
+            FD_ZERO(&waiters);
+            FD_SET(STDIN_FILENO, &waiters);
+            timeval timeout{0, 1500};
+            const int ready = select(STDIN_FILENO + 1, &waiters, nullptr, nullptr, &timeout);
+            if (ready <= 0) break;
+            if (read(STDIN_FILENO, buffer + used, 1) != 1) break;
+            ++used;
+        }
+        if (!used) return first;
+        if (buffer[0] == '[' || buffer[0] == 'O') return buffer[1]; // A..D arrows
+        return first;
+    }
 };
 std::string id(uint64_t value) {
     std::ostringstream out;
@@ -49,7 +73,7 @@ std::string gib(uint64_t value) {
 std::string accountingValue(const mtop::Device &d, amdgpu::vram_accounting::Field field) {
     return mtop::hasAccounting(d) ? std::to_string(d.accounting.values[field]) : "null";
 }
-std::string accountingSize(const mtop::Device &d, amdgpu::vram_accounting::Field field) {
+[[maybe_unused]] std::string accountingSize(const mtop::Device &d, amdgpu::vram_accounting::Field field) {
     return mtop::hasAccounting(d) ? gib(d.accounting.values[field]) : "unavailable";
 }
 std::string quote(const std::string &value);
@@ -196,6 +220,8 @@ std::optional<double> temperatureValue(const mtop::Device &d,uint64_t now) {
 std::optional<mtop::RateCounters> rateCounters(const mtop::Device &d) {
     if (!mtop::hasSoftware(d) || (d.software.flags&amdgpu::software_stats::Saturated)) return {};
     mtop::RateCounters out{d.software.generation,d.software.sampledAtNs,d.software.publishedPackets,0};
+    for (unsigned i=0;i<amdgpu::software_stats::EngineCount;++i)
+        out.enginePendingNs[i]=d.software.engines[i].pendingNs;
     for (const auto &engine:d.software.engines) {
         if (UINT64_MAX-out.pendingNs<engine.pendingNs) return {};
         out.pendingNs+=engine.pendingNs;
@@ -211,7 +237,24 @@ std::optional<mtop::RateCounters> rateCounters(const mtop::Device &d) {
     }
     return out;
 }
-std::string utilizationSource(const mtop::Device &d) {
+// Per-engine dispatch-in-flight busy fraction over the same sample window as
+// the aggregate GPU UTIL row. The driver keeps separate pendingNs counters per
+// engine (SDMA0, SDMA1, GFX, AQL); this is the finest engine granularity the
+// current driver exposes. First sample after a baseline has no window.
+std::optional<double> engineBusyPercent(const mtop::Device &d, unsigned engine,
+                                        const mtop::History &history) {
+    if (!mtop::hasSoftware(d) || (d.software.flags&amdgpu::software_stats::Saturated) ||
+        engine>=amdgpu::software_stats::EngineCount) return {};
+    const auto &previous=history.previousBusy;
+    if (!previous || previous->generation!=d.software.generation ||
+        previous->timeNs>=d.software.sampledAtNs ||
+        d.software.engines[engine].pendingNs<previous->enginePendingNs[engine]) return {};
+    const uint64_t delta=d.software.engines[engine].pendingNs-previous->enginePendingNs[engine];
+    const uint64_t elapsed=d.software.sampledAtNs-previous->timeNs;
+    if (elapsed>2'000'000'000ull) return {}; // stale gap: no rate across it
+    return mtop::busyRatio(delta,0,elapsed);
+}
+[[maybe_unused]] std::string utilizationSource(const mtop::Device &d) {
     if (!mtop::hasSoftware(d)) return "unavailable";
     if (d.software.flags&amdgpu::software_stats::Saturated) return "saturated";
     return "driver dispatch-in-flight telemetry (software_stats pendingNs delta / wall window)";
@@ -252,7 +295,7 @@ std::string decimal(std::optional<double> value,unsigned places=1) {
 }
 // Rust-amdgpu_top-style history row: label, sparkline, current value,
 // min/max/avg. Fixed 0..ceiling scale for percentage metrics.
-std::string historyLine(const std::string &label,const std::string &unit,
+[[maybe_unused]] std::string historyLine(const std::string &label,const std::string &unit,
                         const std::vector<std::optional<double>> &values,
                         std::optional<double> current,double ceiling) {
     const auto minimum=mtop::stats(values);
@@ -321,7 +364,8 @@ void dashboard(const std::vector<mtop::Device> &devices, const mtop::Selection &
                const std::string &error, bool interactive, bool listOnly,
                const Histories *histories=nullptr,mtop::RefreshMode mode={},
                unsigned columns=100,unsigned rows=40,uint64_t now=0,
-               mtop::Graphics graphics=mtop::Graphics::Text,mtop::Frame *frame=nullptr,bool demo=false) {
+               mtop::Graphics graphics=mtop::Graphics::Text,mtop::Frame *frame=nullptr,bool demo=false,
+               const mtop::tui::Ui *ui=nullptr) {
     if (!now) now=clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     columns=std::clamp(columns,24u,200u);rows=std::max(8u,rows);
     std::vector<std::string> lines;
@@ -329,9 +373,9 @@ void dashboard(const std::vector<mtop::Device> &devices, const mtop::Selection &
     std::vector<PixelChart> images;
     auto tint=[&](const std::string&text,const char*code){return interactive ? std::string(code)+text+"\033[0m" : text;};
     auto line=[&](std::string value) {lines.push_back(std::move(value));};
-    line(tint(std::string("amdgpu_mtop")+(demo?" DEMO (synthetic)":"")+"  |  "+std::to_string(devices.size())+" GPU(s)  |  "+mode.label()+
-        (graphics==mtop::Graphics::Kitty ? "  |  PIXEL / Kitty" : graphics==mtop::Graphics::ITerm ? "  |  PIXEL / iTerm" : "  |  TEXT / block sparkline"),"\033[1;36m"));
-    line(std::string(columns,'='));
+    const auto sort=ui ? ui->sort : mtop::tui::Sort{};
+    const bool engines=ui ? ui->enginesVisible : true;
+    using namespace mtop::tui;
     if (!error.empty()) line("Enumeration: "+error);
     if (devices.empty()) line("Waiting for a GPU bound to MacAMDGPU...");
     for (const auto &d:devices) {
@@ -344,55 +388,41 @@ void dashboard(const std::vector<mtop::Device> &devices, const mtop::Selection &
         if (!d && selection.registry) line("Selected GPU disconnected: "+id(*selection.registry));
         if (d && d->error.empty()) {
             using namespace amdgpu::vram_accounting;
+            using namespace amdgpu::metrics;
             const mtop::History empty;
             const auto it=histories ? histories->find(d->registry) : Histories::const_iterator{};
             const auto &history=histories && it!=histories->end() ? it->second : empty;
-            using namespace amdgpu::metrics;
-            // Header: chip identity/geometry + current clocks, temperature, sensors.
-            std::string chip=std::string("gfx")+std::to_string(d->gfx[0])+'.'+std::to_string(d->gfx[1])+'.'+std::to_string(d->gfx[2]);
-            if (d->spec.valid) chip+="  "+std::to_string(d->spec.words[12])+" CUs  "+std::to_string(d->spec.words[4])+" SE";
-            const auto tempNow=temperatureValue(*d,now);
-            line(tint("GPU  "+chip,"\033[1m")+
-                "  "+(d->stage==15 ? "initialized" : "stage "+std::to_string(d->stage))+
-                "  |  "+tint("GFX "+decimal(hardwareValue(*d,GfxClockMHz,now),0)+" MHz","\033[1;36m")+
-                "  "+tint("MEM "+decimal(hardwareValue(*d,MemoryClockMHz,now),0)+" MHz","\033[1;35m")+
-                "  "+tint("TEMP "+decimal(tempNow,0)+" C","\033[1;33m")+
-                "  |  sensors "+telemetryStatus(*d));
-            line("DPM min / AC max  GFX "+decimal(clockValue(*d,0,now,1),0)+" / "+decimal(clockValue(*d,0,now,2),0)+
-                "   MEM "+decimal(clockValue(*d,2,now,1),0)+" / "+decimal(clockValue(*d,2,now,2),0)+
-                " MHz | raw GFX "+decimal(clockValue(*d,0,now),0)+"  MEM "+decimal(clockValue(*d,2,now),0)+
-                " | observed min/max GFX "+decimal(history.minimumGfxClockMHz,0)+" / "+decimal(history.peakGfxClockMHz,0));
-            line(tint("POWER  "+metric(*d,SocketPowerMilliwatts,1000," W"),"\033[1;33m")+
-                "    FAN "+metric(*d,FanRPM,1," RPM")+"    UMC activity "+metric(*d,UmcActivityPercent,1,"%"));
-            if (mtop::hasAccounting(*d)) {
-                const auto &a=d->accounting.values;
-                const double used=double(a[VisibleUsed])+double(a[DeviceUsed]);
-                const double capacity=double(a[VisibleCapacity])+double(a[DeviceCapacity]);
-                line("VRAM allocated "+mtop::meter(used,capacity,std::min(24u,columns>65?columns-60:8u))+
-                    " "+decimal(used/1073741824.0)+" / "+decimal(capacity/1073741824.0)+" GiB (driver pools)");
-                line("  CPU-visible used "+accountingSize(*d,VisibleUsed)+" / "+accountingSize(*d,VisibleCapacity)+
-                    "    GPU-only used "+accountingSize(*d,DeviceUsed)+" / "+accountingSize(*d,DeviceCapacity));
-            } else line("VRAM allocation: unavailable until GPU initialization");
-            if (mtop::hasSoftware(*d)) {
-                uint64_t pending=0,failed=0;
-                for (const auto &e:d->software.engines) {pending+=e.pending;failed+=e.failed;}
-                line("WORK  queues "+std::to_string(d->software.activeQueues)+"  pending jobs "+std::to_string(pending)+
-                    "  queued packets "+std::to_string(d->software.queuedPackets)+"  failed "+std::to_string(failed)+
-                    "  clients "+std::to_string(d->software.participants)+
-                    ((d->software.flags&amdgpu::software_stats::QueueSampleIncomplete)?" (partial snapshot)":""));
-            } else line("Work counters: "+(d->softwareError.empty() ? std::string("unavailable") : d->softwareError));
-            // Live sparkline history rows (60 s window, 60-column fixed scale;
-            // refresh speed never changes the time axis). Pixel protocols add
-            // a small RGB chart per row; the block sparkline stays as fallback.
-            const unsigned pixelRows=interactive && graphics!=mtop::Graphics::Text ? 5 : 0;
-            const unsigned sparkColumns=60;
-            const auto utilizationBuckets=history.buckets(sparkColumns,now,&mtop::ActivityPoint::busyPercent);
-            const auto vramBuckets=history.buckets(sparkColumns,now,&mtop::ActivityPoint::allocatedGiB);
-            const auto tempBuckets=history.buckets(sparkColumns,now,&mtop::ActivityPoint::temperatureC);
-            const auto smuBuckets=history.buckets(sparkColumns,now,&mtop::ActivityPoint::gfxPercent);
-            const auto copyBuckets=history.buckets(sparkColumns,now,&mtop::ActivityPoint::transferMiBPerSecond);
+            const auto utilizationBuckets=history.buckets(120,now,&mtop::ActivityPoint::busyPercent);
+            const auto vramBuckets=history.buckets(60,now,&mtop::ActivityPoint::allocatedGiB);
+            const auto tempBuckets=history.buckets(60,now,&mtop::ActivityPoint::temperatureC);
+            const auto smuBuckets=history.buckets(60,now,&mtop::ActivityPoint::gfxPercent);
+            const auto copyBuckets=history.buckets(60,now,&mtop::ActivityPoint::transferMiBPerSecond);
             const auto vramCeiling=capacityGiB(*d).value_or(1.0);
-            if (pixelRows) {
+            const auto utilNow=history.points.empty() ? std::optional<double>{} : history.points.back().busyPercent;
+                        const auto pwr=hardwareValue(*d,SocketPowerMilliwatts,now);
+            const auto pwrCap=hardwareValue(*d,BoardPowerMilliwatts,now);
+            const auto edgeT=hardwareValue(*d,EdgeTemperatureMillicelsius,now);
+            const auto hotT=hardwareValue(*d,HotspotTemperatureMillicelsius,now);
+            const auto fan=hardwareValue(*d,FanRPM,now);
+            const auto sclk=hardwareValue(*d,GfxClockMHz,now);
+            const auto mclk=hardwareValue(*d,MemoryClockMHz,now);
+            const double pwrW=pwr ? *pwr/1000.0 : 0.0;
+            const double pwrWCap=pwrCap ? *pwrCap/1000.0 : 0.0;
+                        const auto edgeTc=edgeT ? *edgeT/1000.0 : 0.0;
+            const auto hotTc=hotT ? *hotT/1000.0 : 0.0;
+            const auto fanRpm=fan ? *fan : 0.0;
+            const auto sclkMhz=sclk ? *sclk : 0.0;
+            const auto mclkMhz=mclk ? *mclk : 0.0;
+            const auto visibleCap=hasAccounting(*d) ? double(d->accounting.values[VisibleCapacity])/(1ull<<30) : 0.0;
+            const auto deviceCap=hasAccounting(*d) ? double(d->accounting.values[DeviceCapacity])/(1ull<<30) : 0.0;
+            const auto visibleUsed=hasAccounting(*d) ? double(d->accounting.values[VisibleUsed])/(1ull<<30) : 0.0;
+            const auto deviceUsed=hasAccounting(*d) ? double(d->accounting.values[DeviceUsed])/(1ull<<30) : 0.0;
+            const double vramTotal=visibleCap+deviceCap;
+            const double vramUsed=visibleUsed+deviceUsed;
+            const double vramPct=vramTotal>0 ? vramUsed/vramTotal : 0.0;
+            const double gttPct=visibleCap>0 ? visibleUsed/visibleCap : 0.0;
+            const unsigned pixelRows=interactive && graphics!=mtop::Graphics::Text ? 5 : 0;
+                        if (pixelRows) {
                 images.push_back({unsigned(lines.size()+1),1,mtop::chartPNG(utilizationBuckets,480,18,100)});
                 images.push_back({unsigned(lines.size()+2),1,mtop::chartPNG(vramBuckets,480,18,vramCeiling,{230,181,74})});
                 images.push_back({unsigned(lines.size()+3),1,mtop::chartPNG(tempBuckets,480,18,100,{240,120,90})});
@@ -400,43 +430,104 @@ void dashboard(const std::vector<mtop::Device> &devices, const mtop::Selection &
                 images.push_back({unsigned(lines.size()+5),1,mtop::chartPNG(copyBuckets,480,18,0.0,{140,200,140})});
                 for(unsigned i=0;i<5;++i)line("");
             }
-            line(tint(historyLine("GPU UTIL  ","%",utilizationBuckets,
-                history.points.empty() ? std::optional<double>{} : history.points.back().busyPercent,100.0),
-                "\033[1;36m"));
-            line(historyLine("VRAM USED ","GiB",vramBuckets,
-                history.points.empty() ? std::optional<double>{} : history.points.back().allocatedGiB,vramCeiling));
-            line(historyLine("TEMP      ","C",tempBuckets,tempNow,100.0));
-            line("60 s history; sensor capture 1 Hz | util: "+utilizationSource(*d));
-            line(tint(historyLine("SMU GFX   ","%",smuBuckets,
-                hardwareValue(*d,GfxActivityPercent,now),100.0)+
-                "   (raw AverageGfxActivity, uncalibrated)","\033[90m"));
-            if (d->metrics.driverInterface==amdgpu::metrics::kCompatibleInterface &&
-                (d->metrics.flags&amdgpu::kSMUMetricsLinuxCompatible))
-                line("SMU activity: idle can report 100%; the GPU UTIL row is a driver in-flight delta.");
-            else line("SMU activity is firmware-reported; the GPU UTIL row is a driver in-flight delta.");
+            // ===== Section 1: Header =====
+            std::string header="AMDGPU gfx"+std::to_string(d->gfx[0])+'.'+std::to_string(d->gfx[1])+'.'+std::to_string(d->gfx[2]);
+            if (d->spec.valid) header+="  "+std::to_string(d->spec.words[12])+" CUs / "+std::to_string(d->spec.words[4])+" SEs";
+            header+="  "+dim("build "+std::to_string(d->build)+"  "+(d->stage==15 ? "initialized" : "stage "+std::to_string(d->stage)));
+            header+="  "+dim("sensors "+telemetryStatus(*d));
+            if (demo) header+="  "+dim("DEMO (synthetic)");
+            line(tint(top(columns,header),kBorder));
+            line("");
+            // ===== Section 2: GPU CORE LOAD (Braille) =====
+            line(tint(top(columns,bright("GPU CORE LOAD ")+(utilNow ? "["+decimal(*utilNow,0)+"%]" : dim("[ n/a ]"))),kBorder));
+            const size_t cells=columns>10 ? columns-10 : 10;
+            const size_t xCount=std::min<size_t>(utilizationBuckets.size(), cells*2);
+            std::vector<std::optional<double>> plot;
+            for(size_t i=0;i<xCount;++i)
+                plot.push_back(utilizationBuckets[utilizationBuckets.size()-xCount+i]);
+            auto br=braille(plot,5,100.0);
+            const std::string labels[]={"100%","75%","50%","25%","0%"};
+            for(size_t r=0;r<5;++r)
+                line(cell(columns,bright(labels[r])+"  "+dim(br.rows[r])));
+            line(cell(columns,dim(xaxis(cells))));
+            line("");
+            // ===== VRAM / GTT meters =====
+            line(tint(top(columns,bright("VRAM USAGE ")+(vramTotal>0 ? "["+decimal(vramUsed,1)+" / "+decimal(vramTotal,1)+" GB -- "+decimal(vramPct*100.0,1)+"%]" : dim("[ n/a ]"))),kBorder));
+            const unsigned barW=std::min(columns-24u, 40u);
+            line(cell(columns,"  "+gradientBar(vramUsed, barW)+"  VRAM: "+decimal(vramUsed,1)+" GB / "+decimal(vramPct*100.0,0)+"%"));
+            line(cell(columns,"  "+gradientBar(visibleUsed, barW)+"  GTT:   "+decimal(visibleUsed,1)+" GB / "+decimal(gttPct*100.0,0)+"%"));
+            line("");
+            line(cell(columns,bright("POWER & SENSOR STATE")));
+            const unsigned pwrBarW=std::min(columns-32u, 18u);
+            line(cell(columns,"  Pwr: "+(pwr ? decimal(pwrW,0)+"W / "+decimal(pwrWCap,0)+"W ["+gradientBar(pwrW,pwrBarW)+"]" : dim("n/a"))+
+                "  Temp: "+(edgeT ? decimal(edgeTc,0)+"\xc2\xb0"+"C (Junc: "+(hotT?decimal(hotTc,0):"n/a")+"\xc2\xb0"+"C)" : dim("n/a"))));
+            const unsigned fanBarW=std::min(columns-32u, 18u);
+            line(cell(columns,"  Fan: "+(fan ? decimal(fanRpm,0)+" RPM  ["+gradientBar(fanRpm/200.0,fanBarW)+"]" : dim("n/a"))+
+                "  Clock: SCLK "+(sclk?decimal(sclkMhz,0):"n/a")+"MHz MCLK "+(mclk?decimal(mclkMhz,0):"n/a")+"MHz"));
+            line("");
+            // ===== Section 3: GRBM / GRBM2 =====
+            const auto sdma0=mtop::hasSoftware(*d) ? engineBusyPercent(*d,amdgpu::software_stats::SDMA0,history) : std::optional<double>{};
+            const auto gfxEng=mtop::hasSoftware(*d) ? engineBusyPercent(*d,amdgpu::software_stats::GFX,history) : std::optional<double>{};
+            const auto aqlEng=mtop::hasSoftware(*d) ? engineBusyPercent(*d,amdgpu::software_stats::AQL,history) : std::optional<double>{};
+            auto engineBar=[&](std::optional<double> v){
+                return v ? gradientBar(*v/100.0,16)+" "+decimal(*v,0)+"%" : dim("n/a (no in-flight sample window yet)");
+            };
+            line(tint(mid(columns,bright("PERFORMANCE COUNTERS (GRBM / GRBM2)")),kBorder));
+            if (engines) {
+                line(cell(columns,bright("  [GRBM Status]")+"    "+dim("source: driver dispatch-in-flight per engine (selector 61)")));
+                line(cell(columns,"  Graphics Pipe (GFX) : "+(utilNow ? gradientBar(*utilNow/100.0,16)+" "+decimal(*utilNow,0)+"%" : dim("n/a (no in-flight sample window yet)"))));
+                line(cell(columns,"  Compute Engine 0    : "+engineBar(gfxEng)));
+                line(cell(columns,"  Compute Engine 1    : "+(aqlEng ? engineBar(aqlEng) : dim("n/a (AQL compute queue in-flight)"))));
+                line(cell(columns,"  SDMA Engine (DMA)   : "+engineBar(sdma0)+"  "+dim("(SDMA0; SDMA1 not observed)")));
+                line(cell(columns,"  VCN (Video Decode)  : "+dim("n/a (driver exposes no VCN counter; would need MMIO PERFSTATUS or SMU media field)")));
+                line(cell(columns,"  JPEG Engine         : "+dim("n/a (driver exposes no JPEG counter)")));
+                line("");
+                line(cell(columns,bright("  [GRBM2 Status]")+"    "+dim("source: none (MMHUB/GFXHUB PERFSTATUS + L2 counters not exposed by driver)")));
+                line(cell(columns,"  Command Processor (CPF) : "+dim("n/a (MMHUB_PERFSTATUS not exposed)")));
+                line(cell(columns,"  Texture Cache (TCC)     : "+dim("n/a (MMHUB_L2 hit/miss counters not exposed)")));
+                line(cell(columns,"  Depth Block (DB)        : "+dim("n/a (GRBM select + MMIO read not exposed)")));
+                line(cell(columns,"  Color Block (CB)        : "+dim("n/a (GRBM select + MMIO read not exposed)")));
+                line(cell(columns,"  Shader Pipe (SPI)       : "+dim("n/a (per-SPI activity not exposed)")));
+                line(cell(columns,"  Primitive Assembly (PA) : "+dim("n/a (per-PA activity not exposed)")));
+            } else {
+                line(cell(columns,dim("  (hidden; press r to toggle)")));
+            }
+            line("");
+            // ===== Section 4: GPU PROCESSES =====
+            line(tint(mid(columns,bright("GPU PROCESSES (fdinfo)")+"  [sort: "+sort.label()+"]"),kBorder));
+            line(cell(columns,dim("  PID     USER       PROCESS NAME            CPU%    GPU%   GFX/COMP   MEDIA     VRAM USAGE      VRAM BAR")));
+            line(cell(columns,dim("  "+std::string(columns>24?columns-4:20,'-'))));
+            line(cell(columns,dim("  n/a     n/a        per-process GPU accounting not exposed by macOS driver")));
+            line(cell(columns,dim("  Driver exposes total VRAM pools + dispatch-in-flight + SMU sensors only.")));
+            line(cell(columns,dim("  Per-PID GPU%, engine breakdown, VRAM require a driver-side per-client counter.")));
+            line(cell(columns,dim("  See mtop-report.md for the exact missing query.")));
+            line("");
+            // ===== Footer =====
+            const std::string footer="[q] Quit  [h] Interval: "+std::to_string(mode.milliseconds())+"ms"+
+                "  [p] Sort PID  [m] Sort VRAM  [g] Sort GPU  [r] Toggle GRBM";
+            if (interactive) {
+                lines.resize(std::min<size_t>(lines.size(),rows-1));
+                while(lines.size()<rows-1)lines.emplace_back();
+                lines.push_back(tint(footer,"\033[1m"));
+                mtop::Frame temporary;
+                if(frame && graphics==mtop::Graphics::ITerm)frame->previous.clear();
+                std::string output=(frame?*frame:temporary).update(lines,columns,rows);
+                if(graphics==mtop::Graphics::Kitty)
+                    for(unsigned i=0;i<3;++i)output+="\033_Ga=d,d=I,i="+std::to_string(5001+i)+",q=2\033\\";
+                for(size_t i=0;i<images.size();++i) {
+                    const auto &image=images[i];
+                    if(image.row+image.height<=rows)
+                        output+=mtop::pixelImage(graphics,image.png,5001+unsigned(i),image.row,columns-3,image.height);
+                }
+                std::cout<<output;
+            } else {
+                for (const auto &value:lines) std::cout<<value<<'\n';
+                if (!listOnly) std::cout<<footer<<'\n';
+            }
         }
-    }
-    const std::string footer="[h] fast/slow  [n/p] GPU  [q] quit | "+std::string(mode.label());
-    if (interactive) {
-        lines.resize(std::min<size_t>(lines.size(),rows-1));
-        while(lines.size()<rows-1)lines.emplace_back();
-        lines.push_back(tint(footer,"\033[1m"));
-        mtop::Frame temporary;
-        if(frame && graphics==mtop::Graphics::ITerm)frame->previous.clear();
-        std::string output=(frame?*frame:temporary).update(lines,columns,rows);
-        if(graphics==mtop::Graphics::Kitty)
-            for(unsigned i=0;i<3;++i)output+="\033_Ga=d,d=I,i="+std::to_string(5001+i)+",q=2\033\\";
-        for(size_t i=0;i<images.size();++i) {
-            const auto &image=images[i];
-            if(image.row+image.height<=rows)
-                output+=mtop::pixelImage(graphics,image.png,5001+unsigned(i),image.row,columns-3,image.height);
-        }
-        std::cout<<output;
-    } else {
-        for (const auto &value:lines) std::cout<<value<<'\n';
-        if (!listOnly) std::cout<<footer<<'\n';
     }
 }
+
 bool number(const char *text, uint64_t &value) {
     if (!*text || *text == '-' || *text == '+') return false;
     char *end = nullptr;
@@ -456,10 +547,12 @@ int main(int argc, char **argv) {
         const std::string_view arg(argv[i]);
         if (arg == "--help" || arg == "-h") {
             std::cout << "amdgpu_mtop [--list] [--device REGISTRY_ID] [--json] [--watch] [--fast | --slow] [--graphics auto|kitty|iterm|text] [--demo]\n"
-                         "Native macOS monitor for GPUs bound to MacAMDGPU (build 172+).\n"
-                         "Slow: 0.1 s (default), fast: 0.01 s; h toggles, n/p select GPU, q quits.\n"
-                         "Live 60 s sparkline histories: GPU utilization (driver in-flight delta, 0..100%),\n"
-                         "VRAM used GiB, temperature C, plus the raw SMU AverageGfxActivity for reference.\n"
+                         "Native macOS btop-style monitor for GPUs bound to MacAMDGPU (build 172+).\n"
+                         "Slow: 0.1 s (default), fast: 0.01 s; h toggles, arrows select GPU, q quits.\n"
+                         "Hotkeys: m sort VRAM, g sort GPU, p sort PID, r toggle GRBM engines.\n"
+                         "Live 60 s Braille GPU-utilization history (driver in-flight delta, 0..100%),\n"
+                         "VRAM/GTT meters, power/temperature/fan/clock sensors, GRBM/GRBM2 breakdown,\n"
+                         "per-process table (n/a when the driver exposes no per-client counters).\n"
                          "Non-terminal output is one snapshot unless --watch is specified.\n"
                          "Observer: never initializes, resets or changes power policy.\n"
                          "Driver 193+: bounded sensor collection at 1 Hz and software activity counters.\n"
@@ -501,6 +594,7 @@ int main(int argc, char **argv) {
         (major>3 || (major==3 && minor>=7)))program="kitty";
     const auto graphics=mtop::graphicsFor(graphicsOption,program,env("TERM"),!env("TMUX").empty() || !env("STY").empty());
     mtop::Frame frame;
+    mtop::tui::Ui uiState;
     std::unique_ptr<mtop::Sampler> sampler;
     if(interactive && !demo)sampler=std::make_unique<mtop::Sampler>(mode.milliseconds());
     uint64_t sequence=0;
@@ -530,7 +624,20 @@ int main(int argc, char **argv) {
             d.metrics.values[amdgpu::metrics::EdgeTemperatureMillicelsius]=46000;
             d.metrics.values[amdgpu::metrics::HotspotTemperatureMillicelsius]=58000;
             d.metrics.values[amdgpu::metrics::MemoryTemperatureMillicelsius]=54000;
-            amdgpu::software_stats::Counters counters;counters.reset(t);d.software=counters.snapshot(t,true);d.softwareSupported=true;
+            amdgpu::software_stats::Counters counters;counters.reset(t);
+            // Demo: seed per-engine dispatch-in-flight history so the GRBM
+            // panel shows the driver's real per-engine counters (GFX/AQL
+            // in-flight), distinct from the aggregate busy percentage.
+            for(unsigned i=0;i<60;++i) {
+                const uint64_t ts=t-(59-i)*100000000ull;
+                const uint64_t gfxNs=uint64_t(20+15*std::sin(i/13.0))*10000000;
+                const uint64_t aqlNs=uint64_t(10+8*std::sin(i/19.0))*10000000;
+                if(counters.begin(amdgpu::software_stats::GFX,ts))
+                    counters.complete(amdgpu::software_stats::GFX,ts+gfxNs,gfxNs,amdgpu::software_stats::HostToDevice);
+                if(counters.begin(amdgpu::software_stats::AQL,ts))
+                    counters.complete(amdgpu::software_stats::AQL,ts+aqlNs,aqlNs,amdgpu::software_stats::DeviceToDevice);
+            }
+            d.software=counters.snapshot(t,true);d.softwareSupported=true;
             d.software.activeQueues=2;d.software.participants=1;
             amdgpu::VRAMBumpAllocator visible,device;
             visible.init(24ull<<20,232ull<<20);device.init(256ull<<20,31ull<<30);
@@ -580,7 +687,7 @@ int main(int argc, char **argv) {
             winsize dimensions{};
             if (ioctl(STDOUT_FILENO,TIOCGWINSZ,&dimensions)) dimensions={};
             dashboard(devices,selected,error,interactive,listOnly,&histories,mode,
-                dimensions.ws_col ? dimensions.ws_col : 100,dimensions.ws_row ? dimensions.ws_row : 40,sampledAt,graphics,&frame,demo);
+                dimensions.ws_col ? dimensions.ws_col : 100,dimensions.ws_row ? dimensions.ws_row : 40,sampledAt,graphics,&frame,demo,&uiState);
         }
         std::cout.flush();
         if (listOnly || (!interactive && !watch)) break;
@@ -592,11 +699,15 @@ int main(int argc, char **argv) {
         timeval timeout{0, static_cast<suseconds_t>(remaining)};
         const int ready = select(interactive ? STDIN_FILENO + 1 : 0, &descriptors, nullptr, nullptr, &timeout);
         if (ready > 0 && interactive) {
-            char key;
-            if (read(STDIN_FILENO, &key, 1) == 1) {
+            const int key=terminal.readKey();
+            if (key > 0) {
                 if (key == 'q') break;
                 if (key == 'h') {mode.toggle();if(sampler)sampler->period(mode.milliseconds());}
-                if (key == 'n' || key == 'p') selected.step(devices, key == 'n');
+                // 'p' is PID sort per the spec footer; GPU navigation is the
+                // Up/Down arrows (key 'A'/'B').
+                if (key == 'A') selected.step(devices, false);
+                if (key == 'B') selected.step(devices, true);
+                uiState.onKey(char(key));
             }
         } else if (ready < 0 && errno != EINTR) {
             std::cerr << "Input wait failed\n"; return 1;

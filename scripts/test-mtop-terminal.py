@@ -26,7 +26,8 @@ for protocol,program in [('kitty','kitty'),('iterm','iTerm.app'),('text','Apple_
         if process.poll() is None:process.kill();process.wait()
         os.close(master)
     stream=bytes(data);(out/(protocol+'.ansi')).write_bytes(stream)
-    assert b'DEMO (synthetic)' in stream and b'SLOW 0.1 s' in stream
+    assert b'DEMO (synthetic)' in stream
+    assert b'Interval: 10ms' in stream
     assert b'\x1b[?25h' in stream and b'\x1b[?1049l' in stream
     assert stream.count(b'\x1b[2J')==1, 'full clear only on first frame'
     images=[]
