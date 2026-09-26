@@ -87,6 +87,19 @@ void read(io_service_t service, Device &d) {
             d.clocksError = "Invalid clock snapshot ABI";
         else d.clocksSupported = true;
     }
+    // Read-only observer device spec (GFXSpecSnapshot): chip geometry for the
+    // header. kIOReturnNotReady is normal while the GPU is stopped (stage 0).
+    // The driver returns the 32 dwords as uint64 scalar outputs.
+    {
+        uint64_t tag8 = 8, specWords64[32]{};
+        uint32_t specCount = 32;
+        if (IOConnectCallScalarMethod(connection.value, 21, &tag8, 1, specWords64, &specCount) == KERN_SUCCESS &&
+            specCount == 32) {
+            uint32_t words[32]{};
+            for (int i = 0; i < 32; ++i) words[i] = (uint32_t)specWords64[i];
+            if (words[0] != 0) mtop::readGfxSpec(d, words);
+        }
+    }
     if (d.build >= 178) {
         tag = 5;
         uint32_t count = amdgpu::vram_accounting::Count;

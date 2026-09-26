@@ -25,7 +25,23 @@ struct Device {
     bool clocksSupported = false;
     std::string clocksError;
     amdgpu::SMUClockSnapshot clocks{};
+    bool specSupported = false;
+    std::string specError;
+    struct GfxSpec {
+        uint32_t words[32]{};
+        bool valid = false;
+    } spec;
 };
+// QueryInfo tag-8 device spec: read the 32 dwords out, keep the ones that
+// matter (all-zero is the pre-GC-discovery sentinel), record them. The full
+// GFXSpecSnapshot lives in dext/amdgpu/amdgpu_gfx.h; we only need the scalar
+// geometry here so the monitor does not drag in the driver header.
+inline void readGfxSpec(Device &d, const uint32_t *words) {
+    if (!words || !words[0]) return; // header == 0 means GC not yet resolved
+    for (unsigned i = 0; i < 32; ++i) d.spec.words[i] = words[i];
+    d.spec.valid = true;
+    d.specSupported = true;
+}
 
 inline bool hasSoftware(const Device &d) {
     return d.error.empty() && d.softwareSupported && d.softwareError.empty() &&

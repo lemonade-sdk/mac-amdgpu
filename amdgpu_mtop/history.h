@@ -11,12 +11,15 @@
 namespace mtop {
 struct RateCounters {
     uint64_t generation=0, timeNs=0, submitted=0, completedBytes=0;
+    uint64_t pendingNs=0; // Cumulative in-flight interval union (busy counter).
     std::array<uint64_t,5> directions{};
 };
 struct ActivityPoint {
     uint64_t timeNs=0;
     std::optional<double> submissionsPerSecond, transferMiBPerSecond, allocatedGiB;
-    std::optional<double> gfxPercent;
+    std::optional<double> gfxPercent;   // SMU AverageGfxActivity, raw firmware field.
+    std::optional<double> busyPercent;  // Observer-computed, delta-based. See busyRatio().
+    std::optional<double> temperatureC; // Hotspot first, else edge, else memory (Celsius).
     std::array<std::optional<double>,5> copyMiBPerSecond{};
 };
 // Fixed time window: switching between 100 ms and 500 ms does not change the
@@ -26,6 +29,9 @@ struct History {
     std::deque<ActivityPoint> points;
     std::optional<RateCounters> previous;
     std::deque<RateCounters> rateWindow;
+    // Busy counter delta over the sample window (pendingNs delta / elapsed).
+    std::optional<double> busyRatioValue;
+    std::optional<mtop::RateCounters> previousBusy;
     std::optional<double> peakGfxClockMHz, peakMemoryClockMHz;
     std::optional<double> minimumGfxClockMHz, minimumMemoryClockMHz;
     void clocks(std::optional<double> gfx, std::optional<double> memory) {
@@ -35,8 +41,9 @@ struct History {
         if (memory && (!peakMemoryClockMHz || *memory>*peakMemoryClockMHz)) peakMemoryClockMHz=memory;
     }
     void add(uint64_t now, std::optional<RateCounters> counters,
-             std::optional<double> allocatedGiB, std::optional<double> gfxPercent={}) {
-        ActivityPoint point{now,{}, {},allocatedGiB,gfxPercent};
+             std::optional<double> allocatedGiB, std::optional<double> gfxPercent={},
+             std::optional<double> temperatureC={}) {
+        ActivityPoint point{now,{}, {},allocatedGiB,gfxPercent,{},temperatureC};
         if (counters) {
             const bool reset=previous && (counters->generation!=previous->generation ||
                 counters->timeNs<previous->timeNs || counters->submitted<previous->submitted ||
@@ -104,9 +111,46 @@ struct History {
 struct RefreshMode {
     bool fast=false;
     void toggle() {fast=!fast;}
-    unsigned milliseconds() const {return fast ? 100 : 500;}
-    const char *label() const {return fast ? "FAST 0.1 s" : "SLOW 0.5 s";}
+    unsigned milliseconds() const {return fast ? 10 : 100;}
+    const char *label() const {return fast ? "FAST 0.01 s" : "SLOW 0.1 s";}
 };
+// Delta-based activity ratio: (busy delta) / (elapsed), saturated at 100%.
+// Pure and unit-testable: the monitor feeds it driver busy counters when a
+// hardware counter is reachable, otherwise dispatch-in-flight telemetry
+// (driver software_stats). elapsedNs=0 -> unavailable, never a fake 100%.
+inline std::optional<double> busyRatio(uint64_t delta, uint64_t previousDelta,
+                                       uint64_t elapsedNs) {
+    if (!elapsedNs || previousDelta > delta) return {};
+    const double ratio=double(delta-previousDelta)/double(elapsedNs)*100.0;
+    if (ratio<0 || !std::isfinite(ratio)) return {};
+    return std::clamp(ratio,0.0,100.0);
+}
+// Fixed 8-level block sparkline: ▁▂▃▄▅▆▇█. One bar per value; empty values
+// stay blank. ceiling<=0 -> empty string. Used for the Rust-amdgpu_top-style
+// history rows (utilization, memory, temperature).
+inline std::string sparkline(const std::vector<std::optional<double>> &values, double ceiling) {
+    std::string out;
+    if (!(ceiling>0)) return out;
+    out.reserve(values.size()*3);
+    for (const auto &value:values) {
+        if (!value || !std::isfinite(*value) || *value<=0) { out+=' '; continue; }
+        const unsigned level=unsigned(std::clamp(*value/ceiling,0.0,1.0)*7.999); // 0..7
+        const unsigned cp=0x2580+level;
+        out+=char(0xE2);out+=char(0x90|(cp>>6));out+=char(0x80|(cp&63));
+    }
+    return out;
+}
+// min/max/avg of the present values; empty when nothing is available.
+inline std::optional<std::array<double,3>> stats(const std::vector<std::optional<double>> &values) {
+    double minimum=0,maximum=0,sum=0;size_t count=0;
+    for (const auto &value:values) {
+        if (!value || !std::isfinite(*value)) continue;
+        if (!count) minimum=maximum=*value; else {minimum=std::min(minimum,*value);maximum=std::max(maximum,*value);}
+        sum+=*value;++count;
+    }
+    if (!count) return {};
+    return std::array<double,3>{minimum,maximum,sum/double(count)};
+}
 inline std::string meter(double used, double capacity, size_t width) {
     if (!(capacity>0) || !std::isfinite(used) || !std::isfinite(capacity)) return "[unavailable]";
     const size_t filled=size_t(std::clamp(used/capacity,0.0,1.0)*double(width));

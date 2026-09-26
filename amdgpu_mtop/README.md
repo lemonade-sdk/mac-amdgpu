@@ -23,7 +23,7 @@ cmake --build build/amdgpu_mtop --parallel 4
 build/amdgpu_mtop/amdgpu_mtop
 ```
 
-- `h`: toggle **Slow 500 ms** (default) and **Fast 100 ms** dashboard refresh.
+- `h`: toggle **Slow 0.1 s** (default) and **Fast 0.01 s** dashboard refresh.
 - `n` / `p`: select the next / previous GPU.
 - `q` or `Ctrl-C`: quit and restore normal terminal input.
 
@@ -39,6 +39,13 @@ build/amdgpu_mtop/amdgpu_mtop --list
 build/amdgpu_mtop/amdgpu_mtop --device 0x10033939d --slow
 build/amdgpu_mtop/amdgpu_mtop --json
 build/amdgpu_mtop/amdgpu_mtop --json --watch --fast
+
+Live sparkline history rows use the 8-level block characters ▁▂▃▄▅▆▇█
+(Rust-amdgpu_top-style), one bar per 1-second time bucket over a fixed
+60-second window. The GPU UTIL row shows driver dispatch-in-flight
+telemetry (pendingNs delta / wall window, 0..100%), VRAM USED shows
+GiB, TEMP shows Celsius, and the raw SMU AverageGfxActivity row is
+retained for reference (it is uncalibrated: idle can report 100%).
 ```
 
 Use a registry ID from `--list`; the example ID is not a permanent GPU identity.

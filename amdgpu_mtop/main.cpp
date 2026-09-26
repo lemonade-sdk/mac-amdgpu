@@ -173,10 +173,32 @@ void json(const std::vector<mtop::Device> &devices, const mtop::Selection &selec
     std::cout << "]}\n";
 }
 using Histories=std::map<uint64_t,mtop::History>;
+std::optional<double> hardwareValue(const mtop::Device &d,amdgpu::metrics::Field field,uint64_t now) {
+    if (!mtop::fresh(d,now) || !(d.metrics.validFields&(uint64_t(1)<<field))) return {};
+    return double(d.metrics.values[field]);
+}
+std::optional<double> temperatureValue(const mtop::Device &d,uint64_t now) {
+    // Hotspot first, then edge, then memory; 1000 mC per 1 C.
+    for (const auto field:std::array<amdgpu::metrics::Field,3>{amdgpu::metrics::HotspotTemperatureMillicelsius,
+            amdgpu::metrics::EdgeTemperatureMillicelsius,amdgpu::metrics::MemoryTemperatureMillicelsius}) {
+        if (const auto value=hardwareValue(d,field,now)) return *value/1000.0;
+    }
+    return {};
+}
+// True delta-based utilization from driver activity telemetry: software
+// pendingNs (union of dispatch-in-flight intervals) is a cumulative busy
+// counter maintained by the single-writer lifecycle queue; dividing its delta
+// by the monotonic elapsed time is a fraction of the window the engines were
+// in flight, clamped to 100%. This is the fallback source; a reachable
+// hardware busy counter would take precedence (none is exposed by the
+// current observer surface: the SMU table carries only the uncalibrated
+// AverageGfxActivity average, documented as "idle can report 100%").
 std::optional<mtop::RateCounters> rateCounters(const mtop::Device &d) {
     if (!mtop::hasSoftware(d) || (d.software.flags&amdgpu::software_stats::Saturated)) return {};
     mtop::RateCounters out{d.software.generation,d.software.sampledAtNs,d.software.publishedPackets,0};
     for (const auto &engine:d.software.engines) {
+        if (UINT64_MAX-out.pendingNs<engine.pendingNs) return {};
+        out.pendingNs+=engine.pendingNs;
         if (UINT64_MAX-out.submitted<engine.submitted) return {};
         out.submitted+=engine.submitted;
         for (unsigned direction=0;direction<amdgpu::software_stats::DirectionCount;++direction) {
@@ -189,18 +211,59 @@ std::optional<mtop::RateCounters> rateCounters(const mtop::Device &d) {
     }
     return out;
 }
+std::string utilizationSource(const mtop::Device &d) {
+    if (!mtop::hasSoftware(d)) return "unavailable";
+    if (d.software.flags&amdgpu::software_stats::Saturated) return "saturated";
+    return "driver dispatch-in-flight telemetry (software_stats pendingNs delta / wall window)";
+}
+// True delta-based utilization, computed by the monitor from the driver's
+// cumulative in-flight telemetry: pendingNs is the union of dispatch-in-
+// flight intervals, maintained by the single-writer lifecycle queue; its delta
+// over the previous sample divided by the monotonic wall interval is the
+// fraction of that window the engines were in flight, clamped to 100%.
+// The first sample after a baseline has no window and reports unavailable.
+// A hardware busy counter would be preferred, but the observer surface only
+// exposes the SMU AverageGfxActivity average, which is documented as
+// uncalibrated ("idle can report 100%") — see utilizationSource().
+std::optional<double> busyPercent(const mtop::Device &d,
+                                  const mtop::History &history) {
+    const auto counters=rateCounters(d);
+    if (!counters) return {};
+    const auto &previous=history.previousBusy;
+    const bool reset=!previous || previous->generation!=counters->generation ||
+        previous->timeNs>counters->timeNs || previous->pendingNs>counters->pendingNs ||
+        counters->timeNs-previous->timeNs>2'000'000'000ull;
+    if (reset || !previous) return {};
+    return mtop::busyRatio(counters->pendingNs,previous->pendingNs,counters->timeNs-previous->timeNs);
+}
 std::optional<double> allocatedGiB(const mtop::Device &d) {
     using namespace amdgpu::vram_accounting;
     if (!mtop::hasAccounting(d)) return {};
     return (double(d.accounting.values[VisibleUsed])+double(d.accounting.values[DeviceUsed]))/1073741824.0;
 }
-std::optional<double> hardwareValue(const mtop::Device &d,amdgpu::metrics::Field field,uint64_t now) {
-    if (!mtop::fresh(d,now) || !(d.metrics.validFields&(uint64_t(1)<<field))) return {};
-    return double(d.metrics.values[field]);
+std::optional<double> capacityGiB(const mtop::Device &d) {
+    using namespace amdgpu::vram_accounting;
+    if (!mtop::hasAccounting(d)) return {};
+    return (double(d.accounting.values[VisibleCapacity])+double(d.accounting.values[DeviceCapacity]))/1073741824.0;
 }
 std::string decimal(std::optional<double> value,unsigned places=1) {
     if (!value) return "--";
     std::ostringstream out;out<<std::fixed<<std::setprecision(places)<<*value;return out.str();
+}
+// Rust-amdgpu_top-style history row: label, sparkline, current value,
+// min/max/avg. Fixed 0..ceiling scale for percentage metrics.
+std::string historyLine(const std::string &label,const std::string &unit,
+                        const std::vector<std::optional<double>> &values,
+                        std::optional<double> current,double ceiling) {
+    const auto minimum=mtop::stats(values);
+    std::ostringstream out;
+    out<<label<<" ";
+    out.fill(' ');out<<std::setw(34)<<mtop::sparkline(values,ceiling);
+out.fill(' ');
+    out<<"  "<<decimal(current)<<" ";
+    if (unit!="") out<<unit<<" ";
+    if (minimum) out<<"min "<<decimal(minimum->at(0),0)<<"  avg "<<decimal(minimum->at(2),0)<<"  max "<<decimal(minimum->at(1),0);
+    return out.str();
 }
 std::optional<double> clockValue(const mtop::Device &d,unsigned index,uint64_t now,unsigned kind=0) {
     if (index>=4 || (kind ? !mtop::validClocks(d) || d.stage!=15 : !mtop::freshClocks(d,now))) return {};
@@ -267,7 +330,7 @@ void dashboard(const std::vector<mtop::Device> &devices, const mtop::Selection &
     auto tint=[&](const std::string&text,const char*code){return interactive ? std::string(code)+text+"\033[0m" : text;};
     auto line=[&](std::string value) {lines.push_back(std::move(value));};
     line(tint(std::string("amdgpu_mtop")+(demo?" DEMO (synthetic)":"")+"  |  "+std::to_string(devices.size())+" GPU(s)  |  "+mode.label()+
-        (graphics==mtop::Graphics::Kitty ? "  |  PIXEL / Kitty" : graphics==mtop::Graphics::ITerm ? "  |  PIXEL / iTerm" : "  |  TEXT / Braille"),"\033[1;36m"));
+        (graphics==mtop::Graphics::Kitty ? "  |  PIXEL / Kitty" : graphics==mtop::Graphics::ITerm ? "  |  PIXEL / iTerm" : "  |  TEXT / block sparkline"),"\033[1;36m"));
     line(std::string(columns,'='));
     if (!error.empty()) line("Enumeration: "+error);
     if (devices.empty()) line("Waiting for a GPU bound to MacAMDGPU...");
@@ -281,27 +344,26 @@ void dashboard(const std::vector<mtop::Device> &devices, const mtop::Selection &
         if (!d && selection.registry) line("Selected GPU disconnected: "+id(*selection.registry));
         if (d && d->error.empty()) {
             using namespace amdgpu::vram_accounting;
-            line("Sensors: "+telemetryProfile(*d)+" | firmware sampling 1 s | "+telemetryStatus(*d));
             const mtop::History empty;
             const auto it=histories ? histories->find(d->registry) : Histories::const_iterator{};
             const auto &history=histories && it!=histories->end() ? it->second : empty;
             using namespace amdgpu::metrics;
-            line(tint("CLOCKS  firmware average  ","\033[1m")+
-                tint("GFX "+decimal(hardwareValue(*d,GfxClockMHz,now),0)+" MHz","\033[1;36m")+"    "+
-                tint("MEM "+decimal(hardwareValue(*d,MemoryClockMHz,now),0)+" MHz","\033[1;35m"));
-            if(rows>=30 || !interactive) {
-                line("SMU raw snapshot  GFX "+decimal(clockValue(*d,0,now),0)+"  MEM "+decimal(clockValue(*d,2,now),0)+
-                    " MHz | snapshot is not the firmware average");
-                line("Raw observed min/max  GFX "+decimal(history.minimumGfxClockMHz,0)+" / "+decimal(history.peakGfxClockMHz,0)+
-                    "   MEM "+decimal(history.minimumMemoryClockMHz,0)+" / "+decimal(history.peakMemoryClockMHz,0)+" MHz");
-            }
+            // Header: chip identity/geometry + current clocks, temperature, sensors.
+            std::string chip=std::string("gfx")+std::to_string(d->gfx[0])+'.'+std::to_string(d->gfx[1])+'.'+std::to_string(d->gfx[2]);
+            if (d->spec.valid) chip+="  "+std::to_string(d->spec.words[12])+" CUs  "+std::to_string(d->spec.words[4])+" SE";
+            const auto tempNow=temperatureValue(*d,now);
+            line(tint("GPU  "+chip,"\033[1m")+
+                "  "+(d->stage==15 ? "initialized" : "stage "+std::to_string(d->stage))+
+                "  |  "+tint("GFX "+decimal(hardwareValue(*d,GfxClockMHz,now),0)+" MHz","\033[1;36m")+
+                "  "+tint("MEM "+decimal(hardwareValue(*d,MemoryClockMHz,now),0)+" MHz","\033[1;35m")+
+                "  "+tint("TEMP "+decimal(tempNow,0)+" C","\033[1;33m")+
+                "  |  sensors "+telemetryStatus(*d));
             line("DPM min / AC max  GFX "+decimal(clockValue(*d,0,now,1),0)+" / "+decimal(clockValue(*d,0,now,2),0)+
-                "   MEM "+decimal(clockValue(*d,2,now,1),0)+" / "+decimal(clockValue(*d,2,now,2),0)+" MHz");
+                "   MEM "+decimal(clockValue(*d,2,now,1),0)+" / "+decimal(clockValue(*d,2,now,2),0)+
+                " MHz | raw GFX "+decimal(clockValue(*d,0,now),0)+"  MEM "+decimal(clockValue(*d,2,now),0)+
+                " | observed min/max GFX "+decimal(history.minimumGfxClockMHz,0)+" / "+decimal(history.peakGfxClockMHz,0));
             line(tint("POWER  "+metric(*d,SocketPowerMilliwatts,1000," W"),"\033[1;33m")+
                 "    FAN "+metric(*d,FanRPM,1," RPM")+"    UMC activity "+metric(*d,UmcActivityPercent,1,"%"));
-            line("TEMP   edge "+metric(*d,EdgeTemperatureMillicelsius,1000," C")+
-                "    hotspot "+metric(*d,HotspotTemperatureMillicelsius,1000," C")+
-                "    memory "+metric(*d,MemoryTemperatureMillicelsius,1000," C"));
             if (mtop::hasAccounting(*d)) {
                 const auto &a=d->accounting.values;
                 const double used=double(a[VisibleUsed])+double(a[DeviceUsed]);
@@ -319,41 +381,39 @@ void dashboard(const std::vector<mtop::Device> &devices, const mtop::Selection &
                     "  clients "+std::to_string(d->software.participants)+
                     ((d->software.flags&amdgpu::software_stats::QueueSampleIncomplete)?" (partial snapshot)":""));
             } else line("Work counters: "+(d->softwareError.empty() ? std::string("unavailable") : d->softwareError));
-            const unsigned height=rows>=32 ? 4 : 2;
-            auto chart=[&](const std::string &title,const std::string &unit,std::optional<double> mtop::ActivityPoint::*field,
-                           std::optional<double> fixedScale={}) {
-                const auto values=history.buckets((columns-3)*2,now,field);
-                double maximum=1;for (auto value:values) if(value) maximum=std::max(maximum,*value);
-                if (fixedScale) maximum=*fixedScale;
-                auto current=history.points.empty() ? std::optional<double>{} : history.points.back().*field;
-                // A stale or failed firmware read must not retain a previous
-                // numeric headline, even while historical samples remain visible.
-                if (field==&mtop::ActivityPoint::gfxPercent)
-                    current=hardwareValue(*d,amdgpu::metrics::GfxActivityPercent,now);
-                if(field==&mtop::ActivityPoint::transferMiBPerSecond &&
-                    (!history.previous || now<history.previous->timeNs || now-history.previous->timeNs>2'000'000'000ull)) current.reset();
-                line(title+"  "+decimal(current)+" "+unit+
-                    (fixedScale ? "  [scale 0.."+decimal(maximum,0)+"]" : "  [peak scale "+decimal(maximum)+"]"));
-                if(interactive && graphics!=mtop::Graphics::Text) {
-                    images.push_back({unsigned(lines.size()+1),height,mtop::chartPNG(values,(columns-3)*8,height*18,maximum,
-                        field==&mtop::ActivityPoint::transferMiBPerSecond ? std::array<uint8_t,3>{243,181,74} : std::array<uint8_t,3>{64,203,230})});
-                    for(unsigned y=0;y<height;++y)line("|"+std::string(columns-3,' ')+"|");
-                } else for (const auto &row:mtop::graph(values,height,maximum)) line(tint("|"+row+"|","\033[36m"));
-                line("+"+std::string(columns-3,'-')+"+");
-            };
-            // Activity is an absolute percentage, never normalized to the
-            // recent peak and never replaced with a software submission rate.
-            chart("SMU REPORTED GFX","%",&mtop::ActivityPoint::gfxPercent,100.0);
-            chart("TRACKED COPY COMPLETIONS / 1 s avg","MiB/s",&mtop::ActivityPoint::transferMiBPerSecond);
-            const auto rates=history.points.empty() || !history.previous || now<history.previous->timeNs || now-history.previous->timeNs>2'000'000'000ull ?std::array<std::optional<double>,5>{}:history.points.back().copyMiBPerSecond;
-            line("  H2D "+decimal(rates[0])+"   D2H "+decimal(rates[1])+"   VRAM copy "+decimal(rates[2])+" MiB/s");
-            line("  Host copy "+decimal(rates[3])+"   unknown "+decimal(rates[4])+" MiB/s | payload once, at retirement");
-            line("60 s history | sensor capture 1 Hz | tracked copies omit HRX compute blits; not PCIe bandwidth");
+            // Live sparkline history rows (60 s window, 60-column fixed scale;
+            // refresh speed never changes the time axis). Pixel protocols add
+            // a small RGB chart per row; the block sparkline stays as fallback.
+            const unsigned pixelRows=interactive && graphics!=mtop::Graphics::Text ? 5 : 0;
+            const unsigned sparkColumns=60;
+            const auto utilizationBuckets=history.buckets(sparkColumns,now,&mtop::ActivityPoint::busyPercent);
+            const auto vramBuckets=history.buckets(sparkColumns,now,&mtop::ActivityPoint::allocatedGiB);
+            const auto tempBuckets=history.buckets(sparkColumns,now,&mtop::ActivityPoint::temperatureC);
+            const auto smuBuckets=history.buckets(sparkColumns,now,&mtop::ActivityPoint::gfxPercent);
+            const auto copyBuckets=history.buckets(sparkColumns,now,&mtop::ActivityPoint::transferMiBPerSecond);
+            const auto vramCeiling=capacityGiB(*d).value_or(1.0);
+            if (pixelRows) {
+                images.push_back({unsigned(lines.size()+1),1,mtop::chartPNG(utilizationBuckets,480,18,100)});
+                images.push_back({unsigned(lines.size()+2),1,mtop::chartPNG(vramBuckets,480,18,vramCeiling,{230,181,74})});
+                images.push_back({unsigned(lines.size()+3),1,mtop::chartPNG(tempBuckets,480,18,100,{240,120,90})});
+                images.push_back({unsigned(lines.size()+4),1,mtop::chartPNG(smuBuckets,480,18,100,{120,160,200})});
+                images.push_back({unsigned(lines.size()+5),1,mtop::chartPNG(copyBuckets,480,18,0.0,{140,200,140})});
+                for(unsigned i=0;i<5;++i)line("");
+            }
+            line(tint(historyLine("GPU UTIL  ","%",utilizationBuckets,
+                history.points.empty() ? std::optional<double>{} : history.points.back().busyPercent,100.0),
+                "\033[1;36m"));
+            line(historyLine("VRAM USED ","GiB",vramBuckets,
+                history.points.empty() ? std::optional<double>{} : history.points.back().allocatedGiB,vramCeiling));
+            line(historyLine("TEMP      ","C",tempBuckets,tempNow,100.0));
+            line("60 s history; sensor capture 1 Hz | util: "+utilizationSource(*d));
+            line(tint(historyLine("SMU GFX   ","%",smuBuckets,
+                hardwareValue(*d,GfxActivityPercent,now),100.0)+
+                "   (raw AverageGfxActivity, uncalibrated)","\033[90m"));
             if (d->metrics.driverInterface==amdgpu::metrics::kCompatibleInterface &&
                 (d->metrics.flags&amdgpu::kSMUMetricsLinuxCompatible))
-                line("SMU activity: idle can report 100%; workload utilization unverified.");
-            else line("SMU activity is firmware-reported; not CU occupancy or productive workload utilization.");
-
+                line("SMU activity: idle can report 100%; the GPU UTIL row is a driver in-flight delta.");
+            else line("SMU activity is firmware-reported; the GPU UTIL row is a driver in-flight delta.");
         }
     }
     const std::string footer="[h] fast/slow  [n/p] GPU  [q] quit | "+std::string(mode.label());
@@ -397,7 +457,9 @@ int main(int argc, char **argv) {
         if (arg == "--help" || arg == "-h") {
             std::cout << "amdgpu_mtop [--list] [--device REGISTRY_ID] [--json] [--watch] [--fast | --slow] [--graphics auto|kitty|iterm|text] [--demo]\n"
                          "Native macOS monitor for GPUs bound to MacAMDGPU (build 172+).\n"
-                         "Slow: 0.5 s (default), fast: 0.1 s; h toggles, n/p select GPU, q quits.\n"
+                         "Slow: 0.1 s (default), fast: 0.01 s; h toggles, n/p select GPU, q quits.\n"
+                         "Live 60 s sparkline histories: GPU utilization (driver in-flight delta, 0..100%),\n"
+                         "VRAM used GiB, temperature C, plus the raw SMU AverageGfxActivity for reference.\n"
                          "Non-terminal output is one snapshot unless --watch is specified.\n"
                          "Observer: never initializes, resets or changes power policy.\n"
                          "Driver 193+: bounded sensor collection at 1 Hz and software activity counters.\n"
@@ -481,23 +543,32 @@ int main(int argc, char **argv) {
             auto &h=histories[d.registry];
             if(h.points.empty())for(unsigned i=0;i<600;++i) {
                 mtop::ActivityPoint p;p.timeNs=t-(599-i)*100000000ull;p.gfxPercent=40+30*std::sin(i/25.0);
-                p.transferMiBPerSecond=200+160*std::sin(i/37.0);h.points.push_back(p);
+                p.busyPercent=30+25*std::sin(i/17.0)+10*std::sin(i/4.0);
+                p.transferMiBPerSecond=200+160*std::sin(i/37.0);
+                p.allocatedGiB=18+6*std::sin(i/29.0);p.temperatureC=52+8*std::sin(i/41.0);
+                h.points.push_back(p);
             }
             h.clocks(2250,1250);h.clocks(700,1000);
+            h.previousBusy=mtop::RateCounters{1,t,0,0};
             h.previous=mtop::RateCounters{1,t,0,0};
-            h.points.back().copyMiBPerSecond={125.0,0.9,0.0,0.0,0.0};
             newSample=false;
         }
         selected.initialize(devices);
         const auto sampledAt=clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         if(newSample)for (const auto &device:devices) {
             auto &history=histories[device.registry];
-            history.add(sampledAt,rateCounters(device),allocatedGiB(device),hardwareValue(device,amdgpu::metrics::GfxActivityPercent,sampledAt));
+            const auto counters=rateCounters(device);
+            const auto busy=busyPercent(device,history);
+            history.add(sampledAt,counters,allocatedGiB(device),hardwareValue(device,amdgpu::metrics::GfxActivityPercent,sampledAt),
+                        temperatureValue(device,sampledAt));
+            history.previousBusy=counters;
+            if (busy) history.points.back().busyPercent=busy;
             history.clocks(clockValue(device,0,sampledAt),clockValue(device,2,sampledAt));
         }
         for (auto i=histories.begin();i!=histories.end();) {
             const bool present=std::any_of(devices.begin(),devices.end(),[&](const auto &d){return d.registry==i->first;});
             if (!present) i->second.previous.reset();
+            if (!present) i->second.previousBusy.reset();
             if (!present && !i->second.points.empty() && sampledAt-i->second.points.back().timeNs>mtop::History::windowNs) i=histories.erase(i);
             else ++i;
         }
