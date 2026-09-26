@@ -49,12 +49,14 @@ enum DriverABI {
     static let selSoftware: UInt32 = 61     // struct out: software_stats::Snapshot (456 B)
     static let selSensors: UInt32 = 63      // out: 3 u64 (bounded sensor cache)
     static let selSqSlot: UInt32 = 69       // out: 5 u64 [status, seq, sq_busy, ref, clock]
+    static let selSqBusy: UInt32 = 70       // out: 5 u64 [status, busy_delta, total_delta, pct_x100, at_ns]
     static let selMmhub: UInt32 = 68        // out: 4 u64 PERFSTATUS UMC busy
 
     static let minimumBuild: UInt32 = 172
     static let softwareMinimumBuild: UInt32 = 193
     static let mmhubMinimumBuild: UInt32 = 198
     static let sqSlotMinimumBuild: UInt32 = 200
+    static let sqBusyMinimumBuild: UInt32 = 200   // driver-owned SQ busy counter (sel 70)
     static let magic: UInt64 = 0x414D444750554142 // "AMDGPUAB"
 
     // Struct payload sizes (C static_asserts in dext/amdgpu).
@@ -249,6 +251,28 @@ struct MmhubPerfStatus {
     }
 }
 
+// The driver-owned SQ busy-cycle counter read (selector 70, driver 200+): the
+// dext GRBM-broadcasts a read of SQ_PERFCOUNTER0 (BUSY_CYCLES) and
+// SQ_PERFCOUNTER1 (CYCLES) summed across all shader engines and returns the
+// delta over the poll interval. This is a true hardware counter (distinct from
+// the workload-owned aqlprofile slot, selector 69, and from the software
+// dispatch-rate proxy). status != 0 (kIOReturnUnsupported) means the counter
+// is not available (PCI not open / not ready) — show n/a, not 0.
+struct SqBusySample {
+    var status: UInt32 = 0     // 0 = fresh sample; kIOReturnUnsupported = no source
+    var busyDelta: UInt64 = 0  // busy shader cycles in the window
+    var totalDelta: UInt64 = 0 // total shader cycles in the window
+    var pctX100: UInt64 = 0    // busy % scaled by 100 (55% => 5500)
+    var sampledAtNs: UInt64 = 0
+    var valid = false
+    var usable: Bool { valid && status == 0 && totalDelta > 0 }
+
+    /// Busy percentage in 0..100 (for display), or nil when no usable sample.
+    var percent: Double? {
+        usable ? Double(pctX100) / 100.0 : nil
+    }
+}
+
 // MARK: - Device
 
 final class Device {
@@ -280,6 +304,10 @@ final class Device {
     // process (HRX LSE backend) publishes real aqlprofile SQ counter sums
     // into a GART slot; status != 0 means no slot is registered yet.
     var sqSlot = SqSlotSample()
+    // Driver-owned SQ busy-cycle counter (selector 70, driver 200+): the dext
+    // reads the real hardware SQ busy counter directly. Preferred over the
+    // workload slot when both are present.
+    var sqBusy = SqBusySample()
 
     var label: String {
         "0x" + String(registry, radix: 16)
@@ -403,20 +431,49 @@ final class DriverTransport {
         if device.build >= DriverABI.sqSlotMinimumBuild {
             var words = [UInt64](repeating: 0, count: 5)
             let kr = scalar(DriverABI.selSqSlot, [], into: &words)
-            if kr == KERN_SUCCESS, words[0] == 0 {
+            // The driver sign-extends a negative kern_return_t to the full 64
+            // bits (e.g. 0xffffffffe000xxxx), which does NOT fit a UInt32 and
+            // would trap on a raw UInt32(words[n]). Mask every word to its low
+            // 32 bits BEFORE narrowing (same discipline as selector 70 / MMHUB).
+            let statusLow32 = UInt32(words[0] & 0xFFFFFFFF)
+            if kr == KERN_SUCCESS, statusLow32 == 0 {
                 device.sqSlot = SqSlotSample(
                     status: 0,
-                    seq: UInt32(words[1]),
-                    sqBusy: UInt32(words[2]),
-                    refTicks: UInt32(words[3]),
-                    clockHz: UInt32(words[4]))
+                    seq: UInt32(words[1] & 0xFFFFFFFF),
+                    sqBusy: UInt32(words[2] & 0xFFFFFFFF),
+                    refTicks: UInt32(words[3] & 0xFFFFFFFF),
+                    clockHz: UInt32(words[4] & 0xFFFFFFFF))
                 device.sqSlot.valid = true
             } else if kr == KERN_SUCCESS {
                 // status != 0 (no slot registered yet): leave invalid, the
                 // panel shows the honest n/a.
-                device.sqSlot.status = UInt32(words[0])
+                device.sqSlot.status = statusLow32
             } else {
-                device.sqSlot.status = UInt32(kr)
+                device.sqSlot.status = UInt32(truncatingIfNeeded: kr)
+            }
+        }
+
+        // Driver-owned SQ busy-cycle counter (selector 70, build 200+): five
+        // scalars [status, busy_delta, total_delta, pct_x100, at_ns].
+        // Observer-only, no allocation. status != 0 (kIOReturnUnsupported)
+        // means the counter is not available (not ready) — leave invalid so
+        // the panel shows the honest n/a. Check the low-32 status BEFORE any
+        // narrowing (the SIGTRAP lesson: never trap on the unsupported code).
+        if device.build >= DriverABI.sqBusyMinimumBuild {
+            var words = [UInt64](repeating: 0, count: 5)
+            let kr = scalar(DriverABI.selSqBusy, [], into: &words)
+            if kr == KERN_SUCCESS, words[0] == 0 {
+                device.sqBusy = SqBusySample(
+                    status: 0,
+                    busyDelta: words[1],
+                    totalDelta: words[2],
+                    pctX100: words[3],
+                    sampledAtNs: words[4])
+                device.sqBusy.valid = true
+            } else if kr == KERN_SUCCESS {
+                device.sqBusy.status = UInt32(truncatingIfNeeded: words[0])
+            } else {
+                device.sqBusy.status = UInt32(truncatingIfNeeded: kr)
             }
         }
 

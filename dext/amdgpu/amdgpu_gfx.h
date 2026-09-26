@@ -250,6 +250,25 @@ struct GFXSpecSnapshot {
 kern_return_t gfx_get_spec(const DeviceContext &dev, const GFXConfig &cfg,
                            GFXSpecSnapshot &out);
 
+// Reads the driver-owned SQ busy-cycle counter (a real hardware counter, not a
+// software proxy). Selects SQ_PERFCOUNTER0 = BUSY_CYCLES and
+// SQ_PERFCOUNTER1 = CYCLES across all shader engines via a GRBM broadcast,
+// reads the cumulative _LO readouts, and restores the GRBM select — the same
+// access class gfx_get_spec uses for its per-(SE,SH) harvest reads. The GRBM
+// select is held only for the two reads (microseconds), never across a window.
+//
+// The counters are cumulative: the caller is responsible for computing the
+// delta between successive calls (see the observer selector, which caches the
+// previous read). On the first call after boot the values are whatever the
+// hardware has accumulated since power-on, so callers should discard the first
+// sample.
+//
+// Returns kIOReturnSuccess and fills *busy/*total with the current cumulative
+// busy and total shader-cycle counts, or kIOReturnNotReady if the GC IP is not
+// resolved (dev invalid).
+void gfx_read_sq_busy(const DeviceContext &dev, uint64_t &busy,
+                      uint64_t &total);
+
 //
 // Port of gfx_v12_0_init_compute_vmid (gfx_v12_0.c:1766). For each
 // KFD VMID, GRBM-select it and program SH_MEM_CONFIG, SH_MEM_BASES,

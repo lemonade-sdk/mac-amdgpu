@@ -128,6 +128,7 @@ final class SampleHistory {
     private var lastSqSeq: UInt32 = 0
     private var lastSqValue: Double?
     private var lastSqNs: UInt64?
+    var lastSqSource: String?  // which SQ source produced the held value (read by makeSnapshot)
     private let sqHoldMaxNs: UInt64 = 2_500_000_000  // ~5 windows of silence
     // Wall-clock time (nowNs) of the last fresh GPU-load sample; used to expire
     // the held value once the driver stops reporting new work.
@@ -177,26 +178,31 @@ final class SampleHistory {
         var umc: Double?
         var sq: Double?
 
-        // ---- SQ BUSY % (selector 69, driver 200+): real hardware counter ----
-        // The workload process (HRX LSE backend) sums aqlprofile SQ busy
-        // cycles over a fixed window and publishes {seq, sq_busy, ref, clock}
-        // into the shared GART slot. busy % = sq_busy / ref * 100, clamped;
-        // a fresh seq means a fresh window, so hold the last value across the
-        // ~500 ms gap and expire it after ~2.5 s of silence (the panel drops
-        // to a gap instead of showing a stale number).
-        if d.sqSlot.valid, d.sqSlot.seq != lastSqSeq {
+        // ---- SQ BUSY %: real hardware counter ----
+        // PRIMARY (selector 70, driver 200+): the dext GRBM-broadcasts a read
+        // of SQ_PERFCOUNTER0 (BUSY_CYCLES) / SQ_PERFCOUNTER1 (CYCLES) summed
+        // across all shader engines and returns busy % directly (pctX100). No
+        // dependency on the workload registering a slot — this is the true
+        // driver-owned source. FALLBACK (selector 69): the workload-owned
+        // aqlprofile slot, used only when the driver counter is unavailable.
+        if d.sqBusy.usable {
+            lastSqValue = min(max(Double(d.sqBusy.pctX100) / 100.0, 0), 100)
+            lastSqNs = now
+            lastSqSource = "driver-owned SQ busy-cycle counter (selector 70; dext GRBM-broadcast read of SQ_PERFCOUNTER BUSY_CYCLES/CYCLES summed across all shader engines, hardware) - NOT CU occupancy, NOT the dispatch-rate proxy"
+        } else if d.sqSlot.valid, d.sqSlot.seq != lastSqSeq {
+            // Workload-owned aqlprofile slot (selector 69). busy % = sq_busy /
+            // ref * 100, clamped; a fresh seq means a fresh window, so hold the
+            // last value across the ~500 ms gap and expire it after ~2.5 s of
+            // silence (the panel drops to a gap instead of a stale number).
             lastSqSeq = d.sqSlot.seq
             if d.sqSlot.refTicks > 0, d.sqSlot.sqBusy <= d.sqSlot.refTicks * 100 {
-                // sqBusy is a sum over ALL CUs, refTicks is per-dispatch tick
-                // range: the ratio is a per-CU average only when the driver
-                // normalizes. We clamp at 100 and label the panel honestly
-                // ("SQ busy cycles / reference cycles, all CUs").
                 let pct = Double(d.sqSlot.sqBusy) / Double(d.sqSlot.refTicks) * 100.0
                 lastSqValue = min(max(pct, 0), 100)
             } else {
                 lastSqValue = d.sqSlot.sqBusy > 0 ? 100.0 : 0.0
             }
             lastSqNs = now
+            lastSqSource = "Real hardware SQ busy-cycle counter (aqlprofile SQ_BUSY_CYCLES, via the LSE workload process; all-CU sum over a ~0.5 s window) - NOT CU occupancy, NOT the dispatch-rate proxy"
         }
         if let held = lastSqValue, let heldNs = lastSqNs {
             if now - heldNs <= sqHoldMaxNs {
@@ -204,6 +210,7 @@ final class SampleHistory {
             } else {
                 lastSqValue = nil
                 lastSqNs = nil
+                lastSqSource = nil
             }
         }
 
@@ -461,9 +468,18 @@ func makeSnapshot(device: Device?, history: SampleHistory,
     } ?? false
     let hwAvailable = history.lastUmhubReliable
     snap.umcReliable = hwAvailable && !mmhubDead
+    let sqBusyUnavailableLabel: String? = device.flatMap { d in
+        // Panel is empty: no usable SQ-busy value. Explain why — on gfx1201
+        // the driver-owned counter (sel 70) is unavailable (the SQ busy-cycle
+        // counter is armed only by the closed aqlprofile CP-perfmon PM4, not a
+        // driver GRBM read) and the workload slot (sel 69) is not registered.
+        (d.build >= DriverABI.sqBusyMinimumBuild || d.build >= DriverABI.sqSlotMinimumBuild)
+            ? "No live SQ-busy counter on gfx1201: the hardware SQ busy-cycle counter is armed only by the closed aqlprofile CP-perfmon PM4 (workload-side, not a driver GRBM read - sel 70 reports unavailable) and the workload slot (sel 69) is not registered. Use GPU Core Load (dispatch-rate proxy) or SMU GfxActivity for 'is the GPU busy'."
+            : nil
+    }
     snap.sqBusySourceLabel = history.sqBusyCurrent != nil
-        ? "Real hardware SQ busy-cycle counter (aqlprofile SQ_BUSY_CYCLES, via the LSE workload process; all-CU sum over a ~0.5 s window) - NOT CU occupancy, NOT the dispatch-rate proxy"
-        : nil
+        ? history.lastSqSource
+        : sqBusyUnavailableLabel
     var umcLabel = history.lastUmhubSource ?? umcDefaultLabel
     if mmhubDead {
         umcLabel = hwAvailable

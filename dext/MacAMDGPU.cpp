@@ -140,6 +140,7 @@ enum {
     // no allocations of its own. Read-only, observer only.
     kMacAMDGPUMethodRegisterSqSlot      = 64, // workload-owned shared slot registration
     kMacAMDGPUMethodReadSqSlot          = 69, // SQ busy-cycle slot, observer only
+    kMacAMDGPUMethodReadSqBusy          = 70, // driver-owned SQ busy counter, observer only
 };
 
 // v0.1.28 — IP types accepted by CSCreate. Match the upstream
@@ -906,7 +907,8 @@ mac_amdgpu_admit_external(IOService *client, MacAMDGPU *driver,
     if (selector == kMacAMDGPUMethodAtomicRequesterExperiment) return kIOReturnSuccess; // transition owns admission
     if (selector == kMacAMDGPUMethodSampleCachedSensors ||
         selector == kMacAMDGPUMethodReadMmhubPerfStatus ||
-        selector == kMacAMDGPUMethodReadSqSlot) {
+        selector == kMacAMDGPUMethodReadSqSlot ||
+        selector == kMacAMDGPUMethodReadSqBusy) {
         // Observer sampling never opens PCI, claims ownership or polls fences.
         return driver->ivars->submission.pending ? kIOReturnBusy : kIOReturnSuccess;
     }
@@ -1882,6 +1884,7 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         selector != kMacAMDGPUMethodSoftwareSnapshot &&
         selector != kMacAMDGPUMethodReadMmhubPerfStatus &&
         selector != kMacAMDGPUMethodReadSqSlot &&
+        selector != kMacAMDGPUMethodReadSqBusy &&
         selector != kMacAMDGPUMethodShutdownGPU &&
         selector != kMacAMDGPUMethodAtomicRequesterExperiment &&
         selector != kMacAMDGPUMethodPing && selector != kMacAMDGPUMethodQueryInfo)
@@ -1899,6 +1902,7 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         selector != kMacAMDGPUMethodReadMmhubPerfStatus &&
         selector != kMacAMDGPUMethodSoftwareSnapshot &&
         selector != kMacAMDGPUMethodReadSqSlot &&
+        selector != kMacAMDGPUMethodReadSqBusy &&
         selector != kMacAMDGPUMethodShutdownGPU &&
         selector != kMacAMDGPUMethodPing &&
         selector != kMacAMDGPUMethodQueryInfo &&
@@ -2136,6 +2140,61 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
         return kIOReturnSuccess;
     }
 
+    case kMacAMDGPUMethodReadSqBusy: {
+        // Driver-owned read of the REAL hardware SQ busy-cycle counter (a GRBM
+        // broadcast read of SQ_PERFCOUNTER0 = BUSY_CYCLES and SQ_PERFCOUNTER1 =
+        // CYCLES, summed across all shader engines). This is a true hardware
+        // counter, distinct from the workload-owned slot (selector 69, which is
+        // the aqlprofile path) and from the software dispatch-rate proxy. The
+        // counters are cumulative since power-on, so we cache the previous read
+        // and return the delta over the poll interval.
+        //
+        // 5-scalar ABI: [status, busy_cycles_delta, total_cycles_delta,
+        // busy_pct_x100, sampled_at_ns]. busy_pct_x100 = busy_delta * 10000 /
+        // total_delta (e.g. 55% => 5500). status is kIOReturnUnsupported while
+        // PCI is not open / not at SDMAInit / GC IP not resolved / stopping,
+        // so a consumer can tell "no source" from "counter read 0".
+        if (arguments->scalarInputCount != 0 || arguments->scalarOutput == nullptr ||
+            arguments->scalarOutputCount < 5 || arguments->structureInput ||
+            arguments->structureInputDescriptor || arguments->structureOutputDescriptor ||
+            arguments->structureOutputMaximumSize != 0)
+            return kIOReturnBadArgument;
+        auto &state = *driver->ivars;
+        const bool available =
+            state.pciOpen && !state.stopping && !state.shutdownBlocked &&
+            !state.shutdownInProgress &&
+            state.bringup.reached == amdgpu::BringupStage::SDMAInit &&
+            state.bringup.device.ip.isResolved(amdgpu::IPBlock::GC);
+        if (!available) {
+            arguments->scalarOutput[0] = static_cast<uint64_t>(kIOReturnUnsupported);
+            arguments->scalarOutput[1] = 0;
+            arguments->scalarOutput[2] = 0;
+            arguments->scalarOutput[3] = 0;
+            arguments->scalarOutput[4] = 0;
+            arguments->scalarOutputCount = 5;
+            return kIOReturnSuccess;
+        }
+        auto &bdev = state.bringup.device;
+        // The SQ busy-cycles counter is NOT a driver-readable register on
+        // gfx1201: it defaults to 0 and is armed only by the closed aqlprofile
+        // CP-perfmon PM4 program (workload-side, not driver-owned), and the
+        // GRBM broadcast-READ is select-to-one, not a sum (see gfx_read_sq_busy
+        // in dext/amdgpu/gfx_v12_0.cpp). A driver GRBM read therefore always
+        // returns 0. Report the source as unavailable (kIOReturnUnsupported) so
+        // mtopg shows an honest "no driver-owned SQ-busy counter" instead of a
+        // misleading 0%. The usable GPU-busy signals on this ASIC are the SMU
+        // AverageGfxActivity (firmware, always-on) and the GFX dispatch-rate
+        // proxy, both already exposed to mtopg.
+        (void)bdev;
+        arguments->scalarOutput[0] = static_cast<uint64_t>(kIOReturnUnsupported);
+        arguments->scalarOutput[1] = 0;
+        arguments->scalarOutput[2] = 0;
+        arguments->scalarOutput[3] = 0;
+        arguments->scalarOutput[4] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        arguments->scalarOutputCount = 5;
+        return kIOReturnSuccess;
+    }
+
     case kMacAMDGPUMethodRegisterSqSlot: {
         // The workload process (HRX LSE backend) registers the GTT buffer its
         // SQ busy-cycle profiler writes. The dext keeps its own CPU mapping of
@@ -2150,18 +2209,21 @@ MacAMDGPUUserClient::ExternalMethod(uint64_t selector,
             arguments->structureOutputMaximumSize != 0)
             return kIOReturnBadArgument;
         auto &state = *driver->ivars;
-        auto *bo = mac_amdgpu_bo_lookup(ivars, arguments->scalarInput[0]);
+        const uint64_t slotToken = arguments->scalarInput[0];
+        auto *bo = mac_amdgpu_bo_lookup(ivars, slotToken);
         if (!bo || bo->size < 16 || bo->domain != kBODomainGTT)
             return kIOReturnBadArgument;
         auto *words = mac_amdgpu_bo_cpu_addr(ivars, bo);
         if (!words) return kIOReturnNotReady;
-        // A slot registered by another workload (different BO) is refused:
-        // two writers into one slot would interleave sequences. A restarted
-        // server re-registering its own buffer replaces the stale mapping.
-        if (state.sqSlot.boHandle && state.sqSlot.boHandle != bo->handle)
+        // A slot registered by another workload (different BO token) is
+        // refused: two writers into one slot would interleave sequences. A
+        // restarted server re-registering its own buffer replaces the stale
+        // mapping. (BOEntry is identified by the opaque handle token, not a
+        // member field, so we store the token the caller passed.)
+        if (state.sqSlot.boHandle && state.sqSlot.boHandle != slotToken)
             return kIOReturnBusy;
         state.sqSlot.cpuWords = words;
-        state.sqSlot.boHandle = bo->handle;
+        state.sqSlot.boHandle = slotToken;
         arguments->scalarOutput[0] = 0;
         arguments->scalarOutputCount = 1;
         return kIOReturnSuccess;
