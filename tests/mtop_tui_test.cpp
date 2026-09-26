@@ -32,53 +32,80 @@ int main() {
     const auto threeQuarter = fracBar(2.75, 4);
     assert(threeQuarter.find("\xE2\x96\x86") != std::string::npos); // \u2586 6/8 block
 
-    // --- Gradient stops (spec "TrueColor Gradient Palettes") ---
-    // 0% -> cyan #00F0FF.
+    // --- Gradient stops ---
+    // Default (dark-on-light) palette: cyan #0891b2, blue #1d4ed8,
+    // yellow #b45309, orange #c2410c, crimson #be123c.
     {
         auto [r, g, b] = gradient(0);
-        assert(r == 0 && g == 240 && b == 255);
+        assert(r == 8 && g == 145 && b == 178);
     }
-    // 50% -> electric blue #0072FF.
     {
         auto [r, g, b] = gradient(50);
-        assert(r == 0 && g == 114 && b == 255);
+        assert(r == 29 && g == 78 && b == 216);
     }
-    // 60% -> between yellow #FFD600 and orange #FF6B00 (t = (60-50)/(80-50) = 1/3).
+    // 60% -> between yellow #b45309 (180,83,9) and orange #c2410c (194,65,12), t = 1/3.
+    // r: 180 + (1/3)(194-180) = 180 + 4.67 = 184 (truncated)
+    // g: 83  + (1/3)(65-83)   = 83  - 6    = 77
+    // b: 9   + (1/3)(12-9)    = 9   + 1    = 10
     {
         auto [r, g, b] = gradient(60);
-        // r: 255 -> 255 (constant). g: 214 -> 107: 214 + (1/3)(107-214) = 214 - 35.67 = 178.33 -> 178
-        assert(r == 255);
-        assert(g >= 177 && g <= 179);
-        // b: 0 -> 0 (constant).
-        assert(b == 0);
+        assert(r == 184);
+        assert(g == 77);
+        assert(b == 10);
     }
-    // 80% -> orange #FF6B00.
     {
         auto [r, g, b] = gradient(80);
-        assert(r == 255 && g == 107 && b == 0);
+        assert(r == 194 && g == 65 && b == 12);
     }
-    // 100% -> crimson #FF0055.
     {
         auto [r, g, b] = gradient(100);
-        assert(r == 255 && g == 0 && b == 85);
+        assert(r == 190 && g == 18 && b == 60);
     }
     // Clamped: negative -> 0%, >100 -> 100%.
     {
         auto [r, g, b] = gradient(-10);
-        assert(r == 0 && g == 240 && b == 255);
+        assert(r == 8 && g == 145 && b == 178);
         auto [r2, g2, b2] = gradient(200);
-        assert(r2 == 255 && g2 == 0 && b2 == 85);
+        assert(r2 == 190 && g2 == 18 && b2 == 60);
+    }
+    // --dark palette restores the original bright-on-dark spec values:
+    // cyan #00F0FF, blue #0072FF, yellow #FFD600, orange #FF6B00,
+    // crimson #FF0055.
+    {
+        auto [r, g, b] = gradient(0, true);
+        assert(r == 0 && g == 240 && b == 255);
+        auto [r5, g5, b5] = gradient(50, true);
+        assert(r5 == 0 && g5 == 114 && b5 == 255);
+        auto [r1, g1, b1] = gradient(100, true);
+        assert(r1 == 255 && g1 == 0 && b1 == 85);
     }
 
     // --- Gradient bar: cell-by-cell truecolor ---
-    // A 100% bar of width 10 should contain \033[38;2; sequences.
-    const auto bar = gradientBar(10.0, 10);
+    // cells is the filled count in cells (not percent). A 10/10 bar renders
+    // the whole gradient; cell i+1 colors at percent (i+1)/width*100.
+    const auto palette = makePalette(false); // dark-on-light default
+    const auto bar = gradientBar(10.0, 10, palette);
     assert(bar.find("\033[38;2;") != std::string::npos);
     assert(bar.find("\033[0m") != std::string::npos);
-    // A 0% bar is all empty.
-    const auto empty = gradientBar(0.0, 10);
-    assert(empty.find("\033[38;2;") == std::string::npos);
+    // Light palette: first cell is at 10% (between cyan #0891b2 and blue),
+    // last cell is the crimson end stop #be123c.
+    assert(bar.find("\033[38;2;12;131;185m") != std::string::npos);
+    assert(bar.find("\033[38;2;190;18;60m") != std::string::npos);
+    // A 0% bar is all empty, colored for the light background (#d1d5db).
+    const auto empty = gradientBar(0.0, 10, palette);
+    assert(empty.find("\033[38;2;") != std::string::npos);
+    assert(empty.find("\033[38;2;209;213;219m") != std::string::npos);
     assert(visible(empty) == 10);
+    // --dark palette: bright stops, dimmed empty cells.
+    const auto darkPalette = makePalette(true);
+    const auto darkBar = gradientBar(10.0, 10, darkPalette);
+    // First cell at 10% in the bright palette (cyan #00F0FF -> blue #0072FF).
+    assert(darkBar.find("\033[38;2;") != std::string::npos);
+    assert(darkBar.find("\033[38;2;0;214;255m") != std::string::npos);
+    assert(darkBar.find("\033[38;2;255;0;85m") != std::string::npos);
+    const auto darkEmpty = gradientBar(0.0, 10, darkPalette);
+    assert(darkEmpty.find("\033[2m") != std::string::npos);
+    assert(visible(darkEmpty) == 10);
 
     // --- Braille canvas: 2 columns per cell, 4 rows per line ---
     // 2 samples of 100% at ceiling 1.0 -> a single cell, column fully filled.

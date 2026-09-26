@@ -365,7 +365,7 @@ void dashboard(const std::vector<mtop::Device> &devices, const mtop::Selection &
                const Histories *histories=nullptr,mtop::RefreshMode mode={},
                unsigned columns=100,unsigned rows=40,uint64_t now=0,
                mtop::Graphics graphics=mtop::Graphics::Text,mtop::Frame *frame=nullptr,bool demo=false,
-               const mtop::tui::Ui *ui=nullptr) {
+               const mtop::tui::Ui *ui=nullptr,mtop::tui::Palette palette=mtop::tui::Palette{}) {
     if (!now) now=clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     columns=std::clamp(columns,24u,200u);rows=std::max(8u,rows);
     std::vector<std::string> lines;
@@ -376,11 +376,11 @@ void dashboard(const std::vector<mtop::Device> &devices, const mtop::Selection &
     const auto sort=ui ? ui->sort : mtop::tui::Sort{};
     const bool engines=ui ? ui->enginesVisible : true;
     using namespace mtop::tui;
-    if (!error.empty()) line("Enumeration: "+error);
-    if (devices.empty()) line("Waiting for a GPU bound to MacAMDGPU...");
+    if (!error.empty()) line(palette.label("Enumeration: "+error));
+    if (devices.empty()) line(palette.label("Waiting for a GPU bound to MacAMDGPU..."));
     for (const auto &d:devices) {
-        line(std::string(selection.registry==d.registry ? "> " : "  ")+id(d.registry)+
-            (d.error.empty() ? "  gfx"+std::to_string(d.gfx[0])+"."+std::to_string(d.gfx[1])+"."+std::to_string(d.gfx[2])+
+        line(palette.value(std::string(selection.registry==d.registry ? "> " : "  ")+id(d.registry))+
+            palette.label(d.error.empty() ? "  gfx"+std::to_string(d.gfx[0])+"."+std::to_string(d.gfx[1])+"."+std::to_string(d.gfx[2])+
              "  build "+std::to_string(d.build)+"  "+(d.stage==15 ? "initialized" : "stage "+std::to_string(d.stage)) : "  "+d.error));
     }
     if (!listOnly) {
@@ -395,8 +395,34 @@ void dashboard(const std::vector<mtop::Device> &devices, const mtop::Selection &
             const auto utilizationBuckets=history.buckets(120,now,&mtop::ActivityPoint::busyPercent);
             const auto vramBuckets=history.buckets(60,now,&mtop::ActivityPoint::allocatedGiB);
             const auto tempBuckets=history.buckets(60,now,&mtop::ActivityPoint::temperatureC);
+            const auto nad=[&](const std::string&text){return std::string(palette.kNad)+text+"\033[0m";};
             const auto smuBuckets=history.buckets(60,now,&mtop::ActivityPoint::gfxPercent);
+            const auto umcBuckets=history.buckets(60,now,&mtop::ActivityPoint::umcPercent);
             const auto copyBuckets=history.buckets(60,now,&mtop::ActivityPoint::transferMiBPerSecond);
+            // One labeled Braille activity chart (same treatment as GPU CORE
+            // LOAD): 5-row Y-axis, Braille matrix, X-axis caption, and a
+            // min/max/avg footer computed from the plotted window. `title` is
+            // the top border text; `source` is a dim caption citing the field.
+            const auto activityChart=[&](std::vector<std::optional<double>> buckets,
+                                         const std::string &title,const std::string &source){
+                const std::optional<double> current=buckets.empty()?std::optional<double>{}:buckets.back();
+                line(tint(top(columns,palette.section(title)+(current?palette.value("["+decimal(*current,0)+"%]"):nad("[ n/a ]"))),palette.kBorder));
+                const size_t chCells=columns>10?columns-10:10;
+                const size_t n=std::min<size_t>(buckets.size(),chCells*2);
+                std::vector<std::optional<double>> plot;
+                for(size_t i=0;i<n;++i) plot.push_back(buckets[buckets.size()-n+i]);
+                const auto br=braille(plot,5,100.0);
+                const std::string labels[]={"100%","75%","50%","25%","0%"};
+                for(size_t r=0;r<5;++r)
+                    line(cell(columns,palette.label(labels[r])+"  "+palette.label(br.rows[r])));
+                line(cell(columns,palette.label(xaxis(chCells))));
+                const auto s=mtop::stats(plot);
+                line(cell(columns,palette.label("  min ")+(s?palette.value(decimal(s->at(0),1)+"%  max "):nad("min n/a  max "))+
+                           (s?palette.value(decimal(s->at(1),1)+"%  avg "):nad("max n/a  avg "))+
+                           (s?palette.value(decimal(s->at(2),1)+"%") : nad("avg n/a"))));
+                line(cell(columns,palette.label("  ")+nad(source)));
+                line("");
+            };
             const auto vramCeiling=capacityGiB(*d).value_or(1.0);
             const auto utilNow=history.points.empty() ? std::optional<double>{} : history.points.back().busyPercent;
                         const auto pwr=hardwareValue(*d,SocketPowerMilliwatts,now);
@@ -431,15 +457,15 @@ void dashboard(const std::vector<mtop::Device> &devices, const mtop::Selection &
                 for(unsigned i=0;i<5;++i)line("");
             }
             // ===== Section 1: Header =====
-            std::string header="AMDGPU gfx"+std::to_string(d->gfx[0])+'.'+std::to_string(d->gfx[1])+'.'+std::to_string(d->gfx[2]);
-            if (d->spec.valid) header+="  "+std::to_string(d->spec.words[12])+" CUs / "+std::to_string(d->spec.words[4])+" SEs";
-            header+="  "+dim("build "+std::to_string(d->build)+"  "+(d->stage==15 ? "initialized" : "stage "+std::to_string(d->stage)));
-            header+="  "+dim("sensors "+telemetryStatus(*d));
-            if (demo) header+="  "+dim("DEMO (synthetic)");
-            line(tint(top(columns,header),kBorder));
+            std::string header=palette.value("AMDGPU gfx"+std::to_string(d->gfx[0])+'.'+std::to_string(d->gfx[1])+'.'+std::to_string(d->gfx[2]));
+            if (d->spec.valid) header+=palette.label("  "+std::to_string(d->spec.words[12])+" CUs / "+std::to_string(d->spec.words[4])+" SEs");
+            header+=palette.label(std::string("  build ")+std::to_string(d->build)+"  "+(d->stage==15 ? "initialized" : "stage "+std::to_string(d->stage)));
+            header+=palette.label(std::string("  sensors ")+telemetryStatus(*d));
+            if (demo) header+=palette.label("  DEMO (synthetic)");
+            line(tint(top(columns,header),palette.kBorder));
             line("");
             // ===== Section 2: GPU CORE LOAD (Braille) =====
-            line(tint(top(columns,bright("GPU CORE LOAD ")+(utilNow ? "["+decimal(*utilNow,0)+"%]" : dim("[ n/a ]"))),kBorder));
+            line(tint(top(columns,palette.section("GPU CORE LOAD ")+(utilNow ? palette.value("["+decimal(*utilNow,0)+"%]") : nad("[ n/a ]"))),palette.kBorder));
             const size_t cells=columns>10 ? columns-10 : 10;
             const size_t xCount=std::min<size_t>(utilizationBuckets.size(), cells*2);
             std::vector<std::optional<double>> plot;
@@ -448,59 +474,70 @@ void dashboard(const std::vector<mtop::Device> &devices, const mtop::Selection &
             auto br=braille(plot,5,100.0);
             const std::string labels[]={"100%","75%","50%","25%","0%"};
             for(size_t r=0;r<5;++r)
-                line(cell(columns,bright(labels[r])+"  "+dim(br.rows[r])));
-            line(cell(columns,dim(xaxis(cells))));
+                line(cell(columns,palette.label(labels[r])+"  "+palette.label(br.rows[r])));
+            line(cell(columns,palette.label(xaxis(cells))));
             line("");
+            // ===== SMU MEMORY ACTIVITY (UMC) =====
+            // Memory-controller (UMC) busy 0-100% from the SMU metrics table
+            // (firmware offset 126). A real memory-side counter, not gfx
+            // activity and not an n/a placeholder.
+            activityChart(umcBuckets,"SMU MEMORY ACTIVITY (UMC) ",
+                "source: SMU UmcActivityPercent (firmware table offset 126; UMC busy 0-100%)");
             // ===== VRAM / GTT meters =====
-            line(tint(top(columns,bright("VRAM USAGE ")+(vramTotal>0 ? "["+decimal(vramUsed,1)+" / "+decimal(vramTotal,1)+" GB -- "+decimal(vramPct*100.0,1)+"%]" : dim("[ n/a ]"))),kBorder));
+            line(tint(top(columns,palette.section("VRAM USAGE ")+(vramTotal>0 ? palette.value("["+decimal(vramUsed,1)+" / "+decimal(vramTotal,1)+" GB -- "+decimal(vramPct*100.0,1)+"%]") : nad("[ n/a ]"))),palette.kBorder));
             const unsigned barW=std::min(columns-24u, 40u);
-            line(cell(columns,"  "+gradientBar(vramUsed, barW)+"  VRAM: "+decimal(vramUsed,1)+" GB / "+decimal(vramPct*100.0,0)+"%"));
-            line(cell(columns,"  "+gradientBar(visibleUsed, barW)+"  GTT:   "+decimal(visibleUsed,1)+" GB / "+decimal(gttPct*100.0,0)+"%"));
+            line(cell(columns,"  "+gradientBar(vramUsed, barW,palette)+"  "+palette.label("VRAM: ")+palette.value(decimal(vramUsed,1)+" GB / "+decimal(vramPct*100.0,0)+"%")));
+            line(cell(columns,"  "+gradientBar(visibleUsed, barW,palette)+"  "+palette.label("GTT:   ")+palette.value(decimal(visibleUsed,1)+" GB / "+decimal(gttPct*100.0,0)+"%")));
             line("");
-            line(cell(columns,bright("POWER & SENSOR STATE")));
+            line(cell(columns,palette.section("POWER & SENSOR STATE")));
             const unsigned pwrBarW=std::min(columns-32u, 18u);
-            line(cell(columns,"  Pwr: "+(pwr ? decimal(pwrW,0)+"W / "+decimal(pwrWCap,0)+"W ["+gradientBar(pwrW,pwrBarW)+"]" : dim("n/a"))+
-                "  Temp: "+(edgeT ? decimal(edgeTc,0)+"\xc2\xb0"+"C (Junc: "+(hotT?decimal(hotTc,0):"n/a")+"\xc2\xb0"+"C)" : dim("n/a"))));
+            const std::string deg = "\xc2\xb0";
+            auto tempStr = edgeT ? (palette.value(decimal(edgeTc,0)+deg+"C (Junc: "))
+                       + (hotT?palette.value(decimal(hotTc,0)):nad("n/a"))
+                       + palette.value(deg+"C))") : nad("n/a");
+            line(cell(columns,palette.label("  Pwr: ")+(pwr ? palette.value(decimal(pwrW,0)+
+                  "W / "+decimal(pwrWCap,0)+"W [")+gradientBar(pwrW,pwrBarW,palette)+
+                  palette.value("]") : nad("n/a"))+palette.label("  Temp: ")+tempStr));
             const unsigned fanBarW=std::min(columns-32u, 18u);
-            line(cell(columns,"  Fan: "+(fan ? decimal(fanRpm,0)+" RPM  ["+gradientBar(fanRpm/200.0,fanBarW)+"]" : dim("n/a"))+
-                "  Clock: SCLK "+(sclk?decimal(sclkMhz,0):"n/a")+"MHz MCLK "+(mclk?decimal(mclkMhz,0):"n/a")+"MHz"));
+            line(cell(columns,palette.label("  Fan: ")+(fan ? palette.value(decimal(fanRpm,0)+" RPM  [")+gradientBar(fanRpm/200.0,fanBarW,palette)+palette.value("]") : nad("n/a"))+
+                palette.label("  Clock: SCLK ")+(sclk?palette.value(decimal(sclkMhz,0)):nad("n/a"))+palette.label("MHz MCLK ")+(mclk?palette.value(decimal(mclkMhz,0)):nad("n/a"))+palette.label("MHz")));
             line("");
             // ===== Section 3: GRBM / GRBM2 =====
             const auto sdma0=mtop::hasSoftware(*d) ? engineBusyPercent(*d,amdgpu::software_stats::SDMA0,history) : std::optional<double>{};
             const auto gfxEng=mtop::hasSoftware(*d) ? engineBusyPercent(*d,amdgpu::software_stats::GFX,history) : std::optional<double>{};
             const auto aqlEng=mtop::hasSoftware(*d) ? engineBusyPercent(*d,amdgpu::software_stats::AQL,history) : std::optional<double>{};
             auto engineBar=[&](std::optional<double> v){
-                return v ? gradientBar(*v/100.0,16)+" "+decimal(*v,0)+"%" : dim("n/a (no in-flight sample window yet)");
+                return v ? gradientBar(*v/100.0,16,palette)+" "+palette.value(decimal(*v,0)+"%") : nad("n/a (no in-flight sample window yet)");
             };
-            line(tint(mid(columns,bright("PERFORMANCE COUNTERS (GRBM / GRBM2)")),kBorder));
+            line(tint(mid(columns,palette.section("PERFORMANCE COUNTERS (GRBM / GRBM2)")),palette.kBorder));
             if (engines) {
-                line(cell(columns,bright("  [GRBM Status]")+"    "+dim("source: driver dispatch-in-flight per engine (selector 61)")));
-                line(cell(columns,"  Graphics Pipe (GFX) : "+(utilNow ? gradientBar(*utilNow/100.0,16)+" "+decimal(*utilNow,0)+"%" : dim("n/a (no in-flight sample window yet)"))));
-                line(cell(columns,"  Compute Engine 0    : "+engineBar(gfxEng)));
-                line(cell(columns,"  Compute Engine 1    : "+(aqlEng ? engineBar(aqlEng) : dim("n/a (AQL compute queue in-flight)"))));
-                line(cell(columns,"  SDMA Engine (DMA)   : "+engineBar(sdma0)+"  "+dim("(SDMA0; SDMA1 not observed)")));
-                line(cell(columns,"  VCN (Video Decode)  : "+dim("n/a (driver exposes no VCN counter; would need MMIO PERFSTATUS or SMU media field)")));
-                line(cell(columns,"  JPEG Engine         : "+dim("n/a (driver exposes no JPEG counter)")));
+                line(cell(columns,palette.section("  [GRBM Status]")+"    "+palette.label("source: driver dispatch-in-flight per engine (selector 61)")));
+                line(cell(columns,palette.label("  Graphics Pipe (GFX) : ")+(utilNow ? gradientBar(*utilNow/100.0,16,palette)+" "+palette.value(decimal(*utilNow,0)+"%") : nad("n/a (no in-flight sample window yet)"))));
+                line(cell(columns,palette.label("  Compute Engine 0    : ")+engineBar(gfxEng)));
+                line(cell(columns,palette.label("  Compute Engine 1    : ")+(aqlEng ? engineBar(aqlEng) : nad("n/a (AQL compute queue in-flight)"))));
+                line(cell(columns,palette.label("  SDMA Engine (DMA)   : ")+engineBar(sdma0)+"  "+palette.label("(SDMA0; SDMA1 not observed)")));
+                line(cell(columns,palette.label("  VCN (Video Decode)  : ")+nad("n/a (driver exposes no VCN counter; would need MMIO PERFSTATUS or SMU media field)")));
+                line(cell(columns,palette.label("  JPEG Engine         : ")+nad("n/a (driver exposes no JPEG counter)")));
                 line("");
-                line(cell(columns,bright("  [GRBM2 Status]")+"    "+dim("source: none (MMHUB/GFXHUB PERFSTATUS + L2 counters not exposed by driver)")));
-                line(cell(columns,"  Command Processor (CPF) : "+dim("n/a (MMHUB_PERFSTATUS not exposed)")));
-                line(cell(columns,"  Texture Cache (TCC)     : "+dim("n/a (MMHUB_L2 hit/miss counters not exposed)")));
-                line(cell(columns,"  Depth Block (DB)        : "+dim("n/a (GRBM select + MMIO read not exposed)")));
-                line(cell(columns,"  Color Block (CB)        : "+dim("n/a (GRBM select + MMIO read not exposed)")));
-                line(cell(columns,"  Shader Pipe (SPI)       : "+dim("n/a (per-SPI activity not exposed)")));
-                line(cell(columns,"  Primitive Assembly (PA) : "+dim("n/a (per-PA activity not exposed)")));
+                line(cell(columns,palette.section("  [GRBM2 Status]")+"    "+palette.label("source: none (MMHUB/GFXHUB PERFSTATUS + L2 counters not exposed by driver)")));
+                line(cell(columns,palette.label("  Command Processor (CPF) : ")+nad("n/a (MMHUB_PERFSTATUS not exposed)")));
+                line(cell(columns,palette.label("  Texture Cache (TCC)     : ")+nad("n/a (MMHUB_L2 hit/miss counters not exposed)")));
+                line(cell(columns,palette.label("  Depth Block (DB)        : ")+nad("n/a (GRBM select + MMIO read not exposed)")));
+                line(cell(columns,palette.label("  Color Block (CB)        : ")+nad("n/a (GRBM select + MMIO read not exposed)")));
+                line(cell(columns,palette.label("  Shader Pipe (SPI)       : ")+nad("n/a (per-SPI activity not exposed)")));
+                line(cell(columns,palette.label("  Primitive Assembly (PA) : ")+nad("n/a (per-PA activity not exposed)")));
             } else {
-                line(cell(columns,dim("  (hidden; press r to toggle)")));
+                line(cell(columns,palette.label("  (hidden; press r to toggle)")));
             }
             line("");
             // ===== Section 4: GPU PROCESSES =====
-            line(tint(mid(columns,bright("GPU PROCESSES (fdinfo)")+"  [sort: "+sort.label()+"]"),kBorder));
-            line(cell(columns,dim("  PID     USER       PROCESS NAME            CPU%    GPU%   GFX/COMP   MEDIA     VRAM USAGE      VRAM BAR")));
-            line(cell(columns,dim("  "+std::string(columns>24?columns-4:20,'-'))));
-            line(cell(columns,dim("  n/a     n/a        per-process GPU accounting not exposed by macOS driver")));
-            line(cell(columns,dim("  Driver exposes total VRAM pools + dispatch-in-flight + SMU sensors only.")));
-            line(cell(columns,dim("  Per-PID GPU%, engine breakdown, VRAM require a driver-side per-client counter.")));
-            line(cell(columns,dim("  See mtop-report.md for the exact missing query.")));
+            line(tint(mid(columns,palette.section("GPU PROCESSES (fdinfo)")+palette.label("  [sort: ")+std::string(sort.label())+"]"),palette.kBorder));
+            line(cell(columns,palette.label("  PID     USER       PROCESS NAME            CPU%    GPU%   GFX/COMP   MEDIA     VRAM USAGE      VRAM BAR")));
+            line(cell(columns,palette.label("  "+std::string(columns>24?columns-4:20,'-'))));
+            line(cell(columns,palette.label("  n/a     n/a        ")+nad("per-process GPU accounting not exposed by macOS driver")));
+            line(cell(columns,palette.label("  Driver exposes total VRAM pools + dispatch-in-flight + SMU sensors only.")));
+            line(cell(columns,palette.label("  Per-PID GPU%, engine breakdown, VRAM require a driver-side per-client counter.")));
+            line(cell(columns,palette.label("  See mtop-report.md for the exact missing query.")));
             line("");
             // ===== Footer =====
             const std::string footer="[q] Quit  [h] Interval: "+std::to_string(mode.milliseconds())+"ms"+
@@ -508,7 +545,7 @@ void dashboard(const std::vector<mtop::Device> &devices, const mtop::Selection &
             if (interactive) {
                 lines.resize(std::min<size_t>(lines.size(),rows-1));
                 while(lines.size()<rows-1)lines.emplace_back();
-                lines.push_back(tint(footer,"\033[1m"));
+                lines.push_back(tint(footer,palette.dark?"\033[1m":"\033[38;2;17;24;39m"));
                 mtop::Frame temporary;
                 if(frame && graphics==mtop::Graphics::ITerm)frame->previous.clear();
                 std::string output=(frame?*frame:temporary).update(lines,columns,rows);
@@ -538,7 +575,7 @@ bool number(const char *text, uint64_t &value) {
 } // namespace
 
 int main(int argc, char **argv) {
-    bool jsonMode = false, listOnly = false, watch = false, demo = false;
+    bool jsonMode = false, listOnly = false, watch = false, demo = false, dark = false;
     std::string graphicsOption="auto",previewPNG;
     mtop::Selection selected;
     mtop::RefreshMode mode;
@@ -553,6 +590,8 @@ int main(int argc, char **argv) {
                          "Live 60 s Braille GPU-utilization history (driver in-flight delta, 0..100%),\n"
                          "VRAM/GTT meters, power/temperature/fan/clock sensors, GRBM/GRBM2 breakdown,\n"
                          "per-process table (n/a when the driver exposes no per-client counters).\n"
+                         "Palette: dark-on-light by default; --dark restores the original\n"
+                         "bright-on-dark colors for dark terminal backgrounds.\n"
                          "Non-terminal output is one snapshot unless --watch is specified.\n"
                          "Observer: never initializes, resets or changes power policy.\n"
                          "Driver 193+: bounded sensor collection at 1 Hz and software activity counters.\n"
@@ -564,6 +603,7 @@ int main(int argc, char **argv) {
         else if (arg == "--fast") mode.fast = true;
         else if (arg == "--slow") mode.fast = false;
         else if (arg == "--demo") demo = true;
+        else if (arg == "--dark") dark = true;
         else if (arg == "--preview-png" && i+1<argc) previewPNG=argv[++i];
         else if (arg == "--graphics" && i+1<argc) {
             graphicsOption=argv[++i];
@@ -667,7 +707,7 @@ int main(int argc, char **argv) {
             const auto counters=rateCounters(device);
             const auto busy=busyPercent(device,history);
             history.add(sampledAt,counters,allocatedGiB(device),hardwareValue(device,amdgpu::metrics::GfxActivityPercent,sampledAt),
-                        temperatureValue(device,sampledAt));
+                        temperatureValue(device,sampledAt),hardwareValue(device,amdgpu::metrics::UmcActivityPercent,sampledAt));
             history.previousBusy=counters;
             if (busy) history.points.back().busyPercent=busy;
             history.clocks(clockValue(device,0,sampledAt),clockValue(device,2,sampledAt));
@@ -687,7 +727,7 @@ int main(int argc, char **argv) {
             winsize dimensions{};
             if (ioctl(STDOUT_FILENO,TIOCGWINSZ,&dimensions)) dimensions={};
             dashboard(devices,selected,error,interactive,listOnly,&histories,mode,
-                dimensions.ws_col ? dimensions.ws_col : 100,dimensions.ws_row ? dimensions.ws_row : 40,sampledAt,graphics,&frame,demo,&uiState);
+                dimensions.ws_col ? dimensions.ws_col : 100,dimensions.ws_row ? dimensions.ws_row : 40,sampledAt,graphics,&frame,demo,&uiState,mtop::tui::makePalette(dark));
         }
         std::cout.flush();
         if (listOnly || (!interactive && !watch)) break;

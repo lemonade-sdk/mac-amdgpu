@@ -43,12 +43,17 @@ inline void appendFrac(std::string &out, int eighth) {
 }
 
 // Spec section "TrueColor Gradient Palettes":
-// 0-50% cyan #00F0FF -> blue #0072FF, 50-80% yellow #FFD600 -> orange #FF6B00,
-// 80-100% into crimson #FF0055. One stop per percent; 100% is red.
-inline std::array<int, 3> gradient(int percent) {
-    static const std::array<std::array<int, 3>, 5> a = { { {0, 240, 255}, {0, 114, 255},
-                                                     {255, 214, 0}, {255, 107, 0}, {255, 0, 85} } };
+// 0-50% cyan -> blue, 50-80% yellow -> orange, 80-100% into crimson.
+// One stop per percent; 100% is red. Two palettes: bright neon colors for
+// dark backgrounds (the original spec values, --dark) and darkened colors
+// for light backgrounds (default; neon is unreadable on white).
+inline std::array<int, 3> gradient(int percent, bool dark = false) {
+    static const std::array<std::array<int, 3>, 5> bright = {
+        { {0, 240, 255}, {0, 114, 255}, {255, 214, 0}, {255, 107, 0}, {255, 0, 85} } };
+    static const std::array<std::array<int, 3>, 5> light = {
+        { {8, 145, 178}, {29, 78, 216}, {180, 83, 9}, {194, 65, 12}, {190, 18, 60} } };
     static const int stops[] = {0, 50, 50, 80, 80, 100};
+    const auto &a = dark ? bright : light;
     const int p = std::clamp(percent, 0, 100);
     for (int i = 1; i < 5; ++i)
         if (p <= stops[i]) {
@@ -63,14 +68,63 @@ inline std::string rgb(int r, int g, int b) {
     return "\033[38;2;" + std::to_string(std::clamp(r, 0, 255)) + ';' +
         std::to_string(std::clamp(g, 0, 255)) + ';' + std::to_string(std::clamp(b, 0, 255)) + 'm';
 }
+// --- Palette (dark-on-light default, --dark restores bright-on-dark) ---
+// The original palette (dim grey text on a dark background) is unreadable
+// in terminals with light backgrounds. The default palette uses dark text
+// that stays legible on white; `--dark` restores the original colors.
+struct Palette {
+    bool dark = false; // false = dark text for light backgrounds (default).
+    const char *kBorder;   // border/axis lines    #505064 (dark) / #9ca3af
+    const char *kEmpty;    // empty bar glyph (░)  dim       / #d1d5db
+    const char *kNad;      // "n/a" text           #6b7280  / #6b7280
+    const char *kValue;    // primary data text    #111827
+    const char *kLabel;    // metric names, axes   #374151
+    const char *kSection;  // section titles       #111827
+    // Default to the dark-on-light palette so any caller that omits a Palette
+    // gets a valid, legible palette instead of dangling pointers. Defined
+    // after makePalette (delegating constructor).
+    Palette();
+    Palette(bool dark, const char *border, const char *empty, const char *nad,
+            const char *value, const char *label, const char *section)
+        : dark(dark), kBorder(border), kEmpty(empty), kNad(nad),
+          kValue(value), kLabel(label), kSection(section) {}
+    std::string value(std::string_view text) const;
+    std::string label(std::string_view text) const;
+    std::string section(std::string_view text) const;
+    // One glyph of the empty bar, palette-colored.
+    std::string emptyGlyph() const; // defined below (needs kEmpty glyph)
+};
+inline Palette makePalette(bool dark) {
+    const char *border = dark ? "\033[38;2;80;80;100m" : "\033[38;2;156;163;175m";
+    const char *empty = dark ? "\033[2m" : "\033[38;2;209;213;219m";
+    const char *nad = dark ? "\033[38;5;245m" : "\033[38;2;107;114;128m";
+    const char *value = dark ? "\033[38;5;255m" : "\033[38;2;17;24;39m";
+    const char *label = dark ? "\033[38;5;245m" : "\033[38;2;55;65;81m";
+    const char *section = dark ? "\033[1;38;5;255m" : "\033[38;2;17;24;39m";
+    return Palette{dark, border, empty, nad, value, label, section};
+}
+inline Palette::Palette() : dark(false), kBorder("\033[38;2;156;163;175m"), kEmpty("\033[38;2;209;213;219m"),
+                            kNad("\033[38;2;107;114;128m"), kValue("\033[38;2;17;24;39m"),
+                            kLabel("\033[38;2;55;65;81m"), kSection("\033[38;2;17;24;39m") {}
+inline std::string Palette::value(std::string_view text) const {
+    return std::string(kValue) + std::string(text) + "\033[0m";
+}
+inline std::string Palette::label(std::string_view text) const {
+    return std::string(kLabel) + std::string(text) + "\033[0m";
+}
+inline std::string Palette::section(std::string_view text) const {
+    return std::string(kSection) + std::string(text) + "\033[0m";
+}
+// Compatibility wrappers: bold text and the legacy border color, used by
+// tests and any renderer not wired to a Palette.
 inline std::string dim(std::string_view text) { return "\033[2m" + std::string(text) + "\033[22m"; }
 inline std::string bright(std::string_view text) { return "\033[1m" + std::string(text) + "\033[22m"; }
-// Spec: thin dimmed borders, 24-bit #505064.
+// Spec: thin dimmed borders, 24-bit #505064 (dark background variant).
 inline const char *kBorder = "\033[38;2;80;80;100m";
 
 // --- sub-cell bar (spec "High-Resolution Sub-Cell Block Characters") ---
 // cells is the filled count in cells (fractional), clipped to [0, width].
-inline std::string fracBar(double cells, size_t width, std::string_view empty = kEmpty) {
+inline std::string fracBar(double cells, size_t width, std::string_view empty = "\xE2\x96\x91") {
     std::string out;
     if (!width) return out;
     if (!(cells > 0)) {
@@ -89,13 +143,19 @@ inline std::string fracBar(double cells, size_t width, std::string_view empty = 
     }
     return out;
 }
-// Color a full-width bar cell-by-cell along the truecolor gradient.
-inline std::string gradientBar(double cells, size_t width) {
+// One palette-colored empty-bar glyph (░), never the default foreground.
+inline std::string Palette::emptyGlyph() const {
+    return std::string(kEmpty) + "\xE2\x96\x91" + "\033[0m";
+}
+// Color a full-width bar cell-by-cell along the truecolor gradient. The
+// palette selects the dark-on-light (default) or bright-on-dark (--dark)
+// gradient stops and the empty-bar color.
+inline std::string gradientBar(double cells, size_t width, const Palette &pal) {
+    const std::string empty = pal.emptyGlyph();
     std::string out;
     if (!width) return out;
     if (!(cells > 0)) {
-        std::string out;
-        for (size_t i = 0; i < width; ++i) out += kEmpty;
+        for (size_t i = 0; i < width; ++i) out += empty;
         return out;
     }
     cells = std::min<double>(cells, width);
@@ -103,17 +163,17 @@ inline std::string gradientBar(double cells, size_t width) {
     int eighth = int((cells - double(full)) * 8.0 + 0.5);
     if (eighth == 8) { ++full; eighth = 0; }
     for (size_t i = 0; i < width && i < full; ++i) {
-        const auto [r, g, b] = gradient(int(double(i + 1) / double(width) * 100));
+        const auto [r, g, b] = gradient(int(double(i + 1) / double(width) * 100), pal.dark);
         out += rgb(r, g, b) + kBlock + "\033[0m";
     }
     if (full < width) {
         if (eighth) {
-            const auto [r, g, b] = gradient(int(double(full + 1) / double(width) * 100));
+            const auto [r, g, b] = gradient(int(double(full + 1) / double(width) * 100), pal.dark);
             out += rgb(r, g, b);
             appendFrac(out, eighth);
             out += "\033[0m";
         }
-        for (size_t i = 0; i < width - full - size_t(eighth > 0); ++i) out += kEmpty;
+        for (size_t i = 0; i < width - full - size_t(eighth > 0); ++i) out += empty;
     }
     return out;
 }

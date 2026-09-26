@@ -23,6 +23,7 @@ struct ActivityPoint {
     std::optional<double> gfxPercent;   // SMU AverageGfxActivity, raw firmware field.
     std::optional<double> busyPercent;  // Observer-computed, delta-based. See busyRatio().
     std::optional<double> temperatureC; // Hotspot first, else edge, else memory (Celsius).
+    std::optional<double> umcPercent;   // SMU UmcActivityPercent: memory-controller (UMC) busy 0-100%.
     std::array<std::optional<double>,5> copyMiBPerSecond{};
 };
 // Fixed time window: switching between 100 ms and 500 ms does not change the
@@ -45,8 +46,8 @@ struct History {
     }
     void add(uint64_t now, std::optional<RateCounters> counters,
              std::optional<double> allocatedGiB, std::optional<double> gfxPercent={},
-             std::optional<double> temperatureC={}) {
-        ActivityPoint point{now,{}, {},allocatedGiB,gfxPercent,{},temperatureC};
+             std::optional<double> temperatureC={}, std::optional<double> umcPercent={}) {
+        ActivityPoint point{now,{}, {},allocatedGiB,gfxPercent,{},temperatureC,umcPercent,{}};
         if (counters) {
             const bool reset=previous && (counters->generation!=previous->generation ||
                 counters->timeNs<previous->timeNs || counters->submitted<previous->submitted ||

@@ -42,6 +42,7 @@ int main() {
     d.metrics.collectedAtNs=now;
     d.metrics.validFields=(uint64_t(1)<<metrics::Count)-1;
     d.metrics.values[metrics::GfxActivityPercent]=45;
+    d.metrics.values[metrics::UmcActivityPercent]=37;
     d.metrics.values[metrics::GfxClockMHz]=1820;
     d.metrics.values[metrics::MemoryClockMHz]=1250;
     d.metrics.values[metrics::SocketPowerMilliwatts]=105000;
@@ -68,6 +69,7 @@ int main() {
     p.allocatedGiB = 0.5;
     p.temperatureC = 46.0;
     p.gfxPercent = 45.0;
+    p.umcPercent = 37.0;
     histories[d.registry].points.push_back(p);
     // The render test doesn't exercise the engine delta path; leave
     // previousBusy unset so engineBusyPercent returns n/a (documented).
@@ -78,7 +80,7 @@ int main() {
 
     mtop::Frame layout;
     mtop::tui::Ui ui;
-    dashboard({d}, selected, {}, false, false, &histories, {}, 120, 40, now,
+    dashboard({d}, selected, {}, false, false, &histories, {}, 120, 50, now,
               mtop::Graphics::Text, &layout, false, &ui);
     std::cout.rdbuf(previous);
     auto output = captured.str();
@@ -102,6 +104,17 @@ int main() {
     assert(visible.find("30s") != std::string::npos);
     assert(visible.find("15s") != std::string::npos);
     assert(visible.find("0s") != std::string::npos);
+
+    // SMU MEMORY ACTIVITY (UMC) chart: a real memory-side 0-100% counter,
+    // not gfx activity and not a bare n/a. The chart is labeled and cites the
+    // SMU source; the header shows the current UMC %.
+    assert(visible.find("SMU MEMORY ACTIVITY (UMC)") != std::string::npos);
+    assert(visible.find("UmcActivityPercent") != std::string::npos);
+    assert(visible.find("UMC busy 0-100%") != std::string::npos);
+    // The chart's min/max/avg footer is rendered.
+    assert(visible.find("min") != std::string::npos);
+    assert(visible.find("max") != std::string::npos);
+    assert(visible.find("avg") != std::string::npos);
 
     // VRAM / GTT meters.
     assert(visible.find("VRAM USAGE") != std::string::npos);
@@ -161,10 +174,10 @@ int main() {
     mtop::Frame structLayout;
     captured.str(""); captured.clear();
     previous = std::cout.rdbuf(captured.rdbuf());
-    dashboard({d}, selected, {}, true, false, &histories, {}, 120, 40, now,
+    dashboard({d}, selected, {}, true, false, &histories, {}, 120, 50, now,
               mtop::Graphics::Text, &structLayout, false, &ui);
     std::cout.rdbuf(previous);
-    assert(structLayout.previous.size() == 40);
+    assert(structLayout.previous.size() == 50);
     for (const auto &row : structLayout.previous)
         assert(mtop::clipColumns(row, 119) == row);
 
@@ -197,7 +210,7 @@ int main() {
     mtop::Frame interactive;
     ui.sort.kind = mtop::tui::Sort::Vram;
     dashboard({d}, selected, {}, true, false, &histories, mtop::RefreshMode{true},
-              120, 40, now, mtop::Graphics::Text, &interactive, false, &ui);
+              120, 50, now, mtop::Graphics::Text, &interactive, false, &ui);
     std::cout.rdbuf(previous);
     auto interactiveVisible = strip(interactive.previous.back());
     assert(interactiveVisible.find("[q] Quit") != std::string::npos);
@@ -209,7 +222,7 @@ int main() {
     ui.enginesVisible = false;
     captured.str(""); captured.clear();
     previous = std::cout.rdbuf(captured.rdbuf());
-    dashboard({d}, selected, {}, false, false, &histories, {}, 120, 40, now,
+    dashboard({d}, selected, {}, false, false, &histories, {}, 120, 50, now,
               mtop::Graphics::Text, &layout, false, &ui);
     std::cout.rdbuf(previous);
     auto hiddenVisible = strip(captured.str());
@@ -220,7 +233,7 @@ int main() {
     d.metrics.collectedAtNs = now - kSMUMetricsStaleAfterNs - 1;
     captured.str(""); captured.clear();
     previous = std::cout.rdbuf(captured.rdbuf());
-    dashboard({d}, selected, {}, false, false, &histories, {}, 120, 40, now,
+    dashboard({d}, selected, {}, false, false, &histories, {}, 120, 50, now,
               mtop::Graphics::Text, &layout, false, &ui);
     std::cout.rdbuf(previous);
     auto staleVisible = strip(captured.str());
