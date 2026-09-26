@@ -239,14 +239,14 @@ struct ContentView: View {
         VStack(spacing: 10) {
             header
             HStack(alignment: .top, spacing: 10) {
-                Panel(title: "GPU Core Load",
+                Panel(title: "GPU Load",
                       right: snap.coreCurrent != nil ? "[ \(fmt(snap.coreCurrent, 0))% ]" : "[ n/a ]") {
                     TimeSeriesChart(samples: snap.coreLoad, windowSeconds: 60,
                                     color: Palette.accent, fill: Palette.accentFill,
                                     hasData: snap.coreLoad.contains { $0.value != nil },
-                                    emptyCaption: "no dispatch-in-flight samples yet (driver idle or pre-193 build)")
+                                    emptyCaption: "no GFX dispatch samples yet (driver idle or no work submitted)")
                         .frame(height: 150)
-                    Text("source: driver dispatch-in-flight, selector 61 (software_stats pendingNs delta); SMU AverageGfxActivity is incoherent on this host and is not plotted; \(snap.softwareStatsStatus)")
+                    Text("source: \(snap.coreSourceLabel ?? "GFX dispatch-rate, selector 61 (eng2 submitted delta); scale is auto-scaled to peak observed, NOT a busy %")")
                         .font(.system(size: 9, design: .monospaced))
                         .foregroundStyle(Palette.dim)
                         .frame(maxWidth: .infinity, alignment: .leading)

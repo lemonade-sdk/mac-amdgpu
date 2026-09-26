@@ -51,6 +51,7 @@ struct TelemetrySnapshot {
 
     // Charts (rolling, oldest -> newest; nil entries are gaps).
     var coreLoad: [(age: Double, value: Double?)] = []
+    var coreSourceLabel: String?   // provenance of the plotted "GPU load" value
     var umcActivity: [(age: Double, value: Double?)] = []
     var umcSourceLabel: String?   // label of the most recent plotted source
     // False when the plotted UMC number is a known-incoherent firmware field
@@ -94,12 +95,31 @@ final class SampleHistory {
     // previousBusy carries publishedPackets because the driver can regress it
     // between samples (queue-observer retire, see add()); the baseline must
     // reject the sample rather than re-baseline, matching the reference TUI.
-    private var previousBusy: (generation: UInt64, timeNs: UInt64, published: UInt64, pendingNs: UInt64, engines: [UInt64])?
+    private var previousBusy: (generation: UInt64, timeNs: UInt64, published: UInt64, pendingNs: UInt64, engines: [UInt64], gfxSubmitted: UInt64)?
     private var lastPublishedNs: (timeNs: UInt64, generation: UInt64, pendingNs: UInt64, engines: [UInt64])?
     private var previousUmc: (q8: UInt64, atNs: UInt64)?
+    // Peak GFX dispatch rate (packets/sec) observed so far, used to auto-scale
+    // the "GPU load" bar. The GPU load meter is a dispatch-rate proxy, not a
+    // busy %: there is no working busy counter on gfx1201 (SMU GfxActivity is
+    // pinned at 100 while the GPU is awake; GFX pendingNs is structurally 0
+    // because the driver publishes GFX work to the ring with no software-
+    // outstanding interval). The only signal that reliably tracks real GFX
+    // compute work is the per-second rate of GFX packets submitted (eng2 /
+    // the GFX engine). We normalize that rate against the peak seen so far,
+    // so a fully-saturated decode reads ~100 and idle reads 0, and the
+    // caption states the scale is adaptive-to-peak rather than a fixed busy
+    // percentage.
+    private var peakGfxRatePerSec: Double = 0
 
     var lastUmhubSource: String?
     var lastUmhubReliable: Bool = false
+    // Honest provenance for the plotted "GPU load" value. It is a GFX
+    // dispatch-rate proxy (auto-scaled to the peak rate observed so far),
+    // NOT a busy %: on gfx1201 there is no working hardware busy counter
+    // (SMU GfxActivity is pinned at 100 while the GPU is awake; GFX pendingNs
+    // is structurally 0). Stating this in the panel keeps the meter from
+    // being read as CU occupancy or productive-workload utilization.
+    var lastCoreSource: String?
 
     // The plotted window as (age-from-`nowNs`-seconds, value), oldest ->
     // newest. Ages come from the sample timestamps, not the array index, so
@@ -129,69 +149,45 @@ final class SampleHistory {
         // blank. Key on generation + sampledAtNs + counters, same as the
         // reference; a true counter regression (generation change, retired
         // in-flight work) is caught by the existing monotonicity checks.
-        // ---- GPU CORE LOAD: dispatch-in-flight delta (selector 61) ----
+        // ---- GPU LOAD: GFX dispatch-rate proxy (selector 61) ----
+        // On gfx1201 there is no working "GPU busy %" hardware counter:
+        // the SMU GfxActivityPercent field is pinned at 100 whenever the GPU
+        // is awake (incoherent as a load meter), and the GFX engine's
+        // pendingNs is structurally 0 because the driver publishes GFX work
+        // to the ring with no software-outstanding interval (verified: GFX
+        // pendingNs stayed 0 while publishedPackets advanced ~100k/sample and
+        // GFX submitted climbed ~6.9M/sample during a real decode). The only
+        // signal that reliably tracks real GFX compute work is the per-second
+        // rate at which GFX packets are submitted. We compute that rate and
+        // normalize it against the peak rate seen so far, so a saturated
+        // decode reads ~100 and idle reads 0. The caption states the scale is
+        // adaptive-to-peak, not a fixed busy percentage, so it is not read as
+        // CU occupancy.
         if d.softwareSupported, !d.software.saturated {
-            var pendingNs: UInt64 = 0
-            var engines: [UInt64] = []
-            engines.reserveCapacity(4)
-            var overflow = false
-            for e in d.software.engines {
-                if pendingNs > UInt64.max - e.pendingNs { overflow = true; break }
-                pendingNs += e.pendingNs
-                engines.append(e.pendingNs)
-            }
-            if overflow {
-                previousBusy = nil
-            } else {
-                var ratio: Double?
-                if let prev = previousBusy,
-                   prev.generation == d.software.generation,
-                   prev.published <= d.software.publishedPackets,
-                   prev.timeNs < d.software.sampledAtNs,
-                   prev.pendingNs <= pendingNs,
-                   d.software.sampledAtNs - prev.timeNs <= 2_000_000_000,
-                   engines.count == prev.engines.count {
-                    let delta = pendingNs - prev.pendingNs
-                    let elapsed = d.software.sampledAtNs - prev.timeNs
-                    if elapsed > 0 {
-                        let candidate = Double(delta) / Double(elapsed) * 100.0
-                        if candidate >= 0, candidate.isFinite { ratio = min(candidate, 100) }
-                    }
-                }
-                // Counter regression (generation change, or the driver retired
-                // unobserved in-flight work at session teardown and the new
-                // epoch's union counter starts below the old one): re-baseline
-                // from the last *published* window instead of dropping the
-                // sample. The terminal TUI keeps plotting across the
-                // load -> idle -> load transitions this way; if the published
-                // baseline is from another epoch (or still ahead), the window
-                // is simply unavailable for one sample.
-                if ratio == nil, let last = lastPublishedNs,
-                   last.timeNs < d.software.sampledAtNs,
-                   d.software.sampledAtNs - last.timeNs <= 2_000_000_000,
-                   last.engines.count == engines.count {
-                    if last.generation == d.software.generation,
-                       last.pendingNs <= pendingNs {
-                        let elapsed = d.software.sampledAtNs - last.timeNs
-                        if elapsed > 0 {
-                            let candidate = Double(pendingNs - last.pendingNs) / Double(elapsed) * 100.0
-                            if candidate >= 0, candidate.isFinite { ratio = min(candidate, 100) }
+            let gfxSubmitted = d.software.engines[2].submitted  // Engine::GFX
+            var ratio: Double?
+            if let prev = previousBusy,
+               prev.generation == d.software.generation,
+               prev.timeNs < d.software.sampledAtNs,
+               prev.gfxSubmitted <= gfxSubmitted,
+               d.software.sampledAtNs - prev.timeNs <= 2_000_000_000 {
+                let delta = gfxSubmitted - prev.gfxSubmitted
+                let elapsed = d.software.sampledAtNs - prev.timeNs
+                if elapsed > 0 {
+                    let ratePerSec = Double(delta) / Double(elapsed) * 1e9   // packets / sec
+                    if ratePerSec > 0, ratePerSec.isFinite {
+                        if ratePerSec > peakGfxRatePerSec { peakGfxRatePerSec = ratePerSec }
+                        if peakGfxRatePerSec > 0 {
+                            ratio = min(max(ratePerSec / peakGfxRatePerSec * 100.0, 0.0), 100.0)
                         }
-                    } else if previousBusy == nil ||
-                              previousBusy!.generation != last.generation ||
-                              previousBusy!.pendingNs > pendingNs {
-                        // The current baseline is itself stale (a retired
-                        // session's counters): reset to the published epoch.
-                        previousBusy = (last.generation, last.timeNs,
-                                        d.software.publishedPackets, last.pendingNs, last.engines)
                     }
                 }
-                previousBusy = (d.software.generation, d.software.sampledAtNs,
-                                d.software.publishedPackets, pendingNs, engines)
-                if let value = ratio {
-                    core = value
-                    lastPublishedNs = (d.software.sampledAtNs, d.software.generation, pendingNs, engines)
-                }
+            }
+            previousBusy = (d.software.generation, d.software.sampledAtNs,
+                            d.software.publishedPackets, 0, [0, 0, 0, 0], gfxSubmitted)
+            if let value = ratio {
+                core = value
+                lastCoreSource = "GFX dispatch-rate proxy (auto-scaled to peak observed) - tracks real GFX compute work; NOT a busy % (no working busy counter on gfx1201)"
             }
         } else {
             previousBusy = nil
@@ -252,19 +248,39 @@ final class SampleHistory {
 
     // Per-engine dispatch-in-flight busy % for the GRBM strip. Must be
     // called before add() consumes the previous baseline.
+    // Per-engine busy proxy for the GRBM strip, computed from the per-engine
+    // submitted-packet rate (the pendingNs counters are flat for the GFX
+    // engine on this driver, so the rate is the only per-engine signal that
+    // tracks real work). Normalized against the peak per-engine rate seen so
+    // far, matching the aggregate GPU-load meter.
+    private var peakEngineRatePerSec: [Double] = [0, 0, 0, 0]
+    private var previousEngineSubmitted: [UInt64]? = nil
+    private var previousEngineTimeNs: UInt64? = nil
+    private var previousEngineGeneration: UInt64? = nil
+
     func enginePercent(_ d: Device, index: Int) -> Double? {
         guard d.softwareSupported, !d.software.saturated, index < 4 else { return nil }
-        guard let prev = previousBusy,
-              prev.generation == d.software.generation,
-              prev.published <= d.software.publishedPackets,
-              prev.timeNs < d.software.sampledAtNs,
-              d.software.engines[index].pendingNs >= prev.engines[index] else { return nil }
-        let delta = d.software.engines[index].pendingNs - prev.engines[index]
-        let elapsed = d.software.sampledAtNs - prev.timeNs
-        guard elapsed > 0, elapsed <= 2_000_000_000 else { return nil }
-        let ratio = Double(delta) / Double(elapsed) * 100.0
-        guard ratio >= 0, ratio.isFinite else { return nil }
-        return min(max(ratio, 0), 100)
+        let submitted = d.software.engines[index].submitted
+        defer {
+            previousEngineSubmitted = Array(d.software.engines.map { $0.submitted })
+            previousEngineTimeNs = d.software.sampledAtNs
+            previousEngineGeneration = d.software.generation
+        }
+        guard let prevGen = previousEngineGeneration,
+              prevGen == d.software.generation,
+              let prevTime = previousEngineTimeNs,
+              prevTime < d.software.sampledAtNs,
+              let prevSub = previousEngineSubmitted,
+              prevSub[index] <= submitted,
+              d.software.sampledAtNs - prevTime <= 2_000_000_000 else { return nil }
+        let delta = submitted - prevSub[index]
+        let elapsed = d.software.sampledAtNs - prevTime
+        guard elapsed > 0 else { return nil }
+        let ratePerSec = Double(delta) / Double(elapsed) * 1e9
+        guard ratePerSec > 0, ratePerSec.isFinite else { return nil }
+        if ratePerSec > peakEngineRatePerSec[index] { peakEngineRatePerSec[index] = ratePerSec }
+        guard peakEngineRatePerSec[index] > 0 else { return nil }
+        return min(max(ratePerSec / peakEngineRatePerSec[index] * 100.0, 0.0), 100.0)
     }
 
     func reset() {
@@ -274,6 +290,12 @@ final class SampleHistory {
         previousUmc = nil
         lastUmhubSource = nil
         lastUmhubReliable = false
+        lastCoreSource = nil
+        peakGfxRatePerSec = 0
+        peakEngineRatePerSec = [0, 0, 0, 0]
+        previousEngineSubmitted = nil
+        previousEngineTimeNs = nil
+        previousEngineGeneration = nil
     }
 }
 
@@ -313,6 +335,7 @@ func makeSnapshot(device: Device?, history: SampleHistory,
     }
     snap.umcSourceLabel = umcLabel
     snap.coreCurrent = history.coreCurrent
+    snap.coreSourceLabel = history.lastCoreSource
     if let e = device?.error {
         // Device is bound but this read failed: show the specific failure so
         // it is diagnosable. Distinct from "no device found" below.
