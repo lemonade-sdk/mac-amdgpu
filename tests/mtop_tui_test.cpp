@@ -68,16 +68,46 @@ int main() {
         auto [r2, g2, b2] = gradient(200);
         assert(r2 == 190 && g2 == 18 && b2 == 60);
     }
-    // --dark palette restores the original bright-on-dark spec values:
-    // cyan #00F0FF, blue #0072FF, yellow #FFD600, orange #FF6B00,
-    // crimson #FF0055.
+    // --dark palette: vivid-but-not-neon stops for dark terminals:
+    // cyan #22d3ee, blue #60a5fa, yellow #fbbf24, orange #fb923c,
+    // crimson #f87171 (cyan -> yellow -> red ramp).
     {
         auto [r, g, b] = gradient(0, true);
-        assert(r == 0 && g == 240 && b == 255);
+        assert(r == 34 && g == 211 && b == 238);
         auto [r5, g5, b5] = gradient(50, true);
-        assert(r5 == 0 && g5 == 114 && b5 == 255);
+        assert(r5 == 96 && g5 == 165 && b5 == 250);
+        // 60% -> between yellow #fbbf24 (251,191,36) and orange #fb923c (251,146,60), t = 1/3.
+        // r: 251; g: 191 + (1/3)(146-191) = 191 - 15 = 176; b: 36 + (1/3)(60-36) = 36 + 8 = 44.
+        auto [r6, g6, b6] = gradient(60, true);
+        assert(r6 == 251 && g6 == 176 && b6 == 44);
         auto [r1, g1, b1] = gradient(100, true);
-        assert(r1 == 255 && g1 == 0 && b1 == 85);
+        assert(r1 == 248 && g1 == 113 && b1 == 113);
+    }
+    // --dark Palette SGR codes: near-white values, light labels, mid-grey
+    // borders/empty slots, mid-dark-grey n/a (exact codes).
+    const auto cmp=[&](const char*a,const char*b){return std::string(a)==b;};
+    {
+        const auto p = makePalette(true);
+        assert(cmp(p.kBorder, "\033[38;2;75;85;99m"));   // #4b5563
+        assert(cmp(p.kEmpty, "\033[38;2;55;65;81m"));    // #374151
+        assert(cmp(p.kNad, "\033[38;2;107;114;128m"));   // #6b7280
+        assert(cmp(p.kValue, "\033[38;2;229;231;235m")); // #e5e7eb
+        assert(cmp(p.kLabel, "\033[38;2;209;213;219m")); // #d1d5db
+        assert(cmp(p.kSection, "\033[1;38;2;229;231;235m")); // bold #e5e7eb
+        assert(cmp(p.value("42").c_str(), "\033[38;2;229;231;235m42\033[0m"));
+        assert(cmp(p.label("temp").c_str(), "\033[38;2;209;213;219mtemp\033[0m"));
+        assert(cmp(p.section("SEC").c_str(), "\033[1;38;2;229;231;235mSEC\033[0m"));
+        assert(cmp(p.emptyGlyph().c_str(), "\033[38;2;55;65;81m\xE2\x96\x91\033[0m"));
+    }
+    // Default (dark-on-light) palette: exact codes must not change.
+    {
+        const auto p = makePalette(false);
+        assert(cmp(p.kBorder, "\033[38;2;156;163;175m")); // #9ca3af
+        assert(cmp(p.kEmpty, "\033[38;2;209;213;219m"));  // #d1d5db
+        assert(cmp(p.kNad, "\033[38;2;107;114;128m"));   // #6b7280
+        assert(cmp(p.kValue, "\033[38;2;17;24;39m"));    // #111827
+        assert(cmp(p.kLabel, "\033[38;2;55;65;81m"));    // #374151
+        assert(cmp(p.kSection, "\033[38;2;17;24;39m"));  // #111827
     }
 
     // --- Gradient bar: cell-by-cell truecolor ---
@@ -96,15 +126,23 @@ int main() {
     assert(empty.find("\033[38;2;") != std::string::npos);
     assert(empty.find("\033[38;2;209;213;219m") != std::string::npos);
     assert(visible(empty) == 10);
-    // --dark palette: bright stops, dimmed empty cells.
+    // --dark palette: vivid stops, #374151 empty cells.
     const auto darkPalette = makePalette(true);
     const auto darkBar = gradientBar(10.0, 10, darkPalette);
-    // First cell at 10% in the bright palette (cyan #00F0FF -> blue #0072FF).
+    // First cell (10% position) in the dark palette ramps cyan #22d3ee ->
+    // blue #60a5fa with t = 1/10: r 46, g 201 (truncated), b 240.
     assert(darkBar.find("\033[38;2;") != std::string::npos);
-    assert(darkBar.find("\033[38;2;0;214;255m") != std::string::npos);
-    assert(darkBar.find("\033[38;2;255;0;85m") != std::string::npos);
+    assert(darkBar.find("\033[38;2;46;201;240m") != std::string::npos);
+    // Second cell (20%): t = 2/10 -> r 58, g 192, b 242.
+    assert(darkBar.find("\033[38;2;58;192;242m") != std::string::npos);
+    // The 51% cell is the blue end stop #60a5fa.
+    assert(darkBar.find("\033[38;2;96;165;250m") != std::string::npos);
+    // The 60% cell is between yellow #fbbf24 and orange #fb923c: 251;176;44.
+    assert(darkBar.find("\033[38;2;251;176;44m") != std::string::npos);
+    // Last cell is the crimson end stop #f87171.
+    assert(darkBar.find("\033[38;2;248;113;113m") != std::string::npos);
     const auto darkEmpty = gradientBar(0.0, 10, darkPalette);
-    assert(darkEmpty.find("\033[2m") != std::string::npos);
+    assert(darkEmpty.find("\033[38;2;55;65;81m") != std::string::npos);
     assert(visible(darkEmpty) == 10);
 
     // --- Braille canvas: 2 columns per cell, 4 rows per line ---

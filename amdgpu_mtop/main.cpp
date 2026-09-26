@@ -545,7 +545,7 @@ void dashboard(const std::vector<mtop::Device> &devices, const mtop::Selection &
             if (interactive) {
                 lines.resize(std::min<size_t>(lines.size(),rows-1));
                 while(lines.size()<rows-1)lines.emplace_back();
-                lines.push_back(tint(footer,palette.dark?"\033[1m":"\033[38;2;17;24;39m"));
+                lines.push_back(tint(footer,palette.dark?"\033[38;2;209;213;219m":"\033[38;2;17;24;39m"));
                 mtop::Frame temporary;
                 if(frame && graphics==mtop::Graphics::ITerm)frame->previous.clear();
                 std::string output=(frame?*frame:temporary).update(lines,columns,rows);

@@ -48,8 +48,10 @@ inline void appendFrac(std::string &out, int eighth) {
 // dark backgrounds (the original spec values, --dark) and darkened colors
 // for light backgrounds (default; neon is unreadable on white).
 inline std::array<int, 3> gradient(int percent, bool dark = false) {
+    // Dark-mode stops: vivid but not neon — the #00F0FF/#FF0055 family from
+    // the original spec washes out and stings on a dark terminal background.
     static const std::array<std::array<int, 3>, 5> bright = {
-        { {0, 240, 255}, {0, 114, 255}, {255, 214, 0}, {255, 107, 0}, {255, 0, 85} } };
+        { {34, 211, 238}, {96, 165, 250}, {251, 191, 36}, {251, 146, 60}, {248, 113, 113} } };
     static const std::array<std::array<int, 3>, 5> light = {
         { {8, 145, 178}, {29, 78, 216}, {180, 83, 9}, {194, 65, 12}, {190, 18, 60} } };
     static const int stops[] = {0, 50, 50, 80, 80, 100};
@@ -69,17 +71,19 @@ inline std::string rgb(int r, int g, int b) {
         std::to_string(std::clamp(g, 0, 255)) + ';' + std::to_string(std::clamp(b, 0, 255)) + 'm';
 }
 // --- Palette (dark-on-light default, --dark restores bright-on-dark) ---
-// The original palette (dim grey text on a dark background) is unreadable
-// in terminals with light backgrounds. The default palette uses dark text
-// that stays legible on white; `--dark` restores the original colors.
+// The default palette uses dark text that stays legible on a white
+// background; `--dark` switches to a bright-on-dark scheme for dark
+// terminals. The dark scheme uses near-white data text (#e5e7eb), mid-grey
+// borders (#4b5563, visible but unobtrusive), and a #374151 empty-bar that
+// reads as a slot outline without competing with the gradient fill.
 struct Palette {
     bool dark = false; // false = dark text for light backgrounds (default).
-    const char *kBorder;   // border/axis lines    #505064 (dark) / #9ca3af
-    const char *kEmpty;    // empty bar glyph (░)  dim       / #d1d5db
+    const char *kBorder;   // border/axis lines    #4b5563 (dark) / #9ca3af
+    const char *kEmpty;    // empty bar glyph (░)  #374151  / #d1d5db
     const char *kNad;      // "n/a" text           #6b7280  / #6b7280
-    const char *kValue;    // primary data text    #111827
-    const char *kLabel;    // metric names, axes   #374151
-    const char *kSection;  // section titles       #111827
+    const char *kValue;    // primary data text    #e5e7eb (dark) / #111827
+    const char *kLabel;    // metric names, axes   #d1d5db (dark) / #374151
+    const char *kSection;  // section titles       #e5e7eb (dark) / #111827
     // Default to the dark-on-light palette so any caller that omits a Palette
     // gets a valid, legible palette instead of dangling pointers. Defined
     // after makePalette (delegating constructor).
@@ -95,12 +99,12 @@ struct Palette {
     std::string emptyGlyph() const; // defined below (needs kEmpty glyph)
 };
 inline Palette makePalette(bool dark) {
-    const char *border = dark ? "\033[38;2;80;80;100m" : "\033[38;2;156;163;175m";
-    const char *empty = dark ? "\033[2m" : "\033[38;2;209;213;219m";
-    const char *nad = dark ? "\033[38;5;245m" : "\033[38;2;107;114;128m";
-    const char *value = dark ? "\033[38;5;255m" : "\033[38;2;17;24;39m";
-    const char *label = dark ? "\033[38;5;245m" : "\033[38;2;55;65;81m";
-    const char *section = dark ? "\033[1;38;5;255m" : "\033[38;2;17;24;39m";
+    const char *border = dark ? "\033[38;2;75;85;99m" : "\033[38;2;156;163;175m";
+    const char *empty = dark ? "\033[38;2;55;65;81m" : "\033[38;2;209;213;219m";
+    const char *nad = dark ? "\033[38;2;107;114;128m" : "\033[38;2;107;114;128m";
+    const char *value = dark ? "\033[38;2;229;231;235m" : "\033[38;2;17;24;39m";
+    const char *label = dark ? "\033[38;2;209;213;219m" : "\033[38;2;55;65;81m";
+    const char *section = dark ? "\033[1;38;2;229;231;235m" : "\033[38;2;17;24;39m";
     return Palette{dark, border, empty, nad, value, label, section};
 }
 inline Palette::Palette() : dark(false), kBorder("\033[38;2;156;163;175m"), kEmpty("\033[38;2;209;213;219m"),
