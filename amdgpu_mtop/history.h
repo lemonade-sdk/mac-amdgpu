@@ -23,7 +23,8 @@ struct ActivityPoint {
     std::optional<double> gfxPercent;   // SMU AverageGfxActivity, raw firmware field.
     std::optional<double> busyPercent;  // Observer-computed, delta-based. See busyRatio().
     std::optional<double> temperatureC; // Hotspot first, else edge, else memory (Celsius).
-    std::optional<double> umcPercent;   // SMU UmcActivityPercent: memory-controller (UMC) busy 0-100%.
+    std::optional<double> umcPercent;   // Memory-controller (UMC) busy 0-100%; source chosen per sample (SMU table or MMHUB PERFCTR delta). See umcSource.
+    std::string umcSource;              // provenance label for the umcPercent value.
     std::array<std::optional<double>,5> copyMiBPerSecond{};
 };
 // Fixed time window: switching between 100 ms and 500 ms does not change the
@@ -36,6 +37,9 @@ struct History {
     // Busy counter delta over the sample window (pendingNs delta / elapsed).
     std::optional<double> busyRatioValue;
     std::optional<mtop::RateCounters> previousBusy;
+    // Last observed MMHUB UMC busy accumulator (selector 68); 0 means the
+    // source was absent, which resets the delta window.
+    uint64_t previousUmcQ8=0, previousUmcAtNs=0;
     std::optional<double> peakGfxClockMHz, peakMemoryClockMHz;
     std::optional<double> minimumGfxClockMHz, minimumMemoryClockMHz;
     void clocks(std::optional<double> gfx, std::optional<double> memory) {
@@ -46,8 +50,9 @@ struct History {
     }
     void add(uint64_t now, std::optional<RateCounters> counters,
              std::optional<double> allocatedGiB, std::optional<double> gfxPercent={},
-             std::optional<double> temperatureC={}, std::optional<double> umcPercent={}) {
-        ActivityPoint point{now,{}, {},allocatedGiB,gfxPercent,{},temperatureC,umcPercent,{}};
+             std::optional<double> temperatureC={}, std::optional<double> umcPercent={},
+             const std::string &umcSource="") {
+        ActivityPoint point{now,{}, {},allocatedGiB,gfxPercent,{},temperatureC,umcPercent,umcSource,{}};
         if (counters) {
             const bool reset=previous && (counters->generation!=previous->generation ||
                 counters->timeNs<previous->timeNs || counters->submitted<previous->submitted ||

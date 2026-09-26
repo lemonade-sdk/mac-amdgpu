@@ -25,6 +25,13 @@ struct Device {
     bool clocksSupported = false;
     std::string clocksError;
     amdgpu::SMUClockSnapshot clocks{};
+    // MMHUB PERFSTATUS UMC busy (build 198+, selector 68, observer only).
+    struct MmhubPerfStatus {
+        uint32_t status = 0;          // kern_return_t bit pattern from the driver
+        uint32_t raw = 0;             // full PERFSTATUS register value
+        uint64_t umcBusyQ8 = 0;       // cumulative UMC busy, 0.25% steps (1048575 = 100% of window)
+        uint64_t collectedAtNs = 0;   // CLOCK_UPTIME_RAW sample time
+    } mmhub{};
     bool specSupported = false;
     std::string specError;
     struct GfxSpec {
@@ -91,6 +98,44 @@ inline bool interfaceMismatch(const Device &d) {
     return d.telemetrySupported && validSnapshot(d.metrics) &&
         d.metrics.driverInterface != 0 &&
         !amdgpu::smu_metrics_profile_supported(d.metrics);
+}
+
+// MMHUB PERFSTATUS UMC busy source (build 198+, selector 68). The dext samples
+// the MMHUB PERFSTATUS register on its 1 Hz sensor cache and publishes it with
+// selector 68 (observer only, like selector 63): out[0]=status, out[1]=raw
+// register, out[2]=cumulative UMC busy Q8, out[3]=sample wall time
+// (CLOCK_UPTIME_RAW). The counter integrates (busy fraction * 1e9 / 0.25% step)
+// per second, so a full-busy window accumulates kMMHUBPerfStatusMaxQ8 per
+// second and the register saturates; consumers take deltas and drop wrap /
+// saturation regressions, the same way they treat pendingNs.
+inline constexpr uint32_t kMMHUBPerfStatusSelector = 68;
+inline constexpr uint32_t kMMHUBPerfStatusMinimumBuild = 198;
+inline constexpr uint64_t kMMHUBPerfStatusMaxQ8 = 1048575ull; // 20-bit saturating counter
+inline bool validMmhub(const Device &d, uint64_t now) {
+    // The PERFSTATUS register is only meaningful once the GPU is fully
+    // initialized; before stage 15 the driver reports the source unavailable.
+    return d.error.empty() && d.build >= kMMHUBPerfStatusMinimumBuild &&
+        d.stage == 15 && d.mmhub.status == 0 && d.mmhub.collectedAtNs <= now &&
+        now - d.mmhub.collectedAtNs <= amdgpu::kSMUMetricsStaleAfterNs;
+}
+inline bool freshMmhub(const Device &d, uint64_t now) { return validMmhub(d, now); }
+// Delta-based UMC busy percentage over the sample window. previousUmc carries
+// the previous sample's cumulative counter and wall time (0/0 when the source
+// was absent). A counter regression (saturation wrap or a new counter epoch)
+// reports unavailable instead of a fake spike.
+inline std::optional<double> mmhubUmcPercent(const Device &d,
+                                             uint64_t previousUmcQ8, uint64_t previousUmcAtNs) {
+    if (!validMmhub(d, d.mmhub.collectedAtNs)) return {};
+    if (!previousUmcAtNs || previousUmcAtNs >= d.mmhub.collectedAtNs) return {};
+    if (d.mmhub.umcBusyQ8 < previousUmcQ8) return {}; // saturated / wrapped: no window
+    const uint64_t delta = d.mmhub.umcBusyQ8 - previousUmcQ8;
+    const uint64_t elapsed = d.mmhub.collectedAtNs - previousUmcAtNs;
+    if (elapsed < 1000000ull || elapsed > 2'000'000'000ull) return {};
+    // The counter integrates (busy_fraction * 1e9 / 0.25% steps) per second,
+    // so a full-busy window accumulates kMMHUBPerfStatusMaxQ8 per second.
+    const double ratio = double(delta) / (double(kMMHUBPerfStatusMaxQ8) * double(elapsed / 1e9)) * 100.0;
+    if (ratio < 0 || !std::isfinite(ratio)) return {};
+    return std::clamp(ratio, 0.0, 100.0);
 }
 
 // Selection survives enumeration reordering and removal. Never silently

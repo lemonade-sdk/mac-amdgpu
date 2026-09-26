@@ -124,6 +124,22 @@ void read(io_service_t service, Device &d) {
             d.telemetrySupported = true;
         }
     }
+    // MMHUB PERFSTATUS UMC busy accumulator (build 198+, selector 68).
+    // Observer-only read of the driver's sensor cache; never opens PCI or
+    // reconfigures the counter. A non-success status (or a pre-198 driver)
+    // leaves the source unavailable and the TUI falls back to the SMU field.
+    if (d.build >= mtop::kMMHUBPerfStatusMinimumBuild) {
+        uint64_t result[4]{};
+        uint32_t count = 4;
+        (void)IOConnectCallScalarMethod(connection.value, mtop::kMMHUBPerfStatusSelector,
+                                        nullptr, 0, result, &count);
+        if (count == 4) {
+            d.mmhub.status = uint32_t(result[0]);
+            d.mmhub.raw = uint32_t(result[1]);
+            d.mmhub.umcBusyQ8 = result[2] & mtop::kMMHUBPerfStatusMaxQ8;
+            d.mmhub.collectedAtNs = result[3];
+        }
+    }
 }
 } // namespace
 

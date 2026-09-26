@@ -175,12 +175,15 @@ void json(const std::vector<mtop::Device> &devices, const mtop::Selection &selec
                       << ",\"sample_uptime_ns\":" << d.metrics.collectedAtNs
                       << ",\"firmware_metrics_counter\":" << d.metrics.firmwareCounter;
         std::cout << ",\"gfx_activity_percent\":" << metric(d, GfxActivityPercent, 1, "", true)
-                  << ",\"gfx_activity_source\":\"SMU AverageGfxActivity\""
+                  << ",\"gfx_activity_source\":\"SMU AverageGfxActivity (raw firmware field; incoherent on this host — the live GPU CORE LOAD row uses the driver dispatch-in-flight delta)\""
                   << ",\"gfx_activity_scope\":\"firmware-reported activity; not CU occupancy or productive workload utilization\""
                   << ",\"gfx_activity_accuracy\":" << quote(d.metrics.driverInterface==amdgpu::metrics::kCompatibleInterface &&
                       (d.metrics.flags&amdgpu::kSMUMetricsLinuxCompatible) ?
                       "idle_100_percent_observed; workload_utilization_unverified" : "not_independently_calibrated")
                   << ",\"umc_activity_percent\":" << metric(d, UmcActivityPercent, 1, "", true)
+                  << ",\"umc_activity_source\":\"" << (mtop::validMmhub(d, clock_gettime_nsec_np(CLOCK_UPTIME_RAW))
+                      ? "MMHUB PERFSTATUS UMC busy (hardware PERFCTR delta, selector 68)"
+                      : "SMU UmcActivityPercent (firmware table offset 126); absent while the SMU table is incoherent") << "\""
                   << ",\"media_activity_percent\":" << metric(d, MediaActivityPercent, 1, "", true)
                   << ",\"vram_used_bytes\":null,\"gtt_used_bytes\":null"
                   << ",\"gfx_clock_mhz\":" << metric(d, GfxClockMHz, 1, "", true)
@@ -200,6 +203,30 @@ using Histories=std::map<uint64_t,mtop::History>;
 std::optional<double> hardwareValue(const mtop::Device &d,amdgpu::metrics::Field field,uint64_t now) {
     if (!mtop::fresh(d,now) || !(d.metrics.validFields&(uint64_t(1)<<field))) return {};
     return double(d.metrics.values[field]);
+}
+// UMC (memory-controller) busy percentage for one sample. The SMU table's
+// UmcActivityPercent (firmware offset 126) is used when it is fresh and
+// plausible (0..100); otherwise the hardware MMHUB PERFCTR delta (selector
+// 68, build 198+) is the live source. On this host the SMU table is known to
+// be incoherent for the activity fields (AverageGfxActivity reads ~100% at
+// verified idle; UMC reads 0% under real traffic, per the build 193
+// idle/load capture in docs/GPU_MONITOR.md), so the hardware counter is
+// preferred there. The provenance label follows the value that was actually
+// used; a fake SMU value is never shown.
+std::optional<double> umcValue(const mtop::Device &d, uint64_t now,
+                               std::string &source,
+                               uint64_t previousUmcQ8 = 0, uint64_t previousUmcAtNs = 0) {
+    if (const auto smu = hardwareValue(d, amdgpu::metrics::UmcActivityPercent, now)) {
+        if (*smu <= 100.0) {
+            source = "SMU UmcActivityPercent (firmware table offset 126; UMC busy 0-100%)";
+            return *smu;
+        }
+    }
+    if (const auto mmhub = mtop::mmhubUmcPercent(d, previousUmcQ8, previousUmcAtNs)) {
+        source = "MMHUB PERFSTATUS UMC busy (hardware PERFCTR delta, selector 68; 0-100%)";
+        return *mmhub;
+    }
+    return {};
 }
 std::optional<double> temperatureValue(const mtop::Device &d,uint64_t now) {
     // Hotspot first, then edge, then memory; 1000 mC per 1 C.
@@ -398,6 +425,13 @@ void dashboard(const std::vector<mtop::Device> &devices, const mtop::Selection &
             const auto nad=[&](const std::string&text){return std::string(palette.kNad)+text+"\033[0m";};
             const auto smuBuckets=history.buckets(60,now,&mtop::ActivityPoint::gfxPercent);
             const auto umcBuckets=history.buckets(60,now,&mtop::ActivityPoint::umcPercent);
+            // UMC chart source: pick the label from the most recent point that
+            // actually has a value, so the panel always matches the data.
+            std::string umcSourceLabel;
+            for (auto it = history.points.rbegin(); it != history.points.rend(); ++it) {
+                if (it->umcPercent && !it->umcSource.empty()) { umcSourceLabel = it->umcSource; break; }
+            }
+            if (umcSourceLabel.empty()) umcSourceLabel = "SMU UmcActivityPercent (firmware table offset 126; UMC busy 0-100%)";
             const auto copyBuckets=history.buckets(60,now,&mtop::ActivityPoint::transferMiBPerSecond);
             // One labeled Braille activity chart (same treatment as GPU CORE
             // LOAD): 5-row Y-axis, Braille matrix, X-axis caption, and a
@@ -417,9 +451,9 @@ void dashboard(const std::vector<mtop::Device> &devices, const mtop::Selection &
                     line(cell(columns,palette.label(labels[r])+"  "+palette.label(br.rows[r])));
                 line(cell(columns,palette.label(xaxis(chCells))));
                 const auto s=mtop::stats(plot);
-                line(cell(columns,palette.label("  min ")+(s?palette.value(decimal(s->at(0),1)+"%  max "):nad("min n/a  max "))+
-                           (s?palette.value(decimal(s->at(1),1)+"%  avg "):nad("max n/a  avg "))+
-                           (s?palette.value(decimal(s->at(2),1)+"%") : nad("avg n/a"))));
+                line(cell(columns,palette.label("  min ")+(s?palette.value(decimal(s->at(0),1)+"%  max "):nad("n/a  max "))+
+                           (s?palette.value(decimal(s->at(1),1)+"%  avg "):nad("n/a  avg "))+
+                           (s?palette.value(decimal(s->at(2),1)+"%") : nad("n/a"))));
                 line(cell(columns,palette.label("  ")+nad(source)));
                 line("");
             };
@@ -476,13 +510,17 @@ void dashboard(const std::vector<mtop::Device> &devices, const mtop::Selection &
             for(size_t r=0;r<5;++r)
                 line(cell(columns,palette.label(labels[r])+"  "+palette.label(br.rows[r])));
             line(cell(columns,palette.label(xaxis(cells))));
+            line(cell(columns,palette.label(
+                "  source: driver dispatch-in-flight (selector 61); SMU AverageGfxActivity "
+                "incoherent on this host — see mtop-report.md")));
             line("");
             // ===== SMU MEMORY ACTIVITY (UMC) =====
-            // Memory-controller (UMC) busy 0-100% from the SMU metrics table
-            // (firmware offset 126). A real memory-side counter, not gfx
-            // activity and not an n/a placeholder.
+            // Memory-controller (UMC) busy 0-100%. Prefers the SMU table field
+            // when it is fresh and plausible; on this host the SMU table is
+            // incoherent so the driver MMHUB PERFCTR delta (selector 68, build
+            // 198+) is the live source. The source caption follows the value.
             activityChart(umcBuckets,"SMU MEMORY ACTIVITY (UMC) ",
-                "source: SMU UmcActivityPercent (firmware table offset 126; UMC busy 0-100%)");
+                "source: "+umcSourceLabel);
             // ===== VRAM / GTT meters =====
             line(tint(top(columns,palette.section("VRAM USAGE ")+(vramTotal>0 ? palette.value("["+decimal(vramUsed,1)+" / "+decimal(vramTotal,1)+" GB -- "+decimal(vramPct*100.0,1)+"%]") : nad("[ n/a ]"))),palette.kBorder));
             const unsigned barW=std::min(columns-24u, 40u);
@@ -706,9 +744,18 @@ int main(int argc, char **argv) {
             auto &history=histories[device.registry];
             const auto counters=rateCounters(device);
             const auto busy=busyPercent(device,history);
+            std::string umcSource;
+            const auto umc=umcValue(device,sampledAt,umcSource,history.previousUmcQ8,history.previousUmcAtNs);
             history.add(sampledAt,counters,allocatedGiB(device),hardwareValue(device,amdgpu::metrics::GfxActivityPercent,sampledAt),
-                        temperatureValue(device,sampledAt),hardwareValue(device,amdgpu::metrics::UmcActivityPercent,sampledAt));
+                        temperatureValue(device,sampledAt),umc,umcSource);
             history.previousBusy=counters;
+            if (mtop::validMmhub(device, sampledAt)) {
+                history.previousUmcQ8 = device.mmhub.umcBusyQ8;
+                history.previousUmcAtNs = device.mmhub.collectedAtNs;
+            } else {
+                history.previousUmcQ8 = 0;
+                history.previousUmcAtNs = 0;
+            }
             if (busy) history.points.back().busyPercent=busy;
             history.clocks(clockValue(device,0,sampledAt),clockValue(device,2,sampledAt));
         }
