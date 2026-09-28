@@ -20,12 +20,16 @@ fi
 [[ "$(git -C "$hrx_copy" rev-parse HEAD)" == "$hrx_revision" ]] || {
   echo 'Existing build source is at an unexpected revision.' >&2; exit 1;
 }
-if git -C "$hrx_copy" apply --reverse --check "$hrx_patch" 2>/dev/null; then
-  : # The exact tracked adapter is already applied.
-else
-  git -C "$hrx_copy" apply --check "$hrx_patch"
-  git -C "$hrx_copy" apply "$hrx_patch"
-fi
+for patch in "$hrx_patch" \
+  "$repo_root/patches/hrx/symbolic-memo-touched-reset.patch"; do
+  if git -C "$hrx_copy" apply --reverse --check "$patch" 2>/dev/null; then
+    :
+  else
+    git -C "$hrx_copy" apply --check "$patch"
+    git -C "$hrx_copy" apply "$patch"
+  fi
+done
+
 hrx_dependency_args=()
 if [[ -f "$repo_root/build/hrx-macos/_deps/flatcc-src/include/flatcc/flatcc.h" ]]; then
   hrx_dependency_args+=("-DFETCHCONTENT_SOURCE_DIR_FLATCC=$repo_root/build/hrx-macos/_deps/flatcc-src")
