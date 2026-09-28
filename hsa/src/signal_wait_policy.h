@@ -8,10 +8,9 @@
 namespace mac_hsa {
 
 // Blocked waits still poll because GPU DMA stores do not notify a host
-// condition variable. Keep the established default; this bounded override
-// measures wake latency independently of shader, mapping and batching changes.
+// condition variable. Use a 64 us interval to limit completion wake latency.
 inline uint64_t blockedSignalPollNs(const char *setting) {
-    constexpr uint64_t fallback=1000000;
+    constexpr uint64_t fallback=64000;
     if (!setting) return fallback;
     const std::string_view text(setting);
     uint32_t micros=0;

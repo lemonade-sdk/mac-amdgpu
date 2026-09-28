@@ -166,9 +166,12 @@ def main(*, bandwidth_only_default=False):
                 parser.error(f"Missing prerequisite: {path}; run build.py first")
         env = runtime_environment(runtime, trace=True)
         (folder / "environment.json").write_text(json.dumps(capture_environment(), indent=2) + "\n")
-        setting = env.get("MAC_HSA_BLOCKED_POLL_US")
-        effective = int(setting) if setting and setting.isascii() and setting.isdigit() and 10 <= int(setting) <= 1000 else 1000
-        policy = {"MAC_HSA_BLOCKED_POLL_US": setting, "effective_blocked_poll_us": effective,
+        requested = env.get("MAC_HSA_BLOCKED_POLL_US")
+        effective = int(requested) if requested and requested.isascii() and requested.isdigit() and 10 <= int(requested) <= 1000 else 64
+        env["MAC_HSA_BLOCKED_POLL_US"] = str(effective)
+        policy = {"MAC_HSA_BLOCKED_POLL_US": env["MAC_HSA_BLOCKED_POLL_US"],
+                  "requested_blocked_poll_us": requested, "effective_blocked_poll_us": effective,
+                  "selection": "Runner explicitly selects the interval so older runtime copies use the same wait policy",
                   "HRX_completion_wait": "Timeline wait with flags0; HSA_WAIT_STATE_BLOCKED on epoch path",
                   "HSA_completion_wait": "Active hsa_signal_load_scacquire loop",
                   "pure_mailbox_wait": "Active acquire polling, no blocked wait"}
