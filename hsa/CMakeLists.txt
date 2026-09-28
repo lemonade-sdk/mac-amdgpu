@@ -115,7 +115,7 @@ if(BUILD_TESTING)
     -fsanitize=address,undefined -fno-sanitize-recover=all)
   target_link_options(hsa-signal-test PRIVATE -fsanitize=address,undefined)
   add_test(NAME hsa-cpu-signals-default COMMAND ${CMAKE_COMMAND} -E env
-    --unset=MAC_HSA_BLOCKED_POLL_US $<TARGET_FILE:hsa-signal-test> 64000)
+    --unset=MAC_HSA_BLOCKED_POLL_US $<TARGET_FILE:hsa-signal-test> 32000)
   add_test(NAME hsa-cpu-signals COMMAND hsa-signal-test 1000000)
   set_tests_properties(hsa-cpu-signals PROPERTIES
     ENVIRONMENT "MAC_HSA_BLOCKED_POLL_US=1000")

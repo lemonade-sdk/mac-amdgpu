@@ -25,10 +25,11 @@ static void enumerate() {
 int main(int argc,char **argv) {
     assert(argc==1 || argc==2);
     if (argc==2) assert(mac_hsa::blockedSignalPollNs()==std::strtoull(argv[1],nullptr,10));
-    assert(mac_hsa::blockedSignalPollNs(nullptr)==64000);
+    assert(mac_hsa::blockedSignalPollNs(nullptr)==32000);
     for (const char *bad : {"", "-1", "0", "9", "1001", "64us", " 64", "99999999999999999999"})
-        assert(mac_hsa::blockedSignalPollNs(bad)==64000);
+        assert(mac_hsa::blockedSignalPollNs(bad)==32000);
     assert(mac_hsa::blockedSignalPollNs("10")==10000);
+    assert(mac_hsa::blockedSignalPollNs("32")==32000);
     assert(mac_hsa::blockedSignalPollNs("64")==64000);
     assert(mac_hsa::blockedSignalPollNs("1000")==1000000);
     hsa_signal_t signal{};

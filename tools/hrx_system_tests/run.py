@@ -167,7 +167,7 @@ def main(*, bandwidth_only_default=False):
         env = runtime_environment(runtime, trace=True)
         (folder / "environment.json").write_text(json.dumps(capture_environment(), indent=2) + "\n")
         requested = env.get("MAC_HSA_BLOCKED_POLL_US")
-        effective = int(requested) if requested and requested.isascii() and requested.isdigit() and 10 <= int(requested) <= 1000 else 64
+        effective = int(requested) if requested and requested.isascii() and requested.isdigit() and 10 <= int(requested) <= 1000 else 32
         env["MAC_HSA_BLOCKED_POLL_US"] = str(effective)
         policy = {"MAC_HSA_BLOCKED_POLL_US": env["MAC_HSA_BLOCKED_POLL_US"],
                   "requested_blocked_poll_us": requested, "effective_blocked_poll_us": effective,
