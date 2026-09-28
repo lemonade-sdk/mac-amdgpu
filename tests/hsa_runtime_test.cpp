@@ -16,8 +16,16 @@ static hsa_status_t propertyStatus=HSA_STATUS_SUCCESS;
 static uint64_t gpuTimestampFrequency=100000000;
 static hsa_status_t specStatus=HSA_STATUS_SUCCESS;
 static uint64_t specWords[32];
+static hsa_status_t memoryAvailableStatus = HSA_STATUS_SUCCESS;
+static uint64_t memoryAvailableBytes = 6ull << 30;
+static unsigned memoryAvailableReads = 0;
 namespace mac_hsa {
 struct TestConnection final : Connection {
+    hsa_status_t memoryAvailable(uint64_t &bytes) override {
+        ++memoryAvailableReads;
+        bytes = memoryAvailableBytes;
+        return memoryAvailableStatus;
+    }
     hsa_status_t properties(DeviceProperties &properties) override {
         properties={0x7551,0xc0,0x500,0,64,4,1,gpuTimestampFrequency,32,32};
         return propertyStatus;
@@ -76,6 +84,22 @@ int main() {
     assert(hsa_iterate_agents(nullptr, nullptr) == HSA_STATUS_ERROR_INVALID_ARGUMENT);
     assert(hsa_iterate_agents(collect, nullptr) == HSA_STATUS_SUCCESS && observed.size() == 2);
     const auto cpu = observed[0], gpu = observed[1];
+    struct { uint64_t before, available, after; } memory{0xa5, UINT64_MAX, 0x5a};
+    const auto memoryAttribute = hsa_agent_info_t(HSA_AMD_AGENT_INFO_MEMORY_AVAIL);
+    assert(hsa_agent_get_info(cpu, memoryAttribute, &memory.available) == HSA_STATUS_ERROR_INVALID_ARGUMENT);
+    assert(memoryAvailableReads == 0 && memory.available == UINT64_MAX);
+    assert(hsa_agent_get_info(gpu, memoryAttribute, &memory.available) == HSA_STATUS_SUCCESS);
+    assert(memory.available == memoryAvailableBytes && memory.before == 0xa5 && memory.after == 0x5a);
+    memoryAvailableBytes -= 16384;
+    assert(hsa_agent_get_info(gpu, memoryAttribute, &memory.available) == HSA_STATUS_SUCCESS);
+    assert(memory.available == memoryAvailableBytes && memoryAvailableReads == 2);
+    memoryAvailableBytes = 0;
+    assert(hsa_agent_get_info(gpu, memoryAttribute, &memory.available) == HSA_STATUS_SUCCESS && !memory.available);
+    memory.available = UINT64_MAX;
+    memoryAvailableStatus = HSA_STATUS_ERROR;
+    assert(hsa_agent_get_info(gpu, memoryAttribute, &memory.available) == memoryAvailableStatus);
+    assert(memory.available == UINT64_MAX && memory.before == 0xa5 && memory.after == 0x5a);
+    memoryAvailableStatus = HSA_STATUS_SUCCESS;
     uint32_t property=99;
     assert(hsa_agent_get_info(cpu,HSA_AGENT_INFO_NODE,&property)==0 && property==0);
     assert(hsa_agent_get_info(gpu,HSA_AGENT_INFO_NODE,&property)==0 && property==1);

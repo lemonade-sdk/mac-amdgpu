@@ -1,4 +1,5 @@
 #include "device_init.h"
+#include "../../dext/amdgpu/amdgpu_vram_accounting.h"
 #include <IOKit/IOKitLib.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <mach/mach.h>
@@ -170,6 +171,26 @@ public:
         const auto status = ensureReady();
         if (status == HSA_STATUS_SUCCESS) bytes = capacity;
         return status;
+    }
+    hsa_status_t memoryAvailable(uint64_t &bytes) override {
+        std::lock_guard lock(sessionMutex);
+        auto status = ensureReady();
+        if (status != HSA_STATUS_SUCCESS) return status;
+        std::array<uint64_t, 3> build{};
+        status = scalar(43, {}, build);
+        if (status != HSA_STATUS_SUCCESS) return status;
+        if (build[2] < 178) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        const uint64_t tag = 5;
+        amdgpu::vram_accounting::Snapshot accounting{};
+        status = scalar(21, {&tag, 1}, accounting.values);
+        if (status != HSA_STATUS_SUCCESS) return status;
+        using namespace amdgpu::vram_accounting;
+        if (!valid(accounting)) return HSA_STATUS_ERROR;
+        if (!(accounting.values[Flags] & kValid)) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+        // The agent's VRAM pool allocates domain 3. This shared driver pool
+        // accounts for every client and excludes visible/firmware reservations.
+        bytes = accounting.values[DeviceFree];
+        return HSA_STATUS_SUCCESS;
     }
     hsa_status_t allocateBuffer(uint64_t bytes, DeviceBuffer &buffer) override {
         std::lock_guard lock(sessionMutex);

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include "../dext/amdgpu/amdgpu_dispatch_abi.h"
 #include "../dext/amdgpu/amdgpu_aql_abi.h"
+#include "../dext/amdgpu/amdgpu_vram_accounting.h"
 
 namespace {
 struct Buffer { std::vector<uint8_t> bytes; uint64_t domain; };
@@ -28,6 +29,8 @@ bool atomicTimeout = false, streamLive = false;
 unsigned submittedStreams = 0;
 unsigned queueCreates=0,queueKicks=0,queueDestroys=0,queueFault=0;
 unsigned propertyFault=0,serviceFault=0;
+unsigned accountingFault = 0;
+uint64_t deviceUsed = 7ull << 30;
 unsigned computeCalls = 0, computeFault = 0, aqlCalls = 0, aqlFault = 0;
 kern_return_t mockOpen(io_service_t, task_port_t, uint32_t, io_connect_t *port) { *port = ++opens; return KERN_SUCCESS; }
 kern_return_t mockClose(io_connect_t) { ++closes; return KERN_SUCCESS; }
@@ -105,7 +108,30 @@ kern_return_t mockScalar(mach_port_t, uint32_t selector, const uint64_t *in, uin
             if (propertyFault==5) out[6]=3;
             if (propertyFault==6) out[5]=0;
             if (propertyFault==7) out[5]=9;
-        } else { assert(in[0] == 5); out[0] = out[1] = 1; out[10] = 31ull << 30; }
+        } else {
+            using namespace amdgpu::vram_accounting;
+            assert(in[0] == 5 && *outCount == Count);
+            std::fill_n(out, Count, 0);
+            out[Version] = kVersion;
+            if (accountingFault == 9) return kIOReturnNoDevice;
+            if (accountingFault == 3) break;
+            out[Flags] = kValid;
+            out[UsableBytes] = 32ull << 30; out[VisibleBytes] = 256ull << 20;
+            out[VisibleCapacity] = 232ull << 20; out[VisibleUsed] = 32ull << 20;
+            out[VisibleFree] = out[VisibleLargestSpan] = 200ull << 20;
+            out[VisibleCount] = 2;
+            out[DeviceCapacity] = 31ull << 30; out[DeviceUsed] = deviceUsed;
+            out[DeviceFree] = out[DeviceLargestSpan] = out[DeviceCapacity] - deviceUsed;
+            out[DeviceCount] = 9;
+            out[ExcludedBytes] = out[UsableBytes] - out[VisibleCapacity] - out[DeviceCapacity];
+            if (accountingFault == 1) ++out[Version];
+            if (accountingFault == 2) out[Flags] |= 2;
+            if (accountingFault == 4) --*outCount;
+            if (accountingFault == 5) out[DeviceUsed] = out[DeviceCapacity] + 1;
+            if (accountingFault == 6) ++out[DeviceFree];
+            if (accountingFault == 7) ++out[DeviceLargestSpan];
+            if (accountingFault == 8) ++out[ExcludedBytes];
+        }
         break;
     case 6: out[0] = 1; out[1] = 0x80000000; break;
     case 8: ++resets; break;
@@ -245,6 +271,24 @@ int main() {
         for (auto &thread : threads) thread.join();
         assert(resets == 1 && uploads == 10 && maps == 10 && unmaps == maps);
         assert(opens == closes + 1);
+        uint64_t available = UINT64_MAX;
+        assert(connection.memoryAvailable(available) == 0 && available == (24ull << 30));
+        // Another client's allocations change the shared allocator, even when
+        // this connection has not created any BOs.
+        deviceUsed += 16384;
+        assert(connection.memoryAvailable(available) == 0 && available == (24ull << 30) - 16384);
+        deviceUsed = 31ull << 30;
+        assert(connection.memoryAvailable(available) == 0 && !available);
+        deviceUsed = 7ull << 30;
+        for (accountingFault = 1; accountingFault <= 9; ++accountingFault) {
+            available = UINT64_MAX;
+            const auto expected = accountingFault == 3 ? HSA_STATUS_ERROR_OUT_OF_RESOURCES :
+                                  accountingFault == 9 ? HSA_STATUS_ERROR_INVALID_AGENT : HSA_STATUS_ERROR;
+            assert(connection.memoryAvailable(available) == expected && available == UINT64_MAX);
+        }
+        accountingFault = 0; driverBuild = 177;
+        assert(connection.memoryAvailable(available) == HSA_STATUS_ERROR_INVALID_ARGUMENT && available == UINT64_MAX);
+        driverBuild = 179;
         const auto priorOpens = opens;
         assert(connection.read(snapshot) == 0 && snapshot.stage == 15 && opens == priorOpens);
         mac_hsa::DeviceBuffer device;

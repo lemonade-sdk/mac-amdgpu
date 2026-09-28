@@ -232,6 +232,13 @@ hsa_status_t hsa_agent_get_info(hsa_agent_t handle, hsa_agent_info_t attribute, 
     case HSA_AGENT_INFO_WAVEFRONT_SIZE: return property(&mac_hsa::DeviceProperties::wavefrontSize);
     case HSA_AMD_AGENT_INFO_NUM_SHADER_ENGINES: return property(&mac_hsa::DeviceProperties::shaderEngines);
     case HSA_AMD_AGENT_INFO_NUM_SHADER_ARRAYS_PER_SE: return property(&mac_hsa::DeviceProperties::arraysPerEngine);
+    case HSA_AMD_AGENT_INFO_MEMORY_AVAIL: {
+        if (!agent->connection) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        uint64_t available = 0;
+        const auto status = agent->connection->memoryAvailable(available);
+        if (status != HSA_STATUS_SUCCESS) return status;
+        return writeValue(value, available);
+    }
     case HSA_AMD_AGENT_INFO_TIMESTAMP_FREQUENCY: {
         if (!agent->connection) return writeValue(value,uint64_t(1000000000));
         mac_hsa::DeviceProperties properties{};
