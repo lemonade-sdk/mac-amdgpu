@@ -6,10 +6,9 @@ kernel/operand code; HIP and Loom supply the corresponding lowering. A hardware
 instruction table alone is not an implemented model execution path.
 
 The working source is `~/Documents/Development/LemonSeed-Engine`.
-`build/lse-macos-source` remains a compatibility symlink. The publication checkout
-is `build/lse-publish`; isolated qualification candidates are under `build/perf-*`.
-Changes in a candidate directory have not automatically been promoted to the
-working or published engine.
+The build scripts use that checkout directly. Current dispatch policy lives in
+LSE's `src/dispatch`; benchmark candidate directories are historical evidence,
+not active engine sources.
 
 ## Confirmed reference behavior
 
@@ -17,8 +16,8 @@ working or published engine.
   `src/backends/hrx/hipc/hip_sources.cpp`. Shared matrix descriptors, lane maps,
   and operand widths live in `include/lse/math.hpp` and
   `include/lse/kernels/wmma.hpp`.
-- `LSE_HRX_INT8=1` explicitly enables the existing Q4 activation-quantized
-  dot/WMMA paths. Q6/Q8 do not become INT8 merely because the GPU supports it.
+- Central dispatch selects the measured Q4 activation-quantized
+  dot/WMMA paths automatically. Q6/Q8 do not become INT8 merely because the GPU supports it.
   Q6 now has shared staged BF16 and residual FP8/BF8 matrix implementations;
   accepted accuracy and matched timing records determine automatic selection.
 - The validated Q6 path retains MLX affine six-bit storage and dequantizes

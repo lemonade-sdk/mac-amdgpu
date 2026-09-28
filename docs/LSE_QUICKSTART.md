@@ -1,14 +1,14 @@
 # Lemon Seed Engine on mac_amdgpu
 
-[Lemon Seed Engine (LSE)](https://github.com/Geramy/LSE) is the inference engine. [mac_amdgpu](https://github.com/lemonade-sdk/mac-amdgpu) supplies the macOS DriverKit driver, HSA runtime, and tracked macOS adapters for LSE and [HRX/Loom](https://github.com/ROCm/hrx-system). This guide reproduces the native build, guarded operator tests and qualified short CLI/HTTP inference on the local Qwen 27B Q6 checkpoint.
+[Lemon Seed Engine (LSE)](https://github.com/Geramy/LSE) is the inference engine. [mac_amdgpu](https://github.com/lemonade-sdk/mac-amdgpu) supplies the macOS DriverKit driver, HSA runtime, and the macOS adapter for [HRX/Loom](https://github.com/ROCm/hrx-system). This guide reproduces the native build, guarded operator tests and qualified short CLI/HTTP inference on the local Qwen 27B Q6 checkpoint.
 
-The tested path is native Apple Silicon → LSE → Loom → HRX → this HSA runtime → the external `gfx1201` GPU. It does not use Metal, an x86 emulation layer, or an installed Linux ROCr runtime. The LSE adapter explicitly selects HRX/Loom for its GPU checks and rejects CPU fallback.
+The tested path is native Apple Silicon → LSE → Loom → HRX → this HSA runtime → the external `gfx1201` GPU. It does not use Metal, an x86 emulation layer, or an installed Linux ROCr runtime. The LSE checks explicitly select HRX/Loom for its GPU checks and rejects CPU fallback.
 
 ## Requirements
 
 Hardware validation covers the Radeon AI PRO R9700 (`gfx1201`, `1002:7551`) over Thunderbolt on Apple Silicon. Follow the repository's [hardware requirements](../README.md#hardware-requirements), [Apple Developer setup](../README.md#apple-developer-portal-setup), and [driver build/activation instructions](../dext/README.md). Development currently requires the documented SIP configuration, appropriate DriverKit entitlements, signing identity and provisioning profiles. A successful HSA/LSE build does not install or approve the driver.
 
-For compilation, use the selected Xcode command-line tools/SDK, Git, Python 3, CMake, Ninja, Rust/Cargo, and an LLVM toolchain with AMDGPU support and matching libc++ libraries. The validated toolchain is LLVM **21.1.8**; the current development installation uses ELF LLD **23.1.1**, CMake **4.3.1**, and Ninja **1.13.2**. The tokenizer build was validated with Rust/Cargo **1.89.0**; omitting Cargo disables tokenizer-dependent CLI/server targets. The driver project also requires `xcodegen`. Apple's default linker is not an ELF `ld.lld` replacement. C++26 compilation for LSE uses the LLVM libc++ headers and library; the adapter removes the upstream reflection requirement.
+For compilation, use the selected Xcode command-line tools/SDK, Git, Python 3, CMake, Ninja, Rust/Cargo, and an LLVM toolchain with AMDGPU support and matching libc++ libraries. The validated toolchain is LLVM **21.1.8**; the current development installation uses ELF LLD **23.1.1**, CMake **4.3.1**, and Ninja **1.13.2**. The tokenizer build was validated with Rust/Cargo **1.89.0**; omitting Cargo disables tokenizer-dependent CLI/server targets. The driver project also requires `xcodegen`. Apple's default linker is not an ELF `ld.lld` replacement. C++26 compilation for LSE uses the LLVM libc++ headers and library; LSE selects its portable argument binding on macOS.
 
 The scripts select LLVM using [amdgpu-llvm-env.sh](../scripts/amdgpu-llvm-env.sh). To choose another installation of the validated compiler/linker, set their actual paths before running the commands below:
 
@@ -31,14 +31,13 @@ mkdir -p upstream
 git clone https://github.com/ROCm/hrx-system.git upstream/hrx-lse-pin
 git -C upstream/hrx-lse-pin checkout --detach 5927b0e0fafdefb5c8b41aa71bca8fd28791ad7c
 
-git clone https://github.com/Geramy/LSE.git upstream/lse
-git -C upstream/lse checkout --detach b5637a7109d409c21f75586edb75e7631277bce8
+git clone https://github.com/Geramy/LSE.git ../LemonSeed-Engine
 
 git clone https://github.com/iree-org/hsa-runtime-headers.git upstream/hsa-runtime-headers
 git -C upstream/hsa-runtime-headers checkout --detach 4285513114a70f7cf4830c89279c8cfa57b901bb
 ```
 
-These exact revisions match the build scripts and tracked patches. The HRX and LSE scripts reject another revision. They create disposable source copies in `build/hrx-macos-source` and `build/lse-macos-source`, then apply [the HRX adapter](../patches/hrx/macos-coarse-host-adapter.patch) and [the LSE adapter](../patches/lse/macos-host-adapter.patch). Do not apply these patches to the original `upstream/` checkouts. Re-running a script accepts its already-applied exact patch; a stale or independently edited build copy must be reconciled before proceeding.
+HRX uses the pinned revision and [macOS adapter](../patches/hrx/macos-coarse-host-adapter.patch). LSE builds directly from the sibling `LemonSeed-Engine` checkout; its macOS support is upstream and needs no patch. Set `LSE_SOURCE_DIR` to select another checkout. The build script does not reset or patch that checkout. Update it from LSE's default branch before building a newer engine.
 
 First-time HRX configuration may download dependencies such as flatcc using the pinned HRX `MODULE.cmake.lock` URLs and hashes. LSE also fetches fastokens revision `7973014e4f3a6028ac48f305704eacd64d0b4ef6` and Cargo dependencies for the tokenizer. Source clones and first-time dependency downloads need network access. The source and test audit here was performed locally; a brand-new network bootstrap has not been rerun as a separate qualification.
 

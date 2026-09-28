@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/amdgpu-llvm-env.sh
 mkdir -p build/tests
-lse_source="${LSE_SOURCE_DIR:-$PWD/build/lse-macos-source}"
+lse_source="${LSE_SOURCE_DIR:-$PWD/../LemonSeed-Engine}"
 lse_build="${LSE_BUILD_DIR:-$PWD/build/lse-macos-adapter}"
 hrx_dir="$PWD/build/hrx-macos-adapter/libhrx/src/libhrx"
 loom_dir="$PWD/build/hrx-macos-adapter/loom/binding/c"

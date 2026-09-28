@@ -146,7 +146,7 @@ automatically establish an external DriverKit GPU's participation.
 
 ## LSE host port
 
-The tracked LSE adapter targets revision `b5637a7109d409c21f75586edb75e7631277bce8`.
+The original LSE host port targeted revision `b5637a7109d409c21f75586edb75e7631277bce8`; its portability support is now upstream. Current builds use the sibling `LemonSeed-Engine` checkout without an LSE patch. The results below describe that original port.
 It builds the native CLI against the actual HRX and Loom libraries, with kqueue,
 Darwin socket setup, native whole-archive linking and portable aggregate argument
 binding in place of the unavailable reflection extension. Multi-GPU spanning

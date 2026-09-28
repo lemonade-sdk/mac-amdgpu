@@ -3,8 +3,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/amdgpu-llvm-env.sh
-lse_source="$PWD/build/lse-macos-source"
-lse_build="$PWD/build/lse-macos-adapter"
+lse_source="${LSE_SOURCE_DIR:-$PWD/../LemonSeed-Engine}"
+lse_build="${LSE_BUILD_DIR:-$PWD/build/lse-macos-adapter}"
 lse_fixture="$lse_build/lse-runtime-lifetime-fixture.dylib"
 "$llvm_bin/clang++" -std=c++26 -dynamiclib tests/lse_runtime_lifetime_fixture.cpp -o "$lse_fixture"
 for mode in place standalone; do
