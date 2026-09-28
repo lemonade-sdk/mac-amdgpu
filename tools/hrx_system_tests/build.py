@@ -109,7 +109,7 @@ def main():
             with (folder / name).open("w") as output:
                 checked_run([llvm / tool, *flags, folder / "latency.hsaco"], env=env, log=output)
     if not args.skip_compile_measurements:
-        measure_env = dict(runtime_environment(runtime, trace=True), LSE_HRX_INT8="1")
+        measure_env = runtime_environment(runtime, trace=True)
         with (folder / "compile.log").open("w") as log:
             checked_run([folder / "compile-bench", folder], env=measure_env, log=log)
     files = [folder / "compile-bench", folder / "native-bench", folder / "bandwidth-disjoint",
@@ -117,6 +117,7 @@ def main():
              runtime / "libhsa-runtime64.dylib"]
     metadata = {"paths": {"lse_build": str(build), "hrx_build": str(hrx_build),
                           "hrx_source": str(hrx_source), "runtime_dir": str(runtime), "llvm_bin": str(llvm)},
+                "compile_selection": "dispatch tables",
                 "build_commands": commands, "compile_measurements_run": not args.skip_compile_measurements,
                 "files": {str(path.resolve()): {"bytes": path.stat().st_size, "sha256": digest(path)} for path in files},
                 "fixture_sources": {name: digest(SOURCES / name) for name in

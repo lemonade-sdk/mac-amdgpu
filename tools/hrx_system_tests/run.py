@@ -91,6 +91,8 @@ def summarize(folder):
         if (folder / name).is_file():
             result[key] = json.loads((folder / name).read_text())
     if (folder / "compile.csv").is_file():
+        metadata = json.loads((folder / "build-metadata.json").read_text())
+        selection = metadata.get("compile_selection", "LSE_HRX_INT8=1 (historical fixture)")
         rows = read_csv(folder, "compile.csv")
         for name in sorted({row["case"] for row in rows}):
             selected = [row for row in rows if row["case"] == name]
@@ -102,7 +104,7 @@ def summarize(folder):
                 "source_bytes": source.stat().st_size, "code_bytes": code.stat().st_size,
                 "source_sha256": digest(source), "code_sha256": digest(code),
                 "first_call_ms": float(first["compile_ms"]), "warm_uncached_ms": stats(warm),
-                "grid_x": int(first["grid_x"]), "wg_x": int(first["wg_x"]), "selection": "LSE_HRX_INT8=1"})
+                "grid_x": int(first["grid_x"]), "wg_x": int(first["wg_x"]), "selection": selection})
     if (folder / "latency.csv").is_file():
         if "PASS four-category suite; all queues/buffers/executables retired and released" not in (folder / "native.log").read_text():
             raise ValueError("Native latency suite retirement/validation has not passed")

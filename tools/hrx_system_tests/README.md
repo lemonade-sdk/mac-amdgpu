@@ -58,7 +58,7 @@ python3 tools/hrx_system_tests/report.py --output-dir build/benchmarks/hrx-syste
 
 ## Timing definitions and wait policy
 
-- **Compile:** first invocation per fresh compiler instance, then seven calls to `compile(source)` that bypass the JIT disk-cache layer. M512 follows M1 in the same process; first invocation is not a second cold process. Synthetic Q4 fixtures set `LSE_HRX_INT8=1` explicitly.
+- **Compile:** first invocation per fresh compiler instance, then seven calls to `compile(source)` that bypass the JIT disk-cache layer. M512 follows M1 in the same process; first invocation is not a second cold process. Synthetic Q4 fixtures use LSE’s dispatch tables; the build metadata records that selection.
 - **Bandwidth:** host monotonic time from recording eight copies through flush and completed retirement. Allocation, initialization and full validation are excluded. GB/s is decimal; MiB is binary. The rate measures this HRX buffer-copy path, without claiming SDMA-only or theoretical peak bandwidth.
 - **HRX issue:** recording plus flush return. **HRX completion:** recording, flush and observed timeline completion. One checked 4-byte store uses WG32, with 32 warmups and 200 samples.
 - **Bare HSA:** publication/doorbell return and active completion polling are timed separately. Fresh completion signals pair raw CP start/end timestamps with their dispatches. CP ticks are divided by the live GPU timestamp frequency.

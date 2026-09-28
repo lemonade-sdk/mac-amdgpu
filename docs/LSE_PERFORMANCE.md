@@ -10,17 +10,21 @@ Quantization quality is decided by a matched perplexity comparison on
 1024–2048 scored tokens. Arithmetic fixtures below check kernel correctness;
 short-prompt logit captures do not qualify model quality.
 
-## Published defaults (2026-09-27)
+## Default dispatch (2026-09-27)
 
 The default gfx1201 paths retain FP32 floating-point accumulation. Q4 uses
-checkpoint-qualified INT8 scalar decode at M1 and integer WMMA at M512, the
-FFN activation LDS layout, FP32 Flash12 prefill, shared-exponential decode and
-WG128 split attention. Full configuration and mapped-shard SHA-256 hashes
-qualify the automatic Q4 checkpoint; unknown models and unsupported shapes
-retain existing arithmetic. `LSE_HRX_INT8=0` selects exact activation arithmetic;
-`1` retains the explicit diagnostic policy. Existing alternative implementations
-and operand types remain available, with unaccepted candidates inactive.
-Q6 keeps staged BF16 for the two accepted M512 FFN shapes; FP8/BF8 are inactive.
+INT8 scalar decode at M1 and integer WMMA at M512 or larger, with the winning
+FFN activation LDS layout at the two M512 shapes. FP32 Flash12 prefill,
+shared-exponential decode, and WG128 split attention remain the defaults.
+Selection is defined in LSE’s hardware and shape tables under `src/dispatch`.
+Model hashes, perplexity flags, and temporary precision/layout switches are
+removed from execution. Q6 keeps staged BF16 for the two accepted M512 FFN
+shapes. Other kernel implementations and operand types remain available
+without becoming default routes.
+
+The measurements below retain their original binaries, settings, and corpus
+identities. Cleanup changed selection structure and cache identity; it did not
+start another perplexity sweep or establish new throughput measurements.
 
 Matched automatic-policy prefill scores 2046 actual targets: automatic and
 explicit INT8 both produce CE 2.095230 / PPL 8.127312. Matched teacher decode
@@ -36,9 +40,8 @@ Gated-delta decode's existing model normalization now uses one wave per
 128-element head for the exact FP32 `[1,1,16,128]` gfx1201/wave32 layout.
 It preserves FP32 FMA, epsilon flooring, precise division and query-scale
 fusion. Unsupported shapes, staged phases and multiple live outputs retain
-the scalar implementation. Unset or `LSE_GDN_L2_WAVE32=1` selects the new
-layout; `0` or malformed values retain the scalar layout. This is a model
-operation, independent of the retired logit-distance quality tests.
+the scalar implementation. The dispatch table selects the wave layout for
+its supported shape. This model operation remains part of inference.
 
 Seven guarded native fixtures pass all outputs, input preservation and repeated
 executions; all 312 CP events have valid sequence/grid/timestamps. Isolated
