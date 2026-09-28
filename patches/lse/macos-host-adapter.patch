@@ -16925,10 +16925,10 @@ index 0000000..e1645e3
 +}
 diff --git a/tests/test_int8_policy.py b/tests/test_int8_policy.py
 new file mode 100644
-index 0000000..ed26657
+index 0000000..8c0dcb3
 --- /dev/null
 +++ b/tests/test_int8_policy.py
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,33 @@
 +#!/usr/bin/env python3
 +"""Compare real emitted kernel cache identities across independent policies."""
 +import os
@@ -16937,10 +16937,11 @@ index 0000000..ed26657
 +import sys
 +
 +results = {}
-+for name, value, expected in [("unset", None, "0"), ("off", "0", "0"),
++for name, value, expected in [("automatic", None, "0"), ("off", "0", "0"),
 +                              ("invalid", "true", "0"), ("on", "1", "1")]:
 +    env = os.environ.copy()
 +    env.pop("LSE_HRX_INT8", None)
++    env.pop("LSE_Q4_DECODE_EXACT", None)
 +    if value is not None:
 +        env["LSE_HRX_INT8"] = value
 +    env["LSE_WMMA_MIN_M"] = "16"
@@ -16953,11 +16954,14 @@ index 0000000..ed26657
 +    results[name] = dict((key, (hip, loom)) for key, hip, loom in
 +                        re.findall(r"KEY (\S+) hip=(\d+) loom=(\d+)", completed.stdout))
 +    assert len(results[name]) == 6
-+assert results["unset"] == results["off"] == results["invalid"]
-+for shape, keys in results["off"].items():
++assert results["off"] == results["invalid"]
++assert results["automatic"].keys() == results["off"].keys() == results["on"].keys()
++for shape in results["off"]:
 +    for dialect in (0, 1):
-+        assert keys[dialect] != results["on"][shape][dialect], (shape, dialect)
-+print("PASS cross-process HIP/Loom cache separation and canonical disabled policy")
++        identities = {results[policy][shape][dialect]
++                      for policy in ("automatic", "off", "on")}
++        assert len(identities) == 3, (shape, dialect, identities)
++print("PASS cross-process HIP/Loom automatic/off/on cache separation and canonical exact policy")
 diff --git a/tests/test_ir.cpp b/tests/test_ir.cpp
 index 56fefa9..1a578b0 100644
 --- a/tests/test_ir.cpp
