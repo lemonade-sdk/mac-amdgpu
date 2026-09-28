@@ -12,7 +12,8 @@ Same driver, same telemetry, real vector drawing instead of braille.
   to the peak observed in this session; that fallback is an activity proxy.
 - **UMC MEMORY ACTIVITY** — unavailable on this GPU. The decoded SMU 0x33
   UmcActivityPercent field has reported activity at idle and near zero under
-  verified traffic, so it appears only in diagnostic text. The former
+  verified traffic, so it appears in the separate `UCLK avg (SMU raw)` meter.
+  The UMC busy chart requires a hardware counter. The former
   selector 68 MMHUB PERFSTATUS address is unmapped on gfx1201; build 199+
   reports it unavailable rather than a live UMC busy counter.
 - **VRAM / GTT** — driver CPU allocator pools (query tag 5).
@@ -26,11 +27,11 @@ Same driver, same telemetry, real vector drawing instead of braille.
   maximum is flagged.
   DPM levels are advertised AC operating states; deep-sleep averages can fall
   below their minimum.
-- **Sensors (SMU)** — firmware GFX activity, socket/board power,
+- **Sensors (SMU)** — firmware GFX and UCLK activity, socket/board power,
   edge/hotspot temperature and fan. The installed 0x33 firmware profile is not
   independently calibrated: GFX activity has read 100% at initialized idle
   and decoded power has stayed near 300 W while workload activity changed.
-  The decoded activity and power fields remain visible in the original meter
+  The decoded GFX/UCLK activity and power fields remain visible in meter
   bars with concise `SMU raw` labels, separate from the
   hardware-sampled GPU Load chart.
   An enclosure AC wattmeter can check the idle-to-load input-power change,

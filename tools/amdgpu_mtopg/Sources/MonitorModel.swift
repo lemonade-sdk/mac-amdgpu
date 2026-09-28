@@ -83,6 +83,7 @@ struct TelemetrySnapshot {
     var smuGfxActivityPercent: Double?
     var unverifiedSmuGfxActivityPercent: Double?
     var smuGfxDiagnostic: String?
+    var smuUclkActivityPercent: Double?
     var edgeCelsius: Double?
     var hotspotCelsius: Double?
     var fanRPM: Double?
@@ -636,6 +637,9 @@ func makeSnapshot(device: Device?, history: SampleHistory,
             snap.unverifiedSmuGfxActivityPercent = activity
             snap.smuGfxDiagnostic = "Unverified SMU activity field: \(fmt(activity, 0))%"
         }
+    }
+    if d.stage == 15 {
+        snap.smuUclkActivityPercent = d.smuValue(.umcActivityPercent)
     }
     if d.stage == 15, let t = d.smuValue(.edgeTemperatureMillicelsius) { snap.edgeCelsius = t / 1000.0 }
     if d.stage == 15, let t = d.smuValue(.hotspotTemperatureMillicelsius) { snap.hotspotCelsius = t / 1000.0 }

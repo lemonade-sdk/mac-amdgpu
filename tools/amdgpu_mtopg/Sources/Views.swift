@@ -447,6 +447,12 @@ struct ContentView: View {
                               text: (snap.smuGfxActivityPercent ?? snap.unverifiedSmuGfxActivityPercent)
                                   .map { String(format: "%.0f%%", $0) } ?? "n/a",
                               color: Palette.accent)
+                        Meter(label: "UCLK avg (SMU raw)",
+                              value: snap.smuUclkActivityPercent,
+                              maxValue: 100,
+                              text: snap.smuUclkActivityPercent
+                                  .map { String(format: "%.0f%%", $0) } ?? "n/a",
+                              color: Palette.umc)
                         Meter(label: snap.unverifiedSmuSocketPowerWatts != nil || snap.unverifiedSmuBoardPowerWatts != nil
                                     ? "Power (SMU raw)" : "Power",
                               value: snap.powerWatts ?? snap.unverifiedSmuSocketPowerWatts ?? snap.unverifiedSmuBoardPowerWatts,
