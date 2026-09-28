@@ -1,0 +1,631 @@
+{
+  "schema_version": 1,
+  "environment": {
+    "captured_utc": "2026-09-28T02:27:08.305071+00:00",
+    "os": "macOS 26.6.2 (25G83)",
+    "host": "MacBook Pro (Mac17,6), Apple M5 Max",
+    "cpu_cores": 18,
+    "cpu_core_configuration": "6 Super, 12 Performance",
+    "memory_gb": 128,
+    "architecture": "arm64",
+    "host_compiler": "Homebrew clang version 21.1.8",
+    "mac_amdgpu_commit": "fde050c1b8a98a73ffa3cdc8ea2c1c95fe8a6531",
+    "lse_commit": "0f2ad2977d4ed54edaab04fdb50041c399042f25",
+    "monitor_running": true,
+    "server_workload_running": false,
+    "bandwidth_units": "GB/s decimal; buffer sizes MiB binary"
+  },
+  "gpu": {
+    "gpu": "gfx1201",
+    "driver_build": 204,
+    "gfx_major": 12,
+    "gfx_minor": 0,
+    "gfx_revision": 1,
+    "total_vram_bytes": 34208743424,
+    "timestamp_frequency_hz": 100000000
+  },
+  "run": {
+    "start_utc": "2026-09-28T02:36:06.251686+00:00",
+    "elapsed_seconds": 11.891503375023603,
+    "exit_code": 0,
+    "outer_deadline_seconds": 180
+  },
+  "loaded_libraries": {
+    "./build/hsa-code-cache-fix/runtime-default/libloomc.0.dylib": {
+      "sha256": "ebbb7cc3da1db6b7204b003b41afc6f01c5a355ff945553f34c89e2f41ee7a15",
+      "bytes": 9684096
+    },
+    "./build/hsa-code-cache-fix/runtime-default/libhrx.0.dylib": {
+      "sha256": "4fe069d52d081c0759a0cd21702fb513b05c5588914e254c7d2955a45839994d",
+      "bytes": 1481232
+    },
+    "./build/hsa-code-cache-fix/runtime-default/libhsa-runtime64.dylib": {
+      "sha256": "0572b39cc7e7d26164a5e0d2de88c2b044d9d6ab3c2d5f4d17792fb9bae33851",
+      "bytes": 366648
+    }
+  },
+  "compile_cases": [
+    {
+      "case": "q4_m1",
+      "source_lines": 400,
+      "nonblank_lines": 400,
+      "source_bytes": 20332,
+      "code_bytes": 9208,
+      "source_sha256": "572ac498697e34da9affc9507aa5d4edd5e29232cac5019be84b03fbfeb14917",
+      "code_sha256": "017461dc644a47172199b000706f125ad7a9e4da7e15f090b48fcfa9274b1908",
+      "first_call_ms": 20.3922,
+      "warm_uncached_ms": {
+        "n": 7,
+        "min": 4.52396,
+        "median": 4.63833,
+        "p95": 4.712794,
+        "p99": 4.7200228,
+        "max": 4.72183,
+        "mean": 4.627707142857143
+      },
+      "grid_x": 2176,
+      "wg_x": 256,
+      "compiler": "LSE LoomcCompiler.compile, gfx1201",
+      "selection": "LSE_HRX_INT8=1"
+    },
+    {
+      "case": "q4_m512",
+      "source_lines": 1733,
+      "nonblank_lines": 1733,
+      "source_bytes": 97629,
+      "code_bytes": 13304,
+      "source_sha256": "2f8843ef4151de2c2c8f90fa26afa3ea724177928c1390222afc10d8b38a0da4",
+      "code_sha256": "7b4290935137492b49b2b88439291323eeaf797494307d4762add1b11933752f",
+      "first_call_ms": 18.9792,
+      "warm_uncached_ms": {
+        "n": 7,
+        "min": 17.7515,
+        "median": 17.9661,
+        "p95": 18.18902,
+        "p99": 18.217244,
+        "max": 18.2243,
+        "mean": 17.972628571428572
+      },
+      "grid_x": 1088,
+      "wg_x": 256,
+      "compiler": "LSE LoomcCompiler.compile, gfx1201",
+      "selection": "LSE_HRX_INT8=1"
+    }
+  ],
+  "bandwidth_summary": [
+    {
+      "direction": "H2D",
+      "payload_bytes": 4194304,
+      "copies_per_batch": 8,
+      "GBps": {
+        "n": 3,
+        "min": 12.558576618158163,
+        "median": 21.225791718669843,
+        "p95": 21.876619269986364,
+        "p99": 21.934470607881167,
+        "max": 21.948933442354868,
+        "mean": 18.577767259727626
+      },
+      "source_destination_guards": "verified"
+    },
+    {
+      "direction": "H2D",
+      "payload_bytes": 16777216,
+      "copies_per_batch": 8,
+      "GBps": {
+        "n": 3,
+        "min": 6.308496135193426,
+        "median": 6.31032525288979,
+        "p95": 6.480290700239951,
+        "p99": 6.4953987400044095,
+        "max": 6.4991757499455245,
+        "mean": 6.3726657126762465
+      },
+      "source_destination_guards": "verified"
+    },
+    {
+      "direction": "H2D",
+      "payload_bytes": 67108864,
+      "copies_per_batch": 8,
+      "GBps": {
+        "n": 3,
+        "min": 6.657480920242927,
+        "median": 6.663833488229207,
+        "p95": 6.676372165292116,
+        "p99": 6.677486714364374,
+        "max": 6.677765351632439,
+        "mean": 6.666359920034857
+      },
+      "source_destination_guards": "verified"
+    },
+    {
+      "direction": "D2H",
+      "payload_bytes": 4194304,
+      "copies_per_batch": 8,
+      "GBps": {
+        "n": 3,
+        "min": 5.430288592640544,
+        "median": 5.468268350746911,
+        "p95": 5.93049057657887,
+        "p99": 5.971576996652821,
+        "max": 5.9818486016713095,
+        "mean": 5.626801848352922
+      },
+      "source_destination_guards": "verified"
+    },
+    {
+      "direction": "D2H",
+      "payload_bytes": 16777216,
+      "copies_per_batch": 8,
+      "GBps": {
+        "n": 3,
+        "min": 6.787328689363961,
+        "median": 6.790261844861695,
+        "p95": 6.831804333242712,
+        "p99": 6.83549699887658,
+        "max": 6.8364201652850465,
+        "mean": 6.804670233170234
+      },
+      "source_destination_guards": "verified"
+    },
+    {
+      "direction": "D2H",
+      "payload_bytes": 67108864,
+      "copies_per_batch": 8,
+      "GBps": {
+        "n": 3,
+        "min": 7.054178805147625,
+        "median": 7.056492868672078,
+        "p95": 7.061783922515109,
+        "p99": 7.062254238412267,
+        "max": 7.062371817386556,
+        "mean": 7.0576811637354195
+      },
+      "source_destination_guards": "verified"
+    }
+  ],
+  "max_measured_logical_copy_bandwidth": {
+    "H2D": {
+      "direction": "H2D",
+      "payload_bytes": 4194304,
+      "copies_per_batch": 8,
+      "GBps": {
+        "n": 3,
+        "min": 12.558576618158163,
+        "median": 21.225791718669843,
+        "p95": 21.876619269986364,
+        "p99": 21.934470607881167,
+        "max": 21.948933442354868,
+        "mean": 18.577767259727626
+      },
+      "source_destination_guards": "verified"
+    },
+    "D2H": {
+      "direction": "D2H",
+      "payload_bytes": 67108864,
+      "copies_per_batch": 8,
+      "GBps": {
+        "n": 3,
+        "min": 7.054178805147625,
+        "median": 7.056492868672078,
+        "p95": 7.061783922515109,
+        "p99": 7.062254238412267,
+        "max": 7.062371817386556,
+        "mean": 7.0576811637354195
+      },
+      "source_destination_guards": "verified"
+    }
+  },
+  "large_buffer_sustained_bandwidth": {
+    "H2D": {
+      "direction": "H2D",
+      "payload_bytes": 67108864,
+      "copies_per_batch": 8,
+      "GBps": {
+        "n": 3,
+        "min": 6.657480920242927,
+        "median": 6.663833488229207,
+        "p95": 6.676372165292116,
+        "p99": 6.677486714364374,
+        "max": 6.677765351632439,
+        "mean": 6.666359920034857
+      },
+      "source_destination_guards": "verified"
+    },
+    "D2H": {
+      "direction": "D2H",
+      "payload_bytes": 67108864,
+      "copies_per_batch": 8,
+      "GBps": {
+        "n": 3,
+        "min": 7.054178805147625,
+        "median": 7.056492868672078,
+        "p95": 7.061783922515109,
+        "p99": 7.062254238412267,
+        "max": 7.062371817386556,
+        "mean": 7.0576811637354195
+      },
+      "source_destination_guards": "verified"
+    }
+  },
+  "latency_summary": [
+    {
+      "test": "cpu_gpu_cpu_mailbox_rtt",
+      "clock": "host_steady",
+      "ns": {
+        "n": 3072,
+        "min": 6208.0,
+        "median": 12583.0,
+        "p95": 14375.0,
+        "p99": 14458.0,
+        "max": 24916.0,
+        "mean": 11213.605794270834
+      },
+      "trial_summaries": {
+        "1": {
+          "n": 1024,
+          "min": 7958.0,
+          "median": 12833.0,
+          "p95": 14417.0,
+          "p99": 14458.0,
+          "max": 24916.0,
+          "mean": 13101.3486328125
+        },
+        "2": {
+          "n": 1024,
+          "min": 6250.0,
+          "median": 6834.0,
+          "p95": 13125.0,
+          "p99": 14084.0,
+          "max": 17042.0,
+          "mean": 9046.3076171875
+        },
+        "3": {
+          "n": 1024,
+          "min": 6208.0,
+          "median": 12667.0,
+          "p95": 14333.0,
+          "p99": 14417.0,
+          "max": 14709.0,
+          "mean": 11493.1611328125
+        }
+      }
+    },
+    {
+      "test": "d2h_8byte_completion",
+      "clock": "host_steady",
+      "ns": {
+        "n": 256,
+        "min": 1121333.0,
+        "median": 1573229.5,
+        "p95": 1685011.0,
+        "p99": 1745447.95,
+        "max": 1941708.0,
+        "mean": 1531942.546875
+      },
+      "trial_summaries": {
+        "1": {
+          "n": 256,
+          "min": 1121333.0,
+          "median": 1573229.5,
+          "p95": 1685011.0,
+          "p99": 1745447.95,
+          "max": 1941708.0,
+          "mean": 1531942.546875
+        }
+      }
+    },
+    {
+      "test": "gpu_cpu_gpu_mailbox_rtt",
+      "clock": "gpu_agent",
+      "ns": {
+        "n": 3072,
+        "min": 3560.0,
+        "median": 10680.0,
+        "p95": 11120.0,
+        "p99": 11200.0,
+        "max": 24600.0,
+        "mean": 8493.151041666666
+      },
+      "trial_summaries": {
+        "1": {
+          "n": 1024,
+          "min": 3920.0,
+          "median": 10680.0,
+          "p95": 11120.0,
+          "p99": 11200.0,
+          "max": 24600.0,
+          "mean": 9055.8984375
+        },
+        "2": {
+          "n": 1024,
+          "min": 3560.0,
+          "median": 10560.0,
+          "p95": 11120.0,
+          "p99": 11200.0,
+          "max": 11480.0,
+          "mean": 8013.5546875
+        },
+        "3": {
+          "n": 1024,
+          "min": 3960.0,
+          "median": 10680.0,
+          "p95": 11160.0,
+          "p99": 11190.8,
+          "max": 11520.0,
+          "mean": 8410.0
+        }
+      }
+    },
+    {
+      "test": "h2d_8byte_completion",
+      "clock": "host_steady",
+      "ns": {
+        "n": 256,
+        "min": 1070417.0,
+        "median": 1556479.0,
+        "p95": 1657937.25,
+        "p99": 1819981.5499999998,
+        "max": 2832208.0,
+        "mean": 1535805.4453125
+      },
+      "trial_summaries": {
+        "1": {
+          "n": 256,
+          "min": 1070417.0,
+          "median": 1556479.0,
+          "p95": 1657937.25,
+          "p99": 1819981.5499999998,
+          "max": 2832208.0,
+          "mean": 1535805.4453125
+        }
+      }
+    },
+    {
+      "test": "hrx_kernel_completion",
+      "clock": "host_steady",
+      "ns": {
+        "n": 200,
+        "min": 1075500.0,
+        "median": 1571625.0,
+        "p95": 1645956.25,
+        "p99": 1672975.24,
+        "max": 1687000.0,
+        "mean": 1512016.7
+      },
+      "trial_summaries": {
+        "1": {
+          "n": 200,
+          "min": 1075500.0,
+          "median": 1571625.0,
+          "p95": 1645956.25,
+          "p99": 1672975.24,
+          "max": 1687000.0,
+          "mean": 1512016.7
+        }
+      }
+    },
+    {
+      "test": "hrx_kernel_issue",
+      "clock": "host_steady",
+      "ns": {
+        "n": 200,
+        "min": 46625.0,
+        "median": 67896.0,
+        "p95": 146414.59999999995,
+        "p99": 216597.74,
+        "max": 227375.0,
+        "mean": 85223.63
+      },
+      "trial_summaries": {
+        "1": {
+          "n": 200,
+          "min": 46625.0,
+          "median": 67896.0,
+          "p95": 146414.59999999995,
+          "p99": 216597.74,
+          "max": 227375.0,
+          "mean": 85223.63
+        }
+      }
+    },
+    {
+      "test": "hrx_kernel_post_issue_wait",
+      "clock": "host_steady",
+      "ns": {
+        "n": 200,
+        "min": 1017000.0,
+        "median": 1507916.5,
+        "p95": 1519388.1,
+        "p99": 1542735.51,
+        "max": 1550958.0,
+        "mean": 1426793.07
+      },
+      "trial_summaries": {
+        "1": {
+          "n": 200,
+          "min": 1017000.0,
+          "median": 1507916.5,
+          "p95": 1519388.1,
+          "p99": 1542735.51,
+          "max": 1550958.0,
+          "mean": 1426793.07
+        }
+      }
+    },
+    {
+      "test": "hrx_kernel_record",
+      "clock": "host_steady",
+      "ns": {
+        "n": 200,
+        "min": 1209.0,
+        "median": 2437.5,
+        "p95": 4631.249999999998,
+        "p99": 6627.919999999997,
+        "max": 8458.0,
+        "mean": 2742.33
+      },
+      "trial_summaries": {
+        "1": {
+          "n": 200,
+          "min": 1209.0,
+          "median": 2437.5,
+          "p95": 4631.249999999998,
+          "p99": 6627.919999999997,
+          "max": 8458.0,
+          "mean": 2742.33
+        }
+      }
+    },
+    {
+      "test": "hsa_kernel_completion",
+      "clock": "host_steady",
+      "ns": {
+        "n": 200,
+        "min": 148791.0,
+        "median": 182853.5,
+        "p95": 314845.79999999993,
+        "p99": 446179.2499999853,
+        "max": 3290166.0,
+        "mean": 224109.995
+      },
+      "trial_summaries": {
+        "1": {
+          "n": 200,
+          "min": 148791.0,
+          "median": 182853.5,
+          "p95": 314845.79999999993,
+          "p99": 446179.2499999853,
+          "max": 3290166.0,
+          "mean": 224109.995
+        }
+      }
+    },
+    {
+      "test": "hsa_kernel_cp_duration",
+      "clock": "gpu_agent",
+      "ns": {
+        "n": 200,
+        "min": 4080.0,
+        "median": 5080.0,
+        "p95": 5761.999999999999,
+        "p99": 6044.399999999996,
+        "max": 6560.0,
+        "mean": 5069.0
+      },
+      "trial_summaries": {
+        "1": {
+          "n": 200,
+          "min": 4080.0,
+          "median": 5080.0,
+          "p95": 5761.999999999999,
+          "p99": 6044.399999999996,
+          "max": 6560.0,
+          "mean": 5069.0
+        }
+      }
+    },
+    {
+      "test": "hsa_kernel_issue",
+      "clock": "host_steady",
+      "ns": {
+        "n": 200,
+        "min": 53084.0,
+        "median": 68208.0,
+        "p95": 212416.64999999985,
+        "p99": 341592.90999998513,
+        "max": 3209666.0,
+        "mean": 112112.075
+      },
+      "trial_summaries": {
+        "1": {
+          "n": 200,
+          "min": 53084.0,
+          "median": 68208.0,
+          "p95": 212416.64999999985,
+          "p99": 341592.90999998513,
+          "max": 3209666.0,
+          "mean": 112112.075
+        }
+      }
+    }
+  ],
+  "opencl_fixture_compile": {
+    "command": [
+      "/opt/homebrew/Cellar/llvm/21.1.8/bin/clang",
+      "-target",
+      "amdgcn-amd-amdhsa",
+      "-mcpu=gfx1201",
+      "-nogpulib",
+      "-x",
+      "cl",
+      "-cl-std=CL2.0",
+      "-O2",
+      "-c",
+      "./build/benchmarks/hrx-system-tests-20260927/latency.cl",
+      "-o",
+      "./build/benchmarks/hrx-system-tests-20260927/latency.o"
+    ],
+    "link_command": [
+      "/opt/homebrew/bin/ld.lld",
+      "-shared",
+      "--no-undefined",
+      "./build/benchmarks/hrx-system-tests-20260927/latency.o",
+      "-o",
+      "./build/benchmarks/hrx-system-tests-20260927/latency.hsaco"
+    ],
+    "trials": [
+      {
+        "trial": 0,
+        "compile_ms": 38.937417,
+        "link_ms": 109.78925,
+        "total_ms": 148.726667
+      },
+      {
+        "trial": 1,
+        "compile_ms": 39.228125,
+        "link_ms": 13.618125,
+        "total_ms": 52.84625
+      },
+      {
+        "trial": 2,
+        "compile_ms": 38.7105,
+        "link_ms": 13.58275,
+        "total_ms": 52.29325
+      },
+      {
+        "trial": 3,
+        "compile_ms": 39.226083,
+        "link_ms": 13.333875,
+        "total_ms": 52.559958
+      }
+    ],
+    "source_bytes": 2106,
+    "source_lines": 59,
+    "code_bytes": 10992,
+    "nonblank_lines": 57
+  },
+  "validation": "full payload/guards/source preservation and all mailbox sequences; clean queue destruction/shutdown",
+  "methodology": {
+    "compile": "Fresh LoomcCompiler per case, first invocation separately; seven repeated real compile(source) calls bypass JIT disk cache. Compiler initialization and in-process allocator caches may warm. M512 occurs after M1 in same process. No model weights loaded or kernels executed.",
+    "bandwidth": "Reusable mapped HOST_VISIBLE|HOST_COHERENT|DEVICE_VISIBLE host buffers and DEVICE_LOCAL VRAM; HRX retained-buffer copy path. Four-KiB guards on both sides. Eight-copy batch with one flush and completion retirement; 1 identical warmup+3 measured batches per size/direction. Sizes4/16/64MiB. Decimal payloadGB/s. Excludes allocation, poisoning, initialization and verification; includes record/flush/wait. Largest64MiB result is recommended for sustained large-buffer transfer reporting. The4MiB H2D rate is cache-sensitive and must not be claimed as physical link bandwidth. Full sweep includes maximum logical-copy rate, not theoretical peak/SDMA claim. Reused-buffer cache residency unqualified.",
+    "kernel_latency": "32 warmups +200 measured singleWG32 minimal one-lane4-byte store. HRX record latency and issue(record+flush), completion(record+flush+timeline wait) use host steady clock. Bare HSA publish/doorbell issue and active completion wait separately; CP start/end with fresh paired signal gives GPU-domain dispatch interval. Allocation, loading and validation excluded.",
+    "transfer_latency": "32 warmup+256 measured individual8-byte retained-buffer copies per direction. Host steady start through record, flush and completion. This is directional API-to-completion latency, not a pure one-way physical measurement.",
+    "pure_latency": "One resident WG32 kernel (lane0 active), shared mapping ownership release/acquire, sequence-numbered8-byte payload, no mixed CPU/GPU RMW. 128warmup+1024measured rounds\u00d73 trials for each initiator. CPU\u2192GPU\u2192CPU uses host steady clock; GPU\u2192CPU\u2192GPU uses gfx1201 MSG_RTN_GET_REALTIME (s_sendmsg_rtn_b64) at live-query GPU timestamp frequency. Initial launch excluded. Timings include poll, ownership publish and responder turnaround. No clock calibration or subtraction across domains; no exact one-way times and no RTT/2 inference.",
+    "statistics": "Median/minimum and linearly interpolated sampleP95/P99 (position(n-1)*p); mailbox pooled samples plus per-trial summaries."
+  },
+  "wait_policy": {
+    "MAC_HSA_BLOCKED_POLL_US": null,
+    "effective_blocked_poll_us": 1000,
+    "HRX_completion_wait": "hrx_semaphore_wait(flags=0) \u2192 AMDGPU epoch wait \u2192 HSA_WAIT_STATE_BLOCKED, fallback1000000ns",
+    "HSA_completion_wait": "active hsa_signal_load_scacquire loop, no HSA blocked wait",
+    "pure_mailbox_wait": "active atomic_ref acquire polling, no sleep/yield/blocked wait",
+    "source_references": [
+      "hsa/src/signal_wait_policy.h:13",
+      "hsa/src/signal_state.h:98",
+      "build/hrx-macos-source/libhrx/src/libhrx/semaphore.c:64",
+      "build/hrx-macos-source/runtime/src/iree/hal/drivers/amdgpu/semaphore.c:264"
+    ],
+    "evidence": "Originalrun.pycopiesparentenvironmentandsetsonlyDYLD_LIBRARY_PATHandDYLD_PRINT_LIBRARIES; parentenvironmenthasnoMAC_HSA_/IREE_/HRX_/LSE_waitoverrides. Deriveddefaultfromloadedruntimeversionandcurrentmatchingimplementation."
+  }
+}

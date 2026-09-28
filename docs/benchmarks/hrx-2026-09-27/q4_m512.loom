@@ -1,0 +1,1733 @@
+kernel.def export("lse_loom_13976502962541770218") @lse_loom_13976502962541770218() {
+  %cfg_one = index.constant 1 : index
+  %cfg_wg0 = index.constant 256 : index
+  %cfg_n0 = index.constant 1088 : index
+  %cfg_wg1 = index.constant 1 : index
+  %cfg_n1 = index.constant 1 : index
+  %cfg_wg2 = index.constant 1 : index
+  %cfg_n2 = index.constant 1 : index
+  kernel.launch.config workgroups(%cfg_n0, %cfg_n1, %cfg_n2) workgroup_size(%cfg_wg0, %cfg_wg1, %cfg_wg2) : index
+} launch(%in0: buffer, %in1: buffer, %in2: buffer, %in3: buffer, %out: buffer, %count: i32) {
+  %kbase = index.constant 0 : offset
+  %in0_na, %in1_na, %in2_na, %in3_na, %out_na = buffer.assume.noalias %in0, %in1, %in2, %in3, %out : buffer, buffer, buffer, buffer, buffer
+  %in0_view = buffer.view %in0_na[%kbase] : buffer -> view<2621440xf32, #dense>
+  %in1_view = buffer.view %in1_na[%kbase] : buffer -> view<11141120xi32, #dense>
+  %in2_view = buffer.view %in2_na[%kbase] : buffer -> view<1392640xbf16, #dense>
+  %in3_view = buffer.view %in3_na[%kbase] : buffer -> view<1392640xbf16, #dense>
+  %out_view = buffer.view %out_na[%kbase] : buffer -> view<8912896xf32, #dense>
+  %ki_wg = kernel.workgroup.id<x> : index
+  %ki_size = kernel.workgroup.size<x> : index
+  %ki_lane = kernel.workitem.id<x> : index
+  %ki_flat = index.madd %ki_wg, %ki_size, %ki_lane : index
+  %i = index.assume %ki_flat [range(%ki_flat, 0, 278527)] : index
+  %v1193 = scalar.constant 7 : i32
+  %v1184 = index.constant 7 : index
+  %v1178 = scalar.constant 6 : i32
+  %v1169 = index.constant 6 : index
+  %v1163 = scalar.constant 5 : i32
+  %v1154 = index.constant 5 : index
+  %v1148 = scalar.constant 4 : i32
+  %v669 = index.constant 268435456 : index
+  %v656 = index.constant 1048576 : index
+  %v637 = index.constant 4096 : index
+  %v608 = index.constant 640 : index
+  %v430 = index.constant 16777216 : index
+  %v418 = index.constant 65536 : index
+  %v383 = scalar.constant 127.000000 : f32
+  %v381 = scalar.constant 1.00000000e-30 : f32
+  %v377 = scalar.constant 0.00787401572 : f32
+  %v366 = index.constant 3 : index
+  %v235 = index.constant 12 : index
+  %v210 = scalar.constant 3 : i32
+  %v207 = scalar.constant 2 : i32
+  %v204 = scalar.constant 1 : i32
+  %v201 = scalar.constant 0 : i32
+  %v191 = index.constant 512 : index
+  %v187 = index.constant 256 : index
+  %v164 = index.constant 5120 : index
+  %v135 = index.constant 80 : index
+  %v132 = index.constant 2 : index
+  %v126 = index.constant 17408 : index
+  %v114 = index.constant 48 : index
+  %v86 = index.constant 1 : index
+  %v47 = scalar.constant 0.00000000 : f32
+  %v44 = index.constant 1088 : index
+  %v36 = index.constant 0 : index
+  %v34 = index.constant 8 : index
+  %v30 = index.constant 64 : index
+  %v28 = index.constant 136 : index
+  %v22 = index.constant 4 : index
+  %v17 = index.constant 16 : index
+  %v12 = index.constant 32 : index
+  %sldsbytes1 = index.constant 4096 : offset
+  %slds0 = buffer.alloca %sldsbytes1 {base_alignment = 16, memory_space = workgroup} : buffer
+  %sldsbase2 = index.constant 0 : offset
+  %v5 = buffer.view %slds0[%sldsbase2] : buffer -> view<1024xi32, #dense>
+  %sldsbytes4 = index.constant 1024 : offset
+  %slds3 = buffer.alloca %sldsbytes4 {base_alignment = 16, memory_space = workgroup} : buffer
+  %sldsbase5 = index.constant 0 : offset
+  %v6 = buffer.view %slds3[%sldsbase5] : buffer -> view<256xf32, #dense>
+  %sldsbytes7 = index.constant 1024 : offset
+  %slds6 = buffer.alloca %sldsbytes7 {base_alignment = 16, memory_space = workgroup} : buffer
+  %sldsbase8 = index.constant 0 : offset
+  %v7 = buffer.view %slds6[%sldsbase8] : buffer -> view<256xf32, #dense>
+  %sldsbytes10 = index.constant 256 : offset
+  %slds9 = buffer.alloca %sldsbytes10 {base_alignment = 16, memory_space = workgroup} : buffer
+  %sldsbase11 = index.constant 0 : offset
+  %v8 = buffer.view %slds9[%sldsbase11] : buffer -> view<64xf32, #dense>
+  %sldsbytes13 = index.constant 256 : offset
+  %slds12 = buffer.alloca %sldsbytes13 {base_alignment = 16, memory_space = workgroup} : buffer
+  %sldsbase14 = index.constant 0 : offset
+  %v9 = buffer.view %slds12[%sldsbase14] : buffer -> view<64xf32, #dense>
+  %v10 = kernel.workitem.id<x> : index
+  %v13 = index.div %v10, %v12 : index
+  %v15 = index.rem %v10, %v12 : index
+  %v18 = index.rem %v15, %v17 : index
+  %v20 = index.div %v15, %v17 : index
+  %v23 = index.div %v18, %v22 : index
+  %v24 = index.mul %v23, %v22 : index
+  %v26 = kernel.workgroup.id<x> : index
+  %v29 = index.div %v26, %v28 : index
+  %v31 = index.mul %v29, %v30 : index
+  %v33 = index.rem %v26, %v28 : index
+  %v35 = index.mul %v33, %v34 : index
+  %v37 = index.add %v35, %v36 : index
+  %v38 = index.add %v37, %v13 : index
+  %v40 = index.mul %v38, %v17 : index
+  %v42 = index.add %v40, %v18 : index
+  %v45 = index.cmp ult, %v38, %v44 : index
+  %v80 = index.add %v18, %v36 : index
+  %v81 = index.mul %v80, %v17 : index
+  %v83 = index.mul %v20, %v34 : index
+  %v85 = index.add %v36, %v83 : index
+  %v87 = index.mul %v85, %v86 : index
+  %v89 = index.add %v31, %v36 : index
+  %v90 = index.add %v89, %v83 : index
+  %v92 = index.add %v18, %v17 : index
+  %v93 = index.mul %v92, %v17 : index
+  %v97 = index.add %v17, %v83 : index
+  %v98 = index.mul %v97, %v86 : index
+  %v100 = index.add %v31, %v17 : index
+  %v101 = index.add %v100, %v83 : index
+  %v103 = index.add %v18, %v12 : index
+  %v104 = index.mul %v103, %v17 : index
+  %v108 = index.add %v12, %v83 : index
+  %v109 = index.mul %v108, %v86 : index
+  %v111 = index.add %v31, %v12 : index
+  %v112 = index.add %v111, %v83 : index
+  %v115 = index.add %v18, %v114 : index
+  %v116 = index.mul %v115, %v17 : index
+  %v120 = index.add %v114, %v83 : index
+  %v121 = index.mul %v120, %v86 : index
+  %v123 = index.add %v31, %v114 : index
+  %v124 = index.add %v123, %v83 : index
+  %v127 = index.cmp ult, %v42, %v126 : index
+  %v128 = scf.select %v127, %v42, %v36 : index
+  %v133 = index.mul %v20, %v132 : index
+  %v136 = index.mul %v128, %v135 : index
+  %v154 = index.add %v10, %v36 : index
+  %v156 = index.div %v154, %v22 : index
+  %v158 = index.rem %v154, %v22 : index
+  %v160 = index.div %v158, %v22 : index
+  %v162 = index.add %v31, %v156 : index
+  %v165 = index.mul %v162, %v164 : index
+  %v167 = index.div %v156, %v22 : index
+  %v168 = index.rem %v167, %v22 : index
+  %v169 = index.mul %v168, %v22 : index
+  %v171 = index.mul %v156, %v17 : index
+  %v172 = index.mul %v158, %v22 : index
+  %v173 = index.add %v172, %v169 : index
+  %v174 = index.rem %v173, %v17 : index
+  %v175 = index.add %v171, %v174 : index
+  %v177 = index.mul %v156, %v22 : index
+  %v178 = index.add %v177, %v158 : index
+  %v181 = index.mul %v160, %v22 : index
+  %v182 = index.add %v177, %v181 : index
+  %v184 = index.mul %v156, %v86 : index
+  %v185 = index.add %v184, %v160 : index
+  %v188 = index.cmp ult, %v154, %v187 : index
+  %sout18, %sout20, %sout22, %sout24, %sout26, %sout28, %sout30, %sout32, %sout34, %sout36, %sout38, %sout40, %sout42, %sout44, %sout46, %sout48, %sout50, %sout52, %sout54, %sout56, %sout58, %sout60, %sout62, %sout64, %sout66, %sout68, %sout70, %sout72, %sout74, %sout76, %sout78, %sout80, %sout82, %sout84, %sout86, %sout88, %sout90, %sout92, %sout94, %sout96, %sout98, %sout100, %sout102, %sout104, %sout106, %sout108, %sout110, %sout112 = scf.for %v190 = [%v36 to %v135 step %v86](%sacc17 = %v47 : f32, %sacc19 = %v47 : f32, %sacc21 = %v47 : f32, %sacc23 = %v47 : f32, %sacc25 = %v47 : f32, %sacc27 = %v47 : f32, %sacc29 = %v47 : f32, %sacc31 = %v47 : f32, %sacc33 = %v47 : f32, %sacc35 = %v47 : f32, %sacc37 = %v47 : f32, %sacc39 = %v47 : f32, %sacc41 = %v47 : f32, %sacc43 = %v47 : f32, %sacc45 = %v47 : f32, %sacc47 = %v47 : f32, %sacc49 = %v47 : f32, %sacc51 = %v47 : f32, %sacc53 = %v47 : f32, %sacc55 = %v47 : f32, %sacc57 = %v47 : f32, %sacc59 = %v47 : f32, %sacc61 = %v47 : f32, %sacc63 = %v47 : f32, %sacc65 = %v47 : f32, %sacc67 = %v47 : f32, %sacc69 = %v47 : f32, %sacc71 = %v47 : f32, %sacc73 = %v47 : f32, %sacc75 = %v47 : f32, %sacc77 = %v47 : f32, %sacc79 = %v47 : f32, %sacc81 = %v47 : f32, %sacc83 = %v47 : f32, %sacc85 = %v47 : f32, %sacc87 = %v47 : f32, %sacc89 = %v47 : f32, %sacc91 = %v47 : f32, %sacc93 = %v47 : f32, %sacc95 = %v47 : f32, %sacc97 = %v47 : f32, %sacc99 = %v47 : f32, %sacc101 = %v47 : f32, %sacc103 = %v47 : f32, %sacc105 = %v47 : f32, %sacc107 = %v47 : f32, %sacc109 = %v47 : f32, %sacc111 = %v47 : f32) -> (f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32) {
+    %sout114, %sout116, %sout118, %sout120, %sout122, %sout124, %sout126, %sout128, %sout130, %sout132, %sout134, %sout136, %sout138, %sout140, %sout142, %sout144 = scf.if %v188 -> (f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32) {
+      %v192 = index.cmp ult, %v162, %v191 : index
+      %sout146, %sout148, %sout150, %sout152, %sout154, %sout156, %sout158, %sout160, %sout162, %sout164, %sout166, %sout168, %sout170, %sout172, %sout174, %sout176 = scf.if %v192 -> (f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32) {
+        %v193 = index.mul %v190, %v30 : index
+        %v194 = index.mul %v158, %v17 : index
+        %v195 = index.add %v193, %v194 : index
+        %v196 = index.add %v165, %v195 : index
+        %v198 = index.add %v196, %v36 : index
+        %sat177 = index.assume %v198 [range(%v198, 0, 2621436)] : index
+        %v200 = vector.load %in0_view[%sat177] : view<2621440xf32, #dense> -> vector<4xf32>
+        %v202 = vector.extract %v200[0] : vector<4xf32> -> f32
+        %v205 = vector.extract %v200[1] : vector<4xf32> -> f32
+        %v208 = vector.extract %v200[2] : vector<4xf32> -> f32
+        %v211 = vector.extract %v200[3] : vector<4xf32> -> f32
+        %v213 = index.add %v196, %v22 : index
+        %sat178 = index.assume %v213 [range(%v213, 0, 2621436)] : index
+        %v215 = vector.load %in0_view[%sat178] : view<2621440xf32, #dense> -> vector<4xf32>
+        %v216 = vector.extract %v215[0] : vector<4xf32> -> f32
+        %v218 = vector.extract %v215[1] : vector<4xf32> -> f32
+        %v220 = vector.extract %v215[2] : vector<4xf32> -> f32
+        %v222 = vector.extract %v215[3] : vector<4xf32> -> f32
+        %v224 = index.add %v196, %v34 : index
+        %sat179 = index.assume %v224 [range(%v224, 0, 2621436)] : index
+        %v226 = vector.load %in0_view[%sat179] : view<2621440xf32, #dense> -> vector<4xf32>
+        %v227 = vector.extract %v226[0] : vector<4xf32> -> f32
+        %v229 = vector.extract %v226[1] : vector<4xf32> -> f32
+        %v231 = vector.extract %v226[2] : vector<4xf32> -> f32
+        %v233 = vector.extract %v226[3] : vector<4xf32> -> f32
+        %v236 = index.add %v196, %v235 : index
+        %sat180 = index.assume %v236 [range(%v236, 0, 2621436)] : index
+        %v238 = vector.load %in0_view[%sat180] : view<2621440xf32, #dense> -> vector<4xf32>
+        %v239 = vector.extract %v238[0] : vector<4xf32> -> f32
+        %v241 = vector.extract %v238[1] : vector<4xf32> -> f32
+        %v243 = vector.extract %v238[2] : vector<4xf32> -> f32
+        %v245 = vector.extract %v238[3] : vector<4xf32> -> f32
+        %v247 = scalar.absf %v202 : f32
+        %v251 = scalar.absf %v205 : f32
+        %v252 = scalar.maxnumf %v247, %v251 : f32
+        %v254 = scalar.addf %v202, %v205 : f32
+        %v257 = scalar.absf %v208 : f32
+        %v258 = scalar.maxnumf %v252, %v257 : f32
+        %v260 = scalar.addf %v254, %v208 : f32
+        %v263 = scalar.absf %v211 : f32
+        %v264 = scalar.maxnumf %v258, %v263 : f32
+        %v266 = scalar.addf %v260, %v211 : f32
+        %v269 = scalar.absf %v216 : f32
+        %v270 = scalar.maxnumf %v264, %v269 : f32
+        %v272 = scalar.addf %v266, %v216 : f32
+        %v275 = scalar.absf %v218 : f32
+        %v276 = scalar.maxnumf %v270, %v275 : f32
+        %v278 = scalar.addf %v272, %v218 : f32
+        %v281 = scalar.absf %v220 : f32
+        %v282 = scalar.maxnumf %v276, %v281 : f32
+        %v284 = scalar.addf %v278, %v220 : f32
+        %v287 = scalar.absf %v222 : f32
+        %v288 = scalar.maxnumf %v282, %v287 : f32
+        %v290 = scalar.addf %v284, %v222 : f32
+        %v293 = scalar.absf %v227 : f32
+        %v294 = scalar.maxnumf %v288, %v293 : f32
+        %v296 = scalar.addf %v290, %v227 : f32
+        %v299 = scalar.absf %v229 : f32
+        %v300 = scalar.maxnumf %v294, %v299 : f32
+        %v302 = scalar.addf %v296, %v229 : f32
+        %v305 = scalar.absf %v231 : f32
+        %v306 = scalar.maxnumf %v300, %v305 : f32
+        %v308 = scalar.addf %v302, %v231 : f32
+        %v311 = scalar.absf %v233 : f32
+        %v312 = scalar.maxnumf %v306, %v311 : f32
+        %v314 = scalar.addf %v308, %v233 : f32
+        %v317 = scalar.absf %v239 : f32
+        %v318 = scalar.maxnumf %v312, %v317 : f32
+        %v320 = scalar.addf %v314, %v239 : f32
+        %v323 = scalar.absf %v241 : f32
+        %v324 = scalar.maxnumf %v318, %v323 : f32
+        %v326 = scalar.addf %v320, %v241 : f32
+        %v329 = scalar.absf %v243 : f32
+        %v330 = scalar.maxnumf %v324, %v329 : f32
+        %v332 = scalar.addf %v326, %v243 : f32
+        %v335 = scalar.absf %v245 : f32
+        %v336 = scalar.maxnumf %v330, %v335 : f32
+        %v338 = scalar.addf %v332, %v245 : f32
+        %sat212 = index.assume %v178 [range(%v178, 0, 255)] : index
+        view.store %v336, %v6[%sat212] : f32, view<256xf32, #dense>
+        %sat213 = index.assume %v178 [range(%v178, 0, 255)] : index
+        view.store %v338, %v7[%sat213] : f32, view<256xf32, #dense>
+        scf.yield %v202, %v205, %v208, %v211, %v216, %v218, %v220, %v222, %v227, %v229, %v231, %v233, %v239, %v241, %v243, %v245 : f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32
+      } else {
+        scf.yield %sacc81, %sacc83, %sacc85, %sacc87, %sacc89, %sacc91, %sacc93, %sacc95, %sacc97, %sacc99, %sacc101, %sacc103, %sacc105, %sacc107, %sacc109, %sacc111 : f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32
+      }
+      scf.yield %sout146, %sout148, %sout150, %sout152, %sout154, %sout156, %sout158, %sout160, %sout162, %sout164, %sout166, %sout168, %sout170, %sout172, %sout174, %sout176 : f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32
+    } else {
+      scf.yield %sacc81, %sacc83, %sacc85, %sacc87, %sacc89, %sacc91, %sacc93, %sacc95, %sacc97, %sacc99, %sacc101, %sacc103, %sacc105, %sacc107, %sacc109, %sacc111 : f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32
+    }
+    kernel.barrier<workgroup> {ordering = acq_rel, scope = workgroup}
+    scf.if %v188 {
+      %sat214 = index.assume %v182 [range(%v182, 0, 255)] : index
+      %v342 = view.load %v6[%sat214] : view<256xf32, #dense> -> f32
+      %sat215 = index.assume %v182 [range(%v182, 0, 255)] : index
+      %v344 = view.load %v7[%sat215] : view<256xf32, #dense> -> f32
+      %v346 = index.add %v182, %v86 : index
+      %sat216 = index.assume %v346 [range(%v346, 0, 255)] : index
+      %v348 = view.load %v6[%sat216] : view<256xf32, #dense> -> f32
+      %v349 = scalar.maxnumf %v342, %v348 : f32
+      %sat218 = index.assume %v346 [range(%v346, 0, 255)] : index
+      %v353 = view.load %v7[%sat218] : view<256xf32, #dense> -> f32
+      %v354 = scalar.addf %v344, %v353 : f32
+      %v356 = index.add %v182, %v132 : index
+      %sat219 = index.assume %v356 [range(%v356, 0, 255)] : index
+      %v358 = view.load %v6[%sat219] : view<256xf32, #dense> -> f32
+      %v359 = scalar.maxnumf %v349, %v358 : f32
+      %sat221 = index.assume %v356 [range(%v356, 0, 255)] : index
+      %v363 = view.load %v7[%sat221] : view<256xf32, #dense> -> f32
+      %v364 = scalar.addf %v354, %v363 : f32
+      %v367 = index.add %v182, %v366 : index
+      %sat222 = index.assume %v367 [range(%v367, 0, 255)] : index
+      %v369 = view.load %v6[%sat222] : view<256xf32, #dense> -> f32
+      %v370 = scalar.maxnumf %v359, %v369 : f32
+      %sat224 = index.assume %v367 [range(%v367, 0, 255)] : index
+      %v374 = view.load %v7[%sat224] : view<256xf32, #dense> -> f32
+      %v375 = scalar.addf %v364, %v374 : f32
+      %v378 = scalar.mulf %v370, %v377 : f32
+      %sat225 = index.assume %v185 [range(%v185, 0, 63)] : index
+      view.store %v378, %v8[%sat225] : f32, view<64xf32, #dense>
+      %sat226 = index.assume %v185 [range(%v185, 0, 63)] : index
+      view.store %v375, %v9[%sat226] : f32, view<64xf32, #dense>
+      %v382 = scalar.maxnumf %v370, %v381 : f32
+      %v384 = scalar.divf %v383, %v382 : f32
+      %v386 = vector.constant 0 : vector<4xi32>
+      %v389 = scalar.mulf %sout114, %v384 : f32
+      %v390 = scalar.roundevenf %v389 : f32
+      %v392 = scalar.fptosi %v390 : f32 to i32
+      %sword229 = index.cast %v187 : index to i32
+      %v394 = scalar.remui %v392, %sword229 : i32
+      %sword230 = index.cast %v86 : index to i32
+      %v396 = scalar.muli %v394, %sword230 : i32
+      %sword231 = index.cast %v36 : index to i32
+      %v397 = scalar.addi %sword231, %v396 : i32
+      %v400 = scalar.mulf %sout116, %v384 : f32
+      %v401 = scalar.roundevenf %v400 : f32
+      %v403 = scalar.fptosi %v401 : f32 to i32
+      %sword233 = index.cast %v187 : index to i32
+      %v405 = scalar.remui %v403, %sword233 : i32
+      %sword234 = index.cast %v187 : index to i32
+      %v407 = scalar.muli %v405, %sword234 : i32
+      %v408 = scalar.addi %v397, %v407 : i32
+      %v411 = scalar.mulf %sout118, %v384 : f32
+      %v412 = scalar.roundevenf %v411 : f32
+      %v414 = scalar.fptosi %v412 : f32 to i32
+      %sword236 = index.cast %v187 : index to i32
+      %v416 = scalar.remui %v414, %sword236 : i32
+      %sword237 = index.cast %v418 : index to i32
+      %v419 = scalar.muli %v416, %sword237 : i32
+      %v420 = scalar.addi %v408, %v419 : i32
+      %v423 = scalar.mulf %sout120, %v384 : f32
+      %v424 = scalar.roundevenf %v423 : f32
+      %v426 = scalar.fptosi %v424 : f32 to i32
+      %sword239 = index.cast %v187 : index to i32
+      %v428 = scalar.remui %v426, %sword239 : i32
+      %sword240 = index.cast %v430 : index to i32
+      %v431 = scalar.muli %v428, %sword240 : i32
+      %v432 = scalar.addi %v420, %v431 : i32
+      %sinsert241 = vector.insert %v432 into %v386[0] : i32, vector<4xi32>
+      %v437 = scalar.mulf %sout122, %v384 : f32
+      %v438 = scalar.roundevenf %v437 : f32
+      %v440 = scalar.fptosi %v438 : f32 to i32
+      %sword243 = index.cast %v187 : index to i32
+      %v442 = scalar.remui %v440, %sword243 : i32
+      %sword244 = index.cast %v86 : index to i32
+      %v444 = scalar.muli %v442, %sword244 : i32
+      %sword245 = index.cast %v36 : index to i32
+      %v445 = scalar.addi %sword245, %v444 : i32
+      %v448 = scalar.mulf %sout124, %v384 : f32
+      %v449 = scalar.roundevenf %v448 : f32
+      %v451 = scalar.fptosi %v449 : f32 to i32
+      %sword247 = index.cast %v187 : index to i32
+      %v453 = scalar.remui %v451, %sword247 : i32
+      %sword248 = index.cast %v187 : index to i32
+      %v455 = scalar.muli %v453, %sword248 : i32
+      %v456 = scalar.addi %v445, %v455 : i32
+      %v459 = scalar.mulf %sout126, %v384 : f32
+      %v460 = scalar.roundevenf %v459 : f32
+      %v462 = scalar.fptosi %v460 : f32 to i32
+      %sword250 = index.cast %v187 : index to i32
+      %v464 = scalar.remui %v462, %sword250 : i32
+      %sword251 = index.cast %v418 : index to i32
+      %v466 = scalar.muli %v464, %sword251 : i32
+      %v467 = scalar.addi %v456, %v466 : i32
+      %v470 = scalar.mulf %sout128, %v384 : f32
+      %v471 = scalar.roundevenf %v470 : f32
+      %v473 = scalar.fptosi %v471 : f32 to i32
+      %sword253 = index.cast %v187 : index to i32
+      %v475 = scalar.remui %v473, %sword253 : i32
+      %sword254 = index.cast %v430 : index to i32
+      %v477 = scalar.muli %v475, %sword254 : i32
+      %v478 = scalar.addi %v467, %v477 : i32
+      %sinsert255 = vector.insert %v478 into %sinsert241[1] : i32, vector<4xi32>
+      %v483 = scalar.mulf %sout130, %v384 : f32
+      %v484 = scalar.roundevenf %v483 : f32
+      %v486 = scalar.fptosi %v484 : f32 to i32
+      %sword257 = index.cast %v187 : index to i32
+      %v488 = scalar.remui %v486, %sword257 : i32
+      %sword258 = index.cast %v86 : index to i32
+      %v490 = scalar.muli %v488, %sword258 : i32
+      %sword259 = index.cast %v36 : index to i32
+      %v491 = scalar.addi %sword259, %v490 : i32
+      %v494 = scalar.mulf %sout132, %v384 : f32
+      %v495 = scalar.roundevenf %v494 : f32
+      %v497 = scalar.fptosi %v495 : f32 to i32
+      %sword261 = index.cast %v187 : index to i32
+      %v499 = scalar.remui %v497, %sword261 : i32
+      %sword262 = index.cast %v187 : index to i32
+      %v501 = scalar.muli %v499, %sword262 : i32
+      %v502 = scalar.addi %v491, %v501 : i32
+      %v505 = scalar.mulf %sout134, %v384 : f32
+      %v506 = scalar.roundevenf %v505 : f32
+      %v508 = scalar.fptosi %v506 : f32 to i32
+      %sword264 = index.cast %v187 : index to i32
+      %v510 = scalar.remui %v508, %sword264 : i32
+      %sword265 = index.cast %v418 : index to i32
+      %v512 = scalar.muli %v510, %sword265 : i32
+      %v513 = scalar.addi %v502, %v512 : i32
+      %v516 = scalar.mulf %sout136, %v384 : f32
+      %v517 = scalar.roundevenf %v516 : f32
+      %v519 = scalar.fptosi %v517 : f32 to i32
+      %sword267 = index.cast %v187 : index to i32
+      %v521 = scalar.remui %v519, %sword267 : i32
+      %sword268 = index.cast %v430 : index to i32
+      %v523 = scalar.muli %v521, %sword268 : i32
+      %v524 = scalar.addi %v513, %v523 : i32
+      %sinsert269 = vector.insert %v524 into %sinsert255[2] : i32, vector<4xi32>
+      %v529 = scalar.mulf %sout138, %v384 : f32
+      %v530 = scalar.roundevenf %v529 : f32
+      %v532 = scalar.fptosi %v530 : f32 to i32
+      %sword271 = index.cast %v187 : index to i32
+      %v534 = scalar.remui %v532, %sword271 : i32
+      %sword272 = index.cast %v86 : index to i32
+      %v536 = scalar.muli %v534, %sword272 : i32
+      %sword273 = index.cast %v36 : index to i32
+      %v537 = scalar.addi %sword273, %v536 : i32
+      %v540 = scalar.mulf %sout140, %v384 : f32
+      %v541 = scalar.roundevenf %v540 : f32
+      %v543 = scalar.fptosi %v541 : f32 to i32
+      %sword275 = index.cast %v187 : index to i32
+      %v545 = scalar.remui %v543, %sword275 : i32
+      %sword276 = index.cast %v187 : index to i32
+      %v547 = scalar.muli %v545, %sword276 : i32
+      %v548 = scalar.addi %v537, %v547 : i32
+      %v551 = scalar.mulf %sout142, %v384 : f32
+      %v552 = scalar.roundevenf %v551 : f32
+      %v554 = scalar.fptosi %v552 : f32 to i32
+      %sword278 = index.cast %v187 : index to i32
+      %v556 = scalar.remui %v554, %sword278 : i32
+      %sword279 = index.cast %v418 : index to i32
+      %v558 = scalar.muli %v556, %sword279 : i32
+      %v559 = scalar.addi %v548, %v558 : i32
+      %v562 = scalar.mulf %sout144, %v384 : f32
+      %v563 = scalar.roundevenf %v562 : f32
+      %v565 = scalar.fptosi %v563 : f32 to i32
+      %sword281 = index.cast %v187 : index to i32
+      %v567 = scalar.remui %v565, %sword281 : i32
+      %sword282 = index.cast %v430 : index to i32
+      %v569 = scalar.muli %v567, %sword282 : i32
+      %v570 = scalar.addi %v559, %v569 : i32
+      %sinsert283 = vector.insert %v570 into %sinsert269[3] : i32, vector<4xi32>
+      %sat284 = index.assume %v175 [range(%v175, 0, 1020)] : index
+      vector.store %sinsert283, %v5[%sat284] : vector<4xi32>, view<1024xi32, #dense>
+    }
+    kernel.barrier<workgroup> {ordering = acq_rel, scope = workgroup}
+    %v573 = index.mul %v190, %v86 : index
+    %v574 = index.add %v573, %v36 : index
+    %v576 = index.add %v136, %v574 : index
+    %sat285 = index.assume %v576 [range(%v576, 0, 1392639)] : index
+    %v578 = view.load %in2_view[%sat285] : view<1392640xbf16, #dense> -> bf16
+    %v579 = scalar.extf %v578 : bf16 to f32
+    %sat286 = index.assume %v576 [range(%v576, 0, 1392639)] : index
+    %v581 = view.load %in3_view[%sat286] : view<1392640xbf16, #dense> -> bf16
+    %v582 = scalar.extf %v581 : bf16 to f32
+    %v584 = vector.constant 0 : vector<8xi32>
+    %sout288 = scf.for %v585 = [%v36 to %v34 step %v86](%sacc287 = %v584 : vector<8xi32>) -> (vector<8xi32>) unroll {
+      %v586 = index.cast %v36 : index to i32
+      %sinsert289 = vector.insert %v586 into %sacc287[%v585] : i32, vector<8xi32>
+      scf.yield %sinsert289 : vector<8xi32>
+    }
+    %v588 = vector.constant 0 : vector<8xi32>
+    %sout291 = scf.for %v589 = [%v36 to %v34 step %v86](%sacc290 = %v588 : vector<8xi32>) -> (vector<8xi32>) unroll {
+      %v590 = index.cast %v36 : index to i32
+      %sinsert292 = vector.insert %v590 into %sacc290[%v589] : i32, vector<8xi32>
+      scf.yield %sinsert292 : vector<8xi32>
+    }
+    %v592 = vector.constant 0 : vector<8xi32>
+    %sout294 = scf.for %v593 = [%v36 to %v34 step %v86](%sacc293 = %v592 : vector<8xi32>) -> (vector<8xi32>) unroll {
+      %v594 = index.cast %v36 : index to i32
+      %sinsert295 = vector.insert %v594 into %sacc293[%v593] : i32, vector<8xi32>
+      scf.yield %sinsert295 : vector<8xi32>
+    }
+    %v596 = vector.constant 0 : vector<8xi32>
+    %sout297 = scf.for %v597 = [%v36 to %v34 step %v86](%sacc296 = %v596 : vector<8xi32>) -> (vector<8xi32>) unroll {
+      %v598 = index.cast %v36 : index to i32
+      %sinsert298 = vector.insert %v598 into %sacc296[%v597] : i32, vector<8xi32>
+      scf.yield %sinsert298 : vector<8xi32>
+    }
+    %v600 = index.mul %v574, %v30 : index
+    %v601 = index.add %v600, %v36 : index
+    %v603 = vector.constant 0 : vector<2xi32>
+    %sword299 = index.cast %v36 : index to i32
+    %sinsert300 = vector.insert %sword299 into %v603[0] : i32, vector<2xi32>
+    %sword301 = index.cast %v36 : index to i32
+    %sinsert302 = vector.insert %sword301 into %sinsert300[1] : i32, vector<2xi32>
+    %v607 = scalar.andi %v45, %v127 : i1
+    %sout304 = scf.if %v607 -> (vector<2xi32>) {
+      %v609 = index.mul %v42, %v608 : index
+      %v610 = index.add %v601, %v83 : index
+      %v611 = index.div %v610, %v34 : index
+      %v612 = index.add %v609, %v611 : index
+      %v614 = index.add %v612, %v36 : index
+      %sat305 = index.assume %v614 [range(%v614, 0, 11141119)] : index
+      %v616 = view.load %in1_view[%sat305] : view<11141120xi32, #dense> -> i32
+      %sword306 = index.cast %v86 : index to i32
+      %v619 = scalar.divui %v616, %sword306 : i32
+      %sword307 = index.cast %v17 : index to i32
+      %v620 = scalar.remui %v619, %sword307 : i32
+      %sword308 = index.cast %v86 : index to i32
+      %v622 = scalar.muli %v620, %sword308 : i32
+      %sword309 = index.cast %v36 : index to i32
+      %v623 = scalar.addi %sword309, %v622 : i32
+      %sword310 = index.cast %v17 : index to i32
+      %v625 = scalar.divui %v616, %sword310 : i32
+      %sword311 = index.cast %v17 : index to i32
+      %v626 = scalar.remui %v625, %sword311 : i32
+      %sword312 = index.cast %v187 : index to i32
+      %v628 = scalar.muli %v626, %sword312 : i32
+      %v629 = scalar.addi %v623, %v628 : i32
+      %sword313 = index.cast %v187 : index to i32
+      %v631 = scalar.divui %v616, %sword313 : i32
+      %sword314 = index.cast %v17 : index to i32
+      %v632 = scalar.remui %v631, %sword314 : i32
+      %sword315 = index.cast %v418 : index to i32
+      %v634 = scalar.muli %v632, %sword315 : i32
+      %v635 = scalar.addi %v629, %v634 : i32
+      %sword316 = index.cast %v637 : index to i32
+      %v638 = scalar.divui %v616, %sword316 : i32
+      %sword317 = index.cast %v17 : index to i32
+      %v639 = scalar.remui %v638, %sword317 : i32
+      %sword318 = index.cast %v430 : index to i32
+      %v641 = scalar.muli %v639, %sword318 : i32
+      %v642 = scalar.addi %v635, %v641 : i32
+      %sinsert319 = vector.insert %v642 into %sinsert302[0] : i32, vector<2xi32>
+      %sat320 = index.assume %v614 [range(%v614, 0, 11141119)] : index
+      %v647 = view.load %in1_view[%sat320] : view<11141120xi32, #dense> -> i32
+      %sword321 = index.cast %v418 : index to i32
+      %v650 = scalar.divui %v647, %sword321 : i32
+      %sword322 = index.cast %v17 : index to i32
+      %v651 = scalar.remui %v650, %sword322 : i32
+      %sword323 = index.cast %v86 : index to i32
+      %v653 = scalar.muli %v651, %sword323 : i32
+      %sword324 = index.cast %v36 : index to i32
+      %v654 = scalar.addi %sword324, %v653 : i32
+      %sword325 = index.cast %v656 : index to i32
+      %v657 = scalar.divui %v647, %sword325 : i32
+      %sword326 = index.cast %v17 : index to i32
+      %v658 = scalar.remui %v657, %sword326 : i32
+      %sword327 = index.cast %v187 : index to i32
+      %v660 = scalar.muli %v658, %sword327 : i32
+      %v661 = scalar.addi %v654, %v660 : i32
+      %sword328 = index.cast %v430 : index to i32
+      %v663 = scalar.divui %v647, %sword328 : i32
+      %sword329 = index.cast %v17 : index to i32
+      %v664 = scalar.remui %v663, %sword329 : i32
+      %sword330 = index.cast %v418 : index to i32
+      %v666 = scalar.muli %v664, %sword330 : i32
+      %v667 = scalar.addi %v661, %v666 : i32
+      %sword331 = index.cast %v669 : index to i32
+      %v670 = scalar.divui %v647, %sword331 : i32
+      %sword332 = index.cast %v17 : index to i32
+      %v671 = scalar.remui %v670, %sword332 : i32
+      %sword333 = index.cast %v430 : index to i32
+      %v673 = scalar.muli %v671, %sword333 : i32
+      %v674 = scalar.addi %v667, %v673 : i32
+      %sinsert334 = vector.insert %v674 into %sinsert319[1] : i32, vector<2xi32>
+      scf.yield %sinsert334 : vector<2xi32>
+    } else {
+      scf.yield %sinsert302 : vector<2xi32>
+    }
+    %v677 = vector.constant 0 : vector<2xi32>
+    %v678 = index.add %v133, %v36 : index
+    %v679 = index.add %v678, %v24 : index
+    %v680 = index.rem %v679, %v17 : index
+    %v681 = index.add %v81, %v680 : index
+    %sat335 = index.assume %v681 [range(%v681, 0, 1022)] : index
+    %v683 = vector.load %v5[%sat335] : view<1024xi32, #dense> -> vector<2xi32>
+    %v684 = vector.extract %v683[0] : vector<2xi32> -> i32
+    %sinsert336 = vector.insert %v684 into %v677[0] : i32, vector<2xi32>
+    %v686 = vector.extract %v683[1] : vector<2xi32> -> i32
+    %sinsert337 = vector.insert %v686 into %sinsert336[1] : i32, vector<2xi32>
+    %sc338_t0 = index.constant 16 : index
+    %sc338_t1 = index.constant 16 : index
+    %sc338_t2 = index.constant 16 : index
+    %sc338_t3 = encoding.define #matrix_operand<element_format=i8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc338_t4 = encoding.define #matrix_operand<element_format=u8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc338_t5 = vector.fragment<lhs> %sinsert337 shape [%sc338_t0, %sc338_t2] using {schema = %sc338_t3 : encoding<schema>} : vector<2xi32>
+    %sc338_t6 = vector.fragment<rhs> %sout304 shape [%sc338_t2, %sc338_t1] using {schema = %sc338_t4 : encoding<schema>} : vector<2xi32>
+    %sc338_t7 = vector.fragment<init> %sout288 shape [%sc338_t0, %sc338_t1] : vector<8xi32>
+    %v688 = vector.mma %sc338_t5, %sc338_t6, %sc338_t7 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+    %v689 = vector.constant 0 : vector<2xi32>
+    %v693 = index.add %v93, %v680 : index
+    %sat339 = index.assume %v693 [range(%v693, 0, 1022)] : index
+    %v695 = vector.load %v5[%sat339] : view<1024xi32, #dense> -> vector<2xi32>
+    %v696 = vector.extract %v695[0] : vector<2xi32> -> i32
+    %sinsert340 = vector.insert %v696 into %v689[0] : i32, vector<2xi32>
+    %v698 = vector.extract %v695[1] : vector<2xi32> -> i32
+    %sinsert341 = vector.insert %v698 into %sinsert340[1] : i32, vector<2xi32>
+    %sc342_t0 = index.constant 16 : index
+    %sc342_t1 = index.constant 16 : index
+    %sc342_t2 = index.constant 16 : index
+    %sc342_t3 = encoding.define #matrix_operand<element_format=i8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc342_t4 = encoding.define #matrix_operand<element_format=u8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc342_t5 = vector.fragment<lhs> %sinsert341 shape [%sc342_t0, %sc342_t2] using {schema = %sc342_t3 : encoding<schema>} : vector<2xi32>
+    %sc342_t6 = vector.fragment<rhs> %sout304 shape [%sc342_t2, %sc342_t1] using {schema = %sc342_t4 : encoding<schema>} : vector<2xi32>
+    %sc342_t7 = vector.fragment<init> %sout291 shape [%sc342_t0, %sc342_t1] : vector<8xi32>
+    %v700 = vector.mma %sc342_t5, %sc342_t6, %sc342_t7 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+    %v701 = vector.constant 0 : vector<2xi32>
+    %v705 = index.add %v104, %v680 : index
+    %sat343 = index.assume %v705 [range(%v705, 0, 1022)] : index
+    %v707 = vector.load %v5[%sat343] : view<1024xi32, #dense> -> vector<2xi32>
+    %v708 = vector.extract %v707[0] : vector<2xi32> -> i32
+    %sinsert344 = vector.insert %v708 into %v701[0] : i32, vector<2xi32>
+    %v710 = vector.extract %v707[1] : vector<2xi32> -> i32
+    %sinsert345 = vector.insert %v710 into %sinsert344[1] : i32, vector<2xi32>
+    %sc346_t0 = index.constant 16 : index
+    %sc346_t1 = index.constant 16 : index
+    %sc346_t2 = index.constant 16 : index
+    %sc346_t3 = encoding.define #matrix_operand<element_format=i8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc346_t4 = encoding.define #matrix_operand<element_format=u8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc346_t5 = vector.fragment<lhs> %sinsert345 shape [%sc346_t0, %sc346_t2] using {schema = %sc346_t3 : encoding<schema>} : vector<2xi32>
+    %sc346_t6 = vector.fragment<rhs> %sout304 shape [%sc346_t2, %sc346_t1] using {schema = %sc346_t4 : encoding<schema>} : vector<2xi32>
+    %sc346_t7 = vector.fragment<init> %sout294 shape [%sc346_t0, %sc346_t1] : vector<8xi32>
+    %v712 = vector.mma %sc346_t5, %sc346_t6, %sc346_t7 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+    %v713 = vector.constant 0 : vector<2xi32>
+    %v717 = index.add %v116, %v680 : index
+    %sat347 = index.assume %v717 [range(%v717, 0, 1022)] : index
+    %v719 = vector.load %v5[%sat347] : view<1024xi32, #dense> -> vector<2xi32>
+    %v720 = vector.extract %v719[0] : vector<2xi32> -> i32
+    %sinsert348 = vector.insert %v720 into %v713[0] : i32, vector<2xi32>
+    %v722 = vector.extract %v719[1] : vector<2xi32> -> i32
+    %sinsert349 = vector.insert %v722 into %sinsert348[1] : i32, vector<2xi32>
+    %sc350_t0 = index.constant 16 : index
+    %sc350_t1 = index.constant 16 : index
+    %sc350_t2 = index.constant 16 : index
+    %sc350_t3 = encoding.define #matrix_operand<element_format=i8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc350_t4 = encoding.define #matrix_operand<element_format=u8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc350_t5 = vector.fragment<lhs> %sinsert349 shape [%sc350_t0, %sc350_t2] using {schema = %sc350_t3 : encoding<schema>} : vector<2xi32>
+    %sc350_t6 = vector.fragment<rhs> %sout304 shape [%sc350_t2, %sc350_t1] using {schema = %sc350_t4 : encoding<schema>} : vector<2xi32>
+    %sc350_t7 = vector.fragment<init> %sout297 shape [%sc350_t0, %sc350_t1] : vector<8xi32>
+    %v724 = vector.mma %sc350_t5, %sc350_t6, %sc350_t7 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+    %v726 = index.add %v600, %v17 : index
+    %v728 = vector.constant 0 : vector<2xi32>
+    %sword351 = index.cast %v36 : index to i32
+    %sinsert352 = vector.insert %sword351 into %v728[0] : i32, vector<2xi32>
+    %sword353 = index.cast %v36 : index to i32
+    %sinsert354 = vector.insert %sword353 into %sinsert352[1] : i32, vector<2xi32>
+    %sout356 = scf.if %v607 -> (vector<2xi32>) {
+      %v733 = index.mul %v42, %v608 : index
+      %v734 = index.add %v726, %v83 : index
+      %v735 = index.div %v734, %v34 : index
+      %v736 = index.add %v733, %v735 : index
+      %v738 = index.add %v736, %v36 : index
+      %sat357 = index.assume %v738 [range(%v738, 0, 11141119)] : index
+      %v740 = view.load %in1_view[%sat357] : view<11141120xi32, #dense> -> i32
+      %sword358 = index.cast %v86 : index to i32
+      %v743 = scalar.divui %v740, %sword358 : i32
+      %sword359 = index.cast %v17 : index to i32
+      %v744 = scalar.remui %v743, %sword359 : i32
+      %sword360 = index.cast %v86 : index to i32
+      %v746 = scalar.muli %v744, %sword360 : i32
+      %sword361 = index.cast %v36 : index to i32
+      %v747 = scalar.addi %sword361, %v746 : i32
+      %sword362 = index.cast %v17 : index to i32
+      %v749 = scalar.divui %v740, %sword362 : i32
+      %sword363 = index.cast %v17 : index to i32
+      %v750 = scalar.remui %v749, %sword363 : i32
+      %sword364 = index.cast %v187 : index to i32
+      %v752 = scalar.muli %v750, %sword364 : i32
+      %v753 = scalar.addi %v747, %v752 : i32
+      %sword365 = index.cast %v187 : index to i32
+      %v755 = scalar.divui %v740, %sword365 : i32
+      %sword366 = index.cast %v17 : index to i32
+      %v756 = scalar.remui %v755, %sword366 : i32
+      %sword367 = index.cast %v418 : index to i32
+      %v758 = scalar.muli %v756, %sword367 : i32
+      %v759 = scalar.addi %v753, %v758 : i32
+      %sword368 = index.cast %v637 : index to i32
+      %v761 = scalar.divui %v740, %sword368 : i32
+      %sword369 = index.cast %v17 : index to i32
+      %v762 = scalar.remui %v761, %sword369 : i32
+      %sword370 = index.cast %v430 : index to i32
+      %v764 = scalar.muli %v762, %sword370 : i32
+      %v765 = scalar.addi %v759, %v764 : i32
+      %sinsert371 = vector.insert %v765 into %sinsert354[0] : i32, vector<2xi32>
+      %sat372 = index.assume %v738 [range(%v738, 0, 11141119)] : index
+      %v770 = view.load %in1_view[%sat372] : view<11141120xi32, #dense> -> i32
+      %sword373 = index.cast %v418 : index to i32
+      %v773 = scalar.divui %v770, %sword373 : i32
+      %sword374 = index.cast %v17 : index to i32
+      %v774 = scalar.remui %v773, %sword374 : i32
+      %sword375 = index.cast %v86 : index to i32
+      %v776 = scalar.muli %v774, %sword375 : i32
+      %sword376 = index.cast %v36 : index to i32
+      %v777 = scalar.addi %sword376, %v776 : i32
+      %sword377 = index.cast %v656 : index to i32
+      %v779 = scalar.divui %v770, %sword377 : i32
+      %sword378 = index.cast %v17 : index to i32
+      %v780 = scalar.remui %v779, %sword378 : i32
+      %sword379 = index.cast %v187 : index to i32
+      %v782 = scalar.muli %v780, %sword379 : i32
+      %v783 = scalar.addi %v777, %v782 : i32
+      %sword380 = index.cast %v430 : index to i32
+      %v785 = scalar.divui %v770, %sword380 : i32
+      %sword381 = index.cast %v17 : index to i32
+      %v786 = scalar.remui %v785, %sword381 : i32
+      %sword382 = index.cast %v418 : index to i32
+      %v788 = scalar.muli %v786, %sword382 : i32
+      %v789 = scalar.addi %v783, %v788 : i32
+      %sword383 = index.cast %v669 : index to i32
+      %v791 = scalar.divui %v770, %sword383 : i32
+      %sword384 = index.cast %v17 : index to i32
+      %v792 = scalar.remui %v791, %sword384 : i32
+      %sword385 = index.cast %v430 : index to i32
+      %v794 = scalar.muli %v792, %sword385 : i32
+      %v795 = scalar.addi %v789, %v794 : i32
+      %sinsert386 = vector.insert %v795 into %sinsert371[1] : i32, vector<2xi32>
+      scf.yield %sinsert386 : vector<2xi32>
+    } else {
+      scf.yield %sinsert354 : vector<2xi32>
+    }
+    %v798 = vector.constant 0 : vector<2xi32>
+    %v799 = index.add %v133, %v22 : index
+    %v800 = index.add %v799, %v24 : index
+    %v801 = index.rem %v800, %v17 : index
+    %v802 = index.add %v81, %v801 : index
+    %sat387 = index.assume %v802 [range(%v802, 0, 1022)] : index
+    %v804 = vector.load %v5[%sat387] : view<1024xi32, #dense> -> vector<2xi32>
+    %v805 = vector.extract %v804[0] : vector<2xi32> -> i32
+    %sinsert388 = vector.insert %v805 into %v798[0] : i32, vector<2xi32>
+    %v807 = vector.extract %v804[1] : vector<2xi32> -> i32
+    %sinsert389 = vector.insert %v807 into %sinsert388[1] : i32, vector<2xi32>
+    %sc390_t0 = index.constant 16 : index
+    %sc390_t1 = index.constant 16 : index
+    %sc390_t2 = index.constant 16 : index
+    %sc390_t3 = encoding.define #matrix_operand<element_format=i8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc390_t4 = encoding.define #matrix_operand<element_format=u8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc390_t5 = vector.fragment<lhs> %sinsert389 shape [%sc390_t0, %sc390_t2] using {schema = %sc390_t3 : encoding<schema>} : vector<2xi32>
+    %sc390_t6 = vector.fragment<rhs> %sout356 shape [%sc390_t2, %sc390_t1] using {schema = %sc390_t4 : encoding<schema>} : vector<2xi32>
+    %sc390_t7 = vector.fragment<init> %v688 shape [%sc390_t0, %sc390_t1] : vector<8xi32>
+    %v809 = vector.mma %sc390_t5, %sc390_t6, %sc390_t7 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+    %v810 = vector.constant 0 : vector<2xi32>
+    %v814 = index.add %v93, %v801 : index
+    %sat391 = index.assume %v814 [range(%v814, 0, 1022)] : index
+    %v816 = vector.load %v5[%sat391] : view<1024xi32, #dense> -> vector<2xi32>
+    %v817 = vector.extract %v816[0] : vector<2xi32> -> i32
+    %sinsert392 = vector.insert %v817 into %v810[0] : i32, vector<2xi32>
+    %v819 = vector.extract %v816[1] : vector<2xi32> -> i32
+    %sinsert393 = vector.insert %v819 into %sinsert392[1] : i32, vector<2xi32>
+    %sc394_t0 = index.constant 16 : index
+    %sc394_t1 = index.constant 16 : index
+    %sc394_t2 = index.constant 16 : index
+    %sc394_t3 = encoding.define #matrix_operand<element_format=i8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc394_t4 = encoding.define #matrix_operand<element_format=u8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc394_t5 = vector.fragment<lhs> %sinsert393 shape [%sc394_t0, %sc394_t2] using {schema = %sc394_t3 : encoding<schema>} : vector<2xi32>
+    %sc394_t6 = vector.fragment<rhs> %sout356 shape [%sc394_t2, %sc394_t1] using {schema = %sc394_t4 : encoding<schema>} : vector<2xi32>
+    %sc394_t7 = vector.fragment<init> %v700 shape [%sc394_t0, %sc394_t1] : vector<8xi32>
+    %v821 = vector.mma %sc394_t5, %sc394_t6, %sc394_t7 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+    %v822 = vector.constant 0 : vector<2xi32>
+    %v826 = index.add %v104, %v801 : index
+    %sat395 = index.assume %v826 [range(%v826, 0, 1022)] : index
+    %v828 = vector.load %v5[%sat395] : view<1024xi32, #dense> -> vector<2xi32>
+    %v829 = vector.extract %v828[0] : vector<2xi32> -> i32
+    %sinsert396 = vector.insert %v829 into %v822[0] : i32, vector<2xi32>
+    %v831 = vector.extract %v828[1] : vector<2xi32> -> i32
+    %sinsert397 = vector.insert %v831 into %sinsert396[1] : i32, vector<2xi32>
+    %sc398_t0 = index.constant 16 : index
+    %sc398_t1 = index.constant 16 : index
+    %sc398_t2 = index.constant 16 : index
+    %sc398_t3 = encoding.define #matrix_operand<element_format=i8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc398_t4 = encoding.define #matrix_operand<element_format=u8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc398_t5 = vector.fragment<lhs> %sinsert397 shape [%sc398_t0, %sc398_t2] using {schema = %sc398_t3 : encoding<schema>} : vector<2xi32>
+    %sc398_t6 = vector.fragment<rhs> %sout356 shape [%sc398_t2, %sc398_t1] using {schema = %sc398_t4 : encoding<schema>} : vector<2xi32>
+    %sc398_t7 = vector.fragment<init> %v712 shape [%sc398_t0, %sc398_t1] : vector<8xi32>
+    %v833 = vector.mma %sc398_t5, %sc398_t6, %sc398_t7 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+    %v834 = vector.constant 0 : vector<2xi32>
+    %v838 = index.add %v116, %v801 : index
+    %sat399 = index.assume %v838 [range(%v838, 0, 1022)] : index
+    %v840 = vector.load %v5[%sat399] : view<1024xi32, #dense> -> vector<2xi32>
+    %v841 = vector.extract %v840[0] : vector<2xi32> -> i32
+    %sinsert400 = vector.insert %v841 into %v834[0] : i32, vector<2xi32>
+    %v843 = vector.extract %v840[1] : vector<2xi32> -> i32
+    %sinsert401 = vector.insert %v843 into %sinsert400[1] : i32, vector<2xi32>
+    %sc402_t0 = index.constant 16 : index
+    %sc402_t1 = index.constant 16 : index
+    %sc402_t2 = index.constant 16 : index
+    %sc402_t3 = encoding.define #matrix_operand<element_format=i8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc402_t4 = encoding.define #matrix_operand<element_format=u8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc402_t5 = vector.fragment<lhs> %sinsert401 shape [%sc402_t0, %sc402_t2] using {schema = %sc402_t3 : encoding<schema>} : vector<2xi32>
+    %sc402_t6 = vector.fragment<rhs> %sout356 shape [%sc402_t2, %sc402_t1] using {schema = %sc402_t4 : encoding<schema>} : vector<2xi32>
+    %sc402_t7 = vector.fragment<init> %v724 shape [%sc402_t0, %sc402_t1] : vector<8xi32>
+    %v845 = vector.mma %sc402_t5, %sc402_t6, %sc402_t7 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+    %v847 = index.add %v600, %v12 : index
+    %v849 = vector.constant 0 : vector<2xi32>
+    %sword403 = index.cast %v36 : index to i32
+    %sinsert404 = vector.insert %sword403 into %v849[0] : i32, vector<2xi32>
+    %sword405 = index.cast %v36 : index to i32
+    %sinsert406 = vector.insert %sword405 into %sinsert404[1] : i32, vector<2xi32>
+    %sout408 = scf.if %v607 -> (vector<2xi32>) {
+      %v854 = index.mul %v42, %v608 : index
+      %v855 = index.add %v847, %v83 : index
+      %v856 = index.div %v855, %v34 : index
+      %v857 = index.add %v854, %v856 : index
+      %v859 = index.add %v857, %v36 : index
+      %sat409 = index.assume %v859 [range(%v859, 0, 11141119)] : index
+      %v861 = view.load %in1_view[%sat409] : view<11141120xi32, #dense> -> i32
+      %sword410 = index.cast %v86 : index to i32
+      %v864 = scalar.divui %v861, %sword410 : i32
+      %sword411 = index.cast %v17 : index to i32
+      %v865 = scalar.remui %v864, %sword411 : i32
+      %sword412 = index.cast %v86 : index to i32
+      %v867 = scalar.muli %v865, %sword412 : i32
+      %sword413 = index.cast %v36 : index to i32
+      %v868 = scalar.addi %sword413, %v867 : i32
+      %sword414 = index.cast %v17 : index to i32
+      %v870 = scalar.divui %v861, %sword414 : i32
+      %sword415 = index.cast %v17 : index to i32
+      %v871 = scalar.remui %v870, %sword415 : i32
+      %sword416 = index.cast %v187 : index to i32
+      %v873 = scalar.muli %v871, %sword416 : i32
+      %v874 = scalar.addi %v868, %v873 : i32
+      %sword417 = index.cast %v187 : index to i32
+      %v876 = scalar.divui %v861, %sword417 : i32
+      %sword418 = index.cast %v17 : index to i32
+      %v877 = scalar.remui %v876, %sword418 : i32
+      %sword419 = index.cast %v418 : index to i32
+      %v879 = scalar.muli %v877, %sword419 : i32
+      %v880 = scalar.addi %v874, %v879 : i32
+      %sword420 = index.cast %v637 : index to i32
+      %v882 = scalar.divui %v861, %sword420 : i32
+      %sword421 = index.cast %v17 : index to i32
+      %v883 = scalar.remui %v882, %sword421 : i32
+      %sword422 = index.cast %v430 : index to i32
+      %v885 = scalar.muli %v883, %sword422 : i32
+      %v886 = scalar.addi %v880, %v885 : i32
+      %sinsert423 = vector.insert %v886 into %sinsert406[0] : i32, vector<2xi32>
+      %sat424 = index.assume %v859 [range(%v859, 0, 11141119)] : index
+      %v891 = view.load %in1_view[%sat424] : view<11141120xi32, #dense> -> i32
+      %sword425 = index.cast %v418 : index to i32
+      %v894 = scalar.divui %v891, %sword425 : i32
+      %sword426 = index.cast %v17 : index to i32
+      %v895 = scalar.remui %v894, %sword426 : i32
+      %sword427 = index.cast %v86 : index to i32
+      %v897 = scalar.muli %v895, %sword427 : i32
+      %sword428 = index.cast %v36 : index to i32
+      %v898 = scalar.addi %sword428, %v897 : i32
+      %sword429 = index.cast %v656 : index to i32
+      %v900 = scalar.divui %v891, %sword429 : i32
+      %sword430 = index.cast %v17 : index to i32
+      %v901 = scalar.remui %v900, %sword430 : i32
+      %sword431 = index.cast %v187 : index to i32
+      %v903 = scalar.muli %v901, %sword431 : i32
+      %v904 = scalar.addi %v898, %v903 : i32
+      %sword432 = index.cast %v430 : index to i32
+      %v906 = scalar.divui %v891, %sword432 : i32
+      %sword433 = index.cast %v17 : index to i32
+      %v907 = scalar.remui %v906, %sword433 : i32
+      %sword434 = index.cast %v418 : index to i32
+      %v909 = scalar.muli %v907, %sword434 : i32
+      %v910 = scalar.addi %v904, %v909 : i32
+      %sword435 = index.cast %v669 : index to i32
+      %v912 = scalar.divui %v891, %sword435 : i32
+      %sword436 = index.cast %v17 : index to i32
+      %v913 = scalar.remui %v912, %sword436 : i32
+      %sword437 = index.cast %v430 : index to i32
+      %v915 = scalar.muli %v913, %sword437 : i32
+      %v916 = scalar.addi %v910, %v915 : i32
+      %sinsert438 = vector.insert %v916 into %sinsert423[1] : i32, vector<2xi32>
+      scf.yield %sinsert438 : vector<2xi32>
+    } else {
+      scf.yield %sinsert406 : vector<2xi32>
+    }
+    %v919 = vector.constant 0 : vector<2xi32>
+    %v920 = index.add %v133, %v34 : index
+    %v921 = index.add %v920, %v24 : index
+    %v922 = index.rem %v921, %v17 : index
+    %v923 = index.add %v81, %v922 : index
+    %sat439 = index.assume %v923 [range(%v923, 0, 1022)] : index
+    %v925 = vector.load %v5[%sat439] : view<1024xi32, #dense> -> vector<2xi32>
+    %v926 = vector.extract %v925[0] : vector<2xi32> -> i32
+    %sinsert440 = vector.insert %v926 into %v919[0] : i32, vector<2xi32>
+    %v928 = vector.extract %v925[1] : vector<2xi32> -> i32
+    %sinsert441 = vector.insert %v928 into %sinsert440[1] : i32, vector<2xi32>
+    %sc442_t0 = index.constant 16 : index
+    %sc442_t1 = index.constant 16 : index
+    %sc442_t2 = index.constant 16 : index
+    %sc442_t3 = encoding.define #matrix_operand<element_format=i8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc442_t4 = encoding.define #matrix_operand<element_format=u8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc442_t5 = vector.fragment<lhs> %sinsert441 shape [%sc442_t0, %sc442_t2] using {schema = %sc442_t3 : encoding<schema>} : vector<2xi32>
+    %sc442_t6 = vector.fragment<rhs> %sout408 shape [%sc442_t2, %sc442_t1] using {schema = %sc442_t4 : encoding<schema>} : vector<2xi32>
+    %sc442_t7 = vector.fragment<init> %v809 shape [%sc442_t0, %sc442_t1] : vector<8xi32>
+    %v930 = vector.mma %sc442_t5, %sc442_t6, %sc442_t7 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+    %v931 = vector.constant 0 : vector<2xi32>
+    %v935 = index.add %v93, %v922 : index
+    %sat443 = index.assume %v935 [range(%v935, 0, 1022)] : index
+    %v937 = vector.load %v5[%sat443] : view<1024xi32, #dense> -> vector<2xi32>
+    %v938 = vector.extract %v937[0] : vector<2xi32> -> i32
+    %sinsert444 = vector.insert %v938 into %v931[0] : i32, vector<2xi32>
+    %v940 = vector.extract %v937[1] : vector<2xi32> -> i32
+    %sinsert445 = vector.insert %v940 into %sinsert444[1] : i32, vector<2xi32>
+    %sc446_t0 = index.constant 16 : index
+    %sc446_t1 = index.constant 16 : index
+    %sc446_t2 = index.constant 16 : index
+    %sc446_t3 = encoding.define #matrix_operand<element_format=i8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc446_t4 = encoding.define #matrix_operand<element_format=u8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc446_t5 = vector.fragment<lhs> %sinsert445 shape [%sc446_t0, %sc446_t2] using {schema = %sc446_t3 : encoding<schema>} : vector<2xi32>
+    %sc446_t6 = vector.fragment<rhs> %sout408 shape [%sc446_t2, %sc446_t1] using {schema = %sc446_t4 : encoding<schema>} : vector<2xi32>
+    %sc446_t7 = vector.fragment<init> %v821 shape [%sc446_t0, %sc446_t1] : vector<8xi32>
+    %v942 = vector.mma %sc446_t5, %sc446_t6, %sc446_t7 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+    %v943 = vector.constant 0 : vector<2xi32>
+    %v947 = index.add %v104, %v922 : index
+    %sat447 = index.assume %v947 [range(%v947, 0, 1022)] : index
+    %v949 = vector.load %v5[%sat447] : view<1024xi32, #dense> -> vector<2xi32>
+    %v950 = vector.extract %v949[0] : vector<2xi32> -> i32
+    %sinsert448 = vector.insert %v950 into %v943[0] : i32, vector<2xi32>
+    %v952 = vector.extract %v949[1] : vector<2xi32> -> i32
+    %sinsert449 = vector.insert %v952 into %sinsert448[1] : i32, vector<2xi32>
+    %sc450_t0 = index.constant 16 : index
+    %sc450_t1 = index.constant 16 : index
+    %sc450_t2 = index.constant 16 : index
+    %sc450_t3 = encoding.define #matrix_operand<element_format=i8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc450_t4 = encoding.define #matrix_operand<element_format=u8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc450_t5 = vector.fragment<lhs> %sinsert449 shape [%sc450_t0, %sc450_t2] using {schema = %sc450_t3 : encoding<schema>} : vector<2xi32>
+    %sc450_t6 = vector.fragment<rhs> %sout408 shape [%sc450_t2, %sc450_t1] using {schema = %sc450_t4 : encoding<schema>} : vector<2xi32>
+    %sc450_t7 = vector.fragment<init> %v833 shape [%sc450_t0, %sc450_t1] : vector<8xi32>
+    %v954 = vector.mma %sc450_t5, %sc450_t6, %sc450_t7 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+    %v955 = vector.constant 0 : vector<2xi32>
+    %v959 = index.add %v116, %v922 : index
+    %sat451 = index.assume %v959 [range(%v959, 0, 1022)] : index
+    %v961 = vector.load %v5[%sat451] : view<1024xi32, #dense> -> vector<2xi32>
+    %v962 = vector.extract %v961[0] : vector<2xi32> -> i32
+    %sinsert452 = vector.insert %v962 into %v955[0] : i32, vector<2xi32>
+    %v964 = vector.extract %v961[1] : vector<2xi32> -> i32
+    %sinsert453 = vector.insert %v964 into %sinsert452[1] : i32, vector<2xi32>
+    %sc454_t0 = index.constant 16 : index
+    %sc454_t1 = index.constant 16 : index
+    %sc454_t2 = index.constant 16 : index
+    %sc454_t3 = encoding.define #matrix_operand<element_format=i8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc454_t4 = encoding.define #matrix_operand<element_format=u8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc454_t5 = vector.fragment<lhs> %sinsert453 shape [%sc454_t0, %sc454_t2] using {schema = %sc454_t3 : encoding<schema>} : vector<2xi32>
+    %sc454_t6 = vector.fragment<rhs> %sout408 shape [%sc454_t2, %sc454_t1] using {schema = %sc454_t4 : encoding<schema>} : vector<2xi32>
+    %sc454_t7 = vector.fragment<init> %v845 shape [%sc454_t0, %sc454_t1] : vector<8xi32>
+    %v966 = vector.mma %sc454_t5, %sc454_t6, %sc454_t7 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+    %v968 = index.add %v600, %v114 : index
+    %v970 = vector.constant 0 : vector<2xi32>
+    %sword455 = index.cast %v36 : index to i32
+    %sinsert456 = vector.insert %sword455 into %v970[0] : i32, vector<2xi32>
+    %sword457 = index.cast %v36 : index to i32
+    %sinsert458 = vector.insert %sword457 into %sinsert456[1] : i32, vector<2xi32>
+    %sout460 = scf.if %v607 -> (vector<2xi32>) {
+      %v975 = index.mul %v42, %v608 : index
+      %v976 = index.add %v968, %v83 : index
+      %v977 = index.div %v976, %v34 : index
+      %v978 = index.add %v975, %v977 : index
+      %v980 = index.add %v978, %v36 : index
+      %sat461 = index.assume %v980 [range(%v980, 0, 11141119)] : index
+      %v982 = view.load %in1_view[%sat461] : view<11141120xi32, #dense> -> i32
+      %sword462 = index.cast %v86 : index to i32
+      %v985 = scalar.divui %v982, %sword462 : i32
+      %sword463 = index.cast %v17 : index to i32
+      %v986 = scalar.remui %v985, %sword463 : i32
+      %sword464 = index.cast %v86 : index to i32
+      %v988 = scalar.muli %v986, %sword464 : i32
+      %sword465 = index.cast %v36 : index to i32
+      %v989 = scalar.addi %sword465, %v988 : i32
+      %sword466 = index.cast %v17 : index to i32
+      %v991 = scalar.divui %v982, %sword466 : i32
+      %sword467 = index.cast %v17 : index to i32
+      %v992 = scalar.remui %v991, %sword467 : i32
+      %sword468 = index.cast %v187 : index to i32
+      %v994 = scalar.muli %v992, %sword468 : i32
+      %v995 = scalar.addi %v989, %v994 : i32
+      %sword469 = index.cast %v187 : index to i32
+      %v997 = scalar.divui %v982, %sword469 : i32
+      %sword470 = index.cast %v17 : index to i32
+      %v998 = scalar.remui %v997, %sword470 : i32
+      %sword471 = index.cast %v418 : index to i32
+      %v1000 = scalar.muli %v998, %sword471 : i32
+      %v1001 = scalar.addi %v995, %v1000 : i32
+      %sword472 = index.cast %v637 : index to i32
+      %v1003 = scalar.divui %v982, %sword472 : i32
+      %sword473 = index.cast %v17 : index to i32
+      %v1004 = scalar.remui %v1003, %sword473 : i32
+      %sword474 = index.cast %v430 : index to i32
+      %v1006 = scalar.muli %v1004, %sword474 : i32
+      %v1007 = scalar.addi %v1001, %v1006 : i32
+      %sinsert475 = vector.insert %v1007 into %sinsert458[0] : i32, vector<2xi32>
+      %sat476 = index.assume %v980 [range(%v980, 0, 11141119)] : index
+      %v1012 = view.load %in1_view[%sat476] : view<11141120xi32, #dense> -> i32
+      %sword477 = index.cast %v418 : index to i32
+      %v1015 = scalar.divui %v1012, %sword477 : i32
+      %sword478 = index.cast %v17 : index to i32
+      %v1016 = scalar.remui %v1015, %sword478 : i32
+      %sword479 = index.cast %v86 : index to i32
+      %v1018 = scalar.muli %v1016, %sword479 : i32
+      %sword480 = index.cast %v36 : index to i32
+      %v1019 = scalar.addi %sword480, %v1018 : i32
+      %sword481 = index.cast %v656 : index to i32
+      %v1021 = scalar.divui %v1012, %sword481 : i32
+      %sword482 = index.cast %v17 : index to i32
+      %v1022 = scalar.remui %v1021, %sword482 : i32
+      %sword483 = index.cast %v187 : index to i32
+      %v1024 = scalar.muli %v1022, %sword483 : i32
+      %v1025 = scalar.addi %v1019, %v1024 : i32
+      %sword484 = index.cast %v430 : index to i32
+      %v1027 = scalar.divui %v1012, %sword484 : i32
+      %sword485 = index.cast %v17 : index to i32
+      %v1028 = scalar.remui %v1027, %sword485 : i32
+      %sword486 = index.cast %v418 : index to i32
+      %v1030 = scalar.muli %v1028, %sword486 : i32
+      %v1031 = scalar.addi %v1025, %v1030 : i32
+      %sword487 = index.cast %v669 : index to i32
+      %v1033 = scalar.divui %v1012, %sword487 : i32
+      %sword488 = index.cast %v17 : index to i32
+      %v1034 = scalar.remui %v1033, %sword488 : i32
+      %sword489 = index.cast %v430 : index to i32
+      %v1036 = scalar.muli %v1034, %sword489 : i32
+      %v1037 = scalar.addi %v1031, %v1036 : i32
+      %sinsert490 = vector.insert %v1037 into %sinsert475[1] : i32, vector<2xi32>
+      scf.yield %sinsert490 : vector<2xi32>
+    } else {
+      scf.yield %sinsert458 : vector<2xi32>
+    }
+    %v1040 = vector.constant 0 : vector<2xi32>
+    %v1041 = index.add %v133, %v235 : index
+    %v1042 = index.add %v1041, %v24 : index
+    %v1043 = index.rem %v1042, %v17 : index
+    %v1044 = index.add %v81, %v1043 : index
+    %sat491 = index.assume %v1044 [range(%v1044, 0, 1022)] : index
+    %v1046 = vector.load %v5[%sat491] : view<1024xi32, #dense> -> vector<2xi32>
+    %v1047 = vector.extract %v1046[0] : vector<2xi32> -> i32
+    %sinsert492 = vector.insert %v1047 into %v1040[0] : i32, vector<2xi32>
+    %v1049 = vector.extract %v1046[1] : vector<2xi32> -> i32
+    %sinsert493 = vector.insert %v1049 into %sinsert492[1] : i32, vector<2xi32>
+    %sc494_t0 = index.constant 16 : index
+    %sc494_t1 = index.constant 16 : index
+    %sc494_t2 = index.constant 16 : index
+    %sc494_t3 = encoding.define #matrix_operand<element_format=i8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc494_t4 = encoding.define #matrix_operand<element_format=u8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc494_t5 = vector.fragment<lhs> %sinsert493 shape [%sc494_t0, %sc494_t2] using {schema = %sc494_t3 : encoding<schema>} : vector<2xi32>
+    %sc494_t6 = vector.fragment<rhs> %sout460 shape [%sc494_t2, %sc494_t1] using {schema = %sc494_t4 : encoding<schema>} : vector<2xi32>
+    %sc494_t7 = vector.fragment<init> %v930 shape [%sc494_t0, %sc494_t1] : vector<8xi32>
+    %v1051 = vector.mma %sc494_t5, %sc494_t6, %sc494_t7 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+    %v1052 = vector.constant 0 : vector<2xi32>
+    %v1056 = index.add %v93, %v1043 : index
+    %sat495 = index.assume %v1056 [range(%v1056, 0, 1022)] : index
+    %v1058 = vector.load %v5[%sat495] : view<1024xi32, #dense> -> vector<2xi32>
+    %v1059 = vector.extract %v1058[0] : vector<2xi32> -> i32
+    %sinsert496 = vector.insert %v1059 into %v1052[0] : i32, vector<2xi32>
+    %v1061 = vector.extract %v1058[1] : vector<2xi32> -> i32
+    %sinsert497 = vector.insert %v1061 into %sinsert496[1] : i32, vector<2xi32>
+    %sc498_t0 = index.constant 16 : index
+    %sc498_t1 = index.constant 16 : index
+    %sc498_t2 = index.constant 16 : index
+    %sc498_t3 = encoding.define #matrix_operand<element_format=i8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc498_t4 = encoding.define #matrix_operand<element_format=u8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc498_t5 = vector.fragment<lhs> %sinsert497 shape [%sc498_t0, %sc498_t2] using {schema = %sc498_t3 : encoding<schema>} : vector<2xi32>
+    %sc498_t6 = vector.fragment<rhs> %sout460 shape [%sc498_t2, %sc498_t1] using {schema = %sc498_t4 : encoding<schema>} : vector<2xi32>
+    %sc498_t7 = vector.fragment<init> %v942 shape [%sc498_t0, %sc498_t1] : vector<8xi32>
+    %v1063 = vector.mma %sc498_t5, %sc498_t6, %sc498_t7 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+    %v1064 = vector.constant 0 : vector<2xi32>
+    %v1068 = index.add %v104, %v1043 : index
+    %sat499 = index.assume %v1068 [range(%v1068, 0, 1022)] : index
+    %v1070 = vector.load %v5[%sat499] : view<1024xi32, #dense> -> vector<2xi32>
+    %v1071 = vector.extract %v1070[0] : vector<2xi32> -> i32
+    %sinsert500 = vector.insert %v1071 into %v1064[0] : i32, vector<2xi32>
+    %v1073 = vector.extract %v1070[1] : vector<2xi32> -> i32
+    %sinsert501 = vector.insert %v1073 into %sinsert500[1] : i32, vector<2xi32>
+    %sc502_t0 = index.constant 16 : index
+    %sc502_t1 = index.constant 16 : index
+    %sc502_t2 = index.constant 16 : index
+    %sc502_t3 = encoding.define #matrix_operand<element_format=i8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc502_t4 = encoding.define #matrix_operand<element_format=u8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc502_t5 = vector.fragment<lhs> %sinsert501 shape [%sc502_t0, %sc502_t2] using {schema = %sc502_t3 : encoding<schema>} : vector<2xi32>
+    %sc502_t6 = vector.fragment<rhs> %sout460 shape [%sc502_t2, %sc502_t1] using {schema = %sc502_t4 : encoding<schema>} : vector<2xi32>
+    %sc502_t7 = vector.fragment<init> %v954 shape [%sc502_t0, %sc502_t1] : vector<8xi32>
+    %v1075 = vector.mma %sc502_t5, %sc502_t6, %sc502_t7 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+    %v1076 = vector.constant 0 : vector<2xi32>
+    %v1080 = index.add %v116, %v1043 : index
+    %sat503 = index.assume %v1080 [range(%v1080, 0, 1022)] : index
+    %v1082 = vector.load %v5[%sat503] : view<1024xi32, #dense> -> vector<2xi32>
+    %v1083 = vector.extract %v1082[0] : vector<2xi32> -> i32
+    %sinsert504 = vector.insert %v1083 into %v1076[0] : i32, vector<2xi32>
+    %v1085 = vector.extract %v1082[1] : vector<2xi32> -> i32
+    %sinsert505 = vector.insert %v1085 into %sinsert504[1] : i32, vector<2xi32>
+    %sc506_t0 = index.constant 16 : index
+    %sc506_t1 = index.constant 16 : index
+    %sc506_t2 = index.constant 16 : index
+    %sc506_t3 = encoding.define #matrix_operand<element_format=i8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc506_t4 = encoding.define #matrix_operand<element_format=u8, payload_elements=8, payload_registers=2> : encoding<schema>
+    %sc506_t5 = vector.fragment<lhs> %sinsert505 shape [%sc506_t0, %sc506_t2] using {schema = %sc506_t3 : encoding<schema>} : vector<2xi32>
+    %sc506_t6 = vector.fragment<rhs> %sout460 shape [%sc506_t2, %sc506_t1] using {schema = %sc506_t4 : encoding<schema>} : vector<2xi32>
+    %sc506_t7 = vector.fragment<init> %v966 shape [%sc506_t0, %sc506_t1] : vector<8xi32>
+    %v1087 = vector.mma %sc506_t5, %sc506_t6, %sc506_t7 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+    %v1088 = index.add %v87, %v36 : index
+    %sat507 = index.assume %v1088 [range(%v1088, 0, 63)] : index
+    %v1090 = view.load %v8[%sat507] : view<64xf32, #dense> -> f32
+    %sat508 = index.assume %v1088 [range(%v1088, 0, 63)] : index
+    %v1092 = view.load %v9[%sat508] : view<64xf32, #dense> -> f32
+    %v1094 = scalar.mulf %v579, %v1090 : f32
+    %v1096 = vector.extract %v1051[0] : vector<8xi32> -> i32
+    %v1097 = scalar.sitofp %v1096 : i32 to f32
+    %v1098 = scalar.fmaf %v1094, %v1097, %sacc17 : f32
+    %v1099 = scalar.mulf %v582, %v1092 : f32
+    %v1100 = scalar.addf %v1098, %v1099 : f32
+    %v1101 = index.add %v87, %v86 : index
+    %sat510 = index.assume %v1101 [range(%v1101, 0, 63)] : index
+    %v1103 = view.load %v8[%sat510] : view<64xf32, #dense> -> f32
+    %sat511 = index.assume %v1101 [range(%v1101, 0, 63)] : index
+    %v1105 = view.load %v9[%sat511] : view<64xf32, #dense> -> f32
+    %v1107 = scalar.mulf %v579, %v1103 : f32
+    %v1109 = vector.extract %v1051[1] : vector<8xi32> -> i32
+    %v1110 = scalar.sitofp %v1109 : i32 to f32
+    %v1111 = scalar.fmaf %v1107, %v1110, %sacc19 : f32
+    %v1112 = scalar.mulf %v582, %v1105 : f32
+    %v1113 = scalar.addf %v1111, %v1112 : f32
+    %v1114 = index.add %v87, %v132 : index
+    %sat513 = index.assume %v1114 [range(%v1114, 0, 63)] : index
+    %v1116 = view.load %v8[%sat513] : view<64xf32, #dense> -> f32
+    %sat514 = index.assume %v1114 [range(%v1114, 0, 63)] : index
+    %v1118 = view.load %v9[%sat514] : view<64xf32, #dense> -> f32
+    %v1120 = scalar.mulf %v579, %v1116 : f32
+    %v1122 = vector.extract %v1051[2] : vector<8xi32> -> i32
+    %v1123 = scalar.sitofp %v1122 : i32 to f32
+    %v1124 = scalar.fmaf %v1120, %v1123, %sacc21 : f32
+    %v1125 = scalar.mulf %v582, %v1118 : f32
+    %v1126 = scalar.addf %v1124, %v1125 : f32
+    %v1127 = index.add %v87, %v366 : index
+    %sat516 = index.assume %v1127 [range(%v1127, 0, 63)] : index
+    %v1129 = view.load %v8[%sat516] : view<64xf32, #dense> -> f32
+    %sat517 = index.assume %v1127 [range(%v1127, 0, 63)] : index
+    %v1131 = view.load %v9[%sat517] : view<64xf32, #dense> -> f32
+    %v1133 = scalar.mulf %v579, %v1129 : f32
+    %v1135 = vector.extract %v1051[3] : vector<8xi32> -> i32
+    %v1136 = scalar.sitofp %v1135 : i32 to f32
+    %v1137 = scalar.fmaf %v1133, %v1136, %sacc23 : f32
+    %v1138 = scalar.mulf %v582, %v1131 : f32
+    %v1139 = scalar.addf %v1137, %v1138 : f32
+    %v1140 = index.add %v87, %v22 : index
+    %sat519 = index.assume %v1140 [range(%v1140, 0, 63)] : index
+    %v1142 = view.load %v8[%sat519] : view<64xf32, #dense> -> f32
+    %sat520 = index.assume %v1140 [range(%v1140, 0, 63)] : index
+    %v1144 = view.load %v9[%sat520] : view<64xf32, #dense> -> f32
+    %v1146 = scalar.mulf %v579, %v1142 : f32
+    %v1149 = vector.extract %v1051[4] : vector<8xi32> -> i32
+    %v1150 = scalar.sitofp %v1149 : i32 to f32
+    %v1151 = scalar.fmaf %v1146, %v1150, %sacc25 : f32
+    %v1152 = scalar.mulf %v582, %v1144 : f32
+    %v1153 = scalar.addf %v1151, %v1152 : f32
+    %v1155 = index.add %v87, %v1154 : index
+    %sat522 = index.assume %v1155 [range(%v1155, 0, 63)] : index
+    %v1157 = view.load %v8[%sat522] : view<64xf32, #dense> -> f32
+    %sat523 = index.assume %v1155 [range(%v1155, 0, 63)] : index
+    %v1159 = view.load %v9[%sat523] : view<64xf32, #dense> -> f32
+    %v1161 = scalar.mulf %v579, %v1157 : f32
+    %v1164 = vector.extract %v1051[5] : vector<8xi32> -> i32
+    %v1165 = scalar.sitofp %v1164 : i32 to f32
+    %v1166 = scalar.fmaf %v1161, %v1165, %sacc27 : f32
+    %v1167 = scalar.mulf %v582, %v1159 : f32
+    %v1168 = scalar.addf %v1166, %v1167 : f32
+    %v1170 = index.add %v87, %v1169 : index
+    %sat525 = index.assume %v1170 [range(%v1170, 0, 63)] : index
+    %v1172 = view.load %v8[%sat525] : view<64xf32, #dense> -> f32
+    %sat526 = index.assume %v1170 [range(%v1170, 0, 63)] : index
+    %v1174 = view.load %v9[%sat526] : view<64xf32, #dense> -> f32
+    %v1176 = scalar.mulf %v579, %v1172 : f32
+    %v1179 = vector.extract %v1051[6] : vector<8xi32> -> i32
+    %v1180 = scalar.sitofp %v1179 : i32 to f32
+    %v1181 = scalar.fmaf %v1176, %v1180, %sacc29 : f32
+    %v1182 = scalar.mulf %v582, %v1174 : f32
+    %v1183 = scalar.addf %v1181, %v1182 : f32
+    %v1185 = index.add %v87, %v1184 : index
+    %sat528 = index.assume %v1185 [range(%v1185, 0, 63)] : index
+    %v1187 = view.load %v8[%sat528] : view<64xf32, #dense> -> f32
+    %sat529 = index.assume %v1185 [range(%v1185, 0, 63)] : index
+    %v1189 = view.load %v9[%sat529] : view<64xf32, #dense> -> f32
+    %v1191 = scalar.mulf %v579, %v1187 : f32
+    %v1194 = vector.extract %v1051[7] : vector<8xi32> -> i32
+    %v1195 = scalar.sitofp %v1194 : i32 to f32
+    %v1196 = scalar.fmaf %v1191, %v1195, %sacc31 : f32
+    %v1197 = scalar.mulf %v582, %v1189 : f32
+    %v1198 = scalar.addf %v1196, %v1197 : f32
+    %v1199 = index.add %v98, %v36 : index
+    %sat531 = index.assume %v1199 [range(%v1199, 0, 63)] : index
+    %v1201 = view.load %v8[%sat531] : view<64xf32, #dense> -> f32
+    %sat532 = index.assume %v1199 [range(%v1199, 0, 63)] : index
+    %v1203 = view.load %v9[%sat532] : view<64xf32, #dense> -> f32
+    %v1205 = scalar.mulf %v579, %v1201 : f32
+    %v1207 = vector.extract %v1063[0] : vector<8xi32> -> i32
+    %v1208 = scalar.sitofp %v1207 : i32 to f32
+    %v1209 = scalar.fmaf %v1205, %v1208, %sacc33 : f32
+    %v1210 = scalar.mulf %v582, %v1203 : f32
+    %v1211 = scalar.addf %v1209, %v1210 : f32
+    %v1212 = index.add %v98, %v86 : index
+    %sat534 = index.assume %v1212 [range(%v1212, 0, 63)] : index
+    %v1214 = view.load %v8[%sat534] : view<64xf32, #dense> -> f32
+    %sat535 = index.assume %v1212 [range(%v1212, 0, 63)] : index
+    %v1216 = view.load %v9[%sat535] : view<64xf32, #dense> -> f32
+    %v1218 = scalar.mulf %v579, %v1214 : f32
+    %v1220 = vector.extract %v1063[1] : vector<8xi32> -> i32
+    %v1221 = scalar.sitofp %v1220 : i32 to f32
+    %v1222 = scalar.fmaf %v1218, %v1221, %sacc35 : f32
+    %v1223 = scalar.mulf %v582, %v1216 : f32
+    %v1224 = scalar.addf %v1222, %v1223 : f32
+    %v1225 = index.add %v98, %v132 : index
+    %sat537 = index.assume %v1225 [range(%v1225, 0, 63)] : index
+    %v1227 = view.load %v8[%sat537] : view<64xf32, #dense> -> f32
+    %sat538 = index.assume %v1225 [range(%v1225, 0, 63)] : index
+    %v1229 = view.load %v9[%sat538] : view<64xf32, #dense> -> f32
+    %v1231 = scalar.mulf %v579, %v1227 : f32
+    %v1233 = vector.extract %v1063[2] : vector<8xi32> -> i32
+    %v1234 = scalar.sitofp %v1233 : i32 to f32
+    %v1235 = scalar.fmaf %v1231, %v1234, %sacc37 : f32
+    %v1236 = scalar.mulf %v582, %v1229 : f32
+    %v1237 = scalar.addf %v1235, %v1236 : f32
+    %v1238 = index.add %v98, %v366 : index
+    %sat540 = index.assume %v1238 [range(%v1238, 0, 63)] : index
+    %v1240 = view.load %v8[%sat540] : view<64xf32, #dense> -> f32
+    %sat541 = index.assume %v1238 [range(%v1238, 0, 63)] : index
+    %v1242 = view.load %v9[%sat541] : view<64xf32, #dense> -> f32
+    %v1244 = scalar.mulf %v579, %v1240 : f32
+    %v1246 = vector.extract %v1063[3] : vector<8xi32> -> i32
+    %v1247 = scalar.sitofp %v1246 : i32 to f32
+    %v1248 = scalar.fmaf %v1244, %v1247, %sacc39 : f32
+    %v1249 = scalar.mulf %v582, %v1242 : f32
+    %v1250 = scalar.addf %v1248, %v1249 : f32
+    %v1251 = index.add %v98, %v22 : index
+    %sat543 = index.assume %v1251 [range(%v1251, 0, 63)] : index
+    %v1253 = view.load %v8[%sat543] : view<64xf32, #dense> -> f32
+    %sat544 = index.assume %v1251 [range(%v1251, 0, 63)] : index
+    %v1255 = view.load %v9[%sat544] : view<64xf32, #dense> -> f32
+    %v1257 = scalar.mulf %v579, %v1253 : f32
+    %v1259 = vector.extract %v1063[4] : vector<8xi32> -> i32
+    %v1260 = scalar.sitofp %v1259 : i32 to f32
+    %v1261 = scalar.fmaf %v1257, %v1260, %sacc41 : f32
+    %v1262 = scalar.mulf %v582, %v1255 : f32
+    %v1263 = scalar.addf %v1261, %v1262 : f32
+    %v1264 = index.add %v98, %v1154 : index
+    %sat546 = index.assume %v1264 [range(%v1264, 0, 63)] : index
+    %v1266 = view.load %v8[%sat546] : view<64xf32, #dense> -> f32
+    %sat547 = index.assume %v1264 [range(%v1264, 0, 63)] : index
+    %v1268 = view.load %v9[%sat547] : view<64xf32, #dense> -> f32
+    %v1270 = scalar.mulf %v579, %v1266 : f32
+    %v1272 = vector.extract %v1063[5] : vector<8xi32> -> i32
+    %v1273 = scalar.sitofp %v1272 : i32 to f32
+    %v1274 = scalar.fmaf %v1270, %v1273, %sacc43 : f32
+    %v1275 = scalar.mulf %v582, %v1268 : f32
+    %v1276 = scalar.addf %v1274, %v1275 : f32
+    %v1277 = index.add %v98, %v1169 : index
+    %sat549 = index.assume %v1277 [range(%v1277, 0, 63)] : index
+    %v1279 = view.load %v8[%sat549] : view<64xf32, #dense> -> f32
+    %sat550 = index.assume %v1277 [range(%v1277, 0, 63)] : index
+    %v1281 = view.load %v9[%sat550] : view<64xf32, #dense> -> f32
+    %v1283 = scalar.mulf %v579, %v1279 : f32
+    %v1285 = vector.extract %v1063[6] : vector<8xi32> -> i32
+    %v1286 = scalar.sitofp %v1285 : i32 to f32
+    %v1287 = scalar.fmaf %v1283, %v1286, %sacc45 : f32
+    %v1288 = scalar.mulf %v582, %v1281 : f32
+    %v1289 = scalar.addf %v1287, %v1288 : f32
+    %v1290 = index.add %v98, %v1184 : index
+    %sat552 = index.assume %v1290 [range(%v1290, 0, 63)] : index
+    %v1292 = view.load %v8[%sat552] : view<64xf32, #dense> -> f32
+    %sat553 = index.assume %v1290 [range(%v1290, 0, 63)] : index
+    %v1294 = view.load %v9[%sat553] : view<64xf32, #dense> -> f32
+    %v1296 = scalar.mulf %v579, %v1292 : f32
+    %v1298 = vector.extract %v1063[7] : vector<8xi32> -> i32
+    %v1299 = scalar.sitofp %v1298 : i32 to f32
+    %v1300 = scalar.fmaf %v1296, %v1299, %sacc47 : f32
+    %v1301 = scalar.mulf %v582, %v1294 : f32
+    %v1302 = scalar.addf %v1300, %v1301 : f32
+    %v1303 = index.add %v109, %v36 : index
+    %sat555 = index.assume %v1303 [range(%v1303, 0, 63)] : index
+    %v1305 = view.load %v8[%sat555] : view<64xf32, #dense> -> f32
+    %sat556 = index.assume %v1303 [range(%v1303, 0, 63)] : index
+    %v1307 = view.load %v9[%sat556] : view<64xf32, #dense> -> f32
+    %v1309 = scalar.mulf %v579, %v1305 : f32
+    %v1311 = vector.extract %v1075[0] : vector<8xi32> -> i32
+    %v1312 = scalar.sitofp %v1311 : i32 to f32
+    %v1313 = scalar.fmaf %v1309, %v1312, %sacc49 : f32
+    %v1314 = scalar.mulf %v582, %v1307 : f32
+    %v1315 = scalar.addf %v1313, %v1314 : f32
+    %v1316 = index.add %v109, %v86 : index
+    %sat558 = index.assume %v1316 [range(%v1316, 0, 63)] : index
+    %v1318 = view.load %v8[%sat558] : view<64xf32, #dense> -> f32
+    %sat559 = index.assume %v1316 [range(%v1316, 0, 63)] : index
+    %v1320 = view.load %v9[%sat559] : view<64xf32, #dense> -> f32
+    %v1322 = scalar.mulf %v579, %v1318 : f32
+    %v1324 = vector.extract %v1075[1] : vector<8xi32> -> i32
+    %v1325 = scalar.sitofp %v1324 : i32 to f32
+    %v1326 = scalar.fmaf %v1322, %v1325, %sacc51 : f32
+    %v1327 = scalar.mulf %v582, %v1320 : f32
+    %v1328 = scalar.addf %v1326, %v1327 : f32
+    %v1329 = index.add %v109, %v132 : index
+    %sat561 = index.assume %v1329 [range(%v1329, 0, 63)] : index
+    %v1331 = view.load %v8[%sat561] : view<64xf32, #dense> -> f32
+    %sat562 = index.assume %v1329 [range(%v1329, 0, 63)] : index
+    %v1333 = view.load %v9[%sat562] : view<64xf32, #dense> -> f32
+    %v1335 = scalar.mulf %v579, %v1331 : f32
+    %v1337 = vector.extract %v1075[2] : vector<8xi32> -> i32
+    %v1338 = scalar.sitofp %v1337 : i32 to f32
+    %v1339 = scalar.fmaf %v1335, %v1338, %sacc53 : f32
+    %v1340 = scalar.mulf %v582, %v1333 : f32
+    %v1341 = scalar.addf %v1339, %v1340 : f32
+    %v1342 = index.add %v109, %v366 : index
+    %sat564 = index.assume %v1342 [range(%v1342, 0, 63)] : index
+    %v1344 = view.load %v8[%sat564] : view<64xf32, #dense> -> f32
+    %sat565 = index.assume %v1342 [range(%v1342, 0, 63)] : index
+    %v1346 = view.load %v9[%sat565] : view<64xf32, #dense> -> f32
+    %v1348 = scalar.mulf %v579, %v1344 : f32
+    %v1350 = vector.extract %v1075[3] : vector<8xi32> -> i32
+    %v1351 = scalar.sitofp %v1350 : i32 to f32
+    %v1352 = scalar.fmaf %v1348, %v1351, %sacc55 : f32
+    %v1353 = scalar.mulf %v582, %v1346 : f32
+    %v1354 = scalar.addf %v1352, %v1353 : f32
+    %v1355 = index.add %v109, %v22 : index
+    %sat567 = index.assume %v1355 [range(%v1355, 0, 63)] : index
+    %v1357 = view.load %v8[%sat567] : view<64xf32, #dense> -> f32
+    %sat568 = index.assume %v1355 [range(%v1355, 0, 63)] : index
+    %v1359 = view.load %v9[%sat568] : view<64xf32, #dense> -> f32
+    %v1361 = scalar.mulf %v579, %v1357 : f32
+    %v1363 = vector.extract %v1075[4] : vector<8xi32> -> i32
+    %v1364 = scalar.sitofp %v1363 : i32 to f32
+    %v1365 = scalar.fmaf %v1361, %v1364, %sacc57 : f32
+    %v1366 = scalar.mulf %v582, %v1359 : f32
+    %v1367 = scalar.addf %v1365, %v1366 : f32
+    %v1368 = index.add %v109, %v1154 : index
+    %sat570 = index.assume %v1368 [range(%v1368, 0, 63)] : index
+    %v1370 = view.load %v8[%sat570] : view<64xf32, #dense> -> f32
+    %sat571 = index.assume %v1368 [range(%v1368, 0, 63)] : index
+    %v1372 = view.load %v9[%sat571] : view<64xf32, #dense> -> f32
+    %v1374 = scalar.mulf %v579, %v1370 : f32
+    %v1376 = vector.extract %v1075[5] : vector<8xi32> -> i32
+    %v1377 = scalar.sitofp %v1376 : i32 to f32
+    %v1378 = scalar.fmaf %v1374, %v1377, %sacc59 : f32
+    %v1379 = scalar.mulf %v582, %v1372 : f32
+    %v1380 = scalar.addf %v1378, %v1379 : f32
+    %v1381 = index.add %v109, %v1169 : index
+    %sat573 = index.assume %v1381 [range(%v1381, 0, 63)] : index
+    %v1383 = view.load %v8[%sat573] : view<64xf32, #dense> -> f32
+    %sat574 = index.assume %v1381 [range(%v1381, 0, 63)] : index
+    %v1385 = view.load %v9[%sat574] : view<64xf32, #dense> -> f32
+    %v1387 = scalar.mulf %v579, %v1383 : f32
+    %v1389 = vector.extract %v1075[6] : vector<8xi32> -> i32
+    %v1390 = scalar.sitofp %v1389 : i32 to f32
+    %v1391 = scalar.fmaf %v1387, %v1390, %sacc61 : f32
+    %v1392 = scalar.mulf %v582, %v1385 : f32
+    %v1393 = scalar.addf %v1391, %v1392 : f32
+    %v1394 = index.add %v109, %v1184 : index
+    %sat576 = index.assume %v1394 [range(%v1394, 0, 63)] : index
+    %v1396 = view.load %v8[%sat576] : view<64xf32, #dense> -> f32
+    %sat577 = index.assume %v1394 [range(%v1394, 0, 63)] : index
+    %v1398 = view.load %v9[%sat577] : view<64xf32, #dense> -> f32
+    %v1400 = scalar.mulf %v579, %v1396 : f32
+    %v1402 = vector.extract %v1075[7] : vector<8xi32> -> i32
+    %v1403 = scalar.sitofp %v1402 : i32 to f32
+    %v1404 = scalar.fmaf %v1400, %v1403, %sacc63 : f32
+    %v1405 = scalar.mulf %v582, %v1398 : f32
+    %v1406 = scalar.addf %v1404, %v1405 : f32
+    %v1407 = index.add %v121, %v36 : index
+    %sat579 = index.assume %v1407 [range(%v1407, 0, 63)] : index
+    %v1409 = view.load %v8[%sat579] : view<64xf32, #dense> -> f32
+    %sat580 = index.assume %v1407 [range(%v1407, 0, 63)] : index
+    %v1411 = view.load %v9[%sat580] : view<64xf32, #dense> -> f32
+    %v1413 = scalar.mulf %v579, %v1409 : f32
+    %v1415 = vector.extract %v1087[0] : vector<8xi32> -> i32
+    %v1416 = scalar.sitofp %v1415 : i32 to f32
+    %v1417 = scalar.fmaf %v1413, %v1416, %sacc65 : f32
+    %v1418 = scalar.mulf %v582, %v1411 : f32
+    %v1419 = scalar.addf %v1417, %v1418 : f32
+    %v1420 = index.add %v121, %v86 : index
+    %sat582 = index.assume %v1420 [range(%v1420, 0, 63)] : index
+    %v1422 = view.load %v8[%sat582] : view<64xf32, #dense> -> f32
+    %sat583 = index.assume %v1420 [range(%v1420, 0, 63)] : index
+    %v1424 = view.load %v9[%sat583] : view<64xf32, #dense> -> f32
+    %v1426 = scalar.mulf %v579, %v1422 : f32
+    %v1428 = vector.extract %v1087[1] : vector<8xi32> -> i32
+    %v1429 = scalar.sitofp %v1428 : i32 to f32
+    %v1430 = scalar.fmaf %v1426, %v1429, %sacc67 : f32
+    %v1431 = scalar.mulf %v582, %v1424 : f32
+    %v1432 = scalar.addf %v1430, %v1431 : f32
+    %v1433 = index.add %v121, %v132 : index
+    %sat585 = index.assume %v1433 [range(%v1433, 0, 63)] : index
+    %v1435 = view.load %v8[%sat585] : view<64xf32, #dense> -> f32
+    %sat586 = index.assume %v1433 [range(%v1433, 0, 63)] : index
+    %v1437 = view.load %v9[%sat586] : view<64xf32, #dense> -> f32
+    %v1439 = scalar.mulf %v579, %v1435 : f32
+    %v1441 = vector.extract %v1087[2] : vector<8xi32> -> i32
+    %v1442 = scalar.sitofp %v1441 : i32 to f32
+    %v1443 = scalar.fmaf %v1439, %v1442, %sacc69 : f32
+    %v1444 = scalar.mulf %v582, %v1437 : f32
+    %v1445 = scalar.addf %v1443, %v1444 : f32
+    %v1446 = index.add %v121, %v366 : index
+    %sat588 = index.assume %v1446 [range(%v1446, 0, 63)] : index
+    %v1448 = view.load %v8[%sat588] : view<64xf32, #dense> -> f32
+    %sat589 = index.assume %v1446 [range(%v1446, 0, 63)] : index
+    %v1450 = view.load %v9[%sat589] : view<64xf32, #dense> -> f32
+    %v1452 = scalar.mulf %v579, %v1448 : f32
+    %v1454 = vector.extract %v1087[3] : vector<8xi32> -> i32
+    %v1455 = scalar.sitofp %v1454 : i32 to f32
+    %v1456 = scalar.fmaf %v1452, %v1455, %sacc71 : f32
+    %v1457 = scalar.mulf %v582, %v1450 : f32
+    %v1458 = scalar.addf %v1456, %v1457 : f32
+    %v1459 = index.add %v121, %v22 : index
+    %sat591 = index.assume %v1459 [range(%v1459, 0, 63)] : index
+    %v1461 = view.load %v8[%sat591] : view<64xf32, #dense> -> f32
+    %sat592 = index.assume %v1459 [range(%v1459, 0, 63)] : index
+    %v1463 = view.load %v9[%sat592] : view<64xf32, #dense> -> f32
+    %v1465 = scalar.mulf %v579, %v1461 : f32
+    %v1467 = vector.extract %v1087[4] : vector<8xi32> -> i32
+    %v1468 = scalar.sitofp %v1467 : i32 to f32
+    %v1469 = scalar.fmaf %v1465, %v1468, %sacc73 : f32
+    %v1470 = scalar.mulf %v582, %v1463 : f32
+    %v1471 = scalar.addf %v1469, %v1470 : f32
+    %v1472 = index.add %v121, %v1154 : index
+    %sat594 = index.assume %v1472 [range(%v1472, 0, 63)] : index
+    %v1474 = view.load %v8[%sat594] : view<64xf32, #dense> -> f32
+    %sat595 = index.assume %v1472 [range(%v1472, 0, 63)] : index
+    %v1476 = view.load %v9[%sat595] : view<64xf32, #dense> -> f32
+    %v1478 = scalar.mulf %v579, %v1474 : f32
+    %v1480 = vector.extract %v1087[5] : vector<8xi32> -> i32
+    %v1481 = scalar.sitofp %v1480 : i32 to f32
+    %v1482 = scalar.fmaf %v1478, %v1481, %sacc75 : f32
+    %v1483 = scalar.mulf %v582, %v1476 : f32
+    %v1484 = scalar.addf %v1482, %v1483 : f32
+    %v1485 = index.add %v121, %v1169 : index
+    %sat597 = index.assume %v1485 [range(%v1485, 0, 63)] : index
+    %v1487 = view.load %v8[%sat597] : view<64xf32, #dense> -> f32
+    %sat598 = index.assume %v1485 [range(%v1485, 0, 63)] : index
+    %v1489 = view.load %v9[%sat598] : view<64xf32, #dense> -> f32
+    %v1491 = scalar.mulf %v579, %v1487 : f32
+    %v1493 = vector.extract %v1087[6] : vector<8xi32> -> i32
+    %v1494 = scalar.sitofp %v1493 : i32 to f32
+    %v1495 = scalar.fmaf %v1491, %v1494, %sacc77 : f32
+    %v1496 = scalar.mulf %v582, %v1489 : f32
+    %v1497 = scalar.addf %v1495, %v1496 : f32
+    %v1498 = index.add %v121, %v1184 : index
+    %sat600 = index.assume %v1498 [range(%v1498, 0, 63)] : index
+    %v1500 = view.load %v8[%sat600] : view<64xf32, #dense> -> f32
+    %sat601 = index.assume %v1498 [range(%v1498, 0, 63)] : index
+    %v1502 = view.load %v9[%sat601] : view<64xf32, #dense> -> f32
+    %v1504 = scalar.mulf %v579, %v1500 : f32
+    %v1506 = vector.extract %v1087[7] : vector<8xi32> -> i32
+    %v1507 = scalar.sitofp %v1506 : i32 to f32
+    %v1508 = scalar.fmaf %v1504, %v1507, %sacc79 : f32
+    %v1509 = scalar.mulf %v582, %v1502 : f32
+    %v1510 = scalar.addf %v1508, %v1509 : f32
+    kernel.barrier<workgroup> {ordering = acq_rel, scope = workgroup}
+    scf.yield %v1100, %v1113, %v1126, %v1139, %v1153, %v1168, %v1183, %v1198, %v1211, %v1224, %v1237, %v1250, %v1263, %v1276, %v1289, %v1302, %v1315, %v1328, %v1341, %v1354, %v1367, %v1380, %v1393, %v1406, %v1419, %v1432, %v1445, %v1458, %v1471, %v1484, %v1497, %v1510, %sout114, %sout116, %sout118, %sout120, %sout122, %sout124, %sout126, %sout128, %sout130, %sout132, %sout134, %sout136, %sout138, %sout140, %sout142, %sout144 : f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32
+  }
+  %v1511 = index.add %v90, %v36 : index
+  %v1513 = index.cmp ult, %v1511, %v191 : index
+  %v1514 = scalar.andi %v45, %v1513 : i1
+  %v1516 = scalar.andi %v1514, %v127 : i1
+  scf.if %v1516 {
+    %v1517 = index.mul %v1511, %v126 : index
+    %v1518 = index.add %v1517, %v42 : index
+      %kat0 = index.assume %v1518 [range(%v1518, 0, 8912895)] : index
+      view.store %sout18, %out_view[%kat0] : f32, view<8912896xf32, #dense>
+  }
+  %v1519 = index.add %v90, %v86 : index
+  %v1521 = index.cmp ult, %v1519, %v191 : index
+  %v1522 = scalar.andi %v45, %v1521 : i1
+  %v1524 = scalar.andi %v1522, %v127 : i1
+  scf.if %v1524 {
+    %v1525 = index.mul %v1519, %v126 : index
+    %v1526 = index.add %v1525, %v42 : index
+      %kat1 = index.assume %v1526 [range(%v1526, 0, 8912895)] : index
+      view.store %sout20, %out_view[%kat1] : f32, view<8912896xf32, #dense>
+  }
+  %v1527 = index.add %v90, %v132 : index
+  %v1529 = index.cmp ult, %v1527, %v191 : index
+  %v1530 = scalar.andi %v45, %v1529 : i1
+  %v1532 = scalar.andi %v1530, %v127 : i1
+  scf.if %v1532 {
+    %v1533 = index.mul %v1527, %v126 : index
+    %v1534 = index.add %v1533, %v42 : index
+      %kat2 = index.assume %v1534 [range(%v1534, 0, 8912895)] : index
+      view.store %sout22, %out_view[%kat2] : f32, view<8912896xf32, #dense>
+  }
+  %v1535 = index.add %v90, %v366 : index
+  %v1537 = index.cmp ult, %v1535, %v191 : index
+  %v1538 = scalar.andi %v45, %v1537 : i1
+  %v1540 = scalar.andi %v1538, %v127 : i1
+  scf.if %v1540 {
+    %v1541 = index.mul %v1535, %v126 : index
+    %v1542 = index.add %v1541, %v42 : index
+      %kat3 = index.assume %v1542 [range(%v1542, 0, 8912895)] : index
+      view.store %sout24, %out_view[%kat3] : f32, view<8912896xf32, #dense>
+  }
+  %v1543 = index.add %v90, %v22 : index
+  %v1545 = index.cmp ult, %v1543, %v191 : index
+  %v1546 = scalar.andi %v45, %v1545 : i1
+  %v1548 = scalar.andi %v1546, %v127 : i1
+  scf.if %v1548 {
+    %v1549 = index.mul %v1543, %v126 : index
+    %v1550 = index.add %v1549, %v42 : index
+      %kat4 = index.assume %v1550 [range(%v1550, 0, 8912895)] : index
+      view.store %sout26, %out_view[%kat4] : f32, view<8912896xf32, #dense>
+  }
+  %v1551 = index.add %v90, %v1154 : index
+  %v1553 = index.cmp ult, %v1551, %v191 : index
+  %v1554 = scalar.andi %v45, %v1553 : i1
+  %v1556 = scalar.andi %v1554, %v127 : i1
+  scf.if %v1556 {
+    %v1557 = index.mul %v1551, %v126 : index
+    %v1558 = index.add %v1557, %v42 : index
+      %kat5 = index.assume %v1558 [range(%v1558, 0, 8912895)] : index
+      view.store %sout28, %out_view[%kat5] : f32, view<8912896xf32, #dense>
+  }
+  %v1559 = index.add %v90, %v1169 : index
+  %v1561 = index.cmp ult, %v1559, %v191 : index
+  %v1562 = scalar.andi %v45, %v1561 : i1
+  %v1564 = scalar.andi %v1562, %v127 : i1
+  scf.if %v1564 {
+    %v1565 = index.mul %v1559, %v126 : index
+    %v1566 = index.add %v1565, %v42 : index
+      %kat6 = index.assume %v1566 [range(%v1566, 0, 8912895)] : index
+      view.store %sout30, %out_view[%kat6] : f32, view<8912896xf32, #dense>
+  }
+  %v1567 = index.add %v90, %v1184 : index
+  %v1569 = index.cmp ult, %v1567, %v191 : index
+  %v1570 = scalar.andi %v45, %v1569 : i1
+  %v1572 = scalar.andi %v1570, %v127 : i1
+  scf.if %v1572 {
+    %v1573 = index.mul %v1567, %v126 : index
+    %v1574 = index.add %v1573, %v42 : index
+      %kat7 = index.assume %v1574 [range(%v1574, 0, 8912895)] : index
+      view.store %sout32, %out_view[%kat7] : f32, view<8912896xf32, #dense>
+  }
+  %v1575 = index.add %v101, %v36 : index
+  %v1577 = index.cmp ult, %v1575, %v191 : index
+  %v1578 = scalar.andi %v45, %v1577 : i1
+  %v1580 = scalar.andi %v1578, %v127 : i1
+  scf.if %v1580 {
+    %v1581 = index.mul %v1575, %v126 : index
+    %v1582 = index.add %v1581, %v42 : index
+      %kat8 = index.assume %v1582 [range(%v1582, 0, 8912895)] : index
+      view.store %sout34, %out_view[%kat8] : f32, view<8912896xf32, #dense>
+  }
+  %v1583 = index.add %v101, %v86 : index
+  %v1585 = index.cmp ult, %v1583, %v191 : index
+  %v1586 = scalar.andi %v45, %v1585 : i1
+  %v1588 = scalar.andi %v1586, %v127 : i1
+  scf.if %v1588 {
+    %v1589 = index.mul %v1583, %v126 : index
+    %v1590 = index.add %v1589, %v42 : index
+      %kat9 = index.assume %v1590 [range(%v1590, 0, 8912895)] : index
+      view.store %sout36, %out_view[%kat9] : f32, view<8912896xf32, #dense>
+  }
+  %v1591 = index.add %v101, %v132 : index
+  %v1593 = index.cmp ult, %v1591, %v191 : index
+  %v1594 = scalar.andi %v45, %v1593 : i1
+  %v1596 = scalar.andi %v1594, %v127 : i1
+  scf.if %v1596 {
+    %v1597 = index.mul %v1591, %v126 : index
+    %v1598 = index.add %v1597, %v42 : index
+      %kat10 = index.assume %v1598 [range(%v1598, 0, 8912895)] : index
+      view.store %sout38, %out_view[%kat10] : f32, view<8912896xf32, #dense>
+  }
+  %v1599 = index.add %v101, %v366 : index
+  %v1601 = index.cmp ult, %v1599, %v191 : index
+  %v1602 = scalar.andi %v45, %v1601 : i1
+  %v1604 = scalar.andi %v1602, %v127 : i1
+  scf.if %v1604 {
+    %v1605 = index.mul %v1599, %v126 : index
+    %v1606 = index.add %v1605, %v42 : index
+      %kat11 = index.assume %v1606 [range(%v1606, 0, 8912895)] : index
+      view.store %sout40, %out_view[%kat11] : f32, view<8912896xf32, #dense>
+  }
+  %v1607 = index.add %v101, %v22 : index
+  %v1609 = index.cmp ult, %v1607, %v191 : index
+  %v1610 = scalar.andi %v45, %v1609 : i1
+  %v1612 = scalar.andi %v1610, %v127 : i1
+  scf.if %v1612 {
+    %v1613 = index.mul %v1607, %v126 : index
+    %v1614 = index.add %v1613, %v42 : index
+      %kat12 = index.assume %v1614 [range(%v1614, 0, 8912895)] : index
+      view.store %sout42, %out_view[%kat12] : f32, view<8912896xf32, #dense>
+  }
+  %v1615 = index.add %v101, %v1154 : index
+  %v1617 = index.cmp ult, %v1615, %v191 : index
+  %v1618 = scalar.andi %v45, %v1617 : i1
+  %v1620 = scalar.andi %v1618, %v127 : i1
+  scf.if %v1620 {
+    %v1621 = index.mul %v1615, %v126 : index
+    %v1622 = index.add %v1621, %v42 : index
+      %kat13 = index.assume %v1622 [range(%v1622, 0, 8912895)] : index
+      view.store %sout44, %out_view[%kat13] : f32, view<8912896xf32, #dense>
+  }
+  %v1623 = index.add %v101, %v1169 : index
+  %v1625 = index.cmp ult, %v1623, %v191 : index
+  %v1626 = scalar.andi %v45, %v1625 : i1
+  %v1628 = scalar.andi %v1626, %v127 : i1
+  scf.if %v1628 {
+    %v1629 = index.mul %v1623, %v126 : index
+    %v1630 = index.add %v1629, %v42 : index
+      %kat14 = index.assume %v1630 [range(%v1630, 0, 8912895)] : index
+      view.store %sout46, %out_view[%kat14] : f32, view<8912896xf32, #dense>
+  }
+  %v1631 = index.add %v101, %v1184 : index
+  %v1633 = index.cmp ult, %v1631, %v191 : index
+  %v1634 = scalar.andi %v45, %v1633 : i1
+  %v1636 = scalar.andi %v1634, %v127 : i1
+  scf.if %v1636 {
+    %v1637 = index.mul %v1631, %v126 : index
+    %v1638 = index.add %v1637, %v42 : index
+      %kat15 = index.assume %v1638 [range(%v1638, 0, 8912895)] : index
+      view.store %sout48, %out_view[%kat15] : f32, view<8912896xf32, #dense>
+  }
+  %v1639 = index.add %v112, %v36 : index
+  %v1641 = index.cmp ult, %v1639, %v191 : index
+  %v1642 = scalar.andi %v45, %v1641 : i1
+  %v1644 = scalar.andi %v1642, %v127 : i1
+  scf.if %v1644 {
+    %v1645 = index.mul %v1639, %v126 : index
+    %v1646 = index.add %v1645, %v42 : index
+      %kat16 = index.assume %v1646 [range(%v1646, 0, 8912895)] : index
+      view.store %sout50, %out_view[%kat16] : f32, view<8912896xf32, #dense>
+  }
+  %v1647 = index.add %v112, %v86 : index
+  %v1649 = index.cmp ult, %v1647, %v191 : index
+  %v1650 = scalar.andi %v45, %v1649 : i1
+  %v1652 = scalar.andi %v1650, %v127 : i1
+  scf.if %v1652 {
+    %v1653 = index.mul %v1647, %v126 : index
+    %v1654 = index.add %v1653, %v42 : index
+      %kat17 = index.assume %v1654 [range(%v1654, 0, 8912895)] : index
+      view.store %sout52, %out_view[%kat17] : f32, view<8912896xf32, #dense>
+  }
+  %v1655 = index.add %v112, %v132 : index
+  %v1657 = index.cmp ult, %v1655, %v191 : index
+  %v1658 = scalar.andi %v45, %v1657 : i1
+  %v1660 = scalar.andi %v1658, %v127 : i1
+  scf.if %v1660 {
+    %v1661 = index.mul %v1655, %v126 : index
+    %v1662 = index.add %v1661, %v42 : index
+      %kat18 = index.assume %v1662 [range(%v1662, 0, 8912895)] : index
+      view.store %sout54, %out_view[%kat18] : f32, view<8912896xf32, #dense>
+  }
+  %v1663 = index.add %v112, %v366 : index
+  %v1665 = index.cmp ult, %v1663, %v191 : index
+  %v1666 = scalar.andi %v45, %v1665 : i1
+  %v1668 = scalar.andi %v1666, %v127 : i1
+  scf.if %v1668 {
+    %v1669 = index.mul %v1663, %v126 : index
+    %v1670 = index.add %v1669, %v42 : index
+      %kat19 = index.assume %v1670 [range(%v1670, 0, 8912895)] : index
+      view.store %sout56, %out_view[%kat19] : f32, view<8912896xf32, #dense>
+  }
+  %v1671 = index.add %v112, %v22 : index
+  %v1673 = index.cmp ult, %v1671, %v191 : index
+  %v1674 = scalar.andi %v45, %v1673 : i1
+  %v1676 = scalar.andi %v1674, %v127 : i1
+  scf.if %v1676 {
+    %v1677 = index.mul %v1671, %v126 : index
+    %v1678 = index.add %v1677, %v42 : index
+      %kat20 = index.assume %v1678 [range(%v1678, 0, 8912895)] : index
+      view.store %sout58, %out_view[%kat20] : f32, view<8912896xf32, #dense>
+  }
+  %v1679 = index.add %v112, %v1154 : index
+  %v1681 = index.cmp ult, %v1679, %v191 : index
+  %v1682 = scalar.andi %v45, %v1681 : i1
+  %v1684 = scalar.andi %v1682, %v127 : i1
+  scf.if %v1684 {
+    %v1685 = index.mul %v1679, %v126 : index
+    %v1686 = index.add %v1685, %v42 : index
+      %kat21 = index.assume %v1686 [range(%v1686, 0, 8912895)] : index
+      view.store %sout60, %out_view[%kat21] : f32, view<8912896xf32, #dense>
+  }
+  %v1687 = index.add %v112, %v1169 : index
+  %v1689 = index.cmp ult, %v1687, %v191 : index
+  %v1690 = scalar.andi %v45, %v1689 : i1
+  %v1692 = scalar.andi %v1690, %v127 : i1
+  scf.if %v1692 {
+    %v1693 = index.mul %v1687, %v126 : index
+    %v1694 = index.add %v1693, %v42 : index
+      %kat22 = index.assume %v1694 [range(%v1694, 0, 8912895)] : index
+      view.store %sout62, %out_view[%kat22] : f32, view<8912896xf32, #dense>
+  }
+  %v1695 = index.add %v112, %v1184 : index
+  %v1697 = index.cmp ult, %v1695, %v191 : index
+  %v1698 = scalar.andi %v45, %v1697 : i1
+  %v1700 = scalar.andi %v1698, %v127 : i1
+  scf.if %v1700 {
+    %v1701 = index.mul %v1695, %v126 : index
+    %v1702 = index.add %v1701, %v42 : index
+      %kat23 = index.assume %v1702 [range(%v1702, 0, 8912895)] : index
+      view.store %sout64, %out_view[%kat23] : f32, view<8912896xf32, #dense>
+  }
+  %v1703 = index.add %v124, %v36 : index
+  %v1705 = index.cmp ult, %v1703, %v191 : index
+  %v1706 = scalar.andi %v45, %v1705 : i1
+  %v1708 = scalar.andi %v1706, %v127 : i1
+  scf.if %v1708 {
+    %v1709 = index.mul %v1703, %v126 : index
+    %v1710 = index.add %v1709, %v42 : index
+      %kat24 = index.assume %v1710 [range(%v1710, 0, 8912895)] : index
+      view.store %sout66, %out_view[%kat24] : f32, view<8912896xf32, #dense>
+  }
+  %v1711 = index.add %v124, %v86 : index
+  %v1713 = index.cmp ult, %v1711, %v191 : index
+  %v1714 = scalar.andi %v45, %v1713 : i1
+  %v1716 = scalar.andi %v1714, %v127 : i1
+  scf.if %v1716 {
+    %v1717 = index.mul %v1711, %v126 : index
+    %v1718 = index.add %v1717, %v42 : index
+      %kat25 = index.assume %v1718 [range(%v1718, 0, 8912895)] : index
+      view.store %sout68, %out_view[%kat25] : f32, view<8912896xf32, #dense>
+  }
+  %v1719 = index.add %v124, %v132 : index
+  %v1721 = index.cmp ult, %v1719, %v191 : index
+  %v1722 = scalar.andi %v45, %v1721 : i1
+  %v1724 = scalar.andi %v1722, %v127 : i1
+  scf.if %v1724 {
+    %v1725 = index.mul %v1719, %v126 : index
+    %v1726 = index.add %v1725, %v42 : index
+      %kat26 = index.assume %v1726 [range(%v1726, 0, 8912895)] : index
+      view.store %sout70, %out_view[%kat26] : f32, view<8912896xf32, #dense>
+  }
+  %v1727 = index.add %v124, %v366 : index
+  %v1729 = index.cmp ult, %v1727, %v191 : index
+  %v1730 = scalar.andi %v45, %v1729 : i1
+  %v1732 = scalar.andi %v1730, %v127 : i1
+  scf.if %v1732 {
+    %v1733 = index.mul %v1727, %v126 : index
+    %v1734 = index.add %v1733, %v42 : index
+      %kat27 = index.assume %v1734 [range(%v1734, 0, 8912895)] : index
+      view.store %sout72, %out_view[%kat27] : f32, view<8912896xf32, #dense>
+  }
+  %v1735 = index.add %v124, %v22 : index
+  %v1737 = index.cmp ult, %v1735, %v191 : index
+  %v1738 = scalar.andi %v45, %v1737 : i1
+  %v1740 = scalar.andi %v1738, %v127 : i1
+  scf.if %v1740 {
+    %v1741 = index.mul %v1735, %v126 : index
+    %v1742 = index.add %v1741, %v42 : index
+      %kat28 = index.assume %v1742 [range(%v1742, 0, 8912895)] : index
+      view.store %sout74, %out_view[%kat28] : f32, view<8912896xf32, #dense>
+  }
+  %v1743 = index.add %v124, %v1154 : index
+  %v1745 = index.cmp ult, %v1743, %v191 : index
+  %v1746 = scalar.andi %v45, %v1745 : i1
+  %v1748 = scalar.andi %v1746, %v127 : i1
+  scf.if %v1748 {
+    %v1749 = index.mul %v1743, %v126 : index
+    %v1750 = index.add %v1749, %v42 : index
+      %kat29 = index.assume %v1750 [range(%v1750, 0, 8912895)] : index
+      view.store %sout76, %out_view[%kat29] : f32, view<8912896xf32, #dense>
+  }
+  %v1751 = index.add %v124, %v1169 : index
+  %v1753 = index.cmp ult, %v1751, %v191 : index
+  %v1754 = scalar.andi %v45, %v1753 : i1
+  %v1756 = scalar.andi %v1754, %v127 : i1
+  scf.if %v1756 {
+    %v1757 = index.mul %v1751, %v126 : index
+    %v1758 = index.add %v1757, %v42 : index
+      %kat30 = index.assume %v1758 [range(%v1758, 0, 8912895)] : index
+      view.store %sout78, %out_view[%kat30] : f32, view<8912896xf32, #dense>
+  }
+  %v1759 = index.add %v124, %v1184 : index
+  %v1761 = index.cmp ult, %v1759, %v191 : index
+  %v1762 = scalar.andi %v45, %v1761 : i1
+  %v1764 = scalar.andi %v1762, %v127 : i1
+  scf.if %v1764 {
+    %v1765 = index.mul %v1759, %v126 : index
+    %v1766 = index.add %v1765, %v42 : index
+      %kat31 = index.assume %v1766 [range(%v1766, 0, 8912895)] : index
+      view.store %sout80, %out_view[%kat31] : f32, view<8912896xf32, #dense>
+  }
+  kernel.return
+}

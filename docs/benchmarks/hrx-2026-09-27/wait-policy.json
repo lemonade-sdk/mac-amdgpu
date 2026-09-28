@@ -1,0 +1,14 @@
+{
+  "MAC_HSA_BLOCKED_POLL_US": null,
+  "effective_blocked_poll_us": 1000,
+  "HRX_completion_wait": "hrx_semaphore_wait(flags=0) \u2192 AMDGPU epoch wait \u2192 HSA_WAIT_STATE_BLOCKED, fallback1000000ns",
+  "HSA_completion_wait": "active hsa_signal_load_scacquire loop, no HSA blocked wait",
+  "pure_mailbox_wait": "active atomic_ref acquire polling, no sleep/yield/blocked wait",
+  "source_references": [
+    "hsa/src/signal_wait_policy.h:13",
+    "hsa/src/signal_state.h:98",
+    "build/hrx-macos-source/libhrx/src/libhrx/semaphore.c:64",
+    "build/hrx-macos-source/runtime/src/iree/hal/drivers/amdgpu/semaphore.c:264"
+  ],
+  "evidence": "Originalrun.pycopiesparentenvironmentandsetsonlyDYLD_LIBRARY_PATHandDYLD_PRINT_LIBRARIES; parentenvironmenthasnoMAC_HSA_/IREE_/HRX_/LSE_waitoverrides. Deriveddefaultfromloadedruntimeversionandcurrentmatchingimplementation."
+}

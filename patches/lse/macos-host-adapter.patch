@@ -1,6 +1,6 @@
 diff --git a/.github/scripts/build-macos.sh b/.github/scripts/build-macos.sh
 new file mode 100755
-index 0000000..194dfff
+index 0000000..629b41e
 --- /dev/null
 +++ b/.github/scripts/build-macos.sh
 @@ -0,0 +1,153 @@
@@ -49,7 +49,7 @@ index 0000000..194dfff
 +    echo "Dependency is modified: $path" >&2; exit 1;
 +  }
 +}
-+mac_rev=6dd8c2a74d61c12e7cf5f568296bd9c4b6fe7c45
++mac_rev=fde050c1b8a98a73ffa3cdc8ea2c1c95fe8a6531
 +hrx_rev=5927b0e0fafdefb5c8b41aa71bca8fd28791ad7c
 +hsa_headers_rev=4285513114a70f7cf4830c89279c8cfa57b901bb
 +fetch https://github.com/lemonade-sdk/mac-amdgpu.git "$mac_rev" "$work/deps/mac-amdgpu"
@@ -159,7 +159,7 @@ index 0000000..194dfff
 +printf 'macOS arm64 host tests and native gfx1201 compilation passed; no GPU execution was attempted.\n'
 diff --git a/.github/scripts/package-macos.py b/.github/scripts/package-macos.py
 new file mode 100755
-index 0000000..2a66ea7
+index 0000000..6b7ba5b
 --- /dev/null
 +++ b/.github/scripts/package-macos.py
 @@ -0,0 +1,220 @@
@@ -270,7 +270,7 @@ index 0000000..2a66ea7
 +    # Isolate the default JIT cache by immutable source/toolchain identity.
 +    build_inputs = {
 +        'lse': run('git', '-C', str(root), 'rev-parse', 'HEAD').strip(),
-+        'portability_patch': hashlib.sha256((root / '.github/patches/macos-portability.patch').read_bytes()).hexdigest(),
++        'hrx_adapter_patch': hashlib.sha256((work / 'deps/mac-amdgpu/patches/hrx/macos-coarse-host-adapter.patch').read_bytes()).hexdigest(),
 +        'hrx': run('git', '-C', str(work / 'deps/hrx'), 'rev-parse', 'HEAD').strip(),
 +        'mac_amdgpu': run('git', '-C', str(work / 'deps/mac-amdgpu'), 'rev-parse', 'HEAD').strip(),
 +        'llvm': run(str(llvm / 'bin/llvm-config'), '--version').strip(),
@@ -332,7 +332,7 @@ index 0000000..2a66ea7
 +        'gpu_execution_tested_in_ci': False,
 +        'jit_cache_identity': cache_identity,
 +        'jit_cache_build_inputs': build_inputs,
-+        'portability_patch_sha256': hashlib.sha256((root / '.github/patches/macos-portability.patch').read_bytes()).hexdigest(),
++        'hrx_adapter_patch_sha256': build_inputs['hrx_adapter_patch'],
 +    }
 +    (package / 'BUILD.json').write_text(json.dumps(manifest, indent=2) + '\n')
 +    (package / 'QUICKSTART.txt').write_text(
@@ -384,7 +384,7 @@ index 0000000..2a66ea7
 +if __name__ == '__main__':
 +    main()
 diff --git a/.github/scripts/release_notes.py b/.github/scripts/release_notes.py
-index 69eb88c..13f7e7f 100755
+index 69eb88c..f548b6c 100755
 --- a/.github/scripts/release_notes.py
 +++ b/.github/scripts/release_notes.py
 @@ -31,6 +31,17 @@ def run(*args, default=""):
@@ -412,7 +412,7 @@ index 69eb88c..13f7e7f 100755
 +    perf = measured_performance()
 +    if perf:
 +        L.append("## Measured performance (gfx1201 / R9700, "
-+                 "Qwen3.8-27B-Q6)")
++                 "Qwen3.8-27B-Q4)")
 +        L.append("")
 +        L.append(perf)
 +        L.append("")
@@ -422,30 +422,40 @@ index 69eb88c..13f7e7f 100755
      if a.tests:
 diff --git a/.github/scripts/release_perf.md b/.github/scripts/release_perf.md
 new file mode 100644
-index 0000000..3602ee7
+index 0000000..3388d51
 --- /dev/null
 +++ b/.github/scripts/release_perf.md
-@@ -0,0 +1,20 @@
-+Measured on **gfx1201 (AMD R9700, driver 197)**, Qwen3.8-27B-Q6, 1024-token
-+prompt, 3 reps each. All tensors device-resident, compile-free, with
-+`LSE_REQUIRE_DEVICE_KERNELS=1`.
+@@ -0,0 +1,30 @@
++Recorded on **gfx1201 / AMD R9700**, Apple Silicon with Thunderbolt 5,
++Qwen3.8-27B-Q4, native HRX/Loom, MTP off. The warmed matched request used a
++1,024-token prompt and 64 generated tokens, two warmups and three measured
++requests per configuration, with flush 64 and 64 us completion polling.
 +
-+| Stage | This release | v0.4.1 | Delta |
-+|---|---|---|---|
-+| Prefill | **229 PP/s** (median; reps 229.25 / 227.20 / 225.84) | ~151 PP/s | **+51.7%** |
-+| Decode | **16.3 TPS** (median; reps 16.30 / 16.22 / 16.18) | 16.3 TPS | no regression |
++| Stage | Qualified Q4 profile |
++|---|---:|
++| Prefill | **444.532 PP/s** |
++| Decode | **24.2635 TPS** |
 +
-+**What changed.** The GDN projection GEMMs (`in_proj_qkv`, and the full
-+attention `qkv`/`v`/`o` projections) now select the staged-BF16 WMMA path at
-+M=1024 instead of falling to the scalar path. All four large shapes went
-+scalar→WMMA at ~3.0x each, taking the device total from 14053 ms to 9656 ms
-+for the 1024-token prefill. Decode sits at the measured aggregate-GEMV
-+bandwidth ceiling (~415 GB/s versus the ~549 GB/s that 25 TPS would need),
-+so it is unchanged; the M=1024 decode selection fix is included as well.
++These are recorded measurements of the accepted qualified INT8 profile,
++including split-128 WG128 decode. They establish **400+ PP/s and 23+ TPS**
++on this system. The measurement predates the final automatic profile selection
++and wave32 normalization promotion; it is not a benchmark of the release archive.
 +
-+**Quality.** PPL-neutral: these are pure kernel-selection changes (records
-+table only). Greedy text is identical to the f32 reference on the standard
-+prompts, and the 0.005 logit rel-L2 gate holds where it applies.
++The checkpoint-qualified Q4 INT8 M1/M512 paths, Q4 M512 FFN LDS v2,
++FP32 Flash12 prefill, shared-exponential FP32 decode attention, and split-128
++WG128 decode are selected by default where qualified. Other kernels and operand
++types remain available with their existing diagnostic controls. Unknown
++checkpoints retain the exact FP32 path. Floating-point accumulation stays FP32;
++integer dot products accumulate in INT32 before FP32 affine restoration.
++
++**Quality uses perplexity.** New qualification windows contain 1,024–2,048
++actual target tokens. The 2,046-target automatic Q4 prefill result was 8.127312,
++matching explicit INT8 selection, versus 8.100851 for FP32 activations (+0.3266%).
++The 1,024-target automatic teacher-forced result was 7.20144530149 versus
++7.17831687877 with explicit INT8 (+0.3222%). These are separate fixtures and are
++not compared with each other. The accepted Q6 staged-BF16 M512 paths retain
++their documented historical 1,022-target qualification; FP8/BF8 alternatives
++remain inactive.
 diff --git a/.github/workflows/build-release.yml b/.github/workflows/build-release.yml
 index eedfa8c..b5f7f31 100644
 --- a/.github/workflows/build-release.yml
@@ -865,7 +875,7 @@ index 0000000..8bb2b3f
 +selected GPU families) and `macos.yml` (macOS arm64). Dispatch either with
 +`release=true` and a tag to attach the artifacts to a GitHub release.
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 8143b41..e90864f 100644
+index 8143b41..4b6007f 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -10,7 +10,7 @@ if(NOT CMAKE_CXX_COMPILER)
@@ -873,7 +883,7 @@ index 8143b41..e90864f 100644
  
  project(lse
 -  VERSION 0.2.1
-+  VERSION 0.4.2
++  VERSION 0.4.3
    DESCRIPTION "Lemon Seed Engine — modular LLM training/inference engine on HRX"
    LANGUAGES CXX)
  
@@ -2770,6 +2780,39 @@ index e51c708..fdf066f 100644
    std::map<int, IReady*> owners_;
    std::vector<unsigned char> scratch_;
  };
+diff --git a/include/lse/core/sha256.hpp b/include/lse/core/sha256.hpp
+new file mode 100644
+index 0000000..d83a559
+--- /dev/null
++++ b/include/lse/core/sha256.hpp
+@@ -0,0 +1,27 @@
++#pragma once
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <span>
++#include <string>
++#include <string_view>
++namespace lse {
++class Sha256 {
++ public:
++  void update(std::span<const std::byte> bytes) noexcept;
++  [[nodiscard]] std::array<std::byte, 32> finish() noexcept;
++
++ private:
++  void block(const std::byte* bytes) noexcept;
++  std::array<std::uint32_t, 8> state_{0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
++                                      0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u};
++  std::array<std::byte, 64> tail_{};
++  std::uint64_t bytes_ = 0;
++  std::size_t used_ = 0;
++};
++[[nodiscard]] std::string sha256(std::span<const std::byte> bytes);
++[[nodiscard]] inline std::string sha256(std::string_view text) {
++  return sha256(std::as_bytes(std::span(text.data(), text.size())));
++}
++}
 diff --git a/include/lse/graph/epilogue_input.hpp b/include/lse/graph/epilogue_input.hpp
 new file mode 100644
 index 0000000..36f653f
@@ -3862,6 +3905,28 @@ index 0000000..003cff9
 +}
 +
 +}  // namespace lse::math
+diff --git a/include/lse/model/compute_profile.hpp b/include/lse/model/compute_profile.hpp
+new file mode 100644
+index 0000000..b6a3661
+--- /dev/null
++++ b/include/lse/model/compute_profile.hpp
+@@ -0,0 +1,16 @@
++#pragma once
++
++#include <cstdint>
++#include <span>
++#include <string_view>
++namespace lse::model {
++struct Config;
++[[nodiscard]] constexpr bool qualified_q4_load_scope(std::size_t device_count,
++                                                     bool split) noexcept {
++  return device_count == 1 && !split;
++}
++class SafeTensors;
++[[nodiscard]] bool qualified_q4_digests(std::string_view config,
++                                        std::span<const std::string_view> shards) noexcept;
++[[nodiscard]] std::int32_t qualified_q4_compute(const Config&, const SafeTensors&);
++}
 diff --git a/include/lse/model/hybrid_lm.hpp b/include/lse/model/hybrid_lm.hpp
 index 1017269..259318d 100644
 --- a/include/lse/model/hybrid_lm.hpp
@@ -4816,20 +4881,18 @@ index ec85bdc..66f94aa 100644
    }
    return spec;
 diff --git a/src/backends/hrx/hrx_backend.cpp b/src/backends/hrx/hrx_backend.cpp
-index 76bb223..fa63f3f 100644
+index 76bb223..60ecc62 100644
 --- a/src/backends/hrx/hrx_backend.cpp
 +++ b/src/backends/hrx/hrx_backend.cpp
-@@ -1,4 +1,9 @@
+@@ -1,4 +1,7 @@
  #include "lse/backends/hrx/hrx_backend.hpp"
 +#include "lse/backends/hrx/loaded_library.hpp"
-+#if defined(__APPLE__)
 +#include "sq_profiler.hpp"
-+#endif
 +#include "lse/backends/hrx/copy_route.hpp"
  
  #include <dlfcn.h>
  
-@@ -6,6 +11,7 @@
+@@ -6,6 +9,7 @@
  #include <atomic>
  #include <cctype>
  #include <charconv>
@@ -4837,7 +4900,7 @@ index 76bb223..fa63f3f 100644
  #include <cstdio>
  #include <cstdlib>
  #include <cstring>
-@@ -13,10 +19,12 @@
+@@ -13,10 +17,12 @@
  #include <mutex>
  #include <unordered_set>
  #include <optional>
@@ -4850,7 +4913,7 @@ index 76bb223..fa63f3f 100644
  
  extern "C" {
  #include "hrx_runtime.h"
-@@ -26,6 +34,15 @@ namespace lse::backend {
+@@ -26,6 +32,15 @@ namespace lse::backend {
  
  namespace {
  
@@ -4866,7 +4929,7 @@ index 76bb223..fa63f3f 100644
  // Residencies stamped by live hrx backends. copy_peer receives whatever
  // buffer the link probe offers — including another backend family's — and an
  // hrx_buffer_t reinterpreted from a foreign handle walks libhrx off a cliff.
-@@ -63,7 +80,12 @@ bool trace_sync() noexcept {
+@@ -63,7 +78,12 @@ bool trace_sync() noexcept {
  #define LSE_SYNC_TRACE(...)                        \
    do {                                             \
      if (trace_sync()) {                            \
@@ -4880,7 +4943,7 @@ index 76bb223..fa63f3f 100644
        std::fprintf(stderr, "\n");                  \
        std::fflush(stderr);                         \
      }                                              \
-@@ -154,10 +176,27 @@ class HsaRuntime {
+@@ -154,10 +174,27 @@ class HsaRuntime {
    // preload_gpu_runtime already loaded rather than a second runtime. The hot
    // path keeps load_if_missing=false, so it behaves exactly as before.
    explicit HsaRuntime(bool load_if_missing = false) noexcept {
@@ -4894,7 +4957,7 @@ index 76bb223..fa63f3f 100644
      if (lib_ == nullptr && load_if_missing) {
 -      lib_ = dlopen("libhsa-runtime64.so.1", RTLD_LAZY);
 +      lib_ = dlopen(soname, RTLD_LAZY);
-+    }
+     }
 +#if defined(__APPLE__)
 +    // The soname dlopen uses the process DYLD search path, which a driver
 +    // installer cannot set for an already-running binary. If it came up empty,
@@ -4905,12 +4968,12 @@ index 76bb223..fa63f3f 100644
 +    if (lib_ == nullptr) {
 +      lib_ = dlopen(kInstalledHsaLib,
 +                    RTLD_LAZY);
-     }
++    }
 +#endif
      if (lib_ == nullptr) return;
      init_ = reinterpret_cast<InitFn>(dlsym(lib_, "hsa_init"));
      iterate_ = reinterpret_cast<IterateFn>(dlsym(lib_, "hsa_iterate_agents"));
-@@ -270,6 +309,9 @@ class HsaRuntime {
+@@ -270,6 +307,9 @@ class HsaRuntime {
    [[nodiscard]] bool dma_copy(void* dst, HsaAgent dst_agent, const void* src,
                                HsaAgent src_agent, std::size_t bytes) const noexcept {
      if (!can_dma()) return false;
@@ -4920,7 +4983,7 @@ index 76bb223..fa63f3f 100644
      if (!shared_signal_ready_) {
        if (signal_create_(1, 0, nullptr, &shared_signal_) != kHsaSuccess) {
          return false;
-@@ -287,10 +329,11 @@ class HsaRuntime {
+@@ -287,10 +327,11 @@ class HsaRuntime {
        // an interrupt round trip is the same order as the transfer.
        constexpr int kConditionLt = 2;
        constexpr int kWaitActive = 1;
@@ -4935,7 +4998,7 @@ index 76bb223..fa63f3f 100644
    }
  
    // Pins a host range so the copy engine can reach it, returning the address
-@@ -427,6 +470,7 @@ class HsaRuntime {
+@@ -427,6 +468,7 @@ class HsaRuntime {
    // One completion signal, reused. Creating one is a driver object and costs
    // about 40 us -- at 1 MB that was two thirds of the transfer, and it is paid
    // per copy, so a model load pays it per tensor.
@@ -4943,7 +5006,7 @@ index 76bb223..fa63f3f 100644
    mutable HsaSignal shared_signal_{};
    mutable bool shared_signal_ready_ = false;
    SignalWaitFn signal_wait_ = nullptr;
-@@ -673,26 +717,26 @@ StreamCapabilities derive_stream_capabilities(const DeviceInfo& info,
+@@ -673,26 +715,26 @@ StreamCapabilities derive_stream_capabilities(const DeviceInfo& info,
  // exactly what enumerating devices before binding one would otherwise cause.
  std::atomic<bool> g_accelerator_up{false};
  
@@ -4988,7 +5051,7 @@ index 76bb223..fa63f3f 100644
    static std::mutex mu;
    const std::lock_guard lock(mu);
    if (g_accelerator_up.load(std::memory_order_relaxed)) return OkStatus();
-@@ -702,9 +746,17 @@ Status accelerator_up() {
+@@ -702,9 +744,17 @@ Status accelerator_up() {
    // for here because bringing the accelerator up is once per process and the
    // topology is fixed at that moment.
    const std::string group = backend::requested_device_group("hrx");
@@ -5006,7 +5069,7 @@ index 76bb223..fa63f3f 100644
    if (hrx_status_is_ok(status)) {
      g_accelerator_up.store(true, std::memory_order_release);
      return OkStatus();
-@@ -720,6 +772,12 @@ Status accelerator_up() {
+@@ -720,6 +770,12 @@ Status accelerator_up() {
  
  }  // namespace
  
@@ -5019,7 +5082,7 @@ index 76bb223..fa63f3f 100644
  bool HrxBackend::available() noexcept {
  #if LSE_HRX_LINKED
    return true;
-@@ -728,8 +786,59 @@ bool HrxBackend::available() noexcept {
+@@ -728,8 +784,59 @@ bool HrxBackend::available() noexcept {
  #endif
  }
  
@@ -5079,7 +5142,7 @@ index 76bb223..fa63f3f 100644
  Result<std::vector<DeviceDescriptor>> HrxBackend::enumerate_devices() {
  #if !LSE_HRX_LINKED
    return LSE_ERROR(kUnimplemented,
-@@ -1138,6 +1247,15 @@ Status HrxBackend::init_impl(int device_ordinal) {
+@@ -1138,6 +1245,15 @@ Status HrxBackend::init_impl(int device_ordinal) {
      }
    }
  
@@ -5095,7 +5158,7 @@ index 76bb223..fa63f3f 100644
    queue_count_ = probe_queue_count(device);
    stream_caps_ = derive_stream_capabilities(info_, queue_count_);
    if (physical_count_ > 1 && stream_caps_.stream_count < physical_count_) {
-@@ -1164,6 +1282,10 @@ Status HrxBackend::init_impl(int device_ordinal) {
+@@ -1164,6 +1280,10 @@ Status HrxBackend::init_impl(int device_ordinal) {
    // uses it, including the stream-ordered allocator.
    LSE_RETURN_IF_ERROR(stream_at(0).status());
  
@@ -5106,7 +5169,7 @@ index 76bb223..fa63f3f 100644
    initialized_ = true;
    return OkStatus();
  #endif
-@@ -1254,6 +1376,9 @@ void HrxBackend::shutdown_impl() noexcept {
+@@ -1254,6 +1374,9 @@ void HrxBackend::shutdown_impl() noexcept {
    }
    streams_.clear();
    unflushed_launches_.clear();
@@ -5116,7 +5179,7 @@ index 76bb223..fa63f3f 100644
    if (device_ != nullptr) {
      hrx_device_release(static_cast<hrx_device_t>(device_));
      device_ = nullptr;
-@@ -1812,6 +1937,26 @@ Status HrxBackend::copy_peer_impl(const DeviceBuffer& src, DeviceBuffer& dst,
+@@ -1812,6 +1935,26 @@ Status HrxBackend::copy_peer_impl(const DeviceBuffer& src, DeviceBuffer& dst,
        !hrx_owns_residency(dst.residency)) {
      return LSE_ERROR(kUnimplemented, "copy_peer needs two hrx-owned buffers");
    }
@@ -5143,7 +5206,7 @@ index 76bb223..fa63f3f 100644
    const HsaRuntime& hsa = shared_hsa();
    if (!hsa.can_dma()) return LSE_ERROR(kUnimplemented, "no DMA entry points");
    const std::vector<HsaAgent>& agents = peer_agents();
-@@ -1985,6 +2130,88 @@ Result<KernelHandle> HrxBackend::load_executable_impl(
+@@ -1985,6 +2128,88 @@ Result<KernelHandle> HrxBackend::load_executable_impl(
  #endif
  }
  
@@ -5232,7 +5295,7 @@ index 76bb223..fa63f3f 100644
  Status HrxBackend::launch_impl(const KernelHandle& kernel, const LaunchDims& dims,
                                 const DispatchArgs& args,
                                 const DispatchTarget& target) {
-@@ -2024,6 +2251,30 @@ Status HrxBackend::launch_impl(const KernelHandle& kernel, const LaunchDims& dim
+@@ -2024,6 +2249,30 @@ Status HrxBackend::launch_impl(const KernelHandle& kernel, const LaunchDims& dim
      bindings.push_back(out);
    }
  
@@ -8504,6 +8567,136 @@ index 3ad7a35..0abc576 100644
      if (fd < 0) {
        // Out of descriptors: the connection stays queued and the listening
        // socket stays readable, so waiting on it again would report ready
+diff --git a/src/core/sha256.cpp b/src/core/sha256.cpp
+new file mode 100644
+index 0000000..619d9f7
+--- /dev/null
++++ b/src/core/sha256.cpp
+@@ -0,0 +1,124 @@
++#include "lse/core/sha256.hpp"
++#include <algorithm>
++#include <bit>
++#include <cstring>
++#if defined(__APPLE__)
++#include <CommonCrypto/CommonDigest.h>
++#endif
++namespace lse {
++namespace {
++constexpr std::uint32_t k[64] = {
++    0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u, 0x3956c25bu, 0x59f111f1u, 0x923f82a4u,
++    0xab1c5ed5u, 0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u, 0x72be5d74u, 0x80deb1feu,
++    0x9bdc06a7u, 0xc19bf174u, 0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu, 0x2de92c6fu,
++    0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau, 0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u,
++    0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u, 0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu,
++    0x53380d13u, 0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u, 0xa2bfe8a1u, 0xa81a664bu,
++    0xc24b8b70u, 0xc76c51a3u, 0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u, 0x19a4c116u,
++    0x1e376c08u, 0x2748774cu, 0x34b0bcb5u, 0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
++    0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u, 0x90befffau, 0xa4506cebu, 0xbef9a3f7u,
++    0xc67178f2u};
++std::uint32_t get32(const std::byte* p) {
++  return std::uint32_t(p[0]) << 24 | std::uint32_t(p[1]) << 16 | std::uint32_t(p[2]) << 8 |
++         std::uint32_t(p[3]);
++}
++}
++void Sha256::block(const std::byte* p) noexcept {
++  std::uint32_t w[64];
++  for (unsigned i = 0; i < 16; ++i) w[i] = get32(p + 4 * i);
++  for (unsigned i = 16; i < 64; ++i) {
++    auto a = w[i - 15], b = w[i - 2];
++    auto s0 = std::rotr(a, 7) ^ std::rotr(a, 18) ^ (a >> 3);
++    auto s1 = std::rotr(b, 17) ^ std::rotr(b, 19) ^ (b >> 10);
++    w[i] = w[i - 16] + s0 + w[i - 7] + s1;
++  }
++  auto a = state_[0], b = state_[1], c = state_[2], d = state_[3], e = state_[4], f = state_[5],
++       g = state_[6], h = state_[7];
++  for (unsigned i = 0; i < 64; ++i) {
++    auto s1 = std::rotr(e, 6) ^ std::rotr(e, 11) ^ std::rotr(e, 25);
++    auto t1 = h + s1 + ((e & f) ^ ((~e) & g)) + k[i] + w[i];
++    auto s0 = std::rotr(a, 2) ^ std::rotr(a, 13) ^ std::rotr(a, 22);
++    auto t2 = s0 + ((a & b) ^ (a & c) ^ (b & c));
++    h = g;
++    g = f;
++    f = e;
++    e = d + t1;
++    d = c;
++    c = b;
++    b = a;
++    a = t1 + t2;
++  }
++  state_[0] += a;
++  state_[1] += b;
++  state_[2] += c;
++  state_[3] += d;
++  state_[4] += e;
++  state_[5] += f;
++  state_[6] += g;
++  state_[7] += h;
++}
++void Sha256::update(std::span<const std::byte> p) noexcept {
++  bytes_ += p.size();
++  if (used_) {
++    auto take = std::min(64 - used_, p.size());
++    if (take) std::memcpy(tail_.data() + used_, p.data(), take);
++    used_ += take;
++    p = p.subspan(take);
++    if (used_ == 64) {
++      block(tail_.data());
++      used_ = 0;
++    }
++  }
++  while (p.size() >= 64) {
++    block(p.data());
++    p = p.subspan(64);
++  }
++  if (!p.empty()) {
++    std::memcpy(tail_.data(), p.data(), p.size());
++    used_ = p.size();
++  }
++}
++std::array<std::byte, 32> Sha256::finish() noexcept {
++  const auto bits = bytes_ * 8;
++  tail_[used_++] = std::byte{0x80};
++  if (used_ > 56) {
++    std::fill(tail_.begin() + used_, tail_.end(), std::byte{0});
++    block(tail_.data());
++    used_ = 0;
++  }
++  std::fill(tail_.begin() + used_, tail_.begin() + 56, std::byte{0});
++  for (unsigned i = 0; i < 8; ++i) tail_[63 - i] = std::byte((bits >> (8 * i)) & 255);
++  block(tail_.data());
++  std::array<std::byte, 32> out;
++  for (unsigned i = 0; i < 8; ++i)
++    for (unsigned j = 0; j < 4; ++j) out[4 * i + j] = std::byte((state_[i] >> (24 - 8 * j)) & 255);
++  return out;
++}
++std::string sha256(std::span<const std::byte> bytes) {
++  std::array<std::byte, 32> digest;
++#if defined(__APPLE__)
++  // The portable incremental implementation remains independently testable.
++  // Use platform acceleration for multi-gigabyte checkpoint admission.
++  CC_SHA256_CTX state;
++  CC_SHA256_Init(&state);
++  while (!bytes.empty()) {
++    const auto count = std::min<std::size_t>(bytes.size(), 1u << 24);
++    CC_SHA256_Update(&state, bytes.data(), static_cast<CC_LONG>(count));
++    bytes = bytes.subspan(count);
++  }
++  CC_SHA256_Final(reinterpret_cast<unsigned char*>(digest.data()), &state);
++#else
++  Sha256 h;
++  h.update(bytes);
++  digest = h.finish();
++#endif
++  std::string out(64, '0');
++  constexpr char hex[] = "0123456789abcdef";
++  for (std::size_t i = 0; i < digest.size(); ++i) {
++    auto v = std::uint8_t(digest[i]);
++    out[2 * i] = hex[v >> 4];
++    out[2 * i + 1] = hex[v & 15];
++  }
++  return out;
++}
++}
 diff --git a/src/graph/dispatch_profile.hpp b/src/graph/dispatch_profile.hpp
 new file mode 100644
 index 0000000..e03e6e2
@@ -9956,6 +10149,36 @@ index 8525a9b..43e66d9 100644
        const auto j = e.let(lane + ei * wave);
        if (auto in = e.when(j < D)) {
          const auto idx = ((b * heads + h) * D + row) * D + j;
+diff --git a/src/kernels/int8_policy.cpp b/src/kernels/int8_policy.cpp
+new file mode 100644
+index 0000000..e031858
+--- /dev/null
++++ b/src/kernels/int8_policy.cpp
+@@ -0,0 +1,24 @@
++#include "lse/kernels/int8_policy.hpp"
++#include "lse/graph/kernel_primitive.hpp"
++namespace lse::kernels {
++bool activation_int8_enabled(const graph::KernelShapes& s, ActivationInt8Policy policy) noexcept {
++  if (policy == ActivationInt8Policy::kEnabled) return true;
++  if (policy == ActivationInt8Policy::kExact) return false;
++  if (s.iattrs[2] != kQwen27BQ4ComputeRevision || s.iattrs[0] != 4 || s.iattrs[1] != 64 ||
++      !s.device || s.device->arch != "gfx1201" || s.device->wavefront_size != 32 ||
++      s.inputs.size() != 4 || s.input_dtypes.size() != 4 || s.inputs[1].rank() != 2 ||
++      s.input_dtypes[0] != DType::kF32 || s.input_dtypes[1] != DType::kU32 ||
++      s.input_dtypes[2] != DType::kBF16 || s.input_dtypes[3] != DType::kBF16 ||
++      s.output_dtype != DType::kF32 || !s.staged.name.empty() || !s.staged_quant.codes.empty())
++    return false;
++  auto n = s.inputs[1].dim(0);
++  if (n <= 0 || s.output.elem_count() % static_cast<std::size_t>(n)) return false;
++  const auto m = s.output.elem_count() / static_cast<std::size_t>(n);
++  if (m != 1 && m != 512) return false;
++  if (s.inputs[0].rank() != 2 && s.inputs[0].rank() != 3) return false;
++  if (s.inputs[0].rank() == 3 && s.inputs[0].dim(0) != 1) return false;
++  const auto k = s.inputs[1].dim(1) * 8;
++  return k > 0 && k % 64 == 0 && s.inputs[0].rank() > 0 &&
++         s.inputs[0].dim(s.inputs[0].rank() - 1) == k;
++}
++}
 diff --git a/src/kernels/q6_fp8_residual.inc b/src/kernels/q6_fp8_residual.inc
 new file mode 100644
 index 0000000..f0ec881
@@ -12594,6 +12817,70 @@ index c31971a..50357b1 100644
            return &kQuantWmma;
          }
          }
+diff --git a/src/model/compute_profile.cpp b/src/model/compute_profile.cpp
+new file mode 100644
+index 0000000..6c5c03a
+--- /dev/null
++++ b/src/model/compute_profile.cpp
+@@ -0,0 +1,58 @@
++#include "lse/model/compute_profile.hpp"
++#include "lse/model/config.hpp"
++#include "lse/model/weights.hpp"
++#include "lse/core/sha256.hpp"
++#include "lse/kernels/int8_policy.hpp"
++#include <array>
++#include <filesystem>
++#include <fstream>
++#include <sstream>
++namespace lse::model {
++namespace {
++constexpr std::string_view config_digest =
++    "14b65a0ee06517060a6bbd979bb1a8ff54e7b304b1a1f01d54344b88b8285e85";
++constexpr std::array<std::string_view, 3> shards = {
++    "471a9a81b54dddbfef43e8a71960ca24ad3c727891c6b0750a9db9a214aab504",
++    "e7474b8f968f4078dfd4889925961c5b0da9939219b614dba08eb63c46590de7",
++    "1038989bed1346ecdb541a45c078df2aae99a9509f35bfd51e7a04802a5d8402"};
++}
++bool qualified_q4_digests(std::string_view config,
++                          std::span<const std::string_view> actual) noexcept {
++  if (config != config_digest || actual.size() != shards.size()) return false;
++  for (std::size_t i = 0; i < shards.size(); ++i)
++    if (actual[i] != shards[i]) return false;
++  return true;
++}
++std::int32_t qualified_q4_compute(const Config& config, const SafeTensors& weights) {
++  // Fail closed before streaming any shard for unknown architectures/geometry.
++  if (config.hidden_size != 5120 || config.num_layers != 64 || config.vocab_size != 248320 ||
++      config.mlp_intermediate != 17408 || !weights.path().ends_with(".index.json"))
++    return 0;
++  std::ifstream input(std::filesystem::path(weights.path()).parent_path() / "config.json",
++                      std::ios::binary);
++  if (!input) return 0;
++  std::ostringstream buffer;
++  buffer << input.rdbuf();
++  const auto text = buffer.str();
++  if (sha256(text) != config_digest) return 0;
++  auto expected = Config::from_json_string(text);
++  if (!expected.ok()) return 0;
++  // Runtime KV reservation is allocation policy; other model changes invalidate qualification.
++  auto actual = config;
++  actual.kv_length = 0;
++  expected->kv_length = 0;
++  // This runtime flag is not serialized by Config::to_json().
++  if (actual.moe_bias_balance != expected->moe_bias_balance) return 0;
++  if (actual.to_json() != expected->to_json()) return 0;
++  // Config::to_json omits quantization; compare every mapped plane's resolved geometry too.
++  for (const auto& [name, view] : weights.tensors()) {
++    if (view.dtype != DType::kU32) continue;
++    if (actual.quantization.is_skipped(name) != expected->quantization.is_skipped(name)) return 0;
++    const auto a = actual.quantization.resolve(name), b = expected->quantization.resolve(name);
++    if (a.ok() != b.ok()) return 0;
++    if (a.ok() && (a->bits != b->bits || a->group_size != b->group_size)) return 0;
++  }
++  if (!weights.content_sha256_matches(shards)) return 0;
++  return kernels::kQwen27BQ4ComputeRevision;
++}
++}
 diff --git a/src/model/hybrid_lm.cpp b/src/model/hybrid_lm.cpp
 index fcd14f6..41f1cdc 100644
 --- a/src/model/hybrid_lm.cpp
@@ -14762,6 +15049,279 @@ index 0000000..c66a23a
 +        const bool shared = key <= offset && key + window > offset;
 +        LSE_EXPECT(original == shared);
 +      }
++}
++LSE_TEST_MAIN()
+diff --git a/tests/test_automatic_q4.cpp b/tests/test_automatic_q4.cpp
+new file mode 100644
+index 0000000..4161c72
+--- /dev/null
++++ b/tests/test_automatic_q4.cpp
+@@ -0,0 +1,267 @@
++#include "harness.hpp"
++#include "lse/core/sha256.hpp"
++#include "lse/kernels/int8_policy.hpp"
++#include "lse/kernels/quant_operand_cache.hpp"
++#include "lse/model/compute_profile.hpp"
++#include "lse/model/config.hpp"
++#include "lse/model/weights.hpp"
++#include "lse/backends/hrx/arch_database.hpp"
++#include "lse/backends/hrx/loomc/loom_emitter.hpp"
++#include "lse/backends/hrx/hipc/hip_emitter.hpp"
++#include "lse/graph/ops.hpp"
++#include <array>
++#include <chrono>
++#include <cstdio>
++#include <filesystem>
++#include <fstream>
++#include <string>
++using namespace lse;
++using namespace lse::graph;
++namespace {
++std::string incremental(std::string_view input, std::size_t stride) {
++  Sha256 h;
++  for (std::size_t i = 0; i < input.size(); i += stride)
++    h.update(std::as_bytes(std::span(input.data() + i, std::min(stride, input.size() - i))));
++  auto digest = h.finish();
++  std::string out(64, '0');
++  constexpr char hex[] = "0123456789abcdef";
++  for (std::size_t i = 0; i < 32; ++i) {
++    unsigned v = std::uint8_t(digest[i]);
++    out[2 * i] = hex[v >> 4];
++    out[2 * i + 1] = hex[v & 15];
++  }
++  return out;
++}
++Array leaf(Shape shape, DType type) {
++  auto n = std::make_shared<Node>();
++  n->shape = shape;
++  n->dtype = type;
++  return Array(n);
++}
++Array contraction(std::int32_t profile, int m = 1) {
++  auto x = leaf({1, m, 5120}, DType::kF32), w = leaf({17408, 640}, DType::kU32),
++       sc = leaf({17408, 80}, DType::kBF16), bi = leaf({17408, 80}, DType::kBF16);
++  auto q = std::make_shared<QuantPlanes>();
++  q->scales = sc.node();
++  q->biases = bi.node();
++  q->bits = 4;
++  q->group_size = 64;
++  q->in_features = 5120;
++  q->compute_profile_revision = profile;
++  w.node()->quant = q;
++  return linear(x, w);
++}
++struct Request {
++  backend::DeviceInfo device;
++  backend::AmdDeviceInfo amd;
++  std::array<Shape, 4> inputs{Shape{1, 1, 5120}, Shape{17408, 640}, Shape{17408, 80},
++                              Shape{17408, 80}};
++  std::array<DType, 4> dtypes{DType::kF32, DType::kU32, DType::kBF16, DType::kBF16};
++  KernelShapes shapes;
++  Request() {
++    device.arch = "gfx1201";
++    backend::apply_arch_defaults(device, amd);
++    device.extension_id = backend::AmdDeviceInfo::kExtensionId;
++    device.extension = &amd;
++    shapes.inputs = inputs;
++    shapes.input_dtypes = dtypes;
++    shapes.output = {1, 1, 17408};
++    shapes.device = &device;
++    shapes.iattrs = {4, 64, kernels::kQwen27BQ4ComputeRevision, 0};
++  }
++};
++}
++LSE_TEST(sha256_known_vectors_padding_streaming_and_mutation) {
++  const std::array<std::pair<std::string, std::string>, 4> vectors{
++      {{"", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
++       {"abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"},
++       {"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
++        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"},
++       {std::string(1000000, 'a'),
++        "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"}}};
++  for (const auto& [input, expected] : vectors) {
++    LSE_EXPECT(sha256(input) == expected);
++    for (auto stride : {1u, 7u, 64u, 4096u}) LSE_EXPECT(incremental(input, stride) == expected);
++  }
++  for (auto n : {55u, 56u, 63u, 64u, 65u, 119u, 120u, 128u}) {
++    auto input = std::string(n, 'x');
++    LSE_EXPECT(sha256(input) == incremental(input, 13));
++    auto original = sha256(input);
++    input[n / 2] = 'y';
++    LSE_EXPECT(sha256(input) != original);
++  }
++}
++LSE_TEST(qualification_requires_exact_config_and_all_shard_content) {
++  const std::string_view cfg = "14b65a0ee06517060a6bbd979bb1a8ff54e7b304b1a1f01d54344b88b8285e85";
++  std::array<std::string_view, 3> shards{
++      "471a9a81b54dddbfef43e8a71960ca24ad3c727891c6b0750a9db9a214aab504",
++      "e7474b8f968f4078dfd4889925961c5b0da9939219b614dba08eb63c46590de7",
++      "1038989bed1346ecdb541a45c078df2aae99a9509f35bfd51e7a04802a5d8402"};
++  LSE_EXPECT(model::qualified_q4_digests(cfg, shards));
++  LSE_EXPECT(!model::qualified_q4_digests("same architecture different content", shards));
++  LSE_EXPECT(!model::qualified_q4_digests(cfg, std::span(shards).first(2)));
++  shards[1] = "mutated fine-tune";
++  LSE_EXPECT(!model::qualified_q4_digests(cfg, shards));
++}
++LSE_TEST(mapped_content_digest_rejects_a_mutated_shard) {
++  namespace fs = std::filesystem;
++  const auto dir = fs::temp_directory_path() / "lse-q4-profile-mapped-test";
++  fs::create_directories(dir);
++  std::string header = R"({"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}})";
++  const std::uint64_t n = header.size();
++  std::string file(reinterpret_cast<const char*>(&n), sizeof(n));
++  file += header;
++  file.append(4, '\0');
++  auto write = [&](const fs::path& path, const std::string& content) {
++    std::ofstream o(path, std::ios::binary);
++    o.write(content.data(), static_cast<std::streamsize>(content.size()));
++  };
++  write(dir / "a.safetensors", file);
++  auto first = model::SafeTensors::open((dir / "a.safetensors").string());
++  LSE_EXPECT(first.ok());
++  const auto digest = sha256(file);
++  const std::array<std::string_view, 1> expected{digest};
++  if (first.ok()) {
++    LSE_EXPECT(first->content_sha256_matches(expected));
++    LSE_EXPECT(!first->content_sha256_matches({}));
++  }
++  file.back() = 1;
++  write(dir / "b.safetensors", file);
++  auto second = model::SafeTensors::open((dir / "b.safetensors").string());
++  LSE_EXPECT(second.ok());
++  if (second.ok()) LSE_EXPECT(!second->content_sha256_matches(expected));
++  fs::remove_all(dir);
++}
++LSE_TEST(automatic_override_and_shape_scope_are_fail_closed) {
++  LSE_EXPECT(model::qualified_q4_load_scope(1, false));
++  LSE_EXPECT(!model::qualified_q4_load_scope(0, false));
++  LSE_EXPECT(!model::qualified_q4_load_scope(2, false));
++  LSE_EXPECT(!model::qualified_q4_load_scope(1, true));
++  using P = kernels::ActivationInt8Policy;
++  LSE_EXPECT(kernels::parse_activation_int8_policy(nullptr) == P::kAutomatic);
++  for (auto text : {"0", "", "yes", "true", " 1", "2"})
++    LSE_EXPECT(kernels::parse_activation_int8_policy(text) == P::kExact);
++  LSE_EXPECT(kernels::parse_activation_int8_policy("1") == P::kEnabled);
++  Request r;
++  LSE_EXPECT(kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
++  r.inputs[0] = {1, 5120};
++  LSE_EXPECT(kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
++  r.inputs[0] = {5120};
++  LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
++  r.inputs[0] = {1, 1, 1, 5120};
++  LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
++  r.inputs[0] = {1, 1, 5120};
++  LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kExact));
++  r.shapes.iattrs[2] = 0;
++  LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
++  LSE_EXPECT(kernels::activation_int8_enabled(r.shapes, P::kEnabled));
++  r.shapes.iattrs[2] = 1;
++  for (int m : {2, 16, 64, 256, 1024}) {
++    r.inputs[0] = {1, m, 5120};
++    r.shapes.output = {1, m, 17408};
++    LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
++  }
++  r.inputs[0] = {1, 512, 5120};
++  r.shapes.output = {1, 512, 17408};
++  LSE_EXPECT(kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
++  r.device.arch = "gfx1200";
++  LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
++  r.device.arch = "gfx1201";
++  r.device.wavefront_size = 64;
++  LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
++  r.device.wavefront_size = 32;
++  r.shapes.output_dtype = DType::kF16;
++  LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
++  r.shapes.output_dtype = DType::kF32;
++  r.dtypes[3] = DType::kF16;
++  LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
++  r.dtypes[3] = DType::kBF16;
++  r.dtypes[0] = DType::kF16;
++  LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
++  r.dtypes[0] = DType::kF32;
++  r.dtypes[2] = DType::kF16;
++  LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
++  r.dtypes[2] = DType::kBF16;
++  r.shapes.iattrs[0] = 6;
++  LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
++  r.shapes.iattrs[0] = 4;
++  r.shapes.iattrs[1] = 128;
++  LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
++  r.shapes.iattrs[1] = 64;
++  r.shapes.staged.name = "caller-owned";
++  LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
++  r.shapes.staged.name = {};
++  r.inputs[0] = {2, 256, 5120};
++  LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
++}
++LSE_TEST(metadata_propagation_mixed_models_and_cache_domains) {
++  Request r;
++  backend::LoomEmitter loom;
++  backend::HipEmitter hip;
++  auto qualified = contraction(1), unknown = contraction(0), another = contraction(1);
++  LSE_EXPECT(qualified.node()->iattrs[2] == 1 && unknown.node()->iattrs[2] == 0);
++  auto group = [](const Array& a) {
++    const NodePtr roots[]{a.node()};
++    auto groups = Partitioner::partition(roots);
++    for (const auto& g : groups)
++      if (g.anchor == OpKind::kQuantMatMul) return g;
++    return groups.back();
++  };
++  auto a = group(qualified), b = group(unknown), c = group(another);
++  auto la = loom.cache_key(a, r.device), lb = loom.cache_key(b, r.device),
++       lc = loom.cache_key(c, r.device);
++  auto ha = hip.cache_key(a, r.device), hb = hip.cache_key(b, r.device),
++       hc = hip.cache_key(c, r.device);
++  LSE_EXPECT(la != lb && la == lc && ha != hb && ha == hc);
++  auto unknown_code = loom.emit(b, r.device);
++  LSE_EXPECT(unknown_code.ok());
++  if (unknown_code.ok() &&
++      kernels::activation_int8_policy() != kernels::ActivationInt8Policy::kEnabled)
++    LSE_EXPECT(unknown_code->source.find("vector.dot4i") == std::string::npos &&
++               unknown_code->source.find("vector.mma") == std::string::npos);
++  auto emitted = loom.emit(a, r.device);
++  LSE_EXPECT(emitted.ok());
++  if (!emitted.ok()) std::fprintf(stderr, "EMIT %s\n", emitted.status().to_string().c_str());
++  bool expected_dot = kernels::activation_int8_policy() != kernels::ActivationInt8Policy::kExact &&
++                      !kernels::q4_decode_exact_enabled();
++  if (emitted.ok())
++    LSE_EXPECT((emitted->source.find("vector.dot4i") != std::string::npos) == expected_dot);
++  auto mid = contraction(1, 256);
++  auto mid_group = group(mid);
++  auto mid_code = loom.emit(mid_group, r.device);
++  LSE_EXPECT(mid_code.ok());
++  if (!mid_code.ok()) std::fprintf(stderr, "MID %s\n", mid_code.status().to_string().c_str());
++  if (mid_code.ok() &&
++      kernels::activation_int8_policy() == kernels::ActivationInt8Policy::kAutomatic)
++    LSE_EXPECT(mid_code->source.find("vector.mma") == std::string::npos &&
++               mid_code->source.find("vector.dot4i") == std::string::npos);
++  auto pp = contraction(1, 512);
++  auto pp_code = loom.emit(group(pp), r.device);
++  LSE_EXPECT(pp_code.ok());
++  if (!pp_code.ok()) std::fprintf(stderr, "PP %s\n", pp_code.status().to_string().c_str());
++  if (pp_code.ok())
++    LSE_EXPECT((pp_code->source.find("vector.mma") != std::string::npos) ==
++               (kernels::activation_int8_policy() != kernels::ActivationInt8Policy::kExact));
++  auto packed = Array(qualified.node()->inputs[1]);
++  auto q = packed.node()->quant;
++  auto replacement = leaf(q->scales->shape, DType::kBF16);
++  auto altered = quant_linear(Array(qualified.node()->inputs[0]), packed, replacement,
++                              Array(q->biases), 4, 64);
++  LSE_EXPECT(altered.node()->iattrs[2] == 0);
++  auto ids = leaf({1, 1}, DType::kI32);
++  auto emb = embedding(packed, ids);
++  LSE_EXPECT(emb.node()->kind == OpKind::kQuantEmbedding && emb.node()->iattrs[2] == 0);
++  auto idx = leaf({1, 1}, DType::kF32), expert = leaf({2, 17408, 640}, DType::kU32);
++  auto eq = std::make_shared<QuantPlanes>(*q);
++  eq->scales = leaf({2, 17408, 80}, DType::kBF16).node();
++  eq->biases = leaf({2, 17408, 80}, DType::kBF16).node();
++  expert.node()->quant = eq;
++  auto routed = linear_indexed(Array(qualified.node()->inputs[0]), expert, idx, 0);
++  LSE_EXPECT(routed.node()->kind == OpKind::kMoEDispatch && routed.node()->iattrs[1] == 4 &&
++             routed.node()->iattrs[2] == 64 && routed.node()->iattrs[3] == 0);
++  std::printf("CACHE policy=%u loom=%llu hip=%llu unknown_loom=%llu exact_override=%u\n",
++              unsigned(kernels::activation_int8_policy()), (unsigned long long)la,
++              (unsigned long long)ha, (unsigned long long)lb,
++              unsigned(kernels::q4_decode_exact_enabled()));
 +}
 +LSE_TEST_MAIN()
 diff --git a/tests/test_backend_cpu.cpp b/tests/test_backend_cpu.cpp
@@ -20048,6 +20608,193 @@ index 0000000..f0f192c
 +  }
 +  std::puts("server shutdown: timeout, normal return, startup race, socket worker drain PASS");
 +}
+diff --git a/tests/test_sq_profiler.cpp b/tests/test_sq_profiler.cpp
+new file mode 100644
+index 0000000..cef22cd
+--- /dev/null
++++ b/tests/test_sq_profiler.cpp
+@@ -0,0 +1,181 @@
++#include "harness.hpp"
++#include "../src/backends/hrx/sq_profiler.hpp"
++
++#include <cstddef>
++#include <cstdint>
++#include <string_view>
++#include <vector>
++
++namespace {
++
++using Bytes = std::vector<std::uint8_t>;
++using lse::hrx::SqProfileParseState;
++using lse::hrx::SqProfileWindow;
++using lse::hrx::parse_sq_profile_bytes;
++
++void put_u32(Bytes& bytes, std::size_t at, std::uint32_t value) {
++  for (unsigned i = 0; i < 4; ++i) bytes[at + i] = (value >> (i * 8)) & 0xff;
++}
++
++void put_u64(Bytes& bytes, std::size_t at, std::uint64_t value) {
++  put_u32(bytes, at, static_cast<std::uint32_t>(value));
++  put_u32(bytes, at + 4, static_cast<std::uint32_t>(value >> 32));
++}
++
++void append_text(Bytes& bytes, std::string_view text) {
++  bytes.insert(bytes.end(), text.begin(), text.end());
++}
++
++Bytes file_header() {
++  Bytes bytes(24);
++  put_u32(bytes, 0, 0x46505249u);
++  put_u32(bytes, 8, 24);
++  return bytes;
++}
++
++Bytes chunk(std::string_view content_type, const Bytes& payload,
++            std::string_view name = {}) {
++  Bytes bytes(104);
++  put_u64(bytes, 0, 104 + content_type.size() + name.size() + payload.size());
++  put_u64(bytes, 8, payload.size());
++  put_u32(bytes, 56, 104);
++  put_u32(bytes, 60, static_cast<std::uint32_t>(content_type.size()));
++  put_u32(bytes, 64, static_cast<std::uint32_t>(name.size()));
++  bytes[100] = 2;  // IRPF CHUNK
++  append_text(bytes, content_type);
++  append_text(bytes, name);
++  bytes.insert(bytes.end(), payload.begin(), payload.end());
++  return bytes;
++}
++
++Bytes counter_chunk() {
++  constexpr std::string_view block = "SQ";
++  constexpr std::string_view counter_name = "SQ_BUSY_CYCLES";
++  constexpr std::string_view description = "cycles";
++  Bytes payload(48);
++  put_u32(payload, 0, 48 + block.size() + counter_name.size() +
++                          description.size());
++  put_u32(payload, 28, 2);  // A nonzero value offset catches name misparsing.
++  put_u32(payload, 32, 1);
++  put_u32(payload, 36, block.size());
++  put_u32(payload, 40, counter_name.size());
++  put_u32(payload, 44, description.size());
++  append_text(payload, block);
++  append_text(payload, counter_name);
++  append_text(payload, description);
++  return chunk("application/vnd.iree.hal.profile.counters", payload,
++               "counter-metadata");
++}
++
++Bytes sample_chunk(std::uint64_t busy, bool with_ticks = true) {
++  Bytes payload(112 + 3 * 8);
++  put_u32(payload, 0, static_cast<std::uint32_t>(payload.size()));
++  put_u32(payload, 4, with_ticks ? 4 : 0);
++  put_u64(payload, 72, 100);
++  put_u64(payload, 80, 150);
++  put_u32(payload, 104, 3);
++  put_u64(payload, 112, 11);
++  put_u64(payload, 120, 22);
++  put_u64(payload, 128, busy);
++  return chunk("application/vnd.iree.hal.profile.counter-samples", payload,
++               "dispatch-samples");
++}
++
++void append(Bytes& into, const Bytes& from) {
++  into.insert(into.end(), from.begin(), from.end());
++}
++
++}  // namespace
++
++LSE_TEST(sq_profile_parses_metadata_and_sample_payload_at_wire_offsets) {
++  Bytes bytes = file_header();
++  append(bytes, counter_chunk());
++  append(bytes, sample_chunk(333));
++  SqProfileParseState state;
++  SqProfileWindow window;
++  std::size_t consumed = 0;
++  LSE_EXPECT(parse_sq_profile_bytes(bytes.data(), bytes.size(), true, state,
++                                    window, consumed));
++  LSE_EXPECT_EQ(consumed, bytes.size());
++  LSE_EXPECT(state.have_busy_counter);
++  LSE_EXPECT_EQ(state.busy_value_offset, 2u);
++  LSE_EXPECT_EQ(window.busy, 333u);
++  LSE_EXPECT_EQ(window.reference_ticks, 50u);
++  LSE_EXPECT_EQ(window.sample_count, 1u);
++}
++
++LSE_TEST(sq_profile_only_publishes_new_complete_samples) {
++  Bytes first = file_header();
++  append(first, counter_chunk());
++  SqProfileParseState state;
++  SqProfileWindow window;
++  std::size_t consumed = 0;
++  LSE_EXPECT(parse_sq_profile_bytes(first.data(), first.size(), true, state,
++                                    window, consumed));
++  LSE_EXPECT_EQ(consumed, first.size());
++  LSE_EXPECT_EQ(window.sample_count, 0u);
++
++  Bytes second = sample_chunk(7, false);
++  const std::size_t partial_size = second.size() / 2;
++  LSE_EXPECT(parse_sq_profile_bytes(second.data(), partial_size, false, state,
++                                    window, consumed));
++  LSE_EXPECT_EQ(consumed, 0u);
++  LSE_EXPECT_EQ(window.sample_count, 0u);
++  LSE_EXPECT(parse_sq_profile_bytes(second.data(), second.size(), false,
++                                    state, window, consumed));
++  LSE_EXPECT_EQ(consumed, second.size());
++  LSE_EXPECT_EQ(window.busy, 7u);
++  LSE_EXPECT_EQ(window.reference_ticks, 0u);
++  LSE_EXPECT_EQ(window.sample_count, 1u);
++
++  LSE_EXPECT(parse_sq_profile_bytes(nullptr, 0, false, state, window, consumed));
++  LSE_EXPECT_EQ(consumed, 0u);
++  LSE_EXPECT_EQ(window.busy, 0u);
++  LSE_EXPECT_EQ(window.sample_count, 0u);
++}
++
++LSE_TEST(sq_profile_does_not_guess_a_counter_without_metadata) {
++  Bytes bytes = file_header();
++  append(bytes, sample_chunk(99));
++  SqProfileParseState state;
++  SqProfileWindow window;
++  std::size_t consumed = 0;
++  LSE_EXPECT(parse_sq_profile_bytes(bytes.data(), bytes.size(), true, state,
++                                    window, consumed));
++  LSE_EXPECT_EQ(consumed, bytes.size());
++  LSE_EXPECT_EQ(window.busy, 0u);
++  LSE_EXPECT_EQ(window.reference_ticks, 0u);
++  LSE_EXPECT_EQ(window.sample_count, 0u);
++}
++
++LSE_TEST(sq_profile_rejects_malformed_counter_and_sample_lengths) {
++  Bytes bytes = file_header();
++  Bytes counter = counter_chunk();
++  const std::size_t counter_payload = 104 +
++      std::string_view("application/vnd.iree.hal.profile.counters").size() +
++      std::string_view("counter-metadata").size();
++  put_u32(counter, counter_payload + 40, 0xffffffffu);
++  append(bytes, counter);
++  SqProfileParseState state;
++  SqProfileWindow window;
++  std::size_t consumed = 0;
++  LSE_EXPECT(!parse_sq_profile_bytes(bytes.data(), bytes.size(), true, state,
++                                     window, consumed));
++  LSE_EXPECT_EQ(consumed, 0u);
++  LSE_EXPECT(!state.have_busy_counter);
++
++  bytes = file_header();
++  append(bytes, counter_chunk());
++  Bytes sample = sample_chunk(9);
++  const std::size_t sample_payload = 104 +
++      std::string_view("application/vnd.iree.hal.profile.counter-samples").size() +
++      std::string_view("dispatch-samples").size();
++  put_u32(sample, sample_payload + 104, 4);  // Only three values are present.
++  append(bytes, sample);
++  LSE_EXPECT(!parse_sq_profile_bytes(bytes.data(), bytes.size(), true, state,
++                                     window, consumed));
++  LSE_EXPECT_EQ(consumed, 0u);
++  LSE_EXPECT(!state.have_busy_counter);
++}
++
++LSE_TEST_MAIN()
 diff --git a/tests/test_submission_constants.cpp b/tests/test_submission_constants.cpp
 new file mode 100644
 index 0000000..9452333
@@ -20449,745 +21196,6 @@ index 0000000..622a821
 +      "[token-ids] {\"prompt_ids\":[],\"generated_ids\":[],"
 +      "\"stop_tokens_excluded\":true}\n");
 +}
-+LSE_TEST_MAIN()
-diff --git a/include/lse/core/sha256.hpp b/include/lse/core/sha256.hpp
-new file mode 100644
-index 0000000..d83a559
---- /dev/null
-+++ b/include/lse/core/sha256.hpp
-@@ -0,0 +1,27 @@
-+#pragma once
-+
-+#include <array>
-+#include <cstddef>
-+#include <cstdint>
-+#include <span>
-+#include <string>
-+#include <string_view>
-+namespace lse {
-+class Sha256 {
-+ public:
-+  void update(std::span<const std::byte> bytes) noexcept;
-+  [[nodiscard]] std::array<std::byte, 32> finish() noexcept;
-+
-+ private:
-+  void block(const std::byte* bytes) noexcept;
-+  std::array<std::uint32_t, 8> state_{0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
-+                                      0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u};
-+  std::array<std::byte, 64> tail_{};
-+  std::uint64_t bytes_ = 0;
-+  std::size_t used_ = 0;
-+};
-+[[nodiscard]] std::string sha256(std::span<const std::byte> bytes);
-+[[nodiscard]] inline std::string sha256(std::string_view text) {
-+  return sha256(std::as_bytes(std::span(text.data(), text.size())));
-+}
-+}
-diff --git a/include/lse/model/compute_profile.hpp b/include/lse/model/compute_profile.hpp
-new file mode 100644
-index 0000000..b6a3661
---- /dev/null
-+++ b/include/lse/model/compute_profile.hpp
-@@ -0,0 +1,16 @@
-+#pragma once
-+
-+#include <cstdint>
-+#include <span>
-+#include <string_view>
-+namespace lse::model {
-+struct Config;
-+[[nodiscard]] constexpr bool qualified_q4_load_scope(std::size_t device_count,
-+                                                     bool split) noexcept {
-+  return device_count == 1 && !split;
-+}
-+class SafeTensors;
-+[[nodiscard]] bool qualified_q4_digests(std::string_view config,
-+                                        std::span<const std::string_view> shards) noexcept;
-+[[nodiscard]] std::int32_t qualified_q4_compute(const Config&, const SafeTensors&);
-+}
-diff --git a/src/core/sha256.cpp b/src/core/sha256.cpp
-new file mode 100644
-index 0000000..619d9f7
---- /dev/null
-+++ b/src/core/sha256.cpp
-@@ -0,0 +1,124 @@
-+#include "lse/core/sha256.hpp"
-+#include <algorithm>
-+#include <bit>
-+#include <cstring>
-+#if defined(__APPLE__)
-+#include <CommonCrypto/CommonDigest.h>
-+#endif
-+namespace lse {
-+namespace {
-+constexpr std::uint32_t k[64] = {
-+    0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u, 0x3956c25bu, 0x59f111f1u, 0x923f82a4u,
-+    0xab1c5ed5u, 0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u, 0x72be5d74u, 0x80deb1feu,
-+    0x9bdc06a7u, 0xc19bf174u, 0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu, 0x2de92c6fu,
-+    0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau, 0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u,
-+    0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u, 0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu,
-+    0x53380d13u, 0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u, 0xa2bfe8a1u, 0xa81a664bu,
-+    0xc24b8b70u, 0xc76c51a3u, 0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u, 0x19a4c116u,
-+    0x1e376c08u, 0x2748774cu, 0x34b0bcb5u, 0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
-+    0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u, 0x90befffau, 0xa4506cebu, 0xbef9a3f7u,
-+    0xc67178f2u};
-+std::uint32_t get32(const std::byte* p) {
-+  return std::uint32_t(p[0]) << 24 | std::uint32_t(p[1]) << 16 | std::uint32_t(p[2]) << 8 |
-+         std::uint32_t(p[3]);
-+}
-+}
-+void Sha256::block(const std::byte* p) noexcept {
-+  std::uint32_t w[64];
-+  for (unsigned i = 0; i < 16; ++i) w[i] = get32(p + 4 * i);
-+  for (unsigned i = 16; i < 64; ++i) {
-+    auto a = w[i - 15], b = w[i - 2];
-+    auto s0 = std::rotr(a, 7) ^ std::rotr(a, 18) ^ (a >> 3);
-+    auto s1 = std::rotr(b, 17) ^ std::rotr(b, 19) ^ (b >> 10);
-+    w[i] = w[i - 16] + s0 + w[i - 7] + s1;
-+  }
-+  auto a = state_[0], b = state_[1], c = state_[2], d = state_[3], e = state_[4], f = state_[5],
-+       g = state_[6], h = state_[7];
-+  for (unsigned i = 0; i < 64; ++i) {
-+    auto s1 = std::rotr(e, 6) ^ std::rotr(e, 11) ^ std::rotr(e, 25);
-+    auto t1 = h + s1 + ((e & f) ^ ((~e) & g)) + k[i] + w[i];
-+    auto s0 = std::rotr(a, 2) ^ std::rotr(a, 13) ^ std::rotr(a, 22);
-+    auto t2 = s0 + ((a & b) ^ (a & c) ^ (b & c));
-+    h = g;
-+    g = f;
-+    f = e;
-+    e = d + t1;
-+    d = c;
-+    c = b;
-+    b = a;
-+    a = t1 + t2;
-+  }
-+  state_[0] += a;
-+  state_[1] += b;
-+  state_[2] += c;
-+  state_[3] += d;
-+  state_[4] += e;
-+  state_[5] += f;
-+  state_[6] += g;
-+  state_[7] += h;
-+}
-+void Sha256::update(std::span<const std::byte> p) noexcept {
-+  bytes_ += p.size();
-+  if (used_) {
-+    auto take = std::min(64 - used_, p.size());
-+    if (take) std::memcpy(tail_.data() + used_, p.data(), take);
-+    used_ += take;
-+    p = p.subspan(take);
-+    if (used_ == 64) {
-+      block(tail_.data());
-+      used_ = 0;
-+    }
-+  }
-+  while (p.size() >= 64) {
-+    block(p.data());
-+    p = p.subspan(64);
-+  }
-+  if (!p.empty()) {
-+    std::memcpy(tail_.data(), p.data(), p.size());
-+    used_ = p.size();
-+  }
-+}
-+std::array<std::byte, 32> Sha256::finish() noexcept {
-+  const auto bits = bytes_ * 8;
-+  tail_[used_++] = std::byte{0x80};
-+  if (used_ > 56) {
-+    std::fill(tail_.begin() + used_, tail_.end(), std::byte{0});
-+    block(tail_.data());
-+    used_ = 0;
-+  }
-+  std::fill(tail_.begin() + used_, tail_.begin() + 56, std::byte{0});
-+  for (unsigned i = 0; i < 8; ++i) tail_[63 - i] = std::byte((bits >> (8 * i)) & 255);
-+  block(tail_.data());
-+  std::array<std::byte, 32> out;
-+  for (unsigned i = 0; i < 8; ++i)
-+    for (unsigned j = 0; j < 4; ++j) out[4 * i + j] = std::byte((state_[i] >> (24 - 8 * j)) & 255);
-+  return out;
-+}
-+std::string sha256(std::span<const std::byte> bytes) {
-+  std::array<std::byte, 32> digest;
-+#if defined(__APPLE__)
-+  // The portable incremental implementation remains independently testable.
-+  // Use platform acceleration for multi-gigabyte checkpoint admission.
-+  CC_SHA256_CTX state;
-+  CC_SHA256_Init(&state);
-+  while (!bytes.empty()) {
-+    const auto count = std::min<std::size_t>(bytes.size(), 1u << 24);
-+    CC_SHA256_Update(&state, bytes.data(), static_cast<CC_LONG>(count));
-+    bytes = bytes.subspan(count);
-+  }
-+  CC_SHA256_Final(reinterpret_cast<unsigned char*>(digest.data()), &state);
-+#else
-+  Sha256 h;
-+  h.update(bytes);
-+  digest = h.finish();
-+#endif
-+  std::string out(64, '0');
-+  constexpr char hex[] = "0123456789abcdef";
-+  for (std::size_t i = 0; i < digest.size(); ++i) {
-+    auto v = std::uint8_t(digest[i]);
-+    out[2 * i] = hex[v >> 4];
-+    out[2 * i + 1] = hex[v & 15];
-+  }
-+  return out;
-+}
-+}
-diff --git a/src/kernels/int8_policy.cpp b/src/kernels/int8_policy.cpp
-new file mode 100644
-index 0000000..e031858
---- /dev/null
-+++ b/src/kernels/int8_policy.cpp
-@@ -0,0 +1,24 @@
-+#include "lse/kernels/int8_policy.hpp"
-+#include "lse/graph/kernel_primitive.hpp"
-+namespace lse::kernels {
-+bool activation_int8_enabled(const graph::KernelShapes& s, ActivationInt8Policy policy) noexcept {
-+  if (policy == ActivationInt8Policy::kEnabled) return true;
-+  if (policy == ActivationInt8Policy::kExact) return false;
-+  if (s.iattrs[2] != kQwen27BQ4ComputeRevision || s.iattrs[0] != 4 || s.iattrs[1] != 64 ||
-+      !s.device || s.device->arch != "gfx1201" || s.device->wavefront_size != 32 ||
-+      s.inputs.size() != 4 || s.input_dtypes.size() != 4 || s.inputs[1].rank() != 2 ||
-+      s.input_dtypes[0] != DType::kF32 || s.input_dtypes[1] != DType::kU32 ||
-+      s.input_dtypes[2] != DType::kBF16 || s.input_dtypes[3] != DType::kBF16 ||
-+      s.output_dtype != DType::kF32 || !s.staged.name.empty() || !s.staged_quant.codes.empty())
-+    return false;
-+  auto n = s.inputs[1].dim(0);
-+  if (n <= 0 || s.output.elem_count() % static_cast<std::size_t>(n)) return false;
-+  const auto m = s.output.elem_count() / static_cast<std::size_t>(n);
-+  if (m != 1 && m != 512) return false;
-+  if (s.inputs[0].rank() != 2 && s.inputs[0].rank() != 3) return false;
-+  if (s.inputs[0].rank() == 3 && s.inputs[0].dim(0) != 1) return false;
-+  const auto k = s.inputs[1].dim(1) * 8;
-+  return k > 0 && k % 64 == 0 && s.inputs[0].rank() > 0 &&
-+         s.inputs[0].dim(s.inputs[0].rank() - 1) == k;
-+}
-+}
-diff --git a/src/model/compute_profile.cpp b/src/model/compute_profile.cpp
-new file mode 100644
-index 0000000..6c5c03a
---- /dev/null
-+++ b/src/model/compute_profile.cpp
-@@ -0,0 +1,58 @@
-+#include "lse/model/compute_profile.hpp"
-+#include "lse/model/config.hpp"
-+#include "lse/model/weights.hpp"
-+#include "lse/core/sha256.hpp"
-+#include "lse/kernels/int8_policy.hpp"
-+#include <array>
-+#include <filesystem>
-+#include <fstream>
-+#include <sstream>
-+namespace lse::model {
-+namespace {
-+constexpr std::string_view config_digest =
-+    "14b65a0ee06517060a6bbd979bb1a8ff54e7b304b1a1f01d54344b88b8285e85";
-+constexpr std::array<std::string_view, 3> shards = {
-+    "471a9a81b54dddbfef43e8a71960ca24ad3c727891c6b0750a9db9a214aab504",
-+    "e7474b8f968f4078dfd4889925961c5b0da9939219b614dba08eb63c46590de7",
-+    "1038989bed1346ecdb541a45c078df2aae99a9509f35bfd51e7a04802a5d8402"};
-+}
-+bool qualified_q4_digests(std::string_view config,
-+                          std::span<const std::string_view> actual) noexcept {
-+  if (config != config_digest || actual.size() != shards.size()) return false;
-+  for (std::size_t i = 0; i < shards.size(); ++i)
-+    if (actual[i] != shards[i]) return false;
-+  return true;
-+}
-+std::int32_t qualified_q4_compute(const Config& config, const SafeTensors& weights) {
-+  // Fail closed before streaming any shard for unknown architectures/geometry.
-+  if (config.hidden_size != 5120 || config.num_layers != 64 || config.vocab_size != 248320 ||
-+      config.mlp_intermediate != 17408 || !weights.path().ends_with(".index.json"))
-+    return 0;
-+  std::ifstream input(std::filesystem::path(weights.path()).parent_path() / "config.json",
-+                      std::ios::binary);
-+  if (!input) return 0;
-+  std::ostringstream buffer;
-+  buffer << input.rdbuf();
-+  const auto text = buffer.str();
-+  if (sha256(text) != config_digest) return 0;
-+  auto expected = Config::from_json_string(text);
-+  if (!expected.ok()) return 0;
-+  // Runtime KV reservation is allocation policy; other model changes invalidate qualification.
-+  auto actual = config;
-+  actual.kv_length = 0;
-+  expected->kv_length = 0;
-+  // This runtime flag is not serialized by Config::to_json().
-+  if (actual.moe_bias_balance != expected->moe_bias_balance) return 0;
-+  if (actual.to_json() != expected->to_json()) return 0;
-+  // Config::to_json omits quantization; compare every mapped plane's resolved geometry too.
-+  for (const auto& [name, view] : weights.tensors()) {
-+    if (view.dtype != DType::kU32) continue;
-+    if (actual.quantization.is_skipped(name) != expected->quantization.is_skipped(name)) return 0;
-+    const auto a = actual.quantization.resolve(name), b = expected->quantization.resolve(name);
-+    if (a.ok() != b.ok()) return 0;
-+    if (a.ok() && (a->bits != b->bits || a->group_size != b->group_size)) return 0;
-+  }
-+  if (!weights.content_sha256_matches(shards)) return 0;
-+  return kernels::kQwen27BQ4ComputeRevision;
-+}
-+}
-diff --git a/tests/test_automatic_q4.cpp b/tests/test_automatic_q4.cpp
-new file mode 100644
-index 0000000..4161c72
---- /dev/null
-+++ b/tests/test_automatic_q4.cpp
-@@ -0,0 +1,267 @@
-+#include "harness.hpp"
-+#include "lse/core/sha256.hpp"
-+#include "lse/kernels/int8_policy.hpp"
-+#include "lse/kernels/quant_operand_cache.hpp"
-+#include "lse/model/compute_profile.hpp"
-+#include "lse/model/config.hpp"
-+#include "lse/model/weights.hpp"
-+#include "lse/backends/hrx/arch_database.hpp"
-+#include "lse/backends/hrx/loomc/loom_emitter.hpp"
-+#include "lse/backends/hrx/hipc/hip_emitter.hpp"
-+#include "lse/graph/ops.hpp"
-+#include <array>
-+#include <chrono>
-+#include <cstdio>
-+#include <filesystem>
-+#include <fstream>
-+#include <string>
-+using namespace lse;
-+using namespace lse::graph;
-+namespace {
-+std::string incremental(std::string_view input, std::size_t stride) {
-+  Sha256 h;
-+  for (std::size_t i = 0; i < input.size(); i += stride)
-+    h.update(std::as_bytes(std::span(input.data() + i, std::min(stride, input.size() - i))));
-+  auto digest = h.finish();
-+  std::string out(64, '0');
-+  constexpr char hex[] = "0123456789abcdef";
-+  for (std::size_t i = 0; i < 32; ++i) {
-+    unsigned v = std::uint8_t(digest[i]);
-+    out[2 * i] = hex[v >> 4];
-+    out[2 * i + 1] = hex[v & 15];
-+  }
-+  return out;
-+}
-+Array leaf(Shape shape, DType type) {
-+  auto n = std::make_shared<Node>();
-+  n->shape = shape;
-+  n->dtype = type;
-+  return Array(n);
-+}
-+Array contraction(std::int32_t profile, int m = 1) {
-+  auto x = leaf({1, m, 5120}, DType::kF32), w = leaf({17408, 640}, DType::kU32),
-+       sc = leaf({17408, 80}, DType::kBF16), bi = leaf({17408, 80}, DType::kBF16);
-+  auto q = std::make_shared<QuantPlanes>();
-+  q->scales = sc.node();
-+  q->biases = bi.node();
-+  q->bits = 4;
-+  q->group_size = 64;
-+  q->in_features = 5120;
-+  q->compute_profile_revision = profile;
-+  w.node()->quant = q;
-+  return linear(x, w);
-+}
-+struct Request {
-+  backend::DeviceInfo device;
-+  backend::AmdDeviceInfo amd;
-+  std::array<Shape, 4> inputs{Shape{1, 1, 5120}, Shape{17408, 640}, Shape{17408, 80},
-+                              Shape{17408, 80}};
-+  std::array<DType, 4> dtypes{DType::kF32, DType::kU32, DType::kBF16, DType::kBF16};
-+  KernelShapes shapes;
-+  Request() {
-+    device.arch = "gfx1201";
-+    backend::apply_arch_defaults(device, amd);
-+    device.extension_id = backend::AmdDeviceInfo::kExtensionId;
-+    device.extension = &amd;
-+    shapes.inputs = inputs;
-+    shapes.input_dtypes = dtypes;
-+    shapes.output = {1, 1, 17408};
-+    shapes.device = &device;
-+    shapes.iattrs = {4, 64, kernels::kQwen27BQ4ComputeRevision, 0};
-+  }
-+};
-+}
-+LSE_TEST(sha256_known_vectors_padding_streaming_and_mutation) {
-+  const std::array<std::pair<std::string, std::string>, 4> vectors{
-+      {{"", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
-+       {"abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"},
-+       {"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
-+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"},
-+       {std::string(1000000, 'a'),
-+        "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"}}};
-+  for (const auto& [input, expected] : vectors) {
-+    LSE_EXPECT(sha256(input) == expected);
-+    for (auto stride : {1u, 7u, 64u, 4096u}) LSE_EXPECT(incremental(input, stride) == expected);
-+  }
-+  for (auto n : {55u, 56u, 63u, 64u, 65u, 119u, 120u, 128u}) {
-+    auto input = std::string(n, 'x');
-+    LSE_EXPECT(sha256(input) == incremental(input, 13));
-+    auto original = sha256(input);
-+    input[n / 2] = 'y';
-+    LSE_EXPECT(sha256(input) != original);
-+  }
-+}
-+LSE_TEST(qualification_requires_exact_config_and_all_shard_content) {
-+  const std::string_view cfg = "14b65a0ee06517060a6bbd979bb1a8ff54e7b304b1a1f01d54344b88b8285e85";
-+  std::array<std::string_view, 3> shards{
-+      "471a9a81b54dddbfef43e8a71960ca24ad3c727891c6b0750a9db9a214aab504",
-+      "e7474b8f968f4078dfd4889925961c5b0da9939219b614dba08eb63c46590de7",
-+      "1038989bed1346ecdb541a45c078df2aae99a9509f35bfd51e7a04802a5d8402"};
-+  LSE_EXPECT(model::qualified_q4_digests(cfg, shards));
-+  LSE_EXPECT(!model::qualified_q4_digests("same architecture different content", shards));
-+  LSE_EXPECT(!model::qualified_q4_digests(cfg, std::span(shards).first(2)));
-+  shards[1] = "mutated fine-tune";
-+  LSE_EXPECT(!model::qualified_q4_digests(cfg, shards));
-+}
-+LSE_TEST(mapped_content_digest_rejects_a_mutated_shard) {
-+  namespace fs = std::filesystem;
-+  const auto dir = fs::temp_directory_path() / "lse-q4-profile-mapped-test";
-+  fs::create_directories(dir);
-+  std::string header = R"({"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}})";
-+  const std::uint64_t n = header.size();
-+  std::string file(reinterpret_cast<const char*>(&n), sizeof(n));
-+  file += header;
-+  file.append(4, '\0');
-+  auto write = [&](const fs::path& path, const std::string& content) {
-+    std::ofstream o(path, std::ios::binary);
-+    o.write(content.data(), static_cast<std::streamsize>(content.size()));
-+  };
-+  write(dir / "a.safetensors", file);
-+  auto first = model::SafeTensors::open((dir / "a.safetensors").string());
-+  LSE_EXPECT(first.ok());
-+  const auto digest = sha256(file);
-+  const std::array<std::string_view, 1> expected{digest};
-+  if (first.ok()) {
-+    LSE_EXPECT(first->content_sha256_matches(expected));
-+    LSE_EXPECT(!first->content_sha256_matches({}));
-+  }
-+  file.back() = 1;
-+  write(dir / "b.safetensors", file);
-+  auto second = model::SafeTensors::open((dir / "b.safetensors").string());
-+  LSE_EXPECT(second.ok());
-+  if (second.ok()) LSE_EXPECT(!second->content_sha256_matches(expected));
-+  fs::remove_all(dir);
-+}
-+LSE_TEST(automatic_override_and_shape_scope_are_fail_closed) {
-+  LSE_EXPECT(model::qualified_q4_load_scope(1, false));
-+  LSE_EXPECT(!model::qualified_q4_load_scope(0, false));
-+  LSE_EXPECT(!model::qualified_q4_load_scope(2, false));
-+  LSE_EXPECT(!model::qualified_q4_load_scope(1, true));
-+  using P = kernels::ActivationInt8Policy;
-+  LSE_EXPECT(kernels::parse_activation_int8_policy(nullptr) == P::kAutomatic);
-+  for (auto text : {"0", "", "yes", "true", " 1", "2"})
-+    LSE_EXPECT(kernels::parse_activation_int8_policy(text) == P::kExact);
-+  LSE_EXPECT(kernels::parse_activation_int8_policy("1") == P::kEnabled);
-+  Request r;
-+  LSE_EXPECT(kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
-+  r.inputs[0] = {1, 5120};
-+  LSE_EXPECT(kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
-+  r.inputs[0] = {5120};
-+  LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
-+  r.inputs[0] = {1, 1, 1, 5120};
-+  LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
-+  r.inputs[0] = {1, 1, 5120};
-+  LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kExact));
-+  r.shapes.iattrs[2] = 0;
-+  LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
-+  LSE_EXPECT(kernels::activation_int8_enabled(r.shapes, P::kEnabled));
-+  r.shapes.iattrs[2] = 1;
-+  for (int m : {2, 16, 64, 256, 1024}) {
-+    r.inputs[0] = {1, m, 5120};
-+    r.shapes.output = {1, m, 17408};
-+    LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
-+  }
-+  r.inputs[0] = {1, 512, 5120};
-+  r.shapes.output = {1, 512, 17408};
-+  LSE_EXPECT(kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
-+  r.device.arch = "gfx1200";
-+  LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
-+  r.device.arch = "gfx1201";
-+  r.device.wavefront_size = 64;
-+  LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
-+  r.device.wavefront_size = 32;
-+  r.shapes.output_dtype = DType::kF16;
-+  LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
-+  r.shapes.output_dtype = DType::kF32;
-+  r.dtypes[3] = DType::kF16;
-+  LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
-+  r.dtypes[3] = DType::kBF16;
-+  r.dtypes[0] = DType::kF16;
-+  LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
-+  r.dtypes[0] = DType::kF32;
-+  r.dtypes[2] = DType::kF16;
-+  LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
-+  r.dtypes[2] = DType::kBF16;
-+  r.shapes.iattrs[0] = 6;
-+  LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
-+  r.shapes.iattrs[0] = 4;
-+  r.shapes.iattrs[1] = 128;
-+  LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
-+  r.shapes.iattrs[1] = 64;
-+  r.shapes.staged.name = "caller-owned";
-+  LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
-+  r.shapes.staged.name = {};
-+  r.inputs[0] = {2, 256, 5120};
-+  LSE_EXPECT(!kernels::activation_int8_enabled(r.shapes, P::kAutomatic));
-+}
-+LSE_TEST(metadata_propagation_mixed_models_and_cache_domains) {
-+  Request r;
-+  backend::LoomEmitter loom;
-+  backend::HipEmitter hip;
-+  auto qualified = contraction(1), unknown = contraction(0), another = contraction(1);
-+  LSE_EXPECT(qualified.node()->iattrs[2] == 1 && unknown.node()->iattrs[2] == 0);
-+  auto group = [](const Array& a) {
-+    const NodePtr roots[]{a.node()};
-+    auto groups = Partitioner::partition(roots);
-+    for (const auto& g : groups)
-+      if (g.anchor == OpKind::kQuantMatMul) return g;
-+    return groups.back();
-+  };
-+  auto a = group(qualified), b = group(unknown), c = group(another);
-+  auto la = loom.cache_key(a, r.device), lb = loom.cache_key(b, r.device),
-+       lc = loom.cache_key(c, r.device);
-+  auto ha = hip.cache_key(a, r.device), hb = hip.cache_key(b, r.device),
-+       hc = hip.cache_key(c, r.device);
-+  LSE_EXPECT(la != lb && la == lc && ha != hb && ha == hc);
-+  auto unknown_code = loom.emit(b, r.device);
-+  LSE_EXPECT(unknown_code.ok());
-+  if (unknown_code.ok() &&
-+      kernels::activation_int8_policy() != kernels::ActivationInt8Policy::kEnabled)
-+    LSE_EXPECT(unknown_code->source.find("vector.dot4i") == std::string::npos &&
-+               unknown_code->source.find("vector.mma") == std::string::npos);
-+  auto emitted = loom.emit(a, r.device);
-+  LSE_EXPECT(emitted.ok());
-+  if (!emitted.ok()) std::fprintf(stderr, "EMIT %s\n", emitted.status().to_string().c_str());
-+  bool expected_dot = kernels::activation_int8_policy() != kernels::ActivationInt8Policy::kExact &&
-+                      !kernels::q4_decode_exact_enabled();
-+  if (emitted.ok())
-+    LSE_EXPECT((emitted->source.find("vector.dot4i") != std::string::npos) == expected_dot);
-+  auto mid = contraction(1, 256);
-+  auto mid_group = group(mid);
-+  auto mid_code = loom.emit(mid_group, r.device);
-+  LSE_EXPECT(mid_code.ok());
-+  if (!mid_code.ok()) std::fprintf(stderr, "MID %s\n", mid_code.status().to_string().c_str());
-+  if (mid_code.ok() &&
-+      kernels::activation_int8_policy() == kernels::ActivationInt8Policy::kAutomatic)
-+    LSE_EXPECT(mid_code->source.find("vector.mma") == std::string::npos &&
-+               mid_code->source.find("vector.dot4i") == std::string::npos);
-+  auto pp = contraction(1, 512);
-+  auto pp_code = loom.emit(group(pp), r.device);
-+  LSE_EXPECT(pp_code.ok());
-+  if (!pp_code.ok()) std::fprintf(stderr, "PP %s\n", pp_code.status().to_string().c_str());
-+  if (pp_code.ok())
-+    LSE_EXPECT((pp_code->source.find("vector.mma") != std::string::npos) ==
-+               (kernels::activation_int8_policy() != kernels::ActivationInt8Policy::kExact));
-+  auto packed = Array(qualified.node()->inputs[1]);
-+  auto q = packed.node()->quant;
-+  auto replacement = leaf(q->scales->shape, DType::kBF16);
-+  auto altered = quant_linear(Array(qualified.node()->inputs[0]), packed, replacement,
-+                              Array(q->biases), 4, 64);
-+  LSE_EXPECT(altered.node()->iattrs[2] == 0);
-+  auto ids = leaf({1, 1}, DType::kI32);
-+  auto emb = embedding(packed, ids);
-+  LSE_EXPECT(emb.node()->kind == OpKind::kQuantEmbedding && emb.node()->iattrs[2] == 0);
-+  auto idx = leaf({1, 1}, DType::kF32), expert = leaf({2, 17408, 640}, DType::kU32);
-+  auto eq = std::make_shared<QuantPlanes>(*q);
-+  eq->scales = leaf({2, 17408, 80}, DType::kBF16).node();
-+  eq->biases = leaf({2, 17408, 80}, DType::kBF16).node();
-+  expert.node()->quant = eq;
-+  auto routed = linear_indexed(Array(qualified.node()->inputs[0]), expert, idx, 0);
-+  LSE_EXPECT(routed.node()->kind == OpKind::kMoEDispatch && routed.node()->iattrs[1] == 4 &&
-+             routed.node()->iattrs[2] == 64 && routed.node()->iattrs[3] == 0);
-+  std::printf("CACHE policy=%u loom=%llu hip=%llu unknown_loom=%llu exact_override=%u\n",
-+              unsigned(kernels::activation_int8_policy()), (unsigned long long)la,
-+              (unsigned long long)ha, (unsigned long long)lb,
-+              unsigned(kernels::q4_decode_exact_enabled()));
-+}
-+LSE_TEST_MAIN()
-diff --git a/tests/test_sq_profiler.cpp b/tests/test_sq_profiler.cpp
-new file mode 100644
-index 0000000..cef22cd
---- /dev/null
-+++ b/tests/test_sq_profiler.cpp
-@@ -0,0 +1,181 @@
-+#include "harness.hpp"
-+#include "../src/backends/hrx/sq_profiler.hpp"
-+
-+#include <cstddef>
-+#include <cstdint>
-+#include <string_view>
-+#include <vector>
-+
-+namespace {
-+
-+using Bytes = std::vector<std::uint8_t>;
-+using lse::hrx::SqProfileParseState;
-+using lse::hrx::SqProfileWindow;
-+using lse::hrx::parse_sq_profile_bytes;
-+
-+void put_u32(Bytes& bytes, std::size_t at, std::uint32_t value) {
-+  for (unsigned i = 0; i < 4; ++i) bytes[at + i] = (value >> (i * 8)) & 0xff;
-+}
-+
-+void put_u64(Bytes& bytes, std::size_t at, std::uint64_t value) {
-+  put_u32(bytes, at, static_cast<std::uint32_t>(value));
-+  put_u32(bytes, at + 4, static_cast<std::uint32_t>(value >> 32));
-+}
-+
-+void append_text(Bytes& bytes, std::string_view text) {
-+  bytes.insert(bytes.end(), text.begin(), text.end());
-+}
-+
-+Bytes file_header() {
-+  Bytes bytes(24);
-+  put_u32(bytes, 0, 0x46505249u);
-+  put_u32(bytes, 8, 24);
-+  return bytes;
-+}
-+
-+Bytes chunk(std::string_view content_type, const Bytes& payload,
-+            std::string_view name = {}) {
-+  Bytes bytes(104);
-+  put_u64(bytes, 0, 104 + content_type.size() + name.size() + payload.size());
-+  put_u64(bytes, 8, payload.size());
-+  put_u32(bytes, 56, 104);
-+  put_u32(bytes, 60, static_cast<std::uint32_t>(content_type.size()));
-+  put_u32(bytes, 64, static_cast<std::uint32_t>(name.size()));
-+  bytes[100] = 2;  // IRPF CHUNK
-+  append_text(bytes, content_type);
-+  append_text(bytes, name);
-+  bytes.insert(bytes.end(), payload.begin(), payload.end());
-+  return bytes;
-+}
-+
-+Bytes counter_chunk() {
-+  constexpr std::string_view block = "SQ";
-+  constexpr std::string_view counter_name = "SQ_BUSY_CYCLES";
-+  constexpr std::string_view description = "cycles";
-+  Bytes payload(48);
-+  put_u32(payload, 0, 48 + block.size() + counter_name.size() +
-+                          description.size());
-+  put_u32(payload, 28, 2);  // A nonzero value offset catches name misparsing.
-+  put_u32(payload, 32, 1);
-+  put_u32(payload, 36, block.size());
-+  put_u32(payload, 40, counter_name.size());
-+  put_u32(payload, 44, description.size());
-+  append_text(payload, block);
-+  append_text(payload, counter_name);
-+  append_text(payload, description);
-+  return chunk("application/vnd.iree.hal.profile.counters", payload,
-+               "counter-metadata");
-+}
-+
-+Bytes sample_chunk(std::uint64_t busy, bool with_ticks = true) {
-+  Bytes payload(112 + 3 * 8);
-+  put_u32(payload, 0, static_cast<std::uint32_t>(payload.size()));
-+  put_u32(payload, 4, with_ticks ? 4 : 0);
-+  put_u64(payload, 72, 100);
-+  put_u64(payload, 80, 150);
-+  put_u32(payload, 104, 3);
-+  put_u64(payload, 112, 11);
-+  put_u64(payload, 120, 22);
-+  put_u64(payload, 128, busy);
-+  return chunk("application/vnd.iree.hal.profile.counter-samples", payload,
-+               "dispatch-samples");
-+}
-+
-+void append(Bytes& into, const Bytes& from) {
-+  into.insert(into.end(), from.begin(), from.end());
-+}
-+
-+}  // namespace
-+
-+LSE_TEST(sq_profile_parses_metadata_and_sample_payload_at_wire_offsets) {
-+  Bytes bytes = file_header();
-+  append(bytes, counter_chunk());
-+  append(bytes, sample_chunk(333));
-+  SqProfileParseState state;
-+  SqProfileWindow window;
-+  std::size_t consumed = 0;
-+  LSE_EXPECT(parse_sq_profile_bytes(bytes.data(), bytes.size(), true, state,
-+                                    window, consumed));
-+  LSE_EXPECT_EQ(consumed, bytes.size());
-+  LSE_EXPECT(state.have_busy_counter);
-+  LSE_EXPECT_EQ(state.busy_value_offset, 2u);
-+  LSE_EXPECT_EQ(window.busy, 333u);
-+  LSE_EXPECT_EQ(window.reference_ticks, 50u);
-+  LSE_EXPECT_EQ(window.sample_count, 1u);
-+}
-+
-+LSE_TEST(sq_profile_only_publishes_new_complete_samples) {
-+  Bytes first = file_header();
-+  append(first, counter_chunk());
-+  SqProfileParseState state;
-+  SqProfileWindow window;
-+  std::size_t consumed = 0;
-+  LSE_EXPECT(parse_sq_profile_bytes(first.data(), first.size(), true, state,
-+                                    window, consumed));
-+  LSE_EXPECT_EQ(consumed, first.size());
-+  LSE_EXPECT_EQ(window.sample_count, 0u);
-+
-+  Bytes second = sample_chunk(7, false);
-+  const std::size_t partial_size = second.size() / 2;
-+  LSE_EXPECT(parse_sq_profile_bytes(second.data(), partial_size, false, state,
-+                                    window, consumed));
-+  LSE_EXPECT_EQ(consumed, 0u);
-+  LSE_EXPECT_EQ(window.sample_count, 0u);
-+  LSE_EXPECT(parse_sq_profile_bytes(second.data(), second.size(), false,
-+                                    state, window, consumed));
-+  LSE_EXPECT_EQ(consumed, second.size());
-+  LSE_EXPECT_EQ(window.busy, 7u);
-+  LSE_EXPECT_EQ(window.reference_ticks, 0u);
-+  LSE_EXPECT_EQ(window.sample_count, 1u);
-+
-+  LSE_EXPECT(parse_sq_profile_bytes(nullptr, 0, false, state, window, consumed));
-+  LSE_EXPECT_EQ(consumed, 0u);
-+  LSE_EXPECT_EQ(window.busy, 0u);
-+  LSE_EXPECT_EQ(window.sample_count, 0u);
-+}
-+
-+LSE_TEST(sq_profile_does_not_guess_a_counter_without_metadata) {
-+  Bytes bytes = file_header();
-+  append(bytes, sample_chunk(99));
-+  SqProfileParseState state;
-+  SqProfileWindow window;
-+  std::size_t consumed = 0;
-+  LSE_EXPECT(parse_sq_profile_bytes(bytes.data(), bytes.size(), true, state,
-+                                    window, consumed));
-+  LSE_EXPECT_EQ(consumed, bytes.size());
-+  LSE_EXPECT_EQ(window.busy, 0u);
-+  LSE_EXPECT_EQ(window.reference_ticks, 0u);
-+  LSE_EXPECT_EQ(window.sample_count, 0u);
-+}
-+
-+LSE_TEST(sq_profile_rejects_malformed_counter_and_sample_lengths) {
-+  Bytes bytes = file_header();
-+  Bytes counter = counter_chunk();
-+  const std::size_t counter_payload = 104 +
-+      std::string_view("application/vnd.iree.hal.profile.counters").size() +
-+      std::string_view("counter-metadata").size();
-+  put_u32(counter, counter_payload + 40, 0xffffffffu);
-+  append(bytes, counter);
-+  SqProfileParseState state;
-+  SqProfileWindow window;
-+  std::size_t consumed = 0;
-+  LSE_EXPECT(!parse_sq_profile_bytes(bytes.data(), bytes.size(), true, state,
-+                                     window, consumed));
-+  LSE_EXPECT_EQ(consumed, 0u);
-+  LSE_EXPECT(!state.have_busy_counter);
-+
-+  bytes = file_header();
-+  append(bytes, counter_chunk());
-+  Bytes sample = sample_chunk(9);
-+  const std::size_t sample_payload = 104 +
-+      std::string_view("application/vnd.iree.hal.profile.counter-samples").size() +
-+      std::string_view("dispatch-samples").size();
-+  put_u32(sample, sample_payload + 104, 4);  // Only three values are present.
-+  append(bytes, sample);
-+  LSE_EXPECT(!parse_sq_profile_bytes(bytes.data(), bytes.size(), true, state,
-+                                     window, consumed));
-+  LSE_EXPECT_EQ(consumed, 0u);
-+  LSE_EXPECT(!state.have_busy_counter);
-+}
-+
 +LSE_TEST_MAIN()
 diff --git a/tests/test_wave32_l2.cpp b/tests/test_wave32_l2.cpp
 new file mode 100644

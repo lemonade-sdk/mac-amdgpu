@@ -1,0 +1,55 @@
+{
+  "command": [
+    "/opt/homebrew/Cellar/llvm/21.1.8/bin/clang",
+    "-target",
+    "amdgcn-amd-amdhsa",
+    "-mcpu=gfx1201",
+    "-nogpulib",
+    "-x",
+    "cl",
+    "-cl-std=CL2.0",
+    "-O2",
+    "-c",
+    "./build/benchmarks/hrx-system-tests-20260927/latency.cl",
+    "-o",
+    "./build/benchmarks/hrx-system-tests-20260927/latency.o"
+  ],
+  "link_command": [
+    "/opt/homebrew/bin/ld.lld",
+    "-shared",
+    "--no-undefined",
+    "./build/benchmarks/hrx-system-tests-20260927/latency.o",
+    "-o",
+    "./build/benchmarks/hrx-system-tests-20260927/latency.hsaco"
+  ],
+  "trials": [
+    {
+      "trial": 0,
+      "compile_ms": 38.937417,
+      "link_ms": 109.78925,
+      "total_ms": 148.726667
+    },
+    {
+      "trial": 1,
+      "compile_ms": 39.228125,
+      "link_ms": 13.618125,
+      "total_ms": 52.84625
+    },
+    {
+      "trial": 2,
+      "compile_ms": 38.7105,
+      "link_ms": 13.58275,
+      "total_ms": 52.29325
+    },
+    {
+      "trial": 3,
+      "compile_ms": 39.226083,
+      "link_ms": 13.333875,
+      "total_ms": 52.559958
+    }
+  ],
+  "source_bytes": 2106,
+  "source_lines": 59,
+  "code_bytes": 10992,
+  "nonblank_lines": 57
+}

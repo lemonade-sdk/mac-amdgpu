@@ -1,0 +1,15 @@
+{
+  "captured_utc": "2026-09-28T02:27:08.305071+00:00",
+  "os": "macOS 26.6.2 (25G83)",
+  "host": "MacBook Pro (Mac17,6), Apple M5 Max",
+  "cpu_cores": 18,
+  "cpu_core_configuration": "6 Super, 12 Performance",
+  "memory_gb": 128,
+  "architecture": "arm64",
+  "host_compiler": "Homebrew clang version 21.1.8",
+  "mac_amdgpu_commit": "fde050c1b8a98a73ffa3cdc8ea2c1c95fe8a6531",
+  "lse_commit": "0f2ad2977d4ed54edaab04fdb50041c399042f25",
+  "monitor_running": true,
+  "server_workload_running": false,
+  "bandwidth_units": "GB/s decimal; buffer sizes MiB binary"
+}

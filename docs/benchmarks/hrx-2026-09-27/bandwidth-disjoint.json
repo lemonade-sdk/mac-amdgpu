@@ -1,0 +1,55 @@
+{
+  "start_utc": "2026-09-28T02:48:43.966929+00:00",
+  "elapsed_seconds": 3.9018769999966025,
+  "exit_code": 0,
+  "outer_deadline_seconds": 180,
+  "region_bytes": 12582912,
+  "regions": 8,
+  "payload_working_set_bytes": 100663296,
+  "allocation_layout": "eightseparate12MiBpayloadbuffersperendpoint; aggregate96MiB",
+  "allocation_api": "hrx_allocator_allocate_buffer (direct device allocator; avoids stream-pool slabs)",
+  "host_endpoint_count": 1,
+  "device_endpoint_count": 2,
+  "readback_policy": "H2DhostsourceverifiedbeforebeingreusedforfullVRAMreadback;D2HdestinationandVRAMsourcebothverified",
+  "host_buffers": "mapped coherent device-visible GTT",
+  "device_buffers": "DEVICE_LOCAL VRAM",
+  "warmups_per_direction": 1,
+  "trials_per_direction": 3,
+  "timing": "hoststeady record8disjointcopies+flush+completion; allocation/preparation/validation excluded",
+  "validation": "all96MiB source/destination payload plus4KiB guards per region checked eachtrial; freshpatterns; cleanshutdown",
+  "binary_sha256": "d04d7762c0d0abb2a3d5583b1cc5a350afcac2bb2ef758bfe1d8aa4c96300332",
+  "directions": {
+    "H2D": {
+      "median_GBps": 6.0401752709544345,
+      "min_GBps": 6.025923312609649,
+      "max_GBps": 6.066657887798226,
+      "trial_GBps": [
+        6.0401752709544345,
+        6.025923312609649,
+        6.066657887798226
+      ],
+      "n": 3
+    },
+    "D2H": {
+      "median_GBps": 6.627999292053298,
+      "min_GBps": 6.602387170826092,
+      "max_GBps": 6.63074675269712,
+      "trial_GBps": [
+        6.63074675269712,
+        6.627999292053298,
+        6.602387170826092
+      ],
+      "n": 3
+    }
+  },
+  "configured_GART_aperture_bytes": 268435456,
+  "GART_capacity_source": "dext/amdgpu/gmc_v12_0.cpp:kGARTInitialSize; sharedpoolcapacityuseshostwindow",
+  "allocation_size_bytes_each_HRX_buffer": 12591104,
+  "allocation_checks": "returnedHRXcapacityatleastrequested; everymappedhostallocationHSAmetadataCPU/GPUbaseidenticalandCOARSE_GRAINED",
+  "GPU_cache_basis": {
+    "Infinity_Cache_MiB": 64,
+    "L2_MiB": 8,
+    "source": "https://rocmdocs.amd.com/en/docs-7.2.4/reference/gpu-arch-specs.html"
+  },
+  "setup_failures": "failed-*logsretain512MiBsingleallocation,512MiBendpointset,192MiBdualhost/pool,andpointer-introspectionfailures; no timedcopydatafromthoseattempts"
+}

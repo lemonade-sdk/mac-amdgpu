@@ -1,0 +1,19 @@
+```text
+HRX / gfx1201 | M5 Max / 128 GB | macOS 26.6.2 | driver 204
+Test                       | Median      | Details
+---------------------------+-------------+------------------------
+Loom compile: Q4 M1        | 4.638 ms    | 400 lines / 19.86 KiB
+Loom compile: Q4 M512      | 17.966 ms   | 1,733 lines / 95.34 KiB
+Host -> VRAM sustained     | 6.040 GB/s  | max 6.067 GB/s; 96 MiB
+VRAM -> Host sustained     | 6.628 GB/s  | max 6.631 GB/s; 96 MiB
+HRX kernel issue           | 67.896 us   | P95 146.415 us
+HRX kernel completed       | 1571.625 us | P95 1645.956 us
+Bare HSA kernel completed  | 182.853 us  | P95 314.846 us
+Minimal kernel: GPU time   | 5.080 us    | P95 5.762 us
+Host -> VRAM: 8 B complete | 1556.479 us | P95 1657.937 us
+VRAM -> Host: 8 B complete | 1573.229 us | P95 1685.011 us
+CPU -> GPU -> CPU mailbox  | 12.583 us   | P95 14.375 us
+GPU -> CPU -> GPU mailbox  | 10.680 us   | P95 11.120 us
+Compile: warm uncached. GB/s: decimal. Mailbox: round trips, not one-way.
+HRX completed timings include the default 1000 us blocked-poll policy.
+```
