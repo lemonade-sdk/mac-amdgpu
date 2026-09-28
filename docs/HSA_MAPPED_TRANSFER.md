@@ -61,8 +61,34 @@ The process-total scheduler JIT-lookup span across both requests falls from
 7.618 s to 2.547 s; that span includes executable loading and is not compiler
 time alone.
 
+## Frozen build control
+
+A second control used the frozen prepatch build instead of the previously
+installed library. The server executable and two-turn workload were unchanged;
+both control and mapped arms compiled zero new kernels. Both assistant results
+remain exactly equal.
+
+| Measurement | Frozen prepatch build | Mapped transfer |
+| --- | ---: | ---: |
+| First prefill | 18.295 s | 14.541 s |
+| First prefill throughput | 284.61 tokens/s | 358.09 tokens/s |
+| First decode | 25.23 tokens/s | 31.26 tokens/s |
+| Second decode | 31.30 tokens/s | 31.35 tokens/s |
+| New JIT compiles | 0 | 0 |
+| Process-total JIT-lookup span, both requests | 7.457 s | 2.547 s |
+
+The frozen prepatch library has SHA256
+`bfbfe0537074f5b1f8895adc007499fc6ef81898e9c876e61ae97b56c0ede827`.
+It and the mapped candidate use the same 14 unchanged runtime objects; only the
+transport object differs. The original installed baseline has SHA256
+`3394ac3e3d14b6b588bd5c8175fb1705179d93ca9c19215568cfcccdfe07ffc1` and
+lacks an equivalent object manifest, so the second control provides the
+transport-only build comparison. This additional single control supports the
+startup improvement without the original compile-count mismatch; it is still
+not a repeated or randomized benchmark.
+
 Only aggregate results are recorded here. Local HTTP evidence is in
-`build/release/pi-performance/{attention-gdn,mapped-upload}/`, including
+`build/release/pi-performance/{attention-gdn,mapped-upload,upload-control}/`, including
 `metrics-{1,2}.json`, `server.log`, and candidate `hsa-identity.json`.
 
 ## Identity and reproduction
