@@ -20,8 +20,11 @@ uint64_t stage = 15, nextHandle = 0;
 uint64_t driverBuild = 179, exportedBuffer = 0, exportToken[2]{};
 std::map<uint64_t, Buffer> buffers;
 std::vector<uint8_t> dma(32 << 20);
-alignas(16384) uint8_t sharedStorage[65536];
-bool sharedMapFailure = false;
+alignas(4u << 20) uint8_t sharedStorage[4u << 20];
+bool sharedMapFailure = false, sharedAllocationFailure = false, sharedCleanupFailure = false;
+bool hostCheckFailure = false;
+unsigned copyCalls = 0, rpcWrites = 0, rpcReads = 0;
+unsigned sharedAllocationAttempts = 0, sharedMapAttempts = 0;
 uint64_t sharedBase = reinterpret_cast<uintptr_t>(sharedStorage) & ~uint64_t((1ull << 28) - 1);
 unsigned hostChecks = 0, sharedMaps = 0, sharedUnmaps = 0;
 std::vector<std::array<uint64_t, 10>> atomicPackets;
@@ -139,6 +142,11 @@ kern_return_t mockScalar(mach_port_t, uint32_t selector, const uint64_t *in, uin
     case 10: ++uploads; assert(maps == unmaps + 1 && in[1] > 0); out[0] = 0; break;
     case 16: {
         assert(count == 4 && *outCount == 3 && in[2] == 16384 && in[3] == 0);
+        if (in[1] == 2) {
+            ++sharedAllocationAttempts;
+            if (sharedAllocationFailure) return kIOReturnNoMemory;
+            assert(in[0] <= sizeof(sharedStorage));
+        }
         auto handle = ++nextHandle;
         buffers.emplace(handle, Buffer{std::vector<uint8_t>(in[0], 0x91), in[1]});
         out[0] = handle;
@@ -146,13 +154,15 @@ kern_return_t mockScalar(mach_port_t, uint32_t selector, const uint64_t *in, uin
         out[2] = in[1] == 2 ? 0x12340000 : 0;
         break;
     }
-    case 17: assert(buffers.erase(in[0]) == 1); break;
+    case 17:
+        if (sharedCleanupFailure && buffers.at(in[0]).domain == 2) return kIOReturnIOError;
+        assert(buffers.erase(in[0]) == 1); break;
     case 54:
         assert(count == 1 && *outCount == 3 && in[0] == 0);
         out[0] = sharedBase; out[1] = 1ull << 28; out[2] = 0; break;
     case 44:
         assert(count == 1 && *outCount == 6); ++hostChecks;
-        out[0] = 0; out[1] = 8; out[2] = 0; break;
+        out[0] = hostCheckFailure ? 1 : 0; out[1] = 8; out[2] = 0; break;
     case 36:
         assert(count == 1 && *outCount == 2 && buffers.at(in[0]).domain == 2);
         out[0] = 1000 + in[0]; out[1] = buffers.at(in[0]).bytes.size(); break;
@@ -168,6 +178,8 @@ kern_return_t mockScalar(mach_port_t, uint32_t selector, const uint64_t *in, uin
         buffers.emplace(out[0], buffers.at(exportedBuffer)); break;
     case 48: {
         assert(count == 5 && *outCount == 1);
+        ++copyCalls;
+        assert(in[4] <= (4u << 20));
         if (copyFailure) { out[0] = kIOReturnTimeout; break; }
         auto &src = buffers.at(in[0]).bytes, &dst = buffers.at(in[2]).bytes;
         assert(in[1] + in[4] <= src.size() && in[3] + in[4] <= dst.size());
@@ -185,6 +197,7 @@ kern_return_t mockMap(io_connect_t, uint32_t memory, task_port_t, mach_vm_addres
                       mach_vm_size_t *size, IOOptionBits options) {
     if (memory >= 1000) {
         assert(options == 0 && *address == reinterpret_cast<uintptr_t>(sharedStorage));
+        ++sharedMapAttempts;
         if (sharedMapFailure) return KERN_NO_SPACE;
         ++sharedMaps; *size = buffers.at(memory - 1000).bytes.size(); return KERN_SUCCESS;
     }
@@ -228,9 +241,10 @@ kern_return_t mockMethod(mach_port_t, uint32_t selector, const uint64_t *in, uin
     }
     assert(count == 3 && in[1] == 0 && in[2] && in[2] <= 4096 && in[2] % 4 == 0);
     auto &buffer = buffers.at(in[0]); assert(buffer.domain == 1);
-    if (selector == 49) { assert(inSize == in[2]); std::memcpy(buffer.bytes.data(), structureIn, inSize); }
+    if (selector == 49) { ++rpcWrites; assert(inSize == in[2]); std::memcpy(buffer.bytes.data(), structureIn, inSize); }
     else {
         assert(selector == 50 && *outSize == in[2]);
+        ++rpcReads;
         std::memcpy(structureOut, buffer.bytes.data(), *outSize);
         if (malformedRead) --*outSize;
     }
@@ -252,6 +266,122 @@ kern_return_t mockMethod(mach_port_t, uint32_t selector, const uint64_t *in, uin
 #undef IOConnectMapMemory64
 #undef IOConnectUnmapMemory64
 #undef IOConnectCallMethod
+
+void testMappedTransfers() {
+    constexpr size_t chunk = 4u << 20;
+    driverBuild = 204;
+    copyFailure = false;
+    mac_hsa::IOKitConnection connection({});
+    connection.service = 123;
+    connection.registryID = 456;
+    mac_hsa::DeviceBuffer device;
+    assert(connection.allocateBuffer(2 * chunk + 16384, device) == 0);
+    const auto writes = rpcWrites, reads = rpcReads, mapped = sharedMaps;
+    const auto allocated = sharedAllocationAttempts;
+    uint8_t byte = 0;
+    assert(connection.writeBuffer(device, 0, &byte, 0) == 0 && sharedAllocationAttempts == allocated);
+    assert(connection.writeBuffer(device, 0, nullptr, 0) == HSA_STATUS_ERROR_INVALID_ARGUMENT);
+    assert(connection.writeBuffer(device, device.size, &byte, 1) == HSA_STATUS_ERROR_INVALID_ARGUMENT);
+
+    // Whole-buffer comparisons prove that partial dwords preserve both guards.
+    const std::array<std::array<size_t, 2>, 9> cases{{
+        {0, 1}, {1, 1}, {3, 2}, {4, 4}, {17, 4093},
+        {0, chunk}, {3, chunk + 13}, {0, 2 * chunk + 8}, {size_t(device.size - 1), 1}
+    }};
+    for (const auto &[offset, length] : cases) {
+        auto &stored = buffers.at(device.handle).bytes;
+        std::fill(stored.begin(), stored.end(), 0x91);
+        std::vector<uint8_t> source(length), destination(length + 2, 0x63), expected(stored);
+        for (size_t i = 0; i < length; ++i) source[i] = uint8_t(i * 113 + i / 257);
+        std::copy(source.begin(), source.end(), expected.begin() + offset);
+        const auto copies = copyCalls;
+        assert(connection.writeBuffer(device, offset, source.data(), length) == 0 && stored == expected);
+        assert(connection.readBuffer(device, offset, destination.data() + 1, length) == 0);
+        assert(std::equal(source.begin(), source.end(), destination.begin() + 1));
+        assert(destination.front() == 0x63 && destination.back() == 0x63);
+        if (!offset && length == chunk) assert(copyCalls == copies + 2);
+        if (!offset && length == 2 * chunk + 8) assert(copyCalls == copies + 6);
+        assert(rpcWrites == writes && rpcReads == reads);
+        assert(sharedMaps == mapped + 1 && sharedAllocationAttempts == allocated + 1);
+    }
+    // The utility upload still orders instruction-cache invalidation by dispatch.
+    const auto dispatches = computeCalls;
+    computeFault = 0;
+    assert(connection.invalidateCodeCaches() == 0 && computeCalls == dispatches + 1);
+    assert(rpcWrites == writes && rpcReads == reads);
+    assert(connection.freeBuffer(device) == 0);
+}
+
+void testTransferMappingDeclines() {
+    for (unsigned decline = 0; decline < 3; ++decline) {
+        driverBuild = decline ? 204 : 181;
+        sharedAllocationFailure = decline == 1;
+        sharedMapFailure = decline == 2;
+        const auto allocations = sharedAllocationAttempts, attempts = sharedMapAttempts;
+        const auto mapsBefore = sharedMaps, writes = rpcWrites, reads = rpcReads, copies = copyCalls;
+        mac_hsa::IOKitConnection connection({});
+        connection.service = 123;
+        connection.registryID = 456;
+        mac_hsa::DeviceBuffer device;
+        assert(connection.allocateBuffer(16384, device) == 0);
+        const auto buffersBefore = buffers.size();
+        std::vector<uint8_t> source(8192, 0x5b), destination(source.size());
+        assert(connection.writeBuffer(device, 0, source.data(), source.size()) == 0);
+        // A clean decline is latched; later transfers do not retry the mapping.
+        driverBuild = 204;
+        sharedAllocationFailure = sharedMapFailure = false;
+        assert(connection.readBuffer(device, 0, destination.data(), destination.size()) == 0);
+        assert(source == destination && rpcWrites == writes + 2 && rpcReads == reads + 2);
+        assert(copyCalls == copies + 4 && sharedMaps == mapsBefore);
+        assert(sharedAllocationAttempts == allocations + (decline != 0));
+        assert(sharedMapAttempts == attempts + (decline == 2));
+        assert(buffers.size() == buffersBefore + 1); // Only legacy staging survives.
+        assert(connection.freeBuffer(device) == 0);
+    }
+}
+
+void testTransferMappingFaults() {
+    // A failed coherence proof or mapping cleanup must never select fallback.
+    for (unsigned fault = 0; fault < 2; ++fault) {
+        driverBuild = 204;
+        hostCheckFailure = fault == 0;
+        sharedMapFailure = sharedCleanupFailure = fault == 1;
+        const auto copies = copyCalls, writes = rpcWrites, reads = rpcReads;
+        mac_hsa::IOKitConnection connection({});
+        connection.service = 123;
+        connection.registryID = 456;
+        mac_hsa::DeviceBuffer device;
+        assert(connection.allocateBuffer(16384, device) == 0);
+        uint32_t word = 0x76543210;
+        assert(connection.writeBuffer(device, 0, &word, sizeof(word)) == HSA_STATUS_ERROR);
+        const auto retained = buffers.size();
+        hostCheckFailure = sharedMapFailure = sharedCleanupFailure = false;
+        assert(connection.writeBuffer(device, 0, &word, sizeof(word)) == HSA_STATUS_ERROR);
+        assert(connection.freeBuffer(device) == HSA_STATUS_ERROR && buffers.size() == retained);
+        assert(copyCalls == copies && rpcWrites == writes && rpcReads == reads);
+    }
+    // A timed-out copy keeps mapped staging alive and refuses all further work.
+    const auto mapsBefore = sharedMaps, unmapsBefore = sharedUnmaps;
+    {
+        mac_hsa::IOKitConnection connection({});
+        connection.service = 123;
+        connection.registryID = 456;
+        mac_hsa::DeviceBuffer device;
+        assert(connection.allocateBuffer(16384, device) == 0);
+        uint32_t word = 0x76543210;
+        assert(connection.writeBuffer(device, 0, &word, sizeof(word)) == 0);
+        const auto copies = copyCalls, writes = rpcWrites, reads = rpcReads;
+        copyFailure = true;
+        assert(connection.writeBuffer(device, 0, &word, sizeof(word)) == HSA_STATUS_ERROR);
+        assert(sharedMaps == mapsBefore + 1 && sharedUnmaps == unmapsBefore);
+        const auto retained = buffers.size();
+        copyFailure = false;
+        assert(connection.readBuffer(device, 0, &word, sizeof(word)) == HSA_STATUS_ERROR);
+        assert(connection.freeBuffer(device) == HSA_STATUS_ERROR && buffers.size() == retained);
+        assert(copyCalls == copies + 1 && rpcWrites == writes && rpcReads == reads);
+    }
+    assert(sharedUnmaps == unmapsBefore + 1);
+}
 
 int main() {
     {
@@ -506,5 +636,10 @@ int main() {
         assert(connection.freeSharedBuffer(ring)==HSA_STATUS_ERROR && buffers.contains(ring.device.handle));
         serviceFault=0;
     }
+    testMappedTransfers();
+    testTransferMappingDeclines();
+    testTransferMappingFaults();
+    assert(opens == closes && sharedMaps == sharedUnmaps);
+    puts("HSA: mapped bulk transfer, exact partial dwords, RPC compatibility and fault quarantine pass");
     puts("HSA: transient observers, owner Busy without reset, single concurrent initialization, firmware mapping, unaligned SDMA staging/guards and fault retention pass");
 }
