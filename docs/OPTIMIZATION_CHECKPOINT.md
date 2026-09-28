@@ -42,10 +42,9 @@ included in the default:
 - [Two-pass Q6 model selection](https://github.com/Geramy/LSE/tree/perf/q6-centered-repair-model):
   shared HIP/Loom graph expansion, separate values/flags and out-of-place repair.
   All 37 numerical cases pass nine repeats, with hashes identical to the previous
-  accurate implementation. Automatic model selection passes the fixed code
-  context at relative logit L2 0.0000495955, below the unchanged 0.005 gate.
-  Math/story also pass. Compilation-free prefill is 76.72 PP/s versus
-  the 88.57 PP/s control, so this candidate is not promoted.
+  accurate implementation. Quantization acceptance requires matched PPL on
+  1024–2048 scored tokens. Compilation-free prefill is
+  76.72 PP/s versus the 88.57 PP/s control, so this candidate is not promoted.
 - [Inplace allocation-owner lifetimes](https://github.com/Geramy/LSE/tree/testing/inplace-owner-lifetimes):
   isolated planner fix; the original fails and the candidate passes 16 alias
   scenarios, including nonzero inplace inputs, nested views and escaped roots.

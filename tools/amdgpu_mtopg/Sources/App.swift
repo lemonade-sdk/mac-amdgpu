@@ -2,10 +2,8 @@
 //
 // Real 2D vector drawing (SwiftUI Canvas): live rolling charts for GPU core
 // load and UMC memory activity, VRAM/clock/sensor readouts, per-engine
-// dispatch-in-flight strip. Data comes from the same MacAMDGPU IOKit
-// observer client the terminal monitor uses (selector 61 dispatch-in-flight
-// is the trusted core-load source; SMU activity fields are incoherent on
-// this host and are only shown when a source actually produced the value).
+// activity strip. A read-only MacAMDGPU IOKit observer samples GRBM_STATUS
+// for GFX active time when available, with selector 61 packet-rate fallback.
 //
 // Read-only: no GPU work is submitted and no driver state is mutated.
 //
@@ -27,7 +25,7 @@ final class GPUSampler: ObservableObject {
     private var selectedRegistry: UInt64?
     private var running = false
 
-    static let umcDefaultLabel = "no UMC sample yet (fresh SMU UmcActivityPercent, or MMHUB PERFCTR on driver build 198+)"
+    static let umcDefaultLabel = "no UMC sample yet (SMU firmware average; no live MMHUB UMC counter on gfx1201)"
 
     func start() {
         guard !running else { return }
@@ -61,6 +59,7 @@ final class GPUSampler: ObservableObject {
                                     umcDefaultLabel: Self.umcDefaultLabel, engineValues: nil)
             if let r = selectedRegistry, !devices.contains(where: { $0.registry == r }) {
                 selectedRegistry = nil   // selected card vanished: reselect
+                history.reset()
             }
             if selectedRegistry == nil {
                 selectedRegistry = devices.first?.registry
@@ -69,10 +68,10 @@ final class GPUSampler: ObservableObject {
             if let d = selectedDevice {
                 // Engine percents need the pre-add baseline; compute them
                 // first, then fold the sample into the history.
-                let engines = (0..<4).map { history.enginePercent(d, index: $0) }
+                let engines = history.enginePercents(d)
+                history.add(d)
                 snap = makeSnapshot(device: d, history: history,
                                     umcDefaultLabel: Self.umcDefaultLabel, engineValues: engines)
-                history.add(d)
             }
             if let e = error { snap.error = e }
             if let r = selectedRegistry { snap.selectedDeviceID = r }

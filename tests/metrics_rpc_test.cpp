@@ -9,7 +9,11 @@ constexpr int kIOReturnSuccess = 0, kIOReturnBadArgument = 1, kIOReturnNoMemory 
 enum { kMacAMDGPUMethodRuntimeBuild, kMacAMDGPUMethodPing, kMacAMDGPUMethodQueryInfo,
     kMacAMDGPUMethodShutdownGPU, kMacAMDGPUMethodGetBARInfo,
     kMacAMDGPUMethodCollectMetrics = 46, kMacAMDGPUMethodMetricsSnapshot = 47,
-    kMacAMDGPUMethodAtomicRequesterExperiment = 60, kMacAMDGPUMethodSampleCachedSensors = 63, kMacAMDGPUMethodClockSnapshot = 62, kMacAMDGPUMethodSoftwareSnapshot = 61 };
+    kMacAMDGPUMethodAtomicRequesterExperiment = 60, kMacAMDGPUMethodSampleCachedSensors = 63, kMacAMDGPUMethodClockSnapshot = 62, kMacAMDGPUMethodSoftwareSnapshot = 61,
+    kMacAMDGPUMethodReadMmhubPerfStatus = 68, kMacAMDGPUMethodReadSqSlot = 69,
+    kMacAMDGPUMethodReadSqBusy = 70, kMacAMDGPUMethodReadGrbmStatus = 71,
+    kMacAMDGPUMethodReadRawMetricsProbe = 72,
+    kMacAMDGPUMethodReadSpecSnapshot = 73 };
 namespace amdgpu {
 enum class BringupStage { None, SDMAInit };
 static unsigned collections, snapshots;
@@ -19,6 +23,7 @@ static int smu_collect_metrics(int, SMUMetricsContext &ctx, bool ready) {
     ++collections; lastReady = ready;
     ctx.snapshot.sequence = 42;
     ctx.snapshot.validFields = collectionResult == 0 && ready ? 5 : 0;
+    ctx.snapshot.flags = ctx.snapshot.validFields ? kSMUMetricsValid : 0;
     return collectionResult;
 }
 static void smu_metrics_snapshot(const SMUMetricsContext &ctx, bool ready, SMUMetricsSnapshot &out) {
@@ -36,9 +41,10 @@ static void smu_clock_snapshot(const SMUMetricsContext &ctx, bool ready, SMUCloc
 }
 static bool allocationFails;
 struct OSData {
-    uint8_t bytes[sizeof(amdgpu::SMUMetricsSnapshot)];
+    uint8_t bytes[208];
     static OSData *withBytes(const void *bytes, size_t length) {
-        assert(length == sizeof(amdgpu::SMUMetricsSnapshot) || length == sizeof(amdgpu::SMUClockSnapshot));
+        assert(length == sizeof(amdgpu::SMUMetricsSnapshot) ||
+               length == sizeof(amdgpu::SMUClockSnapshot) || length == 208);
         if (allocationFails) return nullptr;
         auto *data = new OSData;
         memcpy(data->bytes, bytes, length);
@@ -80,6 +86,21 @@ int main() {
     args.scalarOutput = out; args.scalarOutputCount = 3;
     assert(call(&driver, 46, &args) == 0 && amdgpu::collections == 1 && amdgpu::lastReady);
     assert(out[0] == 0 && out[1] == 42 && out[2] == 5 && args.scalarOutputCount == 3);
+    state.bringup.metrics.rawProbe[14] = 75;
+    state.bringup.metrics.firmwareVersion = 0x00684c00;
+    uint64_t probe[26]{};
+    Args rawArgs{};
+    uint64_t emptyInputStorage = 0;
+    // DriverKit may supply a pointer even when scalarInputCount is zero.
+    rawArgs.scalarInput = &emptyInputStorage;
+    rawArgs.structureOutputMaximumSize = sizeof(probe);
+    assert(call(&driver, 72, &rawArgs) == 0 && rawArgs.structureOutput);
+    memcpy(probe, rawArgs.structureOutput->bytes, sizeof(probe));
+    delete rawArgs.structureOutput; rawArgs.structureOutput = nullptr;
+    assert(probe[0] == 0 && probe[3] == 42 && probe[19] == 75);
+    assert(probe[2] == 0x00684c00);
+    --rawArgs.structureOutputMaximumSize;
+    assert(call(&driver, 72, &rawArgs) == kIOReturnBadArgument);
     amdgpu::collectionResult = kIOReturnTimeout;
     assert(call(&driver, 46, &args) == 0 && out[0] == kIOReturnTimeout && !out[2]);
     const auto collected = amdgpu::collections;
@@ -92,7 +113,7 @@ int main() {
 
     args = {}; args.structureOutputMaximumSize = sizeof(amdgpu::SMUMetricsSnapshot);
     assert(call(&driver, 47, &args) == 0 && args.structureOutput);
-    assert(amdgpu::snapshots == 1 && amdgpu::collections == collected);
+    assert(amdgpu::snapshots == 2 && amdgpu::collections == collected);
     delete args.structureOutput; args.structureOutput = nullptr;
     allocationFails = true;
     assert(call(&driver, 47, &args) == kIOReturnNoMemory && !args.structureOutput);

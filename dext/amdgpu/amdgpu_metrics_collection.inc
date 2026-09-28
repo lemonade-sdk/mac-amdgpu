@@ -133,6 +133,24 @@ kern_return_t smu_collect_metrics(const DeviceContext &dev,
         ctx.collecting = false;
         return fail(kIOReturnIOError, true);
     }
+    auto probe16 = [&raw](size_t o) -> uint32_t {
+        return uint32_t(raw[o]) | (uint32_t(raw[o + 1]) << 8);
+    };
+    auto probe32 = [&raw](size_t o) -> uint32_t {
+        return uint32_t(raw[o]) | (uint32_t(raw[o + 1]) << 8) |
+            (uint32_t(raw[o + 2]) << 16) | (uint32_t(raw[o + 3]) << 24);
+    };
+    // Fixed ABI order for selector 72. Include the energy accumulator to
+    // distinguish measured power from a constant power-limit-like value.
+    const uint32_t rawProbe[SMUMetricsContext::kRawProbeCount] = {
+        probe32(0), probe32(4), probe32(8), probe32(12),
+        probe16(46), probe16(48), probe16(50), probe16(52),
+        probe16(54), probe16(56), probe32(104),
+        probe16(124), probe16(126), probe32(132),
+        probe16(136), probe16(138), probe16(140), probe16(142),
+        probe16(148), raw[168], probe16(170)
+    };
+    memcpy(ctx.rawProbe, rawProbe, sizeof(rawProbe));
     // CurrClock[] uses uint32 MHz in Linux; these are distinct from the
     // pre/post-deep-sleep averages exported by the original metrics payload.
     ctx.clocks.currentValid = 0;

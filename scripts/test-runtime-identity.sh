@@ -16,7 +16,7 @@ test = test.replace('// PRODUCTION_IDENTITY', identity).replace('// PRODUCTION_P
 Path('build/tests/runtime_identity_test.swift').write_text(test)
 source = Path('dext/MacAMDGPU.cpp').read_text()
 start = source.index('    case kMacAMDGPUMethodRuntimeBuild: {')
-end = source.index('    case kMacAMDGPUMethodPing:', start)
+end = source.index('    case ', start + 1)
 Path('build/tests/runtime_selector_under_test.inc').write_text(source[start:end])
 PY
 xcrun swiftc -swift-version 5 -module-cache-path build/ModuleCache \

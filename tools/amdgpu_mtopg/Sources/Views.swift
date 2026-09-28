@@ -122,50 +122,91 @@ struct TimeSeriesChart: View {
                              at: CGPoint(x: x, y: size.height - 4), anchor: anchor)
             }
 
-            guard hasData else {
-                // No source is producing samples: keep the frame, explain why.
-                let label = Text(emptyCaption)
-                    .font(.system(size: 11))
-                    .foregroundStyle(Palette.dim)
-                context.draw(context.resolve(label),
-                             at: CGPoint(x: plot.midX, y: plot.midY), anchor: .center)
-                return
+            guard hasData else { return }
+
+            // Collect the real (in-window, finite) points in chronological
+            // order (oldest first) with their x/y. We then bridge SMALL time
+            // gaps by interpolation and smooth the result with a Catmull-Rom
+            // spline, so the trace reads as one continuous curve instead of a
+            // jagged line full of empty spots. LARGE gaps (real idle stretches,
+            // or a source that stops) still break the line so we don't draw a
+            // false segment across a period with no data.
+            let pts: [(x: CGFloat, y: CGFloat, age: Double)] = samples.compactMap { (age, value) in
+                guard let v = value, v.isFinite, age <= windowSeconds else { return nil }
+                let x = plot.maxX - plot.width * CGFloat(age / windowSeconds)
+                let y = plot.minY + plot.height * CGFloat(1.0 - min(max(v / 100.0, 0.0), 1.0))
+                return (x, y, age)
             }
+            .sorted { $0.age > $1.age }   // oldest (largest age) first -> left to right
+
+            // A gap larger than this (in seconds) breaks the line; smaller gaps
+            // are interpolated. ~3s is well above the driver's ~1 Hz cadence and
+            // the ~2.5s sample-expiry, so a finished decode still breaks cleanly
+            // but normal sampling jitter is bridged.
+            let maxGap: Double = 3.0
+            // Split into contiguous runs separated by > maxGap.
+            var runs: [[(x: CGFloat, y: CGFloat, age: Double)]] = []
+            var cur: [(x: CGFloat, y: CGFloat, age: Double)] = []
+            for p in pts {
+                if let lastAge = cur.last?.age, (lastAge - p.age) > maxGap {
+                    if cur.count >= 2 { runs.append(cur) } else if cur.count == 1 { runs.append(cur) }
+                    cur = []
+                }
+                cur.append(p)
+            }
+            if cur.count >= 1 { runs.append(cur) }
 
             var path = Path()
             var area = Path()
-            var last: CGPoint?
-            for (age, value) in samples {
-                // A nil / out-of-window sample is a gap (e.g. idle, when the
-                // dispatch-rate proxy emits nothing). Break the line there
-                // instead of drawing a segment straight across the gap, which
-                // reads as a glitch and makes the trace look like it jumps or
-                // restarts. Resetting `last` starts a fresh sub-path at the
-                // next real point.
-                guard let v = value, v.isFinite, age <= windowSeconds else {
-                    last = nil
+            for run in runs {
+                // Single point: draw a dot so an isolated sample isn't lost.
+                if run.count == 1 {
+                    let p = run[0]
+                    path.move(to: CGPoint(x: p.x, y: p.y))
+                    path.addLine(to: CGPoint(x: p.x + 0.01, y: p.y))
                     continue
                 }
-                let x = plot.maxX - plot.width * CGFloat(age / windowSeconds)
-                let y = plot.minY + plot.height * CGFloat(1.0 - min(max(v / 100.0, 0.0), 1.0))
-                let point = CGPoint(x: x, y: y)
-                if last == nil {
-                    path.move(to: point)
-                    area.move(to: CGPoint(x: x, y: plot.maxY))
-                    area.addLine(to: point)
-                } else {
-                    path.addLine(to: point)
-                    area.addLine(to: point)
+                // Build a smoothed Catmull-Rom curve through the run's points.
+                // Each interior point contributes a cubic segment to the next.
+                let c = run.map { CGPoint(x: $0.x, y: $0.y) }
+                var segStart = c[0]
+                path.move(to: segStart)
+                area.move(to: CGPoint(x: c[0].x, y: plot.maxY))
+                area.addLine(to: segStart)
+                for i in 0..<(c.count - 1) {
+                    let p0 = (i > 0) ? c[i - 1] : c[i]
+                    let p1 = c[i]
+                    let p2 = c[i + 1]
+                    let p3 = (i + 2 < c.count) ? c[i + 2] : c[i + 1]
+                    // Catmull-Rom -> cubic Bezier control points (tension 0.5).
+                    let c1 = CGPoint(x: p1.x + (p2.x - p0.x) / 6.0, y: p1.y + (p2.y - p0.y) / 6.0)
+                    let c2 = CGPoint(x: p2.x - (p3.x - p1.x) / 6.0, y: p2.y - (p3.y - p1.y) / 6.0)
+                    path.move(to: p1)
+                    path.addCurve(to: p2, control1: c1, control2: c2)
+                    area.addCurve(to: p2, control1: c1, control2: c2)
+                    segStart = p2
                 }
-                last = point
-            }
-            if let end = last {
-                area.addLine(to: CGPoint(x: end.x, y: plot.maxY))
+                area.addLine(to: CGPoint(x: segStart.x, y: plot.maxY))
                 area.closeSubpath()
-                context.fill(area, with: .color(fill))
             }
+            context.fill(area, with: .color(fill))
             context.stroke(path, with: .color(color),
-                           style: StrokeStyle(lineWidth: 1.6, lineJoin: .round))
+                           style: StrokeStyle(lineWidth: 1.6, lineCap: .round, lineJoin: .round))
+        }
+        .overlay {
+            if !hasData {
+                GeometryReader { geometry in
+                    Text(emptyCaption)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(Palette.dim)
+                        .multilineTextAlignment(.center)
+                        .lineLimit(3)
+                        .frame(width: max(0, geometry.size.width - 66))
+                        .position(x: geometry.size.width / 2 + 15,
+                                  y: geometry.size.height / 2 - 5)
+                }
+                .allowsHitTesting(false)
+            }
         }
     }
 }
@@ -184,11 +225,14 @@ struct Panel<Content: View>: View {
                     .font(.system(size: 12, weight: .semibold, design: .monospaced))
                     .foregroundStyle(Palette.bright)
                     .textCase(.uppercase)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
                 Spacer()
                 if let right {
                     Text(right)
                         .font(.system(size: 12, weight: .semibold, design: .monospaced))
                         .foregroundStyle(Palette.bright)
+                        .fixedSize(horizontal: true, vertical: false)
                 }
             }
             content()
@@ -196,6 +240,21 @@ struct Panel<Content: View>: View {
         .padding(12)
         .background(RoundedRectangle(cornerRadius: 10).fill(Palette.panel))
         .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Palette.border, lineWidth: 1))
+    }
+}
+
+struct SourceCaption: View {
+    let summary: String
+    let detail: String
+    var color: Color = Palette.dim
+
+    var body: some View {
+        Text(summary)
+            .font(.system(size: 9, design: .monospaced))
+            .foregroundStyle(color)
+            .lineLimit(2)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .help(detail)
     }
 }
 
@@ -213,7 +272,8 @@ struct Meter: View {
             Text(label)
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(Palette.dim)
-                .frame(width: 74, alignment: .leading)
+                .lineLimit(1)
+                .frame(width: 125, alignment: .leading)
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
                     RoundedRectangle(cornerRadius: 3).fill(Color.white.opacity(0.08))
@@ -235,7 +295,7 @@ struct Meter: View {
 
 extension TelemetrySnapshot {
     var umcCurrent: Double? {
-        umcActivity.last { $0.value != nil }?.value
+        umcActivity.last?.value
     }
 }
 
@@ -255,48 +315,53 @@ struct ContentView: View {
                     TimeSeriesChart(samples: snap.coreLoad, windowSeconds: 60,
                                     color: Palette.accent, fill: Palette.accentFill,
                                     hasData: snap.coreLoad.contains { $0.value != nil },
-                                    emptyCaption: "no GFX dispatch samples yet (driver idle or no work submitted)")
+                                    emptyCaption: "No GFX activity sample yet")
                         .frame(height: 150)
-                    Text("source: \(snap.coreSourceLabel ?? "GFX dispatch-rate, selector 61 (eng2 submitted delta); adaptive scale, decays toward current - NOT a busy %")")
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundStyle(Palette.dim)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    SourceCaption(summary: snap.coreHardware
+                                    ? "GFX active samples (sel 71), rolling 2 s; not CU occupancy"
+                                    : "GFX packet rate (sel 61), scaled to observed peak; not busy %",
+                                  detail: snap.coreSourceLabel ?? "No fresh GFX activity source")
                 }
-                Panel(title: snap.umcReliable ? "UMC Memory Activity"
-                                              : "UMC Memory Activity  ⚠ unreliable",
+                Panel(title: "UMC Activity",
                       right: snap.umcCurrent != nil
-                         ? "[ \(fmt(snap.umcCurrent, 0))% \(snap.umcReliable ? "" : "(firmware avg, not memory-busy)") ]"
+                         ? "[ \(fmt(snap.umcCurrent, 0))%\(snap.umcReliable ? "" : " ⚠") ]"
                          : "[ n/a ]") {
                     TimeSeriesChart(samples: snap.umcActivity, windowSeconds: 60,
                                     color: Palette.umc, fill: Palette.umcFill,
                                     hasData: snap.umcActivity.contains { $0.value != nil },
-                                    emptyCaption: "no UMC samples yet (waiting for a fresh SMU UmcActivityPercent; MMHUB PERFCTR is unavailable on this ASIC — the MMHUB PERFSTATUS register does not exist in the RDNA4 register map)")
+                                    emptyCaption: "No fresh UMC activity sample")
                         .frame(height: 150)
-                        .opacity(snap.umcReliable ? 1.0 : 0.45)
-                    Text("source: " + (snap.umcSourceLabel ?? "none"))
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundStyle(snap.umcReliable ? Palette.dim : .orange)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .opacity(snap.umcReliable || !snap.umcActivity.contains { $0.value != nil }
+                                 ? 1.0 : 0.45)
+                    SourceCaption(summary: snap.umcCurrent == nil
+                                    ? "UMC busy unavailable on this GPU"
+                                    : (snap.umcReliable
+                                        ? "MMHUB hardware UMC counter (sel 68)"
+                                        : "SMU firmware average; uncalibrated on this GPU"),
+                                  detail: snap.umcSourceLabel ?? "No fresh SMU UMC activity sample; MMHUB UMC counter is unavailable on gfx1201",
+                                  color: snap.umcReliable ? Palette.dim : .orange)
                 }
-                Panel(title: "SQ Busy % (hardware counter)",
+                Panel(title: "SQ Busy",
                       right: snap.sqBusyCurrent != nil
                          ? "[ \(fmt(snap.sqBusyCurrent, 0))% ]"
                          : "[ n/a ]") {
                     TimeSeriesChart(samples: snap.sqBusy, windowSeconds: 60,
                                     color: Palette.sq, fill: Palette.sqFill,
                                     hasData: snap.sqBusy.contains { $0.value != nil },
-                                    emptyCaption: "no SQ busy-cycle windows yet (workload process must publish the shared slot, driver 200+)")
+                                    emptyCaption: "No live SQ busy-cycle window")
                         .frame(height: 150)
-                    Text("source: " + (snap.sqBusySourceLabel ??
-                        "no shared SQ slot registered (the LSE server publishes aqlprofile SQ_BUSY_CYCLES sums when built with the SQ profiler; real hardware counter, NOT the dispatch-rate proxy)"))
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundStyle(Palette.dim)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    SourceCaption(summary: snap.sqBusyCurrent != nil
+                                    ? (snap.sqBusySourceLabel?.contains("driver-owned") == true
+                                        ? "SQ hardware busy cycles (driver sel 70)"
+                                        : "SQ hardware busy cycles (workload sel 69)")
+                                    : "No SQ counter: sel 70 unavailable; sel 69 slot absent",
+                                  detail: snap.sqBusySourceLabel ?? "No shared SQ slot registered; LSE publishes aqlprofile SQ_BUSY_CYCLES when its SQ profiler is active")
                 }
             }
             HStack(alignment: .top, spacing: 10) {
                 Panel(title: "VRAM") {
-                    if let used = snap.vramUsedGiB, let total = snap.vramTotalGiB {
+                    if let used = snap.vramUsedGiB, let total = snap.vramTotalGiB,
+                       used.isFinite, total.isFinite, total > 0 {
                         Meter(label: "VRAM", value: used, maxValue: total,
                               text: String(format: "%.2f / %.2f GB (%.0f%%)", used, total, used / total * 100))
                         if let vu = snap.vramVisibleUsedGiB, let vt = snap.vramVisibleTotalGiB, vt > 0 {
@@ -316,32 +381,78 @@ struct ContentView: View {
                 }
                 Panel(title: "Clocks (SMU, MHz)") {
                     VStack(alignment: .leading, spacing: 4) {
+                        if snap.stage != 15 {
+                            Text(snap.idle
+                                 ? "GPU idle; no active driver session. Clocks appear during GPU work."
+                                 : "current clocks unavailable until GPU initialization")
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(Palette.dim)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                         ForEach(snap.clocks) { row in
-                            HStack {
-                                Text(row.name).frame(width: 68, alignment: .leading)
-                                Text(fmtInt(row.current) + " MHz")
-                                    .frame(width: 70, alignment: .trailing)
-                                if let lo = row.minimum, let hi = row.maximum {
-                                    Text(String(format: "(%d – %d)", Int(lo), Int(hi)))
-                                        .font(.system(size: 10, design: .monospaced))
-                                        .foregroundStyle(Palette.dim)
+                            VStack(alignment: .leading, spacing: 1) {
+                                HStack {
+                                    Text(row.name).frame(width: 68, alignment: .leading)
+                                    Text(row.current.map { fmtInt($0) + " MHz " + (row.currentKind == "avg" ? "SMU avg" : "raw") } ?? "n/a")
+                                        .frame(width: 150, alignment: .trailing)
+                                    if let lo = row.minimum, let hi = row.maximum {
+                                        Text(String(format: "DPM %d–%d", Int(lo), Int(hi)))
+                                            .font(.system(size: 10, design: .monospaced))
+                                            .foregroundStyle(Palette.dim)
+                                    }
+                                    Spacer()
                                 }
-                                Spacer()
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundStyle(row.current != nil ? Palette.bright : Palette.dim)
+                                if row.currentKind == "avg", let raw = row.rawCurrent {
+                                    Text("raw CurrClock: \(fmtInt(raw)) MHz")
+                                        .font(.system(size: 9, design: .monospaced))
+                                        .foregroundStyle(Palette.dim)
+                                        .padding(.leading, 68)
+                                } else if let average = row.average {
+                                    Text("SMU avg field: \(fmtInt(average)) MHz")
+                                        .font(.system(size: 9, design: .monospaced))
+                                        .foregroundStyle(Palette.dim)
+                                        .padding(.leading, 68)
+                                }
+                                if let note = row.note {
+                                    Text(note)
+                                        .font(.system(size: 9, design: .monospaced))
+                                        .foregroundStyle(Palette.warm)
+                                        .padding(.leading, 68)
+                                }
                             }
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundStyle(row.current != nil ? Palette.bright : Palette.dim)
+                        }
+                        if snap.stage == 15 {
+                            Text("DPM = advertised AC levels; averages may include deep sleep")
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(Palette.dim)
+                                .lineLimit(2)
                         }
                     }
                 }
                 Panel(title: "Sensors (SMU)") {
                     VStack(alignment: .leading, spacing: 4) {
-                        // Power: board limit when the SMU exposes it, else a
-                        // sensible cap for the 300 W-class R9700 mobile GPU.
-                        Meter(label: "Power",
-                              value: snap.powerWatts,
-                              maxValue: snap.boardPowerWatts.map { $0 > 0 ? $0 : nil } ?? 300,
-                              text: (snap.powerWatts.map { String(format: "%.0f W", $0) } ?? "n/a")
-                                  + (snap.boardPowerWatts.map { " / \(Int($0)) W cap" } ?? ""),
+                        if snap.stage != 15 {
+                            Text(snap.idle
+                                 ? "GPU idle; sensors need an active driver session."
+                                 : "sensor cache unavailable until GPU initialization")
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(Palette.dim)
+                        }
+                        Meter(label: snap.unverifiedSmuGfxActivityPercent != nil
+                                    ? "GFX avg (SMU raw)" : "GFX avg",
+                              value: snap.smuGfxActivityPercent ?? snap.unverifiedSmuGfxActivityPercent,
+                              maxValue: 100,
+                              text: (snap.smuGfxActivityPercent ?? snap.unverifiedSmuGfxActivityPercent)
+                                  .map { String(format: "%.0f%%", $0) } ?? "n/a",
+                              color: Palette.accent)
+                        Meter(label: snap.unverifiedSmuSocketPowerWatts != nil || snap.unverifiedSmuBoardPowerWatts != nil
+                                    ? "Power (SMU raw)" : "Power",
+                              value: snap.powerWatts ?? snap.unverifiedSmuSocketPowerWatts ?? snap.unverifiedSmuBoardPowerWatts,
+                              maxValue: 300,
+                              text: (snap.powerWatts ?? snap.unverifiedSmuSocketPowerWatts ?? snap.unverifiedSmuBoardPowerWatts)
+                                  .map { String(format: "%.0f W", $0) } ?? "n/a",
                               color: Palette.warm)
                         Meter(label: "Edge",
                               value: snap.edgeCelsius,
@@ -362,7 +473,7 @@ struct ContentView: View {
                     }
                 }
             }
-            Panel(title: "Engines (dispatch-in-flight, per window)") {
+            Panel(title: "Engines (packet rate, per window)") {
                 VStack(spacing: 6) {
                     ForEach(snap.engines) { row in
                         HStack(spacing: 10) {
@@ -395,7 +506,7 @@ struct ContentView: View {
                         }
                     }
                 }
-                Text("source: driver software_stats selector 61, per-engine pendingNs delta; VCN/JPEG have no observer counter")
+                Text("source: driver software_stats selector 61, per-engine submitted-packet rate scaled to observed peak; VCN/JPEG have no observer counter")
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundStyle(Palette.dim)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -439,7 +550,7 @@ struct ContentView: View {
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(Palette.dim)
             if snap.idle {
-                Text("idle — no in-flight GPU work")
+                Text("idle — no active GPU session")
                     .font(.system(size: 11, weight: .semibold, design: .monospaced))
                     .foregroundStyle(Palette.umc)
             } else {

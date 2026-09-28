@@ -16,7 +16,10 @@ enum { kMacAMDGPUMethodRuntimeBuild, kMacAMDGPUMethodPing,
        kMacAMDGPUMethodLoadFirmware, kMacAMDGPUMethodSetIPBase,
        kMacAMDGPUMethodLoadDiscoveryBin, kMacAMDGPUMethodResetDevice,
        kMacAMDGPUMethodSetupInterrupts, kMacAMDGPUMethodAtomicRequesterExperiment,
-       kMacAMDGPUMethodSetPowerState, kMacAMDGPUMethodDisableSmuFeatures };
+       kMacAMDGPUMethodSetPowerState, kMacAMDGPUMethodDisableSmuFeatures,
+       kMacAMDGPUMethodReadMmhubPerfStatus, kMacAMDGPUMethodReadSqSlot,
+       kMacAMDGPUMethodReadSqBusy, kMacAMDGPUMethodReadGrbmStatus,
+       kMacAMDGPUMethodReadRawMetricsProbe, kMacAMDGPUMethodReadSpecSnapshot };
 struct IOService {};
 static unsigned openCalls;
 #define OSDynamicCast(type, pointer) static_cast<type *>(pointer)
@@ -136,12 +139,17 @@ int main() {
     assert(call(observer, kMacAMDGPUMethodClockSnapshot) == 0 && openCalls == 0);
     assert(call(observer, kMacAMDGPUMethodRuntimeBuild) == 0 && openCalls == 0);
     assert(call(observer, kMacAMDGPUMethodMetricsSnapshot) == 0 && openCalls == 0);
+    assert(call(observer, kMacAMDGPUMethodReadGrbmStatus) == 0 && openCalls == 0);
+    assert(call(observer, kMacAMDGPUMethodReadRawMetricsProbe) == 0 && openCalls == 0);
+    assert(call(observer, kMacAMDGPUMethodReadSpecSnapshot) == 0 && openCalls == 0);
     assert(call(owner, kMacAMDGPUMethodCollectMetrics) == kIOReturnNotOpen && openCalls == 0);
     assert(call(owner, kMacAMDGPUMethodBOFree) == 0 && state.sessions.initializationClient == &owner && pci.openedBy == &driver);
     const uint64_t monitorSelectors[] = {
         kMacAMDGPUMethodRuntimeBuild, kMacAMDGPUMethodQueryInfo,
         kMacAMDGPUMethodMetricsSnapshot, kMacAMDGPUMethodClockSnapshot,
-        kMacAMDGPUMethodSoftwareSnapshot, kMacAMDGPUMethodSampleCachedSensors
+        kMacAMDGPUMethodSoftwareSnapshot, kMacAMDGPUMethodSampleCachedSensors,
+        kMacAMDGPUMethodReadGrbmStatus, kMacAMDGPUMethodReadRawMetricsProbe,
+        kMacAMDGPUMethodReadSpecSnapshot
     };
     auto observeWithoutLease = [&] {
         const auto participants = state.sessions.participants;
@@ -149,7 +157,9 @@ int main() {
         const auto exclusive = state.sessions.exclusiveClient;
         const auto opens = openCalls;
         for (auto selector : monitorSelectors) {
-            const auto expected = selector == kMacAMDGPUMethodSampleCachedSensors &&
+            const auto expected = (selector == kMacAMDGPUMethodSampleCachedSensors ||
+                                   selector == kMacAMDGPUMethodReadGrbmStatus ||
+                                   selector == kMacAMDGPUMethodReadSpecSnapshot) &&
                                   state.submission.pending ? kIOReturnBusy : kIOReturnSuccess;
             assert(call(observer, selector) == expected);
         }

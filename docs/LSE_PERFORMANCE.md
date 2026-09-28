@@ -1,13 +1,329 @@
 # LSE performance baseline and comparison plan
 
-LSE runs the local Qwen3.8-27B six-bit text checkpoint on the Radeon AI PRO
+LSE runs the local Qwen3.8-27B Q4 and Q6 text checkpoints on the Radeon AI PRO
 R9700 through Loom, HRX and the macOS HSA runtime. **Performance parity with
 llama.cpp has not been demonstrated.** The current measurements establish a
 working baseline and identify work to profile; they are not a matched benchmark
 against another engine.
 
-**Current default:** the ordinary Mac same-queue policy, with no experimental
-switch, measures **88.9301 PP/s and 17.5059 TPS** on 512 input / 129 output,
+Quantization quality is decided by a matched perplexity comparison on
+1024–2048 scored tokens. Arithmetic fixtures below check kernel correctness;
+short-prompt logit captures do not qualify model quality.
+
+## Published defaults (2026-09-27)
+
+The default gfx1201 paths retain FP32 floating-point accumulation. Q4 uses
+checkpoint-qualified INT8 scalar decode at M1 and integer WMMA at M512, the
+FFN activation LDS layout, FP32 Flash12 prefill, shared-exponential decode and
+WG128 split attention. Full configuration and mapped-shard SHA-256 hashes
+qualify the automatic Q4 checkpoint; unknown models and unsupported shapes
+retain existing arithmetic. `LSE_HRX_INT8=0` selects exact activation arithmetic;
+`1` retains the explicit diagnostic policy. Existing alternative implementations
+and operand types remain available, with unaccepted candidates inactive.
+Q6 keeps staged BF16 for the two accepted M512 FFN shapes; FP8/BF8 are inactive.
+
+Matched automatic-policy prefill scores 2046 actual targets: automatic and
+explicit INT8 both produce CE 2.095230 / PPL 8.127312. Matched teacher decode
+scores 1024 actual targets after a 511-token prefix: automatic produces
+CE 1.97428174219 / PPL 7.20144530149; explicit INT8 produces
+CE 1.97106493758 / PPL 7.17831687877 (+0.3222% PPL for automatic).
+Automatic selection retains exact M2–M256 prefix arithmetic. All four runs
+exit successfully with finite outputs and zero host groups or fallbacks.
+Cold process durations include initialization and are not throughput claims.
+Evidence: `build/pp-optimization/q4-current-goal/automatic-policy/QUALITY.md`.
+
+Gated-delta decode's existing model normalization now uses one wave per
+128-element head for the exact FP32 `[1,1,16,128]` gfx1201/wave32 layout.
+It preserves FP32 FMA, epsilon flooring, precise division and query-scale
+fusion. Unsupported shapes, staged phases and multiple live outputs retain
+the scalar implementation. Unset or `LSE_GDN_L2_WAVE32=1` selects the new
+layout; `0` or malformed values retain the scalar layout. This is a model
+operation, independent of the retired logit-distance quality tests.
+
+Seven guarded native fixtures pass all outputs, input preservation and repeated
+executions; all 312 CP events have valid sequence/grid/timestamps. Isolated
+key normalization decreases 6.492 to 2.386 us and query normalization
+6.526 to 2.459 us (63.25% and 62.32%). Matched teacher perplexity scores
+1024 actual targets: scalar CE 1.9710649375806779 / PPL 7.1783168787653056;
+wave CE 1.973520018776001 / PPL 7.1959618806417565 (+0.24581%). Both runs
+exit successfully with finite outputs and zero host groups or fallbacks.
+No full-request speedup is claimed for this normalization change. Evidence:
+`/private/tmp/lse-l2-wave32-current-20260927/teacher-results.json` and
+`native-current-equivalence.json`; native source and cache identities match
+all twelve qualified compiler fixtures.
+
+## Q4 warmed server baseline before split attention (2026-09-27)
+
+The accepted kernel profile in one persistent server measured median
+448.457 PP/s and 21.177 TPS over three requests after two warmups, using the
+pinned 1024-token prompt and 64 generated tokens. All five response texts
+match, the measured requests add no JIT compiles, and shutdown exits cleanly.
+This uses Loom, MTP disabled, explicit `LSE_HRX_INT8=1`, WMMA minimum M512,
+flush64/poll64 us, shared exponentials, and required device kernels.
+
+Each matched CLI experiment below starts a new process. Its rates include
+first-forward/decode setup and should not be substituted for this warmed
+server baseline. The server's first request measured 285.852 PP/s and
+17.202 TPS; the second compiled three new objects before the graph settled.
+This is a baseline measurement correction, not an optimization gain.
+The 30 TPS / 600 PP/s targets remain unmet.
+
+A separate five-second CPU sample during a 256-output-token request finds
+4055 of 4294 serving-thread sampled stacks in scheduler/backend
+synchronization. This is waiting-stack evidence, not CPU utilization or GPU
+occupancy. The sampled request is excluded from the throughput medians.
+Frozen server/archive hashes, requests, logs, and CPU call graph:
+`build/pp-optimization/q4-current-goal/warm-server/`.
+
+## Q4 gfx1201 prefill tile (2026-09-27)
+
+The current Q4 build selects a 12-query Flash attention tile for gfx1201
+prefill with at least 12 query rows. Other devices and prefill queries with
+8–11 rows retain the eight-query tile; shorter queries use the base attention
+kernel. Decode uses a separate kernel. On the local
+Qwen3.8-27B-Q4 checkpoint, a warmed A/B/B/A run with a pinned 1024-token
+prompt measured 272.71 and 268.52 PP/s for tile 8, versus 282.30 and
+280.81 PP/s for tile 12: a 4.0% mean prefill gain. All four requests used
+108,481 device groups, no host groups or fallbacks, and no JIT compiles.
+Their short decode measurements were 16.93/16.78 and 16.67/16.65 TPS,
+respectively; this run does not establish a decode speedup.
+
+A matched GPU perplexity comparison excluded one 512-token warmup and used
+two 512-token windows (1022 next-token targets). Both tiles produced mean cross
+entropy 2.214695 and perplexity 9.158613, with finite outputs. The corpus
+SHA-256 is `4d207d8fc8c7298a0489133e104c3e12ecee9c58f2c9828dec178725cd9f17b0`.
+Frozen binaries, logs, model shard hashes, and perplexity captures are under
+`build/pp-optimization/q4-current-goal/flash12-prefill/`.
+
+## Q4 gfx1201 shared-exponential decode (2026-09-27)
+
+Paged, single-query FP32 attention now computes each softmax exponential once
+per key in shared memory. The QK sum and each output's denominator/value
+accumulation retain their original FP32 order. A workgroup barrier separates
+the maximum scan from overwriting the shared scores. The supported gfx1201
+decode path selects this implementation by default;
+`LSE_SHARED_EXP_SDPA=0` selects the previous implementation.
+
+A corrected, warmed A/B/B/A run used the same pinned 1024-token prompt and
+64 generated tokens. The previous implementation measured 16.54/16.50 TPS,
+versus 16.74/16.74 TPS for shared exponentials: a 1.3% mean decode gain.
+All four generated token sequences match. Each request used 108,481 device
+groups, zero host groups or fallbacks, and zero JIT compiles. Mean prefill
+rates were 277.49 and 277.91 PP/s; this decode change does not establish a
+prefill gain. The 30 TPS and 600 PP/s targets remain unmet.
+
+A matched teacher-forced decode perplexity run excluded 511 warmup tokens and
+scored 1024 one-token steps. Both implementations produced cross entropy
+1.971577051 and perplexity 7.181993930, with finite outputs and
+1,722,006 device groups, zero host groups, and zero fallbacks. The corpus
+SHA-256 is `4d207d8fc8c7298a0489133e104c3e12ecee9c58f2c9828dec178725cd9f17b0`.
+This exercises the changed single-query kernel; a batched prefill perplexity
+run does not qualify that kernel.
+
+The attention object cache previously omitted the selected implementation
+from its key. Earlier shared-exponential comparisons could reuse the same
+object for both arms and are withdrawn. Cache identity now includes every
+selected attention implementation. Distinct keys, object hashes, and barrier
+counts verify the corrected comparisons above. Evidence is under
+`build/pp-optimization/q4-current-goal/shared-exp/` and `shared-exp-ppl/`.
+
+The matching one-layer MTP adapter was also tested with strict device-only
+execution. Low acceptance and expensive verification made depth 1 and depth 3
+slower than ordinary decode on the pinned fixture; MTP remains disabled for
+these performance measurements. Evidence is under
+`build/pp-optimization/q4-current-goal/mtp-adapter/`.
+
+Two further decode experiments were rejected and reverted. Wave-parallel
+FP32 QK measured 16.56 TPS against 16.81 TPS for shared exponentials
+(1.49% slower). Sharing Q4 INT8 activation staging across two/four output
+columns measured 16.595/15.98 TPS against 16.75 TPS (0.93%/4.60% slower),
+with identical generated IDs and zero fallbacks or measured JIT compilation.
+The single-column Q4 object already emits 12 VOPD pairs; increased column
+reuse raised register/instruction counts without a throughput gain. Evidence:
+`build/pp-optimization/q4-current-goal/{wave-qk,dot-columns}/`.
+
+Two-group Q4 WMMA prefill staging was also rejected and reverted. A matched
+warmed A/B/B/A comparison measured 218.235 PP/s against 279.43 PP/s for
+one-group staging (21.90% slower), with identical generated IDs and zero host
+groups, fallbacks or warmed JIT compiles. Eight model objects used 128 VGPRs;
+two masked/fused objects reached 239/243, all with 13,312 LDS bytes and no
+scratch. These are resource demands, not measured occupancy. The accepted
+one-group default remains selected. Evidence:
+`build/pp-optimization/q4-current-goal/two-group-prefill/`.
+
+## Q4 gfx1201 split-key decode (2026-09-27)
+
+Single-query paged FP32 attention partitions the keys into 128-key workgroups
+and merges their local softmax results in FP32. This increases parallel work
+across the GPU for the measured context lengths. The partial kernel uses
+14 VGPRs and 512 LDS bytes; merge uses eight VGPRs and 128 LDS bytes, both
+with zero scratch. These resource counts are not live occupancy measurements.
+
+A matched persistent-server pair, each with two warmups and three measured
+requests, used the pinned 1024-token prompt and 64 generated tokens. Median
+decode rose from 21.1304 to 23.8160 TPS (+12.71%); median prefill was
+445.8368 versus 445.5723 PP/s. Each arm repeats its response text and adds
+zero JIT compiles in measured requests. Different continuations across arms
+are evaluated by perplexity because the merge changes FP32 reduction order.
+MTP is disabled and device kernels are required in both arms.
+
+A matched teacher-forced comparison excluded 511 warmup tokens and scored
+1024 single-token steps. The prior kernel produced cross entropy 1.971577051
+and PPL 7.181993930; split-key produced 1.971064938 and 7.178316879,
+respectively (-0.0512% PPL). Every scored output was finite, with zero host
+groups or fallbacks. Device groups were 1,722,006 and 1,738,406. The extra
+16,400 groups are one merge per full-attention layer over 1024 scored steps
+and the warmup's first single-query step under the explicit experimental
+switch. The ascending prefill ladder processes that one-token remainder
+before larger chunks. The corpus hash is the same as above.
+
+The default scope is gfx1201/wave32, paged FP32 single-query D256,
+initial live context at least 512 tokens and capacity at most 4096. Explicit
+`LSE_SPLIT_KEY_SDPA=0` selects the previous implementation; value `1` admits
+the broader supported experimental range. A long-context retained program
+followed by short batch-row metadata rebuilds with the prior attention kernel;
+the next short step replays that prior schedule. Speculative replacement keeps
+its rollback program. A schedule built for a short context remains unchanged
+as it grows until a graph rebuild. The default-unset strict smoke passed with
+109,489 device groups and zero host groups, fallbacks or JIT compiles; four
+focused tests passed. The macOS adapter applies to the pinned base with
+173 paths matching the current engine byte for byte. Five fresh CPU suites
+pass, including retained-program runtime, graph, attention, Flash and operand
+policy coverage. Evidence: `adapter-sync-current/` beside the split artifacts.
+The 30 TPS / 600 PP/s targets remain unmet. Evidence:
+`build/pp-optimization/q4-current-goal/split-key/`.
+
+## Current warmed Q4 dispatch profile (2026-09-27)
+
+The accepted split-attention server measured 451.442 PP/s and 23.899 TPS on
+one request after two warmups. The profiling arm measured 447.794 PP/s and
+22.819 TPS: observed elapsed-time increases of 0.814% prefill and 4.730%
+decode. All six response texts match, every request has zero JIT compiles,
+and both servers exit successfully. This sequential pair measures observed
+profiling overhead, not a randomized overhead bound.
+
+The completed CP capture matches all 328,469 exported dispatch counts to the
+independent LSE host summary. The third request contains 3,334 prefill
+dispatches, totaling 2,228.755 ms of kernel durations inside a 2,248.646 ms
+envelope. Its 63 decode steps contain 1,685 dispatches each, with median
+36.198 ms of kernel durations, 5.835 ms of positive internal gaps and a
+1.056 ms gap between steps. Host and device clock origins are independent;
+these gaps are not measured GPU idle time or occupancy.
+
+Prefill FFN up/gate accounts for 744.603 ms and down for 383.890 ms;
+attention accounts for 326.305 ms. Decode FFN up/gate and down total
+17.272 ms per token, split partial attention 2.523 ms, and the largest
+normalization family 2.072 ms. These dispatch timings guide further work.
+Evidence: `build/pp-optimization/q4-current-goal/current-profile/`.
+
+A smaller Q4 prefill row tile was rejected and reverted. A persistent-server
+pair with two warmups and three measured requests each measured median
+450.088 PP/s for 64 rows versus 300.068 PP/s for 32 rows (-33.33%). The
+smaller tile reduced representative resource demands from 107 to 95 VGPRs
+and 6,656 to 3,328 LDS bytes, with no scratch; that did not improve throughput.
+Both arms repeat the same response text and add no measured JIT compiles.
+Evidence: `build/pp-optimization/q4-current-goal/rows32-prefill/`.
+
+## Current Q4 prefill activation quality (2026-09-27)
+
+A matched current-engine comparison changes only `LSE_HRX_INT8=0` versus `1`.
+One 1024-input warmup is excluded, then two independent 1024-input context
+windows score exactly 2046 next-token predictions with prefill chunk 512.
+FP32 activations produce mean cross entropy 2.091969 and PPL 8.100851;
+INT8 activations produce 2.095230 and 8.127312 (+0.3266% PPL). All captured
+outputs are finite, device kernels are required, and both processes exit
+successfully. Floating-point accumulation remains FP32. This short corpus
+qualifies this checkpoint/profile; it does not qualify other models/devices.
+
+The corpus differs from the earlier three-window fixture, so absolute PPL
+values must not be compared across those corpora. The older fixture used
+two 512-input scored windows, which contain 1022 next-token targets; its old
+1024-scored label was incorrect. Its frozen arithmetic and PPL values are
+unchanged. The current fixture records actual scored targets and rejects
+counts outside 1024–2048. Evidence, frozen binary/archives/input/capture hashes:
+`build/pp-optimization/q4-current-goal/prefill-policy-ppl/`.
+
+## Q4 split attention with two channels per thread (2026-09-27)
+
+The qualified split128 decode path now uses WG128. Each thread processes two
+adjacent value channels; the partial record remains 258 FP32 values and the
+ordered QK, denominator, value and merge arithmetic is retained. Both stages
+have new implementation identities. Unset or `LSE_SPLIT_KEY_WG128=1` selects
+the new layout; `0` or malformed values retain WG256. The existing device,
+shape and long-context selection restrictions remain in force.
+
+Ten native full-record/output, sentinel and repeat checks pass bitwise.
+An 848-event CP capture verifies the complete dispatch sequence and timestamps.
+Isolated partial-plus-merge durations improve 28.60–35.28% over live lengths
+512, 1024 and 1535. No scratch is used. The current model shape emits no VOPD
+pairs in either stage, so this result does not establish a dual-issue gain.
+
+The same frozen server binary, two warmups and three measured requests per arm,
+measures 23.8491 versus 24.2635 TPS (+1.7375%) and 447.302 versus 444.532 PP/s.
+All ten texts match, measured requests add no JIT compiles and both owners exit
+successfully. This is an ordered pair. A matched teacher comparison scores
+1024 actual next-token targets after a 511-token prefix: both arms produce
+CE 1.971064938 and PPL 7.178316879 with zero host groups or fallbacks.
+The cached long-to-short replay scope check also passes. An earlier cold-cache
+scope fixture failed in its pre-split prefix with an invalid HSA signal index;
+that runtime failure is preserved and its cause remains unresolved.
+Evidence: `build/pp-optimization/q4-current-goal/split-wg128/`.
+
+## Q4 FFN activation LDS layout (2026-09-27)
+
+The two measured M512 FFN shapes now use four-word quarter rotations for
+activation LDS rows, aligned 128-bit stores and aligned 64-bit fragment loads.
+Selection is restricted to gfx1201/wave32, Q4/group64, F32 activations/output,
+BF16 scales/biases, and N17408/K5120 or N5120/K17408. Unset or
+`LSE_Q4_WMMA_ACTS_SWIZZLE=1` selects the layout; `0` or malformed retains the
+original. Quantization rounding, integer matrix products and FP32 affine
+restore order are unchanged. One templated implementation serves both layouts.
+
+Native ABBA durations improve 18.61% for FFN up and 19.41% for down. Complete
+outputs are byte-identical, all eight owners exit successfully, and fourteen
+refactored compiler fixtures reproduce the qualified native object bytes.
+The candidate uses 110 VGPRs, 16 SGPRs, 6656 LDS bytes and zero scratch, versus
+107/16/6656/0. Recognized VOPD pairs increase from 39 to 43; resource and ISA
+counts do not establish actual occupancy or LDS bank-conflict rates.
+
+The matched perplexity gate scores 2046 actual targets in two 1024-input
+windows after an excluded warmup. Both arms produce CE 2.095230 and
+PPL 8.127312, with finite outputs and clean exits. Quiet server ABBA candidate
+medians are 458.182 and 455.238 PP/s versus the first baseline's 447.497 PP/s,
+about 2% higher. The final baseline drifts to 425.753 PP/s even with all heavy
+build/hash work paused. The pooled 3.98% observation is not a stable gain
+estimate; the drift's cause is not established. This M512 specialization
+does not claim a decode gain. All twenty texts match and measured JIT is zero.
+Evidence: `build/pp-optimization/q4-current-goal/acts-lds/`.
+
+## Combined engine CPU sample (2026-09-27)
+
+The integrated WG128 and FFN LDS defaults complete two warmups and a
+1024-input/256-output request with the expected greedy prefix, zero new
+measured JIT compiles and clean shutdown. The sampled request measures
+470.588 PP/s and 24.539 TPS; it is not a matched performance comparison.
+
+A five-second, one-millisecond CPU sample captures 4305 epochs on the serving
+thread. Final device synchronization contains 4021 epochs (93.40%); hidden
+evaluation submission contains 197 (4.58%). Within submission, queue flushes
+contain 66 epochs and IOKit queue kicks 54. These are nested sampled stacks,
+not additive CPU costs, measured GPU occupancy or proof of GPU idle time.
+
+Offline classification of the preceding CP capture finds median per-token
+gaps of 4.347 ms within submissions and 1.487 ms between submissions, with
+27 submissions per token at flush64. Profiling affects this capture. Larger
+batches can address submission boundaries, but cannot be assumed to remove
+all dispatch gaps. Earlier flush256 and whole-token submission comparisons
+did not improve their older Q6 fixtures. The current 30 TPS / 600 PP/s
+targets remain unmet. Evidence: `combined-profile/` and
+`current-profile/submission-gaps.json` beneath
+`build/pp-optimization/q4-current-goal/`.
+
+## Earlier Q6 runtime qualification
+
+**Earlier Q6 default record:** the ordinary Mac same-queue policy, with no
+experimental switch, measured **88.9301 PP/s and 17.5059 TPS** on 512 input /
+129 output,
 KV1024, MTP disabled, flush64/poll64. These are medians of three measured requests
 after two warmups. All five responses match the control, all measured requests
 have zero compilation or disk-cache misses, and shutdown succeeds. Final default
@@ -50,23 +366,15 @@ phases.json,profile-ready-off/result.json,profile-ready-on/result.json}`.
 **Current qualification correction:** the M256 residual-two-product vector
 BF16 profile is withdrawn from automatic selection. A newly matched reference
 changes only those two Q6 projections back to their original FP32 contraction,
-preserving cooperative RMS and every other model/runtime input. Its comparison
-measures vector logit relative L2 **0.00503022829645**, exceeding the unchanged
-**0.005** limit. Earlier **0.00408522** evidence came from a different RMS
-context and does not establish the current profile's accuracy. The source
-profile is now Candidate with failed model quality and a conservative 5031-ppm
-record; the ordinary selector uses FP32 for those shapes.
+preserving cooperative RMS and every other model/runtime input. The profile
+remains a Candidate until a matched 1024–2048-scored-token PPL comparison
+qualifies it; the ordinary selector
+uses FP32 for those shapes.
 
-The centered M256 candidate measures **0.00406726276905** against that same
-matched reference on the story prompt and passes that context. All three implementations repeat bit-exactly,
-have finite logits and the same argmax. Its **0.00661439** difference against
-the vector implementation alone was not a valid substitute for comparison
-with the original FP32 projection. Expanded checks reject the centered
-replacement: the code prompt measures **0.02952281953125** relative L2, above
-the unchanged **0.005** limit; the math prompt passes at **0.00122390946142**.
-Both use exactly 512 matching input tokens and 248,320 finite logits, with
-bit-exact repeats and matching argmax. Matching the next token alone does not
-satisfy the logit accuracy gate. The centered replacement remains experimental.
+The centered M256 candidate and matched FP32 reference repeat bit-exactly
+on the fixed story prompt, with finite logits and the same argmax. The
+centered replacement remains experimental pending a matched
+1024–2048-scored-token PPL comparison.
 Evidence: `centered-m256-quality-{code,math}.json`,
 `centered-m256-scalar-vs-{baseline,candidate}.json` and
 `build/perf-q6-m256-scalar-reference/identity-proof.json`.
@@ -81,9 +389,8 @@ requests, with text identical across all ten candidate/control responses and
 zero new compilations in the three measured requests. It measured median
 **119.215 PP/s and 16.648 TPS**, versus **143.262 PP/s and 16.691 TPS** for the
 withdrawn vector performance control. Thus the centered change is not a speedup
-over that approximation. The expanded-context accuracy failure above prevents
-automatic selection regardless of speed; full-model qualification must be
-repeated after an arithmetic correction. Evidence:
+over that approximation. The missing PPL qualification prevents automatic
+selection regardless of speed. Evidence:
 `centered-current-pp512-tg128-comparison.json`.
 
 An isolated, explicitly enabled Q6 INT8 residual-correction implementation
@@ -111,13 +418,11 @@ The older experiment history below is retained for context.
 These candidates remain separate from the accurate default above.
 
 The revised centered M256 implementation uses two BF16 activation terms and
-ordered FP32 repair for exceptional or cancellation-sensitive outputs. It now
-passes all three fixed 512-token model contexts against the matched FP32
-reference: relative logit L2 is **0.0000495955** for code, **0.00000208275**
-for math, and **0.00000649414** for story, below the unchanged 0.005 limit.
-All 248,320 logits are finite, repetitions are bit-exact, and argmax agrees.
-This supersedes the earlier candidate's accuracy failure, not its performance
-qualification: the revised story diagnostic achieves only **21.68 PP/s** with
+ordered FP32 repair for exceptional or cancellation-sensitive outputs. On
+three fixed 512-token contexts against the matched FP32 reference, all
+248,320 logits are finite, repetitions are bit-exact, and argmax agrees.
+This does not establish PPL quality. The revised story diagnostic achieves
+only **21.68 PP/s** with
 zero new compilations, so this implementation is not promoted.
 
 A separate two-pass prototype moves repair out of the matrix kernel. The first
@@ -125,9 +430,8 @@ pass writes values and repair flags; a second ordinary GPU kernel copies valid
 values or recomputes flagged outputs in the original FP32 order. It uses a
 distinct output allocation and requires no CPU readback or shared atomic RMW.
 All **37 numerical cases with nine repeats each** pass, with output hashes
-identical to the revised single-pass implementation. Automatic HIP/Loom model selection also passes the code context at relative L2
-0.0000495955, with bit-exact repeats and matching argmax. Math/story model gates
-also pass. The newer compilation-free comparison measures 76.72 PP/s, slower
+identical to the revised single-pass implementation. The newer
+compilation-free comparison measures 76.72 PP/s, slower
 than the current default; the branch is not promoted. Evidence:
 `centered-v3-quality-{code,math,story}.json`,
 `q6-centered-repair-phase-numeric.log`, and
@@ -655,18 +959,32 @@ The monitor remained running. Each iteration checked every output and guards.
 
 The original FP32 projection took 4.946 ms and 18.448 ms for the first two
 shapes in a preceding controlled comparison. Workgroup reuse therefore matters
-more here than choosing the smallest matrix operand. Automatic selection uses
-the accepted staged-BF16 records for these exact shapes on gfx1201/64 CU;
-unknown shapes and single-token decode retain the existing floating-point path.
-The measurements do not establish a winner for untested shapes or other GPUs.
+more here than choosing the smallest matrix operand. These are historical
+projection measurements; M64 and untested shapes retain the scalar path.
+
+Current gfx1201/driver 201 qualification selects staged BF16 only for the
+Q6 FFN shapes `(M,N,K)=(512,17408,5120)` and `(512,5120,17408)`. On the
+Qwen3.8-27B-MLX-6bit model, the pinned WikiText-2 corpus
+(`4d207d8fc8c7298a0489133e104c3e12ecee9c58f2c9828dec178725cd9f17b0`,
+verified with `shasum -a 256`)
+gave 1022 actual targets after one excluded 512-token warmup window: scalar
+PPL **9.062509**, scoped BF16 PPL **9.062366**, with overlapping bootstrap CIs,
+matching token IDs and finite logits. Eight warm, JIT-free retained-graph
+host eval-plus-retirement samples measured **20.071 → 7.270 ms** for up and
+**18.386 → 6.922 ms** for down. Rocprofmac device dispatch timestamps measured
+**19.807 → 7.040 ms** and **18.228 → 6.722 ms**, respectively. Only these two
+cost records retain their explicit acceptance after correcting the historical
+input-token count to actual targets; new tests use 1024–2048 actual targets.
+M64, M1024, other projections and single-token decode remain on the scalar
+path. These results cover this model and device.
 
 OCP conversion passed both formats, all 256 decode byte values, representable
 roundtrips, rounding midpoints, overflow, signed zero, NaN/infinity, two replays,
 offsets and buffer guards. The complete E4M3 model candidate produced finite
-logits for all 248,320 vocabulary entries after the same 64-token prompt:
-relative L2 difference 0.12055%, KL divergence 1.26e-6, identical highest-scoring
-token and top-20 membership. This single prompt is not a broad model-quality
-evaluation. BF8 failed the cancellation-safe absolute budget on two numerical
+logits for all 248,320 vocabulary entries after the same 64-token prompt,
+with identical highest-scoring token and top-20 membership. This single prompt
+does not qualify model quality; a 1024–2048-scored-token perplexity comparison
+is required. BF8 failed the cancellation-safe absolute budget on two numerical
 fixtures and is not an accepted automatic Q6 choice.
 
 One fixture with inputs around 1e-38 differed from the CPU FP32 reference in
@@ -818,13 +1136,13 @@ Both requests had exactly 1,361 input-history tokens and identical history hash
 | 2 | 440 (` with`) | 18.6044197 | 780 (` his`) | 0.0000381470 |
 
 Neither row contained a nonfinite value. Their maximum absolute difference was
-0.0001716614 and relative L2 difference8.77543e-6. This establishes that a small
+0.0001716614. This establishes that a small
 numerical difference reverses a nearly tied greedy decision; it does not identify
 which upstream operation introduced the difference. The diagnostic preserves
 selection but extends the logits buffer's lifetime, so it is not a timing run.
 
 An existing `LSE_KV_PREALLOC=1` control returned equal400-token continuations,
-but its rows still differed (maximum absolute0.0002918243, relative L2 1.63052e-5).
+but its rows still differed (maximum absolute0.0002918243).
 Both selected token780, with margins0.0001411438 and0.0000152588. Therefore
 preallocation does not establish a numerical fix and is not promoted as one.
 Artifacts: `qwen-rms-logit-diagnostic`, `rms-logits-337/comparison.json`,
@@ -835,8 +1153,8 @@ The same diagnostic was then linked against the unchanged baseline kernel and
 emitter archives. It also produced different continuations at the same token,
 with identical 1,361-token input history and hash. Request 1 selected token 780
 with a margin of 0.0001220703; request 2 selected token 440 with a margin of
-0.0000915527. Maximum absolute logit difference was 0.0006694794 and relative
-L2 difference was 3.64895e-5. Both GPU selections agreed with their respective
+0.0000915527. Maximum absolute logit difference was 0.0006694794. Both GPU
+selections agreed with their respective
 row maxima; the server exited successfully, while text equality failed.
 
 This control means the underlying numerical variation is **not established as
@@ -918,8 +1236,8 @@ a controlled performance result. Evidence: `qwen-two-column-1k1k/result.json`.
 A separate baseline diagnostic read the existing final hidden row after the
 normal synchronization, without adding graph roots. Both requests used identical
 1,024-token input history. The first hidden row, already at the end of prefill,
-differed in 5,117/5,120 FP32 words: maximum absolute difference 0.00067246,
-relative L2 error 0.000075469. All 338 captured rows differed. This moves the next
+differed in 5,117/5,120 FP32 words: maximum absolute difference 0.00067246.
+All 338 captured rows differed. This moves the next
 investigation into prefill rather than attributing the initial difference to
 decode RMS or the final vocabulary projection. Readback/file I/O perturbs
 timing; this is not a throughput measurement or proof of identical compiled
@@ -1002,8 +1320,8 @@ by clean shutdown (`hrx-canonical-status-failure.log`).
 
 ### Prefill chunk size and warmup limits
 
-The normal generator uses 256-token chunks, while current measured BF16 Q6 matrix
-selection records cover M64 and M512. A private generator-only 512-token-chunk
+At the time of this experiment, the generator used 256-token chunks. A private
+generator-only 512-token-chunk
 prototype completed two 512-input/33-output requests, then failed allocation on
 the third with the old runtime. It shut down cleanly and is not promoted. The unchanged 256-token
 control completed all three requests with identical text.
@@ -1056,15 +1374,16 @@ Evidence: `qwen-prefill512-tlsf-canonical/result.json`. The runtime SHA-256 was
 An isolated correction splits each FP32-dequantized Q6 weight into a BF16 high
 part and a BF16 residual, then accumulates two native matrix products in FP32.
 Packed model storage is unchanged. This addresses compounded activation/weight
-rounding without relaxing the existing 0.5% quality limits. Exceptional blocks
+rounding while preserving the arithmetic fixture checks. Exceptional blocks
 use uniform FP32 computation on the GPU.
 
 The R9700 passed all 16 cases, each evaluated nine times with output/input
 guards: the K64 adversarial case, five exceptional-value cases, and ten M256
-cases. Maximum relative L2 error among these fixtures was 0.003062. The scalar
+cases. The scalar
 control subsequently passed 15/16 cases with explicit repeated-output hash
 checks. It failed only the subnormal case: a reference value of 3.48975e-39
-became zero (relative L2 error 1). The corrected candidate passed that case. This records an existing scalar limitation rather
+became zero. The corrected candidate passed that case. This records an existing
+scalar limitation rather
 than excluding subnormals or loosening the criterion.
 
 Full-size projection measurements used one warm execution followed by eight
@@ -1108,10 +1427,9 @@ investigation below. Evidence: `qwen-bf16-residual2-m256/result.json` and
 The subsequent quality diagnostic captured the existing host prefill logits,
 before sampling, without adding device allocations or readbacks. Two baseline
 and two candidate requests had exactly matching prompt token bytes and 248,320
-finite logits each. All four cross-comparisons retained the same argmax and
-relative L2 error 0.003241–0.004721, below the existing 0.005 limit. However,
-candidate-to-candidate error was 0.005177 versus baseline repeat error 0.0001367.
-The larger repeat variation is unresolved; matching text and passing cross-pair
+finite logits each. All four cross-comparisons retained the same argmax.
+Candidate repeats differed, while baseline repeats were more stable.
+The repeat variation is unresolved; matching text and passing cross-pair
 checks alone do not establish production acceptance. Evidence:
 `build/tests/driver195-hardware/bf16-m256-logit-comparison.json`.
 
@@ -1185,11 +1503,10 @@ as the KV pool grows and should not be presented as steady-state PP/s.
 Evidence: `qwen-rms-final-slots-r2-1k1k/result.json` and
 `qwen-final-slots-current-1k1k/result.json`.
 
-The M256 vector-BF16 model quality check also passes with the corrected planner:
+The M256 vector-BF16 logit diagnostic was repeated with the corrected planner:
 all 248,320 logits are bit-identical between repeated requests for both the
-scalar control and vector candidate. Cross-implementation relative L2 is
-0.00408522, below the unchanged 0.005 limit, with the same argmax in all four
-pairings. This removes the previously observed 0.005177 candidate repeat noise.
+scalar control and vector candidate. The argmax agrees in all four
+pairings. This removes the previously observed candidate repeat noise.
 Long generation and throughput qualification are separate. Evidence:
 `bf16-vector-m256-r2-logit-comparison.json` under the hardware test directory.
 
@@ -1227,8 +1544,8 @@ tests passed before this GPU check. Evidence:
 `06c03b0c36fc60192c5e238db1819ad32315a8fc7a1fc91104b82b48d44ea329`).
 
 The next isolated centered-affine Q6 candidate passed 32 guarded GPU cases,
-nine identical repeats each, against the original ordered FP32 reference and
-the unchanged 0.005 relative-L2 limit. Coverage includes row tails, full model
+nine identical repeats each, against the original ordered FP32 reference.
+Coverage includes row tails, full model
 K widths, cancellation, exceptional values and unchanged inputs/guards. It
 factors group scale and bias around centered integer codes to reduce matrix
 products, with ordered FP32 fallback for exceptional and cancellation-sensitive
@@ -1244,10 +1561,10 @@ timestamps). Both implementations exactly match the original FP32 reference
 on these inputs. This distribution exercises the matrix path; it does not
 measure the fallback-heavy mixed-sign-bias case or model throughput. Full-model
 logit comparison against the existing vector BF16 implementation subsequently
-failed the 0.005 threshold at 0.00661439, despite zero repeat noise and matching
-argmax. The candidate remains experimental; a matched M256-only scalar reference
-is required to assess error against the original FP32 contraction, since the
-vector control is itself approximate. Evidence:
+had zero repeat noise and matching argmax. That short-prompt diagnostic does not
+qualify model quality. The candidate
+remains experimental pending matched 1024–2048-scored-token PPL evidence;
+the vector control is itself approximate. Evidence:
 `q6-centered-affine-{baseline,candidate}-{up256,down256}.log`.
 
 A separate four-column decode candidate shares activation loads across four

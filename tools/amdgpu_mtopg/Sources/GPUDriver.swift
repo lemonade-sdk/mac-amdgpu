@@ -47,9 +47,11 @@ enum DriverABI {
     static let selMetrics: UInt32 = 47      // struct out: SMUMetricsSnapshot (192 B)
     static let selClocks: UInt32 = 62       // struct out: SMUClockSnapshot (96 B)
     static let selSoftware: UInt32 = 61     // struct out: software_stats::Snapshot (456 B)
-    static let selSensors: UInt32 = 63      // out: 3 u64 (bounded sensor cache)
+    static let selSensors: UInt32 = 63      // out: 3 u64 (refresh bounded sensor cache)
     static let selSqSlot: UInt32 = 69       // out: 5 u64 [status, seq, sq_busy, ref, clock]
     static let selSqBusy: UInt32 = 70       // out: 5 u64 [status, busy_delta, total_delta, pct_x100, at_ns]
+    static let selGrbmStatus: UInt32 = 71   // out: 3 u64 [status, raw GRBM_STATUS, at_ns]
+    static let selSpecSnapshot: UInt32 = 73 // struct out: GFXSpecSnapshot (128 B)
     static let selMmhub: UInt32 = 68        // out: 4 u64 PERFSTATUS UMC busy
 
     static let minimumBuild: UInt32 = 172
@@ -57,19 +59,21 @@ enum DriverABI {
     static let mmhubMinimumBuild: UInt32 = 198
     static let sqSlotMinimumBuild: UInt32 = 200
     static let sqBusyMinimumBuild: UInt32 = 200   // driver-owned SQ busy counter (sel 70)
+    static let grbmStatusMinimumBuild: UInt32 = 203
+    static let specSnapshotMinimumBuild: UInt32 = 204
     static let magic: UInt64 = 0x414D444750554142 // "AMDGPUAB"
 
     // Struct payload sizes (C static_asserts in dext/amdgpu).
     static let metricsSize = 192
     static let clocksSize = 96
     static let softwareSize = 456
+    static let specSize = 128
 
     // QueryInfo (21) tags.
     static let tagGfxVersion: UInt64 = 1
     static let tagVram: UInt64 = 2
     static let tagStage: UInt64 = 4
     static let tagAccounting: UInt64 = 5
-    static let tagDeviceSpec: UInt64 = 8
 }
 
 // SMU metrics fields (amdgpu_metrics.h enum order).
@@ -87,7 +91,7 @@ enum SMUField: UInt {
     case hotspotTemperatureMillicelsius = 10
     case memoryTemperatureMillicelsius = 11
     case fanRPM = 12
-    static let count = 17
+    static let count = 16
 }
 
 let kSMUMetricsSnapshotVersion: UInt32 = 1
@@ -203,7 +207,7 @@ struct SoftwareStatsSnapshot {
     var saturated: Bool { flags & 4 != 0 }
 
     init(bytes: [UInt8]) {
-        // C layout: 4 x u32, 11 x u64, then 4 x EngineSnapshot (96 B each).
+        // C layout: 4 x u32, 11 x u64, then 4 x EngineSnapshot (88 B each).
         func le(_ offset: Int) -> UInt32 { SafeLE.u32(bytes, offset) }
         func lu(_ offset: Int) -> UInt64 { SafeLE.u64(bytes, offset) }
         version = le(0); size = le(4); flags = le(8); reserved = le(12)
@@ -212,7 +216,7 @@ struct SoftwareStatsSnapshot {
         publishedPackets = lu(64); consumedPackets = lu(72); retiredPackets = lu(80)
         cpuUploadBytes = lu(88); cpuReadbackBytes = lu(96)
         for i in 0..<Self.engineCount {
-            let base = 128 + 96 * i
+            let base = 104 + 88 * i
             engines[i] = SoftwareEngineSnapshot(bytes: Array(bytes[base...]))
         }
     }
@@ -251,13 +255,9 @@ struct MmhubPerfStatus {
     }
 }
 
-// The driver-owned SQ busy-cycle counter read (selector 70, driver 200+): the
-// dext GRBM-broadcasts a read of SQ_PERFCOUNTER0 (BUSY_CYCLES) and
-// SQ_PERFCOUNTER1 (CYCLES) summed across all shader engines and returns the
-// delta over the poll interval. This is a true hardware counter (distinct from
-// the workload-owned aqlprofile slot, selector 69, and from the software
-// dispatch-rate proxy). status != 0 (kIOReturnUnsupported) means the counter
-// is not available (PCI not open / not ready) — show n/a, not 0.
+// Selector 70's ABI is reserved for a driver-owned SQ busy-cycle delta.
+// The current driver reports kIOReturnUnsupported because gfx1201 SQ counters
+// require a workload-side CP perfmon program; show n/a until one is qualified.
 struct SqBusySample {
     var status: UInt32 = 0     // 0 = fresh sample; kIOReturnUnsupported = no source
     var busyDelta: UInt64 = 0  // busy shader cycles in the window
@@ -271,6 +271,14 @@ struct SqBusySample {
     var percent: Double? {
         usable ? Double(pctX100) / 100.0 : nil
     }
+}
+
+struct GrbmStatusSample {
+    var status: UInt32 = 0
+    var raw: UInt32 = 0
+    var sampledAtNs: UInt64 = 0
+    var valid = false
+    var active: Bool { raw & 0x8000_0000 != 0 }
 }
 
 // MARK: - Device
@@ -304,10 +312,9 @@ final class Device {
     // process (HRX LSE backend) publishes real aqlprofile SQ counter sums
     // into a GART slot; status != 0 means no slot is registered yet.
     var sqSlot = SqSlotSample()
-    // Driver-owned SQ busy-cycle counter (selector 70, driver 200+): the dext
-    // reads the real hardware SQ busy counter directly. Preferred over the
-    // workload slot when both are present.
+    // Driver-owned SQ busy-cycle counter (selector 70), currently unsupported.
     var sqBusy = SqBusySample()
+    var grbmStatus = GrbmStatusSample()
 
     var label: String {
         "0x" + String(registry, radix: 16)
@@ -322,6 +329,8 @@ final class DriverTransport {
     // before this dictionary ever goes away), so no iterator ever
     // outlives its match.
     private let match: CFDictionary?
+    private var lastSensorAttemptNs: [UInt64: UInt64] = [:]
+    private var specCache: [UInt64: [UInt32]] = [:]
 
     init() {
         match = IOServiceNameMatching("MacAMDGPU")
@@ -344,26 +353,29 @@ final class DriverTransport {
         _ = IORegistryEntryGetRegistryEntryID(service, &device.registry)
 
         var connection: io_connect_t = IO_OBJECT_NULL
-        guard IOServiceOpen(service, mach_task_self_, 0, &connection) == KERN_SUCCESS else {
-            device.error = "IOServiceOpen failed"
+        let openResult = IOServiceOpen(service, mach_task_self_, 0, &connection)
+        guard openResult == KERN_SUCCESS else {
+            device.error = krString("IOServiceOpen", openResult)
             return device
         }
         defer { IOServiceClose(connection) }
 
         func scalar(_ selector: UInt32, _ inWords: [UInt64], into outWords: inout [UInt64]) -> kern_return_t {
             var count = UInt32(outWords.count)
-            return outWords.withUnsafeMutableBufferPointer { outPtr in
+            let result = outWords.withUnsafeMutableBufferPointer { outPtr in
                 inWords.withUnsafeBufferPointer { inPtr in
                     IOConnectCallScalarMethod(connection, selector, inPtr.baseAddress, UInt32(inWords.count),
                                               outPtr.baseAddress, &count)
                 }
             }
+            return result == KERN_SUCCESS && count != outWords.count ? kIOReturnBadArgument : result
         }
 
         func structCall(_ selector: UInt32, into payload: inout [UInt8]) -> kern_return_t {
             var bytes = payload.count
-            return IOConnectCallStructMethod(connection, selector, nil, 0,
-                                             &payload, &bytes)
+            let result = IOConnectCallStructMethod(connection, selector, nil, 0,
+                                                   &payload, &bytes)
+            return result == KERN_SUCCESS && bytes != payload.count ? kIOReturnBadArgument : result
         }
 
         // Identity / build gate (selector 43).
@@ -396,13 +408,39 @@ final class DriverTransport {
             device.stage = UInt32(stage[0])
         }
 
-        // Tag 8: GFXSpecSnapshot chip geometry (32 dwords; all-zero means the
-        // GC IP is not resolved yet, which is normal while stopped).
-        var specWords = [UInt64](repeating: 0, count: 32)
-        tag = DriverABI.tagDeviceSpec
-        if scalar(DriverABI.selQuery, [tag], into: &specWords) == KERN_SUCCESS, specWords.count == 32, specWords[0] != 0 {
-            device.specWords = specWords.map { UInt32($0) }
-            device.specValid = true
+        // Selector 47/62 only return cached CPU snapshots. Ask the driver to
+        // refresh that cache when an initialized owner already has the GPU
+        // running. This observer endpoint neither opens PCI nor claims a
+        // session; both the monitor and driver limit collection to 1 Hz.
+        if device.build >= DriverABI.softwareMinimumBuild, device.stage == 15 {
+            let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+            let previous = lastSensorAttemptNs[device.registry] ?? 0
+            if previous == 0 || now < previous || now - previous >= 1_000_000_000 {
+                lastSensorAttemptNs[device.registry] = now
+                var result = [UInt64](repeating: 0, count: 3)
+                _ = scalar(DriverABI.selSensors, [], into: &result)
+            }
+        }
+
+        // The original QueryInfo tag 8 returns 32 scalars, above DriverKit's
+        // 16-scalar RPC limit. Build 203 exposes the same 128-byte data as a
+        // struct; older builds leave geometry unavailable.
+        if device.stage != 15 { specCache.removeValue(forKey: device.registry) }
+        if device.build >= DriverABI.specSnapshotMinimumBuild, device.stage == 15 {
+            if let spec = specCache[device.registry] {
+                device.specWords = spec
+                device.specValid = true
+            } else {
+                var raw = [UInt8](repeating: 0, count: DriverABI.specSize)
+                if structCall(DriverABI.selSpecSnapshot, into: &raw) == KERN_SUCCESS {
+                    let spec = (0..<32).map { SafeLE.u32(raw, $0 * 4) }
+                    if spec[0] != 0 {
+                        specCache[device.registry] = spec
+                        device.specWords = spec
+                        device.specValid = true
+                    }
+                }
+            }
         }
 
         // Software activity counters (selector 61, build 193+).
@@ -411,8 +449,7 @@ final class DriverTransport {
             let kr = structCall(DriverABI.selSoftware, into: &raw)
             if kr == KERN_SUCCESS {
                 let s = SoftwareStatsSnapshot(bytes: raw)
-                if s.version == 1, s.size == UInt32(DriverABI.softwareSize), s.reserved == 0,
-                   s.generation > 0 {
+                if Self.validSoftware(s) {
                     device.software = s
                     device.softwareSupported = true
                 } else {
@@ -474,6 +511,22 @@ final class DriverTransport {
                 device.sqBusy.status = UInt32(truncatingIfNeeded: words[0])
             } else {
                 device.sqBusy.status = UInt32(truncatingIfNeeded: kr)
+            }
+        }
+
+        // The driver makes one passive GRBM_STATUS read per observer poll.
+        // A rolling fraction of GUI_ACTIVE samples is computed in the model.
+        if device.build >= DriverABI.grbmStatusMinimumBuild {
+            var words = [UInt64](repeating: 0, count: 3)
+            let kr = scalar(DriverABI.selGrbmStatus, [], into: &words)
+            if kr == KERN_SUCCESS, words[0] == 0,
+               words[1] <= UInt32.max, words[2] > 0 {
+                device.grbmStatus = GrbmStatusSample(status: 0,
+                    raw: UInt32(words[1]), sampledAtNs: words[2], valid: true)
+            } else if kr == KERN_SUCCESS {
+                device.grbmStatus.status = UInt32(truncatingIfNeeded: words[0])
+            } else {
+                device.grbmStatus.status = UInt32(truncatingIfNeeded: kr)
             }
         }
 
@@ -544,6 +597,8 @@ final class DriverTransport {
             if scalar(DriverABI.selMmhub, [], into: &result) == KERN_SUCCESS, result.count == 4 {
                 let statusLow32 = UInt32(result[0] & 0xFFFFFFFF)
                 let raw = UInt32(result[1] & 0xFFFFFFFF)
+                device.mmhub.status = statusLow32
+                device.mmhub.raw = raw
                 let unavailable = (statusLow32 & 0xFFFF) == 0x2c7 && (statusLow32 & 0xE000_0000) != 0
                 if !unavailable, statusLow32 == 0, raw != 0xFFFFFFFF {
                     device.mmhub = MmhubPerfStatus(status: statusLow32, raw: raw,
@@ -602,6 +657,24 @@ final class DriverTransport {
         return s.status == 0 && s.validFields != 0 && s.flags & (1 << 1 | 1 << 2) == 0
     }
 
+    static func validSoftware(_ s: SoftwareStatsSnapshot) -> Bool {
+        guard s.version == 1, s.size == UInt32(DriverABI.softwareSize), s.reserved == 0,
+              s.flags & ~UInt32(15) == 0, s.available, s.generation > 0,
+              s.sampledAtNs >= s.sessionStartNs,
+              s.consumedPackets <= s.publishedPackets,
+              s.retiredPackets <= s.publishedPackets - s.consumedPackets,
+              s.queuedPackets <= s.publishedPackets - s.consumedPackets - s.retiredPackets
+        else { return false }
+        for e in s.engines {
+            guard e.completed <= e.submitted, e.failed <= e.submitted,
+                  e.retired <= e.submitted - e.completed,
+                  e.pending <= e.submitted - e.completed - e.retired,
+                  e.pendingNs <= s.sampledAtNs - s.sessionStartNs
+            else { return false }
+        }
+        return true
+    }
+
     static func validAccounting(_ v: [UInt64]) -> Bool {
         guard v[0] == 1, v[1] & ~1 == 0 else { return false }
         if v[1] & 1 == 0 { return !v[2...].contains(where: { $0 != 0 }) }
@@ -623,6 +696,8 @@ extension Device {
     /// Fresh + valid SMU value for a field (stale/faulted -> nil).
     func smuValue(_ field: SMUField) -> Double? {
         guard metricsSupported, metricsError == nil, DriverTransport.validMetrics(metrics),
+              (metrics.driverInterface == 0x2e ||
+               (metrics.driverInterface == 0x33 && metrics.flags & 8 != 0)),
               metrics.flags & 1 != 0, nowNs >= metrics.collectedAtNs,
               nowNs - metrics.collectedAtNs <= kSMUMetricsStaleAfterNs,
               metrics.validFields & (1 << field.rawValue) != 0 else { return nil }
@@ -635,7 +710,7 @@ extension Device {
         guard clocksSupported, clocksError == nil, clocks.version == 1,
               clocks.size == UInt32(DriverABI.clocksSize),
               clocks.currentValid & ~15 == 0, clocks.limitsValid & ~15 == 0,
-              index < 4 else { return nil }
+              index >= 0, index < 4 else { return nil }
         switch kind {
         case 0:
             guard clocks.flags & 1 != 0, clocks.flags & (1 << 1 | 1 << 2) == 0,

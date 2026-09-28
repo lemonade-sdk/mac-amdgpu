@@ -6,8 +6,10 @@ python3 - <<'PY'
 from pathlib import Path
 s = Path('dext/MacAMDGPU.cpp').read_text()
 a = s.index('    case kMacAMDGPUMethodSampleCachedSensors:')
-b = s.index('    case kMacAMDGPUMethodRuntimeBuild:', a)
-Path('build/tests/metrics_rpc_under_test.inc').write_text(s[a:b])
+b = s.index('    case kMacAMDGPUMethodReadSpecSnapshot:', a)
+c = s.index('    case kMacAMDGPUMethodClockSnapshot:', b)
+d = s.index('    case kMacAMDGPUMethodRuntimeBuild:', c)
+Path('build/tests/metrics_rpc_under_test.inc').write_text(s[a:b] + s[c:d])
 a = s.index('    if (driver->ivars->shutdownBlocked &&')
 b = s.index('    kern_return_t admission =', a)
 Path('build/tests/metrics_allowlist_under_test.inc').write_text(s[a:b])

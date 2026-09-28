@@ -47,6 +47,11 @@ inline bool smu_metrics_profile_supported(const SMUMetricsSnapshot &s) {
 }
 
 struct SMUMetricsContext {
+    // Diagnostic allowlist from the last coherent metrics-table transfer.
+    // Only known clock, activity, power, temperature and fan offsets are
+    // copied; no firmware padding or private table fields are exposed.
+    static constexpr uint32_t kRawProbeCount = 21;
+    uint32_t rawProbe[kRawProbeCount]{};
     // Reserved inside PSP's persistent firmware arena, not separately owned.
     // Keep these coordinates after partial address programming or a timeout.
     uint64_t tableMC;

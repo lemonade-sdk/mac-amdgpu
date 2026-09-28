@@ -85,6 +85,8 @@ int main() {
     assert(ctx.snapshot.values[metrics::SocketPowerMilliwatts] == 75000);
     assert(ctx.snapshot.values[metrics::UmcActivityPercent] == 31);
     assert(ctx.snapshot.firmwareCounter == 9 && ctx.snapshot.flags == kSMUMetricsValid);
+    assert(ctx.rawProbe[10] == 9 && ctx.rawProbe[11] == 27 &&
+           ctx.rawProbe[12] == 31 && ctx.rawProbe[14] == 75);
     const auto collected = ctx.snapshot.collectedAtNs;
     assert(smu_collect_metrics(dev, ctx, true) == 0 && commands == 1); // Shared cache interval.
     SMUMetricsSnapshot snap{};

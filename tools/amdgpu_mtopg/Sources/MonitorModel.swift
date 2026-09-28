@@ -2,20 +2,13 @@
 //
 // Mirrors the terminal monitor's accounting: a value is published only when
 // the underlying driver source actually produced it. In particular:
-//  - GPU CORE LOAD is the delta of the driver dispatch-in-flight union
-//    counter (software_stats selector 61). The SMU AverageGfxActivity field
-//    is incoherent on this host (reads ~100% at verified idle) and is never
-//    used for the core-load chart.
-//  - UMC MEMORY ACTIVITY matches the terminal monitor: the MMHUB PERFSTATUS
-//    hardware PERFCTR delta (selector 68, driver build 198+) is preferred
-//    when it has produced a sample; otherwise the SMU UmcActivityPercent
-//    field is shown when fresh and plausible (0..100). That field lives in
-//    the same unqualified SMU table as AverageGfxActivity and is known
-//    incoherent on this host (it moves at verified idle and reads 0% under
-//    real traffic, per the build 193 idle/load capture in
-//    docs/GPU_MONITOR.md), so its caption says so. On a pre-198 build it is
-//    the only UMC source that exists; a permanently blank chart would hide a
-//    real firmware number, so it is plotted with the honest caption.
+//  - GPU CORE LOAD uses rolling GRBM_STATUS.GUI_ACTIVE samples when the
+//    driver provides selector 71. Older drivers fall back to the submitted-
+//    packet-rate proxy from selector 61. Neither is CU occupancy.
+//    SMU AverageGfxActivity reads ~100% at verified idle and is separate.
+//  - UMC MEMORY ACTIVITY uses selector 68 only when it supplies a hardware
+//    sample. It is unavailable on gfx1201; the uncalibrated SMU UCLK activity
+//    field remains a labeled diagnostic rather than a memory-busy meter.
 //
 // MIT License — see the repository LICENSE.
 
@@ -27,16 +20,20 @@ import Foundation
 struct EngineRow: Identifiable {
     let id: Int
     let name: String
-    let value: Double?      // in-flight busy % over the sample window, if any
+    let value: Double?      // submitted-packet rate scaled to observed peak
     let note: String        // provenance / why unavailable
 }
 
 struct ClockRow: Identifiable {
     let id: Int
     let name: String
-    let current: Double?    // MHz
+    let current: Double?    // SMU GFX average, or raw CurrClock (MHz)
+    let currentKind: String // "avg" for firmware average, "raw" for CurrClock
+    let rawCurrent: Double? // unverified as an instantaneous operating clock
+    let average: Double?    // firmware average, retained as a diagnostic
     let minimum: Double?
     let maximum: Double?
+    let note: String?
 }
 
 struct TelemetrySnapshot {
@@ -52,6 +49,7 @@ struct TelemetrySnapshot {
     // Charts (rolling, oldest -> newest; nil entries are gaps).
     var coreLoad: [(age: Double, value: Double?)] = []
     var coreSourceLabel: String?   // provenance of the plotted "GPU load" value
+    var coreHardware: Bool = false
     var umcActivity: [(age: Double, value: Double?)] = []
     var umcSourceLabel: String?   // label of the most recent plotted source
     // False when the plotted UMC number is a known-incoherent firmware field
@@ -79,6 +77,12 @@ struct TelemetrySnapshot {
 
     var powerWatts: Double?
     var boardPowerWatts: Double?
+    var unverifiedSmuSocketPowerWatts: Double?
+    var unverifiedSmuBoardPowerWatts: Double?
+    var powerDiagnostic: String?
+    var smuGfxActivityPercent: Double?
+    var unverifiedSmuGfxActivityPercent: Double?
+    var smuGfxDiagnostic: String?
     var edgeCelsius: Double?
     var hotspotCelsius: Double?
     var fanRPM: Double?
@@ -99,25 +103,24 @@ final class SampleHistory {
     }
 
     private(set) var points: [Point] = []
-    // previousBusy carries publishedPackets because the driver can regress it
-    // between samples (queue-observer retire, see add()); the baseline must
-    // reject the sample rather than re-baseline, matching the reference TUI.
-    private var previousBusy: (generation: UInt64, timeNs: UInt64, published: UInt64, pendingNs: UInt64, engines: [UInt64], gfxSubmitted: UInt64)?
-    private var lastPublishedNs: (timeNs: UInt64, generation: UInt64, pendingNs: UInt64, engines: [UInt64])?
+    // Previous GFX submission count and driver snapshot time. A generation
+    // change or counter regression starts a new rate baseline.
+    private var previousBusy: (generation: UInt64, timeNs: UInt64, gfxSubmitted: UInt64)?
     private var previousUmc: (q8: UInt64, atNs: UInt64)?
+    private var grbmSamples: [(atNs: UInt64, active: Bool)] = []
+    private let grbmWindowNs: UInt64 = 2_000_000_000
+    private(set) var lastCoreIsHardware = false
     // Reference GFX dispatch rate (packets/sec) used to scale the "GPU load"
     // bar. It is a decaying peak: it rises quickly to match a fresh burst of
     // work (so a new decode calibrates within a second or two) but decays
     // slowly toward the current rate when work drops, so the bar tracks
     // CURRENT load and the number actually moves rather than freezing against
-    // a frozen all-time high. The GPU load meter is a dispatch-rate proxy,
-    // not a busy %: there is no working busy counter on gfx1201 (SMU
+    // a frozen all-time high. The fallback meter is a dispatch-rate proxy,
+    // not a busy %: there is no SQ busy-cycle counter on gfx1201 (SMU
     // GfxActivity is pinned at 100 while the GPU is awake; GFX pendingNs is
     // structurally 0 because the driver publishes GFX work to the ring with no
-    // software-outstanding interval). The only signal that reliably tracks real
-    // GFX compute work is the per-second rate of GFX packets submitted (eng2 /
-    // the GFX engine). The caption states the scale is adaptive, not a fixed
-    // busy percentage, so it is not read as CU occupancy.
+    // software-outstanding interval). The per-second rate of GFX packets
+    // submitted (engine 2) remains a fallback on older driver builds.
     private var peakGfxRatePerSec: Double = 0
     // Last computed GPU-load value, forward-filled across the driver's ~1 Hz
     // sample repeats (the TUI polls at 10 Hz) so the chart is continuous.
@@ -133,8 +136,6 @@ final class SampleHistory {
     // Wall-clock time (nowNs) of the last fresh GPU-load sample; used to expire
     // the held value once the driver stops reporting new work.
     private var lastCoreNs: UInt64?
-    // Driver sample time of the last work advance (informational / for expiry).
-    private var lastWorkNs: UInt64 = 0
     // Consecutive below-peak samples before the reference eases down. During a
     // steady decode the per-sample rate fluctuates, so we require a sustained
     // run of low samples (not a single one) before decaying the peak, keeping a
@@ -154,12 +155,7 @@ final class SampleHistory {
 
     var lastUmhubSource: String?
     var lastUmhubReliable: Bool = false
-    // Honest provenance for the plotted "GPU load" value. It is a GFX
-    // dispatch-rate proxy (auto-scaled to the peak rate observed so far),
-    // NOT a busy %: on gfx1201 there is no working hardware busy counter
-    // (SMU GfxActivity is pinned at 100 while the GPU is awake; GFX pendingNs
-    // is structurally 0). Stating this in the panel keeps the meter from
-    // being read as CU occupancy or productive-workload utilization.
+    // Provenance for the selected sampled-active or packet-rate source.
     var lastCoreSource: String?
 
     // The plotted window as (age-from-`nowNs`-seconds, value), oldest ->
@@ -169,27 +165,31 @@ final class SampleHistory {
         points.map { (age: Double(nowNs - $0.timeNs) / 1e9, value: $0[keyPath: key]) }
     }
 
-    var coreCurrent: Double? { points.last { $0.core != nil }?.core }
-    var sqBusyCurrent: Double? { points.last { $0.sqBusy != nil }?.sqBusy }
+    var coreCurrent: Double? { points.last?.core }
+    var sqBusyCurrent: Double? { points.last?.sqBusy }
 
     func add(_ d: Device) {
+        // A released owner session invalidates every activity source. Discard
+        // the old chart immediately so stage 0 cannot display a held 0% load.
+        if d.stage != 15 {
+            reset()
+            return
+        }
         let now = d.nowNs
         var core: Double?
         var umc: Double?
         var sq: Double?
+        lastCoreIsHardware = false
 
         // ---- SQ BUSY %: real hardware counter ----
-        // PRIMARY (selector 70, driver 200+): the dext GRBM-broadcasts a read
-        // of SQ_PERFCOUNTER0 (BUSY_CYCLES) / SQ_PERFCOUNTER1 (CYCLES) summed
-        // across all shader engines and returns busy % directly (pctX100). No
-        // dependency on the workload registering a slot — this is the true
-        // driver-owned source. FALLBACK (selector 69): the workload-owned
-        // aqlprofile slot, used only when the driver counter is unavailable.
-        if d.sqBusy.usable {
+        // Try the driver-owned SQ counter (selector 70), then the workload
+        // slot (selector 69). Both are currently unavailable on this host;
+        // keep the readout empty until either source produces a sample.
+        if d.stage == 15, d.sqBusy.usable {
             lastSqValue = min(max(Double(d.sqBusy.pctX100) / 100.0, 0), 100)
             lastSqNs = now
-            lastSqSource = "driver-owned SQ busy-cycle counter (selector 70; dext GRBM-broadcast read of SQ_PERFCOUNTER BUSY_CYCLES/CYCLES summed across all shader engines, hardware) - NOT CU occupancy, NOT the dispatch-rate proxy"
-        } else if d.sqSlot.valid, d.sqSlot.seq != lastSqSeq {
+            lastSqSource = "Driver-provided SQ busy-cycle delta (selector 70); hardware counter, not CU occupancy"
+        } else if d.stage == 15, d.sqSlot.valid, d.sqSlot.seq != lastSqSeq {
             // Workload-owned aqlprofile slot (selector 69). busy % = sq_busy /
             // ref * 100, clamped; a fresh seq means a fresh window, so hold the
             // last value across the ~500 ms gap and expire it after ~2.5 s of
@@ -203,6 +203,11 @@ final class SampleHistory {
             }
             lastSqNs = now
             lastSqSource = "Real hardware SQ busy-cycle counter (aqlprofile SQ_BUSY_CYCLES, via the LSE workload process; all-CU sum over a ~0.5 s window) - NOT CU occupancy, NOT the dispatch-rate proxy"
+        }
+        if d.stage != 15 {
+            lastSqValue = nil
+            lastSqNs = nil
+            lastSqSource = nil
         }
         if let held = lastSqValue, let heldNs = lastSqNs {
             if now - heldNs <= sqHoldMaxNs {
@@ -229,7 +234,7 @@ final class SampleHistory {
         // reference; a true counter regression (generation change, retired
         // in-flight work) is caught by the existing monotonicity checks.
         // ---- GPU LOAD: GFX dispatch-rate proxy (selector 61) ----
-        // On gfx1201 there is no working "GPU busy %" hardware counter:
+        // The fallback has no hardware busy-cycle denominator:
         // the SMU GfxActivityPercent field is pinned at 100 whenever the GPU
         // is awake (incoherent as a load meter), and the GFX engine's
         // pendingNs is structurally 0 because the driver publishes GFX work
@@ -263,7 +268,6 @@ final class SampleHistory {
                     let ratePerSec = Double(delta) / Double(elapsed) * 1e9   // packets / sec
                     if ratePerSec > 0, ratePerSec.isFinite {
                         sawFreshData = true
-                        lastWorkNs = sampledNow
                         // The reference tracks the peak rate. It rises
                         // instantly on a new burst (fast calibration). It only
                         // decays when the current rate stays below it for a
@@ -289,33 +293,40 @@ final class SampleHistory {
                     }
                 }
             }
-            previousBusy = (d.software.generation, sampledNow,
-                            d.software.publishedPackets, 0, [0, 0, 0, 0], gfxSubmitted)
+            previousBusy = (d.software.generation, sampledNow, gfxSubmitted)
             if let value = ratio {
                 lastCoreValue = value
                 lastCoreNs = now
-                lastCoreSource = "GFX dispatch-rate proxy (adaptive scale, decays toward current) - tracks real GFX compute work; NOT a busy % (no working busy counter on gfx1201)"
+                lastCoreSource = "GFX dispatch-rate proxy (adaptive scale); not a hardware busy percentage"
                 core = value
             } else {
                 // No fresh rate this poll (stale repeat, first sample, or the
                 // driver re-sampled but the counter did not advance = idle).
                 // Hold the last value across stale repeats so the line is
-                // continuous at the driver's ~1 Hz rate, but EXPIRE it once the
-                // driver stops reporting new work: after `coreHoldMaxNs` with no
-                // fresh data the held value decays to 0, so the bar drops when
-                // the decode finishes instead of staying stuck at the last %.
+                // continuous at the driver's ~1 Hz rate, then SMOOTHLY DECAY
+                // it toward 0 once the driver stops reporting new work (instead
+                // of a hard drop to 0), so the chart eases down as a decode
+                // finishes rather than spiking flat. The decay is exponential
+                // in the staleness beyond the hold window (~0.4s time-constant),
+                // so a just-finished decode reads near its last value and fully
+                // settles to 0 within ~1.5s.
                 if let held = lastCoreValue, let heldNs = lastCoreNs {
                     let stale = now - heldNs
                     if sawFreshData == false && stale <= coreHoldMaxNs {
                         core = held
-                    } else if stale > coreHoldMaxNs {
-                        // Expired: no new work for > the hold window -> 0.
-                        core = 0
-                        lastCoreValue = nil
-                        lastCoreNs = nil
+                    } else {
+                        // Beyond the hold window: ease the held value toward 0.
+                        let overNs = UInt64(max(stale - coreHoldMaxNs, 0))
+                        let decayTau: UInt64 = 400_000_000   // ~0.4 s time-constant
+                        let factor = exp(-Double(overNs) / Double(decayTau))
+                        let decayed = held * factor
+                        core = decayed < 0.5 ? 0 : decayed
+                        // Once effectively settled, release the held baseline so
+                        // the next burst re-calibrates cleanly from 0.
+                        if core == 0 { lastCoreValue = nil; lastCoreNs = nil }
                     }
                     if core != nil, lastCoreSource == nil {
-                        lastCoreSource = "GFX dispatch-rate proxy (adaptive scale, decays toward current) - tracks real GFX compute work; NOT a busy % (no working busy counter on gfx1201)"
+                        lastCoreSource = "GFX dispatch-rate proxy (adaptive scale); not a hardware busy percentage"
                     }
                 }
             }
@@ -325,15 +336,37 @@ final class SampleHistory {
             lastCoreNs = nil
         }
 
-        // ---- UMC MEMORY ACTIVITY: same source priority as the terminal TUI ----
+        // GUI_ACTIVE is a hardware idle/active indication. Sample it at the
+        // monitor's 10 Hz cadence and report the active-sample fraction over
+        // the last two seconds. This approximates GFX active time; it does
+        // not measure CU occupancy or productive shader cycles. A fresh
+        // sample must advance the driver's timestamp. Older builds retain
+        // the software dispatch-rate proxy computed above.
+        if d.stage == 15, d.grbmStatus.valid,
+           d.grbmStatus.sampledAtNs <= now,
+           now - d.grbmStatus.sampledAtNs <= 500_000_000,
+           grbmSamples.last.map({ $0.atNs < d.grbmStatus.sampledAtNs }) ?? true {
+            grbmSamples.append((d.grbmStatus.sampledAtNs, d.grbmStatus.active))
+        }
+        grbmSamples.removeAll { sample in
+            now < sample.atNs || now - sample.atNs > grbmWindowNs
+        }
+        if d.stage != 15 { grbmSamples.removeAll() }
+        if grbmSamples.count >= 8 {
+            let active = grbmSamples.reduce(0) { $0 + ($1.active ? 1 : 0) }
+            core = Double(active) / Double(grbmSamples.count) * 100.0
+            lastCoreIsHardware = true
+            lastCoreSource = "GRBM_STATUS.GUI_ACTIVE (selector 71): active samples over a rolling 2 s window at up to 10 Hz; approximate GFX active time, not CU occupancy or shader busy cycles"
+        } else if core != nil {
+            lastCoreSource = "GFX submitted-packet rate (selector 61), scaled to the observed peak; workload activity proxy, not a hardware busy percentage"
+        }
+
+        // ---- UMC MEMORY ACTIVITY ----
         // The MMHUB PERFSTATUS hardware PERFCTR delta (selector 68, build 198+)
-        // is preferred while it has produced a sample. Otherwise the SMU
-        // UmcActivityPercent field (firmware offset 126) is shown when fresh
-        // and plausible: it is the only UMC source that exists on a pre-198
-        // build, and although it sits in the unqualified SMU table (it moves
-        // at verified idle and reads 0% under real traffic on this host), it
-        // is a real firmware number — plotted with the honest caption, exactly
-        // as the terminal monitor does.
+        // is preferred while it has produced a sample. The SMU average may
+        // fill in on a qualified 0x2e table. Firmware interface 0x33 has
+        // reported UMC activity at idle and zero under traffic on this host;
+        // keep that decoded field diagnostic-only.
         var umcSource: String?
         var umcReliable = false
         let m = d.mmhub
@@ -355,13 +388,8 @@ final class SampleHistory {
                 }
             }
         }
-        if umc == nil, let smu = d.smuValue(.umcActivityPercent), smu <= 100 {
-            // SMU fallback, matching the terminal TUI exactly: on a pre-198
-            // build this is the only UMC source that exists; on 198+ it
-            // bridges the first second while the MMHUB delta has no window
-            // yet. It is a real firmware number, just from the unqualified
-            // SMU table (moves at verified idle, reads 0 under traffic on
-            // this host), so the caption says so.
+        if umc == nil, d.metrics.driverInterface == 0x2e,
+           let smu = d.smuValue(.umcActivityPercent), smu <= 100 {
             umc = smu
             umcReliable = false
             umcSource = "SMU UmcActivityPercent (firmware table offset 126; UMC busy 0-100%) — unqualified firmware field on this host (moves at idle, 0 under traffic)"
@@ -378,9 +406,7 @@ final class SampleHistory {
         if points.count > Self.maxPoints { points.removeFirst(points.count - Self.maxPoints) }
     }
 
-    // Per-engine dispatch-in-flight busy % for the GRBM strip. Must be
-    // called before add() consumes the previous baseline.
-    // Per-engine busy proxy for the GRBM strip, computed from the per-engine
+    // Per-engine packet-rate proxy for the strip, computed from the per-engine
     // submitted-packet rate (the pendingNs counters are flat for the GFX
     // engine on this driver, so the rate is the only per-engine signal that
     // tracks real work). Normalized against the peak per-engine rate seen so
@@ -390,11 +416,16 @@ final class SampleHistory {
     private var previousEngineTimeNs: UInt64? = nil
     private var previousEngineGeneration: UInt64? = nil
 
-    func enginePercent(_ d: Device, index: Int) -> Double? {
-        guard d.softwareSupported, !d.software.saturated, index < 4 else { return nil }
-        let submitted = d.software.engines[index].submitted
+    func enginePercents(_ d: Device) -> [Double?] {
+        guard d.stage == 15, d.softwareSupported, !d.software.saturated else {
+            previousEngineSubmitted = nil
+            previousEngineTimeNs = nil
+            previousEngineGeneration = nil
+            return Array(repeating: nil, count: 4)
+        }
+        let submitted = d.software.engines.map(\.submitted)
         defer {
-            previousEngineSubmitted = Array(d.software.engines.map { $0.submitted })
+            previousEngineSubmitted = submitted
             previousEngineTimeNs = d.software.sampledAtNs
             previousEngineGeneration = d.software.generation
         }
@@ -403,23 +434,27 @@ final class SampleHistory {
               let prevTime = previousEngineTimeNs,
               prevTime < d.software.sampledAtNs,
               let prevSub = previousEngineSubmitted,
-              prevSub[index] <= submitted,
-              d.software.sampledAtNs - prevTime <= 2_000_000_000 else { return nil }
-        let delta = submitted - prevSub[index]
+              d.software.sampledAtNs - prevTime <= 2_000_000_000
+        else { return Array(repeating: nil, count: 4) }
         let elapsed = d.software.sampledAtNs - prevTime
-        guard elapsed > 0 else { return nil }
-        let ratePerSec = Double(delta) / Double(elapsed) * 1e9
-        guard ratePerSec > 0, ratePerSec.isFinite else { return nil }
-        if ratePerSec > peakEngineRatePerSec[index] { peakEngineRatePerSec[index] = ratePerSec }
-        guard peakEngineRatePerSec[index] > 0 else { return nil }
-        return min(max(ratePerSec / peakEngineRatePerSec[index] * 100.0, 0.0), 100.0)
+        return (0..<4).map { index in
+            guard prevSub[index] <= submitted[index] else { return nil }
+            let ratePerSec = Double(submitted[index] - prevSub[index]) / Double(elapsed) * 1e9
+            guard ratePerSec > 0, ratePerSec.isFinite else { return nil }
+            if ratePerSec > peakEngineRatePerSec[index] {
+                peakEngineRatePerSec[index] = ratePerSec
+            }
+            guard peakEngineRatePerSec[index] > 0 else { return nil }
+            return min(max(ratePerSec / peakEngineRatePerSec[index] * 100.0, 0.0), 100.0)
+        }
     }
 
     func reset() {
         points.removeAll()
         previousBusy = nil
-        lastPublishedNs = nil
         previousUmc = nil
+        grbmSamples.removeAll()
+        lastCoreIsHardware = false
         lastUmhubSource = nil
         lastUmhubReliable = false
         lastCoreSource = nil
@@ -429,7 +464,6 @@ final class SampleHistory {
         peakGfxRatePerSec = 0
         lastCoreValue = nil
         lastCoreNs = nil
-        lastWorkNs = 0
         gfxLowStreak = 0
         peakEngineRatePerSec = [0, 0, 0, 0]
         previousEngineSubmitted = nil
@@ -474,14 +508,17 @@ func makeSnapshot(device: Device?, history: SampleHistory,
         // counter is armed only by the closed aqlprofile CP-perfmon PM4, not a
         // driver GRBM read) and the workload slot (sel 69) is not registered.
         (d.build >= DriverABI.sqBusyMinimumBuild || d.build >= DriverABI.sqSlotMinimumBuild)
-            ? "No live SQ-busy counter on gfx1201: the hardware SQ busy-cycle counter is armed only by the closed aqlprofile CP-perfmon PM4 (workload-side, not a driver GRBM read - sel 70 reports unavailable) and the workload slot (sel 69) is not registered. Use GPU Core Load (dispatch-rate proxy) or SMU GfxActivity for 'is the GPU busy'."
+            ? "No live SQ-busy counter on gfx1201: the hardware SQ busy-cycle counter requires aqlprofile CP-perfmon PM4 (selector 70 reports unavailable), and the workload slot (selector 69) is not registered. GPU Load uses sampled GFX active time on driver build 203+, or a labeled packet-rate proxy on older builds."
             : nil
     }
     snap.sqBusySourceLabel = history.sqBusyCurrent != nil
         ? history.lastSqSource
         : sqBusyUnavailableLabel
     var umcLabel = history.lastUmhubSource ?? umcDefaultLabel
-    if mmhubDead {
+    if let d = device, d.stage == 15, d.metrics.driverInterface == 0x33,
+       let decoded = d.smuValue(.umcActivityPercent) {
+        umcLabel = "SMU UCLK activity (0x2e layout, 0x33 uncalibrated): \(fmt(decoded, 0))%; no hardware UMC busy counter."
+    } else if mmhubDead {
         umcLabel = hwAvailable
             ? "MMHUB PERFSTATUS UMC busy (hardware PERFCTR delta, selector 68; 0-100%)"
             : "UNRELIABLE — SMU UmcActivityPercent firmware average (offset 126); NOT a memory-busy counter. MMHUB PERFSTATUS (selector 68, offset 0x04c18) does not exist in the RDNA4 register map - driver build 199+ reports it unavailable (pre-199 read back 0xFFFFFFFF idle + load), so there is no hardware UMC-busy counter on this ASIC."
@@ -489,6 +526,7 @@ func makeSnapshot(device: Device?, history: SampleHistory,
     snap.umcSourceLabel = umcLabel
     snap.coreCurrent = history.coreCurrent
     snap.coreSourceLabel = history.lastCoreSource
+    snap.coreHardware = history.lastCoreIsHardware
     if let e = device?.error {
         // Device is bound but this read failed: show the specific failure so
         // it is diagnosable. Distinct from "no device found" below.
@@ -513,7 +551,7 @@ func makeSnapshot(device: Device?, history: SampleHistory,
         snap.idle = true
     }
     if d.specValid {
-        snap.specInfo = "\(d.specWords[12]) CUs / \(d.specWords[4]) SEs"
+        snap.specInfo = "\(d.specWords[9]) CUs / \(d.specWords[1]) SEs"
     }
     snap.softwareStatsStatus = d.softwareSupported ? "selector 61 active" : (d.softwareError ?? "build < 193")
 
@@ -522,11 +560,45 @@ func makeSnapshot(device: Device?, history: SampleHistory,
     snap.vramVisibleUsedGiB = d.vramVisibleUsedGiB
     snap.vramVisibleTotalGiB = d.vramVisibleCapacityGiB
 
+    let clockFields: [SMUField] = [.gfxClockMHz, .socClockMHz,
+                                   .memoryClockMHz, .fabricClockMHz]
     for (i, name) in ["GFX", "SOC", "MEMORY", "FABRIC"].enumerated() {
+        let selected = d.stage == 15 ? d.smuValue(clockFields[i]) : nil
+        let raw = d.stage == 15 ? d.clockValue(index: i, kind: 0) : nil
+        let maximum = d.clockValue(index: i, kind: 2)
+        // The firmware's selected UCLK average can read ~2517 MHz while its
+        // own advertised AC maximum is 1258 MHz and raw CurrClock is 1258.
+        // Keep incompatible averages out of the SOC/MEMORY/FABRIC headlines;
+        // a GFX average remains a labeled SMU field even if it conflicts.
+        let selectedUsable: Bool
+        if let selected {
+            selectedUsable = maximum.map { selected <= $0 * 1.05 } ?? true
+        } else {
+            selectedUsable = false
+        }
+        // Keep the fresh GFX average visible at idle and under load. On the
+        // 0x33 firmware it is a decoded SMU field, not a calibrated current
+        // core clock; the raw CurrClock remains visible on the next line.
+        let useAverage = i == 0 && selected != nil &&
+            (d.metrics.driverInterface == 0x2e || d.metrics.driverInterface == 0x33)
+        let note: String?
+        if i == 0 && selected != nil && d.metrics.driverInterface == 0x33 {
+            note = selectedUsable
+                ? "IF 0x33; uncalibrated"
+                : "SMU avg exceeds DPM max; IF 0x33"
+        } else if selected != nil && !selectedUsable {
+            note = "firmware average conflicts with DPM MHz"
+        } else {
+            note = nil
+        }
         snap.clocks.append(ClockRow(id: i, name: name,
-                                    current: d.clockValue(index: i, kind: 0),
+                                    current: useAverage ? selected : raw,
+                                    currentKind: useAverage ? "avg" : "raw",
+                                    rawCurrent: raw,
+                                    average: selected,
                                     minimum: d.clockValue(index: i, kind: 1),
-                                    maximum: d.clockValue(index: i, kind: 2)))
+                                    maximum: maximum,
+                                    note: note))
     }
 
     // Per-engine strip: the driver exposes four dispatch engines (SDMA0,
@@ -537,19 +609,37 @@ func makeSnapshot(device: Device?, history: SampleHistory,
         snap.engines.append(EngineRow(
             id: i, name: engineNames[i], value: value,
             note: value != nil ? "" :
-                (i == 3 ? "no AQL in-flight sample window" :
-                 i == 1 ? "SDMA1 not observed" : "no in-flight sample window yet")))
+                (i >= 2
+                    ? "selector 61 saw no packets; HSA dispatches may be outside this counter"
+                    : "selector 61 saw no packets in this window")))
     }
     snap.engines.append(EngineRow(id: 4, name: "VCN (Video)", value: nil,
                                   note: "driver exposes no VCN counter"))
     snap.engines.append(EngineRow(id: 5, name: "JPEG", value: nil,
                                   note: "driver exposes no JPEG counter"))
 
-    if let p = d.smuValue(.socketPowerMilliwatts) { snap.powerWatts = p / 1000.0 }
-    if let p = d.smuValue(.boardPowerMilliwatts) { snap.boardPowerWatts = p / 1000.0 }
-    if let t = d.smuValue(.edgeTemperatureMillicelsius) { snap.edgeCelsius = t / 1000.0 }
-    if let t = d.smuValue(.hotspotTemperatureMillicelsius) { snap.hotspotCelsius = t / 1000.0 }
-    if let f = d.smuValue(.fanRPM) { snap.fanRPM = f }
+    let socketPower = (d.stage == 15 ? d.smuValue(.socketPowerMilliwatts) : nil).map { $0 / 1000.0 }
+    let boardPower = (d.stage == 15 ? d.smuValue(.boardPowerMilliwatts) : nil).map { $0 / 1000.0 }
+    if d.metrics.driverInterface == 0x2e {
+        snap.powerWatts = socketPower
+        snap.boardPowerWatts = boardPower
+    } else if d.metrics.driverInterface == 0x33,
+              socketPower != nil || boardPower != nil {
+        snap.unverifiedSmuSocketPowerWatts = socketPower
+        snap.unverifiedSmuBoardPowerWatts = boardPower
+        snap.powerDiagnostic = "Unverified SMU fields: socket \(fmt(socketPower, 0)) W, board avg \(fmt(boardPower, 0)) W"
+    }
+    if d.stage == 15, let activity = d.smuValue(.gfxActivityPercent) {
+        if d.metrics.driverInterface == 0x2e {
+            snap.smuGfxActivityPercent = activity
+        } else if d.metrics.driverInterface == 0x33 {
+            snap.unverifiedSmuGfxActivityPercent = activity
+            snap.smuGfxDiagnostic = "Unverified SMU activity field: \(fmt(activity, 0))%"
+        }
+    }
+    if d.stage == 15, let t = d.smuValue(.edgeTemperatureMillicelsius) { snap.edgeCelsius = t / 1000.0 }
+    if d.stage == 15, let t = d.smuValue(.hotspotTemperatureMillicelsius) { snap.hotspotCelsius = t / 1000.0 }
+    if d.stage == 15, let f = d.smuValue(.fanRPM) { snap.fanRPM = f }
     return snap
 }
 
