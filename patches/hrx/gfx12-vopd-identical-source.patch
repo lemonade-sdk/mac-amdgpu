@@ -1,0 +1,352 @@
+diff --git a/loom/py/loom/gen/target/arch/amdgpu/amdgpu_target_info.py b/loom/py/loom/gen/target/arch/amdgpu/amdgpu_target_info.py
+index c920811c..1a83d13f 100644
+--- a/loom/py/loom/gen/target/arch/amdgpu/amdgpu_target_info.py
++++ b/loom/py/loom/gen/target/arch/amdgpu/amdgpu_target_info.py
+@@ -69,6 +69,7 @@ from loom.target.arch.amdgpu.target_info import (  # noqa: E402
+     AMDGPU_DESCRIPTOR_SET_INFO_FLAG_VOP3_TWO_SCALAR_SOURCES,
+     AMDGPU_DESCRIPTOR_SET_INFO_FLAG_VOPD_NUMERIC_MINMAX_MNEMONICS,
+     AMDGPU_DESCRIPTOR_SET_INFO_FLAG_VOPD_PACKETIZATION,
++    AMDGPU_DESCRIPTOR_SET_INFO_FLAG_VOPD_SAME_VGPR_SOURCES,
+     AMDGPU_DESCRIPTOR_SET_INFO_KNOWN_FLAGS,
+     AMDGPU_DESCRIPTOR_SET_ORDINAL_NONE,
+     AMDGPU_ELF_GENERIC_VERSION_MASK_V6,
+@@ -285,6 +286,10 @@ _DESCRIPTOR_SET_INFO_FLAG_EXPRS = (
+         AMDGPU_DESCRIPTOR_SET_INFO_FLAG_NATIVE_OCP_FP8_NONCANONICAL_NAN,
+         "LOOM_AMDGPU_DESCRIPTOR_SET_INFO_FLAG_NATIVE_OCP_FP8_NONCANONICAL_NAN",
+     ),
++    (
++        AMDGPU_DESCRIPTOR_SET_INFO_FLAG_VOPD_SAME_VGPR_SOURCES,
++        "LOOM_AMDGPU_DESCRIPTOR_SET_INFO_FLAG_VOPD_SAME_VGPR_SOURCES",
++    ),
+ )
+ 
+ _PROCESSOR_INFO_FLAG_EXPRS = (
+diff --git a/loom/py/loom/target/arch/amdgpu/target_info.py b/loom/py/loom/target/arch/amdgpu/target_info.py
+index a9253b87..05193885 100644
+--- a/loom/py/loom/target/arch/amdgpu/target_info.py
++++ b/loom/py/loom/target/arch/amdgpu/target_info.py
+@@ -273,6 +273,7 @@ AMDGPU_DESCRIPTOR_SET_INFO_FLAG_VOPD_NUMERIC_MINMAX_MNEMONICS = 1 << 2
+ AMDGPU_DESCRIPTOR_SET_INFO_FLAG_NATIVE_PACKED_BF16_ARITHMETIC = 1 << 3
+ AMDGPU_DESCRIPTOR_SET_INFO_FLAG_VOP3_TWO_SCALAR_SOURCES = 1 << 4
+ AMDGPU_DESCRIPTOR_SET_INFO_FLAG_NATIVE_OCP_FP8_NONCANONICAL_NAN = 1 << 5
++AMDGPU_DESCRIPTOR_SET_INFO_FLAG_VOPD_SAME_VGPR_SOURCES = 1 << 6
+ AMDGPU_DESCRIPTOR_SET_INFO_KNOWN_FLAGS = (
+     AMDGPU_DESCRIPTOR_SET_INFO_FLAG_DESCRIPTOR_PACKET_ENCODING
+     | AMDGPU_DESCRIPTOR_SET_INFO_FLAG_VOPD_PACKETIZATION
+@@ -280,6 +281,7 @@ AMDGPU_DESCRIPTOR_SET_INFO_KNOWN_FLAGS = (
+     | AMDGPU_DESCRIPTOR_SET_INFO_FLAG_NATIVE_PACKED_BF16_ARITHMETIC
+     | AMDGPU_DESCRIPTOR_SET_INFO_FLAG_VOP3_TWO_SCALAR_SOURCES
+     | AMDGPU_DESCRIPTOR_SET_INFO_FLAG_NATIVE_OCP_FP8_NONCANONICAL_NAN
++    | AMDGPU_DESCRIPTOR_SET_INFO_FLAG_VOPD_SAME_VGPR_SOURCES
+ )
+ AMDGPU_DESCRIPTOR_SET_INFO_FLAGS_RDNA = (
+     AMDGPU_DESCRIPTOR_SET_INFO_FLAG_DESCRIPTOR_PACKET_ENCODING
+@@ -292,6 +294,7 @@ AMDGPU_DESCRIPTOR_SET_INFO_FLAGS_RDNA_VOPD = (
+ AMDGPU_DESCRIPTOR_SET_INFO_FLAGS_RDNA4_VOPD = (
+     AMDGPU_DESCRIPTOR_SET_INFO_FLAGS_RDNA_VOPD
+     | AMDGPU_DESCRIPTOR_SET_INFO_FLAG_VOPD_NUMERIC_MINMAX_MNEMONICS
++    | AMDGPU_DESCRIPTOR_SET_INFO_FLAG_VOPD_SAME_VGPR_SOURCES
+ )
+ AMDGPU_DESCRIPTOR_SET_INFO_FLAGS_RDNA4_VOPD_NONCANONICAL_FP8 = (
+     AMDGPU_DESCRIPTOR_SET_INFO_FLAGS_RDNA4_VOPD
+diff --git a/loom/py/loom/target/arch/amdgpu/target_info_test.py b/loom/py/loom/target/arch/amdgpu/target_info_test.py
+index 1d611180..32b74818 100644
+--- a/loom/py/loom/target/arch/amdgpu/target_info_test.py
++++ b/loom/py/loom/target/arch/amdgpu/target_info_test.py
+@@ -23,6 +23,7 @@ from loom.target.arch.amdgpu.lds_bank_service import (
+ )
+ from loom.target.arch.amdgpu.target_info import (
+     AMDGPU_DESCRIPTOR_SET_INFO_FLAG_NATIVE_OCP_FP8_NONCANONICAL_NAN,
++    AMDGPU_DESCRIPTOR_SET_INFO_FLAG_VOPD_SAME_VGPR_SOURCES,
+     AMDGPU_DESCRIPTOR_SET_INFOS,
+     AMDGPU_GENERIC_MATRIX_FEATURE_EXCLUSIONS,
+     AMDGPU_INSTRUCTION_CONSTRAINT_DS_PAIRED_ADDRESS_ALIGNMENT,
+@@ -91,6 +92,15 @@ def test_descriptor_set_isa_xml_validation_accepts_matching_architecture() -> No
+     )
+ 
+ 
++def test_identical_vgpr_sources_are_scoped_to_rdna4_descriptor_sets() -> None:
++    for info in AMDGPU_DESCRIPTOR_SET_INFOS:
++        allows_same = bool(
++            info.flags & AMDGPU_DESCRIPTOR_SET_INFO_FLAG_VOPD_SAME_VGPR_SOURCES
++        )
++        is_rdna4 = all(isa.isa_xml_key == "rdna4" for isa in info.isa_infos)
++        assert allows_same == is_rdna4, info.key
++
++
+ def test_noncanonical_native_fp8_nan_is_scoped_to_gfx12_descriptor_sets() -> None:
+     flagged_generator_targets = {
+         info.generator_target
+diff --git a/loom/src/loom/target/arch/amdgpu/planning/vopd_plan.c b/loom/src/loom/target/arch/amdgpu/planning/vopd_plan.c
+index 30b474c3..f090d9a9 100644
+--- a/loom/src/loom/target/arch/amdgpu/planning/vopd_plan.c
++++ b/loom/src/loom/target/arch/amdgpu/planning/vopd_plan.c
+@@ -163,6 +163,8 @@ typedef struct loom_amdgpu_vopd_plan_builder_t {
+   iree_host_size_t component_rule_lookup_count;
+   // Per-scheduled-packet private planner flags.
+   loom_amdgpu_vopd_packet_flags_t* packet_flags;
++  // True when the descriptor set permits identical 32-bit VGPR source reads.
++  bool allows_same_vgpr_sources;
+   // True when the target requires VALU/TRANS result-window tracking.
+   bool tracks_trans_result_windows;
+   // Per-physical-VGPR state for GFX11 TRANS-result packetization windows.
+@@ -1191,15 +1193,19 @@ static uint32_t loom_amdgpu_vopd_read_immediate_u32(
+   return (uint32_t)value;
+ }
+ 
+-static bool loom_amdgpu_vopd_bank_compatible(uint16_t x_register,
+-                                             uint16_t y_register,
+-                                             uint16_t bank_mask) {
+-  return (x_register & bank_mask) != (y_register & bank_mask);
++static bool loom_amdgpu_vopd_bank_compatible(
++    uint16_t x_register, uint16_t y_register, uint16_t bank_mask,
++    bool allows_same_vgpr_sources) {
++  // Component readers admit one 32-bit physical VGPR per explicit source,
++  // including packed DOT2; wider allocations never reach this comparison.
++  return (x_register & bank_mask) != (y_register & bank_mask) ||
++         (allows_same_vgpr_sources && x_register == y_register);
+ }
+ 
+ static loom_amdgpu_vopd_register_constraint_flags_t
+ loom_amdgpu_vopd_register_constraint_flags(
+-    const loom_amdgpu_vopd_candidate_pair_t* candidate) {
++    const loom_amdgpu_vopd_candidate_pair_t* candidate,
++    bool allows_same_vgpr_sources) {
+   loom_amdgpu_vopd_register_constraint_flags_t flags = 0;
+   if (((candidate->x.vdst ^ candidate->y.vdst) & 1u) == 0) {
+     flags |= LOOM_AMDGPU_VOPD_REGISTER_CONSTRAINT_FLAG_DESTINATION_PARITY;
+@@ -1209,13 +1215,13 @@ loom_amdgpu_vopd_register_constraint_flags(
+   if (iree_any_bit_set(paired_source_registers,
+                        LOOM_AMDGPU_VOPD_COMPONENT_SOURCE_SRC0) &&
+       !loom_amdgpu_vopd_bank_compatible(candidate->x.src0, candidate->y.src0,
+-                                        3)) {
++                                       3, allows_same_vgpr_sources)) {
+     flags |= LOOM_AMDGPU_VOPD_REGISTER_CONSTRAINT_FLAG_SRC0_BANK;
+   }
+   if (iree_any_bit_set(paired_source_registers,
+                        LOOM_AMDGPU_VOPD_COMPONENT_SOURCE_VSRC1) &&
+       !loom_amdgpu_vopd_bank_compatible(candidate->x.vsrc1, candidate->y.vsrc1,
+-                                        3)) {
++                                       3, allows_same_vgpr_sources)) {
+     flags |= LOOM_AMDGPU_VOPD_REGISTER_CONSTRAINT_FLAG_VSRC1_BANK;
+   }
+   if (iree_any_bit_set(candidate->y.source_register_mask,
+@@ -1251,9 +1257,10 @@ static void loom_amdgpu_vopd_swap_component_sources(
+ }
+ 
+ static bool loom_amdgpu_vopd_try_register_orientations(
+-    loom_amdgpu_vopd_candidate_pair_t* candidate,
++    loom_amdgpu_vopd_candidate_pair_t* candidate, bool allows_same_vgpr_sources,
+     loom_amdgpu_vopd_register_constraint_flags_t* out_constraint_flags) {
+-  *out_constraint_flags = loom_amdgpu_vopd_register_constraint_flags(candidate);
++  *out_constraint_flags = loom_amdgpu_vopd_register_constraint_flags(
++      candidate, allows_same_vgpr_sources);
+   if (*out_constraint_flags == 0) {
+     return true;
+   }
+@@ -1266,7 +1273,8 @@ static bool loom_amdgpu_vopd_try_register_orientations(
+                        LOOM_AMDGPU_VOPD_COMPONENT_FLAG_COMMUTABLE_SOURCES);
+   if (can_swap_x) {
+     loom_amdgpu_vopd_swap_component_sources(&candidate->x);
+-    if (loom_amdgpu_vopd_register_constraint_flags(candidate) == 0) {
++    if (loom_amdgpu_vopd_register_constraint_flags(
++            candidate, allows_same_vgpr_sources) == 0) {
+       candidate->flags |= LOOM_AMDGPU_VOPD_PAIR_FLAG_X_SOURCES_SWAPPED;
+       return true;
+     }
+@@ -1274,7 +1282,8 @@ static bool loom_amdgpu_vopd_try_register_orientations(
+   }
+   if (can_swap_y) {
+     loom_amdgpu_vopd_swap_component_sources(&candidate->y);
+-    if (loom_amdgpu_vopd_register_constraint_flags(candidate) == 0) {
++    if (loom_amdgpu_vopd_register_constraint_flags(
++            candidate, allows_same_vgpr_sources) == 0) {
+       candidate->flags |= LOOM_AMDGPU_VOPD_PAIR_FLAG_Y_SOURCES_SWAPPED;
+       return true;
+     }
+@@ -1283,7 +1292,8 @@ static bool loom_amdgpu_vopd_try_register_orientations(
+   if (can_swap_x && can_swap_y) {
+     loom_amdgpu_vopd_swap_component_sources(&candidate->x);
+     loom_amdgpu_vopd_swap_component_sources(&candidate->y);
+-    if (loom_amdgpu_vopd_register_constraint_flags(candidate) == 0) {
++    if (loom_amdgpu_vopd_register_constraint_flags(
++            candidate, allows_same_vgpr_sources) == 0) {
+       candidate->flags |= LOOM_AMDGPU_VOPD_PAIR_FLAG_X_SOURCES_SWAPPED |
+                           LOOM_AMDGPU_VOPD_PAIR_FLAG_Y_SOURCES_SWAPPED;
+       return true;
+@@ -1596,7 +1606,8 @@ static void loom_amdgpu_vopd_analyze_pair(
+   out_analysis->rejection_reason =
+       LOOM_AMDGPU_VOPD_REJECTION_REASON_REGISTER_CONSTRAINTS;
+   if (!loom_amdgpu_vopd_try_register_orientations(
+-          &candidate, &out_analysis->register_constraint_flags)) {
++          &candidate, builder->allows_same_vgpr_sources,
++          &out_analysis->register_constraint_flags)) {
+     return;
+   }
+   out_analysis->candidate = candidate;
+@@ -2157,6 +2168,9 @@ iree_status_t loom_amdgpu_vopd_plan_build(
+           schedule->target.descriptor_set, &component_rule_lookup_count);
+   IREE_ASSERT(component_rule_lookup != NULL);
+ 
++  const loom_amdgpu_descriptor_set_info_t* descriptor_set_info =
++      loom_amdgpu_target_info_descriptor_set_at(
++          schedule->target.descriptor_set->descriptor_set_ordinal);
+   loom_amdgpu_vopd_plan_builder_t builder = {
+       .schedule = schedule,
+       .allocation = allocation,
+@@ -2168,6 +2182,10 @@ iree_status_t loom_amdgpu_vopd_plan_build(
+       .matrix_coexecution = matrix_coexecution,
+       .component_rule_lookup = component_rule_lookup,
+       .component_rule_lookup_count = component_rule_lookup_count,
++      .allows_same_vgpr_sources =
++          descriptor_set_info != NULL &&
++          iree_any_bit_set(descriptor_set_info->flags,
++                          LOOM_AMDGPU_DESCRIPTOR_SET_INFO_FLAG_VOPD_SAME_VGPR_SOURCES),
+       .tracks_trans_result_windows =
+           loom_amdgpu_processor_properties_have_scheduling(
+               processor_properties,
+diff --git a/loom/src/loom/target/arch/amdgpu/target_info_defs.h b/loom/src/loom/target/arch/amdgpu/target_info_defs.h
+index 586a550a..8873e6b6 100644
+--- a/loom/src/loom/target/arch/amdgpu/target_info_defs.h
++++ b/loom/src/loom/target/arch/amdgpu/target_info_defs.h
+@@ -382,6 +382,9 @@ typedef enum loom_amdgpu_descriptor_set_info_flag_bits_e {
+   // Native OCP FP8 encodes require exact NaN canonicalization after conversion.
+   LOOM_AMDGPU_DESCRIPTOR_SET_INFO_FLAG_NATIVE_OCP_FP8_NONCANONICAL_NAN =
+       UINT64_C(1) << 5,
++  // VOPD components may share an identical, same-width VGPR source.
++  LOOM_AMDGPU_DESCRIPTOR_SET_INFO_FLAG_VOPD_SAME_VGPR_SOURCES = UINT64_C(1)
++                                                                 << 6,
+   // Descriptor-set info flags known by the AMDGPU target package.
+   LOOM_AMDGPU_DESCRIPTOR_SET_INFO_KNOWN_FLAGS =
+       LOOM_AMDGPU_DESCRIPTOR_SET_INFO_FLAG_DESCRIPTOR_PACKET_ENCODING |
+@@ -389,7 +392,8 @@ typedef enum loom_amdgpu_descriptor_set_info_flag_bits_e {
+       LOOM_AMDGPU_DESCRIPTOR_SET_INFO_FLAG_VOPD_NUMERIC_MINMAX_MNEMONICS |
+       LOOM_AMDGPU_DESCRIPTOR_SET_INFO_FLAG_NATIVE_PACKED_BF16_ARITHMETIC |
+       LOOM_AMDGPU_DESCRIPTOR_SET_INFO_FLAG_VOP3_TWO_SCALAR_SOURCES |
+-      LOOM_AMDGPU_DESCRIPTOR_SET_INFO_FLAG_NATIVE_OCP_FP8_NONCANONICAL_NAN,
++      LOOM_AMDGPU_DESCRIPTOR_SET_INFO_FLAG_NATIVE_OCP_FP8_NONCANONICAL_NAN |
++      LOOM_AMDGPU_DESCRIPTOR_SET_INFO_FLAG_VOPD_SAME_VGPR_SOURCES,
+ } loom_amdgpu_descriptor_set_info_flag_bits_t;
+ 
+ // Bitset of loom_amdgpu_descriptor_set_info_flag_bits_t values.
+diff --git a/loom/src/loom/target/emit/native/amdgpu/test/vopd_plan.loom-test b/loom/src/loom/target/emit/native/amdgpu/test/vopd_plan.loom-test
+index 2a620074..4b8c56b7 100644
+--- a/loom/src/loom/target/emit/native/amdgpu/test/vopd_plan.loom-test
++++ b/loom/src/loom/target/emit/native/amdgpu/test/vopd_plan.loom-test
+@@ -447,7 +447,7 @@ low.func.def target<amdgpu.rdna4.core>(@gfx12_target) @gfx12_vopd_plan_commutes_
+ }
+ 
+ // ----
+-{"format":"loom.amdgpu.vopd_plan.v0","function":"gfx12_vopd_plan_commutes_binary_sources","target":"gfx12_target","descriptor_set":"amdgpu.rdna4.core","pair_count":1,"rejection_count":0,"packet_count":3,"pairs":[{"index":0,"reason":"dual_mul_f32","block":0,"flags":2,"literal_u32":null,"x":{"packet":0,"node":0,"descriptor":"amdgpu.v_mul_f32","op_id":3,"op":"mul_f32","vdst":4,"src0":2,"vsrc1":0,"sources_swapped":true},"y":{"packet":1,"node":1,"descriptor":"amdgpu.v_mul_f32","op_id":3,"op":"mul_f32","vdst":5,"src0":1,"vsrc1":2}}],"rejections":[],"packets":[{"index":0,"role":"first","pair":0},{"index":1,"role":"second","pair":0},{"index":2,"role":"none","pair":null}]}
++{"format":"loom.amdgpu.vopd_plan.v0","function":"gfx12_vopd_plan_commutes_binary_sources","target":"gfx12_target","descriptor_set":"amdgpu.rdna4.core","pair_count":1,"rejection_count":0,"packet_count":3,"pairs":[{"index":0,"reason":"dual_mul_f32","block":0,"flags":0,"literal_u32":null,"x":{"packet":0,"node":0,"descriptor":"amdgpu.v_mul_f32","op_id":3,"op":"mul_f32","vdst":4,"src0":0,"vsrc1":2},"y":{"packet":1,"node":1,"descriptor":"amdgpu.v_mul_f32","op_id":3,"op":"mul_f32","vdst":5,"src0":1,"vsrc1":2}}],"rejections":[],"packets":[{"index":0,"role":"first","pair":0},{"index":1,"role":"second","pair":0},{"index":2,"role":"none","pair":null}]}
+ 
+ // ====
+ 
+@@ -462,3 +462,107 @@ low.func.def target<amdgpu.rdna4.gfx125x.core>(@gfx1250_target) @gfx1250_vopd_pl
+ 
+ // ----
+ {"format":"loom.amdgpu.vopd_plan.v0","function":"gfx1250_vopd_plan_address_state_insertion","target":"gfx1250_target","descriptor_set":"amdgpu.rdna4.gfx125x.core","pair_count":0,"rejection_count":1,"packet_count":4,"pairs":[],"rejections":[{"index":0,"reason":"second_packet_has_insertion","block":0,"first":{"packet":1,"node":1,"descriptor":"amdgpu.v_mov_b32","op_id":8,"op":"mov_b32","vdst":4,"src0":0,"vsrc1":0,"flags":0,"literal_u32":null},"second":{"packet":2,"node":2,"descriptor":"amdgpu.v_max_i32","op_id":23,"op":"max_i32","vdst":5,"src0":2,"vsrc1":3,"flags":0,"literal_u32":null}}],"packets":[{"index":0,"role":"none","pair":null},{"index":1,"role":"none","pair":null},{"index":2,"role":"none","pair":null},{"index":3,"role":"none","pair":null}]}
++
++// ====
++
++// RUN: emit amdgpu-vopd-plan-json @gfx12_same_source_fmac strategy=source fixed=%shared:physical_register:0:1 fixed=%rhs0:physical_register:1:1 fixed=%rhs1:physical_register:2:1 fixed=%acc0:physical_register:4:1 fixed=%acc1:physical_register:5:1 fixed=%next0:physical_register:4:1 fixed=%next1:physical_register:5:1
++amdgpu.target<gfx1201> @test_target
++low.func.def target<amdgpu.rdna4.core>(@test_target) @gfx12_same_source_fmac(%shared: reg<amdgpu.vgpr>, %rhs0: reg<amdgpu.vgpr>, %rhs1: reg<amdgpu.vgpr>, %acc0: reg<amdgpu.vgpr>, %acc1: reg<amdgpu.vgpr>) asm {
++  %next0 = v_fmac_f32 %acc0, %shared, %rhs0
++  %next1 = v_fmac_f32 %acc1, %shared, %rhs1
++  return
++}
++
++// ----
++{"format":"loom.amdgpu.vopd_plan.v0","function":"gfx12_same_source_fmac","target":"test_target","descriptor_set":"amdgpu.rdna4.core","pair_count":1,"rejection_count":0,"packet_count":3,"pairs":[{"index":0,"reason":"dual_fmac_f32","block":0,"flags":0,"literal_u32":null,"x":{"packet":0,"node":0,"descriptor":"amdgpu.v_fmac_f32","op_id":0,"op":"fmac_f32","vdst":4,"src0":0,"vsrc1":1},"y":{"packet":1,"node":1,"descriptor":"amdgpu.v_fmac_f32","op_id":0,"op":"fmac_f32","vdst":5,"src0":0,"vsrc1":2}}],"rejections":[],"packets":[{"index":0,"role":"first","pair":0},{"index":1,"role":"second","pair":0},{"index":2,"role":"none","pair":null}]}
++
++// ====
++
++// RUN: emit amdgpu-vopd-plan-json @gfx12_same_source_sub strategy=source fixed=%lhs0:physical_register:0:1 fixed=%lhs1:physical_register:1:1 fixed=%shared:physical_register:2:1 fixed=%next0:physical_register:4:1 fixed=%next1:physical_register:5:1
++amdgpu.target<gfx1201> @test_target
++low.func.def target<amdgpu.rdna4.core>(@test_target) @gfx12_same_source_sub(%lhs0: reg<amdgpu.vgpr>, %lhs1: reg<amdgpu.vgpr>, %shared: reg<amdgpu.vgpr>) asm {
++  %next0 = v_sub_f32 %lhs0, %shared
++  %next1 = v_sub_f32 %lhs1, %shared
++  return
++}
++
++// ----
++{"format":"loom.amdgpu.vopd_plan.v0","function":"gfx12_same_source_sub","target":"test_target","descriptor_set":"amdgpu.rdna4.core","pair_count":1,"rejection_count":0,"packet_count":3,"pairs":[{"index":0,"reason":"dual_sub_f32","block":0,"flags":0,"literal_u32":null,"x":{"packet":0,"node":0,"descriptor":"amdgpu.v_sub_f32","op_id":5,"op":"sub_f32","vdst":4,"src0":0,"vsrc1":2},"y":{"packet":1,"node":1,"descriptor":"amdgpu.v_sub_f32","op_id":5,"op":"sub_f32","vdst":5,"src0":1,"vsrc1":2}}],"rejections":[],"packets":[{"index":0,"role":"first","pair":0},{"index":1,"role":"second","pair":0},{"index":2,"role":"none","pair":null}]}
++
++// ====
++
++// RUN: emit amdgpu-vopd-plan-json @gfx12_same_packed_source_dot2 strategy=source fixed=%shared:physical_register:0:1 fixed=%rhs0:physical_register:1:1 fixed=%rhs1:physical_register:2:1 fixed=%acc0:physical_register:4:1 fixed=%acc1:physical_register:5:1 fixed=%next0:physical_register:4:1 fixed=%next1:physical_register:5:1
++amdgpu.target<gfx1201> @test_target
++low.func.def target<amdgpu.rdna4.core>(@test_target) @gfx12_same_packed_source_dot2(%shared: reg<amdgpu.vgpr>, %rhs0: reg<amdgpu.vgpr>, %rhs1: reg<amdgpu.vgpr>, %acc0: reg<amdgpu.vgpr>, %acc1: reg<amdgpu.vgpr>) asm {
++  %next0 = v_dot2_f32_f16 %shared, %rhs0, %acc0
++  %next1 = v_dot2_f32_f16 %shared, %rhs1, %acc1
++  return
++}
++
++// ----
++{"format":"loom.amdgpu.vopd_plan.v0","function":"gfx12_same_packed_source_dot2","target":"test_target","descriptor_set":"amdgpu.rdna4.core","pair_count":1,"rejection_count":0,"packet_count":3,"pairs":[{"index":0,"reason":"dual_dot2_f32_f16","block":0,"flags":0,"literal_u32":null,"x":{"packet":0,"node":0,"descriptor":"amdgpu.v_dot2_f32_f16","op_id":12,"op":"dot2_f32_f16","vdst":4,"src0":0,"vsrc1":1},"y":{"packet":1,"node":1,"descriptor":"amdgpu.v_dot2_f32_f16","op_id":12,"op":"dot2_f32_f16","vdst":5,"src0":0,"vsrc1":2}}],"rejections":[],"packets":[{"index":0,"role":"first","pair":0},{"index":1,"role":"second","pair":0},{"index":2,"role":"none","pair":null}]}
++
++// ====
++
++// RUN: emit amdgpu-vopd-plan-json @gfx12_distinct_same_bank_sources strategy=source fixed=%lhs0:physical_register:0:1 fixed=%rhs0:physical_register:1:1 fixed=%lhs1:physical_register:4:1 fixed=%rhs1:physical_register:5:1 fixed=%next0:physical_register:6:1 fixed=%next1:physical_register:7:1
++amdgpu.target<gfx1201> @test_target
++low.func.def target<amdgpu.rdna4.core>(@test_target) @gfx12_distinct_same_bank_sources(%lhs0: reg<amdgpu.vgpr>, %rhs0: reg<amdgpu.vgpr>, %lhs1: reg<amdgpu.vgpr>, %rhs1: reg<amdgpu.vgpr>) asm {
++  %next0 = v_sub_f32 %lhs0, %rhs0
++  %next1 = v_sub_f32 %lhs1, %rhs1
++  return
++}
++
++// ----
++{"format":"loom.amdgpu.vopd_plan.v0","function":"gfx12_distinct_same_bank_sources","target":"test_target","descriptor_set":"amdgpu.rdna4.core","pair_count":0,"rejection_count":1,"packet_count":3,"pairs":[],"rejections":[{"index":0,"reason":"register_constraints","register_constraints":["src0_bank","vsrc1_bank"],"block":0,"first":{"packet":0,"node":0,"descriptor":"amdgpu.v_sub_f32","op_id":5,"op":"sub_f32","vdst":6,"src0":0,"vsrc1":1,"flags":0,"literal_u32":null},"second":{"packet":1,"node":1,"descriptor":"amdgpu.v_sub_f32","op_id":5,"op":"sub_f32","vdst":7,"src0":4,"vsrc1":5,"flags":0,"literal_u32":null}}],"packets":[{"index":0,"role":"none","pair":null},{"index":1,"role":"none","pair":null},{"index":2,"role":"none","pair":null}]}
++
++// ====
++
++// RUN: emit amdgpu-vopd-plan-json @gfx12_same_source_same_destination_parity strategy=source fixed=%lhs0:physical_register:0:1 fixed=%lhs1:physical_register:1:1 fixed=%shared:physical_register:2:1 fixed=%next0:physical_register:4:1 fixed=%next1:physical_register:6:1
++amdgpu.target<gfx1201> @test_target
++low.func.def target<amdgpu.rdna4.core>(@test_target) @gfx12_same_source_same_destination_parity(%lhs0: reg<amdgpu.vgpr>, %lhs1: reg<amdgpu.vgpr>, %shared: reg<amdgpu.vgpr>) asm {
++  %next0 = v_sub_f32 %lhs0, %shared
++  %next1 = v_sub_f32 %lhs1, %shared
++  return
++}
++
++// ----
++{"format":"loom.amdgpu.vopd_plan.v0","function":"gfx12_same_source_same_destination_parity","target":"test_target","descriptor_set":"amdgpu.rdna4.core","pair_count":0,"rejection_count":1,"packet_count":3,"pairs":[],"rejections":[{"index":0,"reason":"register_constraints","register_constraints":["destination_parity"],"block":0,"first":{"packet":0,"node":0,"descriptor":"amdgpu.v_sub_f32","op_id":5,"op":"sub_f32","vdst":4,"src0":0,"vsrc1":2,"flags":0,"literal_u32":null},"second":{"packet":1,"node":1,"descriptor":"amdgpu.v_sub_f32","op_id":5,"op":"sub_f32","vdst":6,"src0":1,"vsrc1":2,"flags":0,"literal_u32":null}}],"packets":[{"index":0,"role":"none","pair":null},{"index":1,"role":"none","pair":null},{"index":2,"role":"none","pair":null}]}
++
++// ====
++
++// RUN: emit amdgpu-vopd-plan-json @gfx12_same_source_dependent_result strategy=source fixed=%lhs0:physical_register:0:1 fixed=%shared:physical_register:2:1 fixed=%next0:physical_register:4:1 fixed=%next1:physical_register:5:1
++amdgpu.target<gfx1201> @test_target
++low.func.def target<amdgpu.rdna4.core>(@test_target) @gfx12_same_source_dependent_result(%lhs0: reg<amdgpu.vgpr>, %shared: reg<amdgpu.vgpr>) asm {
++  %next0 = v_sub_f32 %lhs0, %shared
++  %next1 = v_sub_f32 %next0, %shared
++  return
++}
++
++// ----
++{"format":"loom.amdgpu.vopd_plan.v0","function":"gfx12_same_source_dependent_result","target":"test_target","descriptor_set":"amdgpu.rdna4.core","pair_count":0,"rejection_count":1,"packet_count":3,"pairs":[],"rejections":[{"index":0,"reason":"first_result_used_by_second","block":0,"first":{"packet":0,"node":0,"descriptor":"amdgpu.v_sub_f32","op_id":5,"op":"sub_f32","vdst":4,"src0":0,"vsrc1":2,"flags":0,"literal_u32":null},"second":{"packet":1,"node":1,"descriptor":"amdgpu.v_sub_f32","op_id":5,"op":"sub_f32","vdst":5,"src0":4,"vsrc1":2,"flags":0,"literal_u32":null}}],"packets":[{"index":0,"role":"none","pair":null},{"index":1,"role":"none","pair":null},{"index":2,"role":"none","pair":null}]}
++
++// ====
++
++// RUN: emit amdgpu-vopd-plan-json @gfx12_same_source_preserves_reverse_alias_rejection strategy=source fixed=%lhs0:physical_register:0:1 fixed=%lhs1:physical_register:1:1 fixed=%shared:physical_register:2:1 fixed=%next0:physical_register:5:1 fixed=%next1:physical_register:0:1
++amdgpu.target<gfx1201> @test_target
++low.func.def target<amdgpu.rdna4.core>(@test_target) @gfx12_same_source_preserves_reverse_alias_rejection(%lhs0: reg<amdgpu.vgpr>, %lhs1: reg<amdgpu.vgpr>, %shared: reg<amdgpu.vgpr>) asm {
++  %next0 = v_sub_f32 %lhs0, %shared
++  %next1 = v_sub_f32 %lhs1, %shared
++  return
++}
++
++// ----
++{"format":"loom.amdgpu.vopd_plan.v0","function":"gfx12_same_source_preserves_reverse_alias_rejection","target":"test_target","descriptor_set":"amdgpu.rdna4.core","pair_count":0,"rejection_count":1,"packet_count":3,"pairs":[],"rejections":[{"index":0,"reason":"register_constraints","register_constraints":["y_destination_x_src0_alias"],"block":0,"first":{"packet":0,"node":0,"descriptor":"amdgpu.v_sub_f32","op_id":5,"op":"sub_f32","vdst":5,"src0":0,"vsrc1":2,"flags":0,"literal_u32":null},"second":{"packet":1,"node":1,"descriptor":"amdgpu.v_sub_f32","op_id":5,"op":"sub_f32","vdst":0,"src0":1,"vsrc1":2,"flags":0,"literal_u32":null}}],"packets":[{"index":0,"role":"none","pair":null},{"index":1,"role":"none","pair":null},{"index":2,"role":"none","pair":null}]}
++
++// ====
++
++// RUN: emit amdgpu-vopd-plan-json @gfx11_same_source_sub_remains_rejected strategy=source fixed=%lhs0:physical_register:0:1 fixed=%lhs1:physical_register:1:1 fixed=%shared:physical_register:2:1 fixed=%next0:physical_register:4:1 fixed=%next1:physical_register:5:1
++amdgpu.target<gfx1100> @test_target
++low.func.def target<amdgpu.rdna3.core>(@test_target) @gfx11_same_source_sub_remains_rejected(%lhs0: reg<amdgpu.vgpr>, %lhs1: reg<amdgpu.vgpr>, %shared: reg<amdgpu.vgpr>) asm {
++  %next0 = v_sub_f32 %lhs0, %shared
++  %next1 = v_sub_f32 %lhs1, %shared
++  return
++}
++
++// ----
++{"format":"loom.amdgpu.vopd_plan.v0","function":"gfx11_same_source_sub_remains_rejected","target":"test_target","descriptor_set":"amdgpu.rdna3.core","pair_count":0,"rejection_count":1,"packet_count":3,"pairs":[],"rejections":[{"index":0,"reason":"register_constraints","register_constraints":["vsrc1_bank"],"block":0,"first":{"packet":0,"node":0,"descriptor":"amdgpu.v_sub_f32","op_id":5,"op":"sub_f32","vdst":4,"src0":0,"vsrc1":2,"flags":0,"literal_u32":null},"second":{"packet":1,"node":1,"descriptor":"amdgpu.v_sub_f32","op_id":5,"op":"sub_f32","vdst":5,"src0":1,"vsrc1":2,"flags":0,"literal_u32":null}}],"packets":[{"index":0,"role":"none","pair":null},{"index":1,"role":"none","pair":null},{"index":2,"role":"none","pair":null}]}
