@@ -61,3 +61,18 @@ The persistent compiler implementation is in
 it to the pinned source. LSE release build scripts must apply the same patch and
 include its hash in compiler provenance. Compiler image identity is part of the
 LSE kernel cache key.
+
+## Matched short-context HTTP check
+
+A fresh-server comparison used the same 1,024-token prompt, 128 generated tokens,
+Q4 target, Q8 DFlash2 draft, seven proposals, BF16 KV, temperature 0.6, top-k 20,
+top-p 0.95, and an empty kernel cache for each binary.
+
+| Implementation | Prefill | Decode |
+|---|---:|---:|
+| Explicit staging | 406.705 tok/s | 27.375 tok/s |
+| Compiler staging | 410.247 tok/s | 27.788 tok/s |
+
+Generated text was identical. Both runs accepted 102 proposals over 25 passes,
+compiled 237 kernels, submitted 50,228 device groups, and had zero host fallbacks.
+This single pair checks integration; it does not establish a short-context speedup.
