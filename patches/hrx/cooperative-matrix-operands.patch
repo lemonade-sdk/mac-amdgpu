@@ -172,10 +172,10 @@ index 556ef4d1..aded8424 100644
  
 diff --git a/loom/src/loom/transforms/kernel/stage_matrix_operands.c b/loom/src/loom/transforms/kernel/stage_matrix_operands.c
 new file mode 100644
-index 00000000..100f1d9f
+index 00000000..5d1a6cc5
 --- /dev/null
 +++ b/loom/src/loom/transforms/kernel/stage_matrix_operands.c
-@@ -0,0 +1,837 @@
+@@ -0,0 +1,1210 @@
 +// Copyright 2026 The IREE Authors
 +// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 +#include "loom/transforms/kernel/stage_matrix_operands.h"
@@ -231,6 +231,11 @@ index 00000000..100f1d9f
 +  loom_op_t* producer;
 +  loom_ir_remap_t remap;
 +  loom_value_id_t mapped_lane;
++  // Per-run congruence classes share reads and conversions inside one mask.
++  uint8_t* run_classes;
++  loom_value_id_t* run_values;
++  loom_value_id_t run_value_count;
++  unsigned run_component;
 +  uint64_t workgroup_bytes, storage_limit;
 +  bool unknown_storage;
 +  loom_target_compile_report_t* report;
@@ -333,7 +338,9 @@ index 00000000..100f1d9f
 +      (op->traits & LOOM_TRAIT_CONVERGENT))
 +    return false;
 +  if (loom_op_dialect_id(op->kind) == LOOM_DIALECT_VECTOR &&
-+      !loom_vector_insert_isa(op) && !loom_vector_constant_isa(op))
++      !loom_vector_insert_isa(op) && !loom_vector_constant_isa(op) &&
++      !loom_vector_splat_isa(op) && !loom_vector_bitcast_isa(op) &&
++      !loom_vector_extract_isa(op))
 +    return false;
 +  if (op->region_count && !loom_scf_if_isa(op)) return false;
 +  for (uint16_t r = 0; r < op->region_count; ++r) {
@@ -370,6 +377,25 @@ index 00000000..100f1d9f
 +    if (global_scalar_read(c, loom_op_operands(op)[i], depth + 1)) return true;
 +  return false;
 +}
++// Conversions may use small vectors, but must not read a carried payload.
++static bool independent_scalar(context_t* c, loom_value_id_t v,
++                               unsigned depth) {
++  if (depth > 128) return false;
++  const loom_value_t* value =
++      loom_value_table_const_value(&c->module->values, v);
++  if (loom_value_is_block_arg(value)) {
++    loom_block_t* block =
++        loom_region_entry_block(loom_scf_for_body(c->producer));
++    return loom_value_def_block(value) != block ||
++           v == loom_block_arg_id(block, 0);
++  }
++  loom_op_t* op = defining(c, v);
++  if (!within(op, c->producer)) return true;
++  for (uint16_t i = 0; i < op->operand_count; ++i)
++    if (!independent_scalar(c, loom_op_operands(op)[i], depth + 1))
++      return false;
++  return true;
++}
 +static bool pointwise(context_t* c, loom_value_id_t v, loom_value_id_t carried,
 +                      loom_value_id_t iv, bool* has_load) {
 +  if (v == carried) return true;
@@ -378,10 +404,12 @@ index 00000000..100f1d9f
 +  if (loom_vector_insert_isa(op)) {
 +    loom_value_slice_t indices = loom_vector_insert_indices(op);
 +    if (indices.count != 1 || indices.values[0] != iv) return false;
++    if (!independent_scalar(c, loom_vector_insert_value(op), 0)) return false;
 +    *has_load |= global_scalar_read(c, loom_vector_insert_value(op), 0);
 +    return pointwise(c, loom_vector_insert_dest(op), carried, iv, has_load);
 +  }
 +  if (loom_scf_if_isa(op)) {
++    if (!independent_scalar(c, loom_scf_if_condition(op), 0)) return false;
 +    const loom_value_t* value =
 +        loom_value_table_const_value(&c->module->values, v);
 +    uint16_t ordinal = loom_value_def_index(value);
@@ -523,6 +551,147 @@ index 00000000..100f1d9f
 +      return varies ? bad : (run_t){0, 1, true};
 +  }
 +}
++// Exact offsets within the redistributed eight-column run. Packed bytes
++// produce repeated word offsets (0,0,0,0,1,1,1,1), not an affine scalar stride.
++typedef struct sequence_t {
++  int64_t delta[8];
++  uint64_t alignment;
++  bool valid;
++} sequence_t;
++static sequence_t sequence(context_t* c, loom_value_id_t v, unsigned depth) {
++  sequence_t bad = {0};
++  if (depth > 128) return bad;
++  run_t affine = run(c, v);
++  if (affine.valid) {
++    sequence_t out = {.alignment = affine.alignment, .valid = true};
++    if (affine.stride < -INT64_C(4294967296) ||
++        affine.stride > INT64_C(4294967296))
++      return bad;
++    for (unsigned i = 0; i < 8; ++i) out.delta[i] = affine.stride * i;
++    return out;
++  }
++  loom_op_t* op = defining(c, v);
++  if (!op || op->region_count || !op->operand_count || op->operand_count > 3)
++    return bad;
++  sequence_t a[3] = {0};
++  for (unsigned i = 0; i < op->operand_count; ++i) {
++    a[i] = sequence(c, loom_op_operands(op)[i], depth + 1);
++    if (!a[i].valid) return bad;
++  }
++  sequence_t out = {.alignment = iree_min(a[0].alignment, a[1].alignment),
++                    .valid = true};
++  switch (op->kind) {
++    case LOOM_OP_INDEX_CAST:
++    case LOOM_OP_INDEX_ASSUME:
++      return a[0];
++    case LOOM_OP_INDEX_ADD:
++    case LOOM_OP_INDEX_SUB:
++      for (unsigned i = 0; i < 8; ++i) {
++        if (a[0].delta[i] < -INT64_C(4294967296) ||
++            a[0].delta[i] > INT64_C(4294967296) ||
++            a[1].delta[i] < -INT64_C(4294967296) ||
++            a[1].delta[i] > INT64_C(4294967296))
++          return bad;
++        out.delta[i] =
++            a[0].delta[i] +
++            (op->kind == LOOM_OP_INDEX_ADD ? a[1].delta[i] : -a[1].delta[i]);
++      }
++      return out;
++    case LOOM_OP_INDEX_DIV:
++    case LOOM_OP_INDEX_REM: {
++      int64_t divisor = 0;
++      if (!loom_value_facts_as_exact_i64(
++              loom_rewriter_value_facts(&c->rw, loom_op_operands(op)[1]),
++              &divisor) ||
++          divisor <= 0 || (divisor & (divisor - 1)) ||
++          a[0].alignment < (uint64_t)divisor)
++        return bad;
++      out.alignment =
++          op->kind == LOOM_OP_INDEX_DIV ? a[0].alignment / divisor : divisor;
++      for (unsigned i = 0; i < 8; ++i) {
++        if (a[0].delta[i] < 0) return bad;
++        out.delta[i] = op->kind == LOOM_OP_INDEX_DIV ? a[0].delta[i] / divisor
++                                                     : a[0].delta[i] % divisor;
++      }
++      return out;
++    }
++    default:
++      return bad;
++  }
++}
++static bool converted_read(context_t* c, loom_op_t* op, bool* coalesced) {
++  loom_value_slice_t indices = loom_view_load_indices(op);
++  if (indices.count != 1) return false;
++  loom_value_id_t at = indices.values[0];
++  // Fragment boundaries are resolved independently for each scalar access.
++  // Strip wrapping only for the profitability check, never for code generation.
++  for (;;) {
++    loom_op_t* address = defining(c, at);
++    if (!address) break;
++    if (loom_index_assume_isa(address) || loom_index_cast_isa(address)) {
++      at = loom_op_operands(address)[0];
++      continue;
++    }
++    int64_t modulus = 0;
++    if (loom_index_rem_isa(address) &&
++        loom_value_facts_as_exact_i64(
++            loom_rewriter_value_facts(&c->rw, loom_op_operands(address)[1]),
++            &modulus) &&
++        modulus >= 32) {
++      at = loom_op_operands(address)[0];
++      continue;
++    }
++    break;
++  }
++  sequence_t seq = sequence(c, at, 0);
++  if (!seq.valid) return false;
++  bool uniform = true, contiguous = true, packed = true;
++  for (unsigned i = 0; i < 8; ++i) {
++    uniform &= seq.delta[i] == 0;
++    contiguous &= seq.delta[i] == i;
++    packed &= seq.delta[i] == i / 4;
++  }
++  *coalesced |= contiguous || packed;
++  return uniform || contiguous || packed;
++}
++static bool converted_scalar(context_t* c, loom_value_id_t v, bool* coalesced,
++                             unsigned depth) {
++  if (depth > 128) return false;
++  loom_op_t* op = defining(c, v);
++  if (!op || (!within(op, c->producer) && dependency(c, v) == 1)) return true;
++  if (loom_view_load_isa(op)) return converted_read(c, op, coalesced);
++  if (op->region_count || !(op->traits & LOOM_TRAIT_PURE)) return false;
++  for (unsigned i = 0; i < op->operand_count; ++i)
++    if (!converted_scalar(c, loom_op_operands(op)[i], coalesced, depth + 1))
++      return false;
++  return true;
++}
++static bool convertible(context_t* c, loom_value_id_t v,
++                        loom_value_id_t carried, bool* coalesced) {
++  if (v == carried) {
++    loom_op_t* init = defining(
++        c, loom_scf_for_iter_args(c->producer)
++               .values[loom_value_def_index(loom_value_table_const_value(
++                           &c->module->values, v)) -
++                       1]);
++    return init && loom_vector_constant_isa(init);
++  }
++  loom_op_t* op = defining(c, v);
++  if (!op) return false;
++  if (loom_vector_insert_isa(op))
++    return converted_scalar(c, loom_vector_insert_value(op), coalesced, 0);
++  if (!loom_scf_if_isa(op)) return false;
++  // Each scalar keeps its original predicate. No masked vector overread.
++  unsigned ordinal =
++      loom_value_def_index(loom_value_table_const_value(&c->module->values, v));
++  for (unsigned r = 0; r < op->region_count; ++r) {
++    loom_op_t* yield = loom_region_entry_block(loom_op_regions(op)[r])->last_op;
++    if (!convertible(c, loom_scf_yield_values(yield).values[ordinal], carried,
++                     coalesced))
++      return false;
++  }
++  return true;
++}
 +static bool vectorizable(context_t* c, loom_value_id_t v,
 +                         loom_value_id_t carried) {
 +  if (v == carried) {
@@ -574,8 +743,35 @@ index 00000000..100f1d9f
 +  }
 +  return false;
 +}
++static uint8_t run_class(context_t* c, loom_value_id_t v, unsigned component) {
++  uint8_t* entry = &c->run_classes[(iree_host_size_t)v * 8 + component];
++  if (*entry != UINT8_MAX) return *entry;
++  *entry = component;
++  if (!component) return 0;
++  sequence_t seq = sequence(c, v, 0);
++  if (seq.valid) {
++    for (unsigned i = 0; i < component; ++i)
++      if (seq.delta[i] == seq.delta[component])
++        return *entry = run_class(c, v, i);
++    return *entry;
++  }
++  loom_op_t* op = defining(c, v);
++  if (!op || op->region_count) return *entry;
++  for (unsigned i = 0; i < component; ++i) {
++    bool same = true;
++    for (unsigned j = 0; j < op->operand_count && same; ++j) {
++      loom_value_id_t input = loom_op_operands(op)[j];
++      same = run_class(c, input, component) == run_class(c, input, i);
++    }
++    if (same) return *entry = run_class(c, v, i);
++  }
++  return *entry;
++}
 +static iree_status_t clone_value(context_t* c, loom_value_id_t v,
-+                                 loom_value_id_t* result) {
++                                 loom_value_id_t* result);
++static iree_status_t clone_value_uncached(context_t* c, loom_value_id_t v,
++
++                                          loom_value_id_t* result) {
 +  if (loom_ir_remap_try_lookup_value(&c->remap, v, result))
 +    return iree_ok_status();
 +  loom_op_t* op = defining(c, v);
@@ -596,6 +792,20 @@ index 00000000..100f1d9f
 +  IREE_RETURN_IF_ERROR(
 +      loom_ir_clone_op(&c->rw.builder, op, &c->remap, &cloned));
 +  return loom_ir_remap_resolve_value(&c->remap, v, result);
++}
++static iree_status_t clone_value(context_t* c, loom_value_id_t v,
++                                 loom_value_id_t* result) {
++  if (!c->run_values || v >= c->run_value_count)
++    return clone_value_uncached(c, v, result);
++  uint8_t group = run_class(c, v, c->run_component);
++  loom_value_id_t* cached = &c->run_values[(iree_host_size_t)v * 8 + group];
++  if (*cached != LOOM_VALUE_ID_INVALID) {
++    *result = *cached;
++    return iree_ok_status();
++  }
++  IREE_RETURN_IF_ERROR(clone_value_uncached(c, v, result));
++  *cached = *result;
++  return iree_ok_status();
 +}
 +static iree_status_t fresh_remap(context_t* c, loom_value_id_t oldf) {
 +  IREE_RETURN_IF_ERROR(loom_ir_remap_initialize(
@@ -682,8 +892,150 @@ index 00000000..100f1d9f
 +  *result = loom_scf_if_results(built).values[0];
 +  return iree_ok_status();
 +}
++static bool uniform_masks(context_t* c, loom_value_id_t v,
++                          loom_value_id_t carried) {
++  if (v == carried) return true;
++  loom_op_t* op = defining(c, v);
++  if (loom_vector_insert_isa(op)) return true;
++  run_t mask = run(c, loom_scf_if_condition(op));
++  if (!mask.valid || mask.stride) return false;
++  unsigned ordinal =
++      loom_value_def_index(loom_value_table_const_value(&c->module->values, v));
++  for (unsigned r = 0; r < 2; ++r) {
++    loom_op_t* yield = loom_region_entry_block(loom_op_regions(op)[r])->last_op;
++    if (!uniform_masks(c, loom_scf_yield_values(yield).values[ordinal],
++                       carried))
++      return false;
++  }
++  return true;
++}
++// Keep invariant masks outside the complete run so CSE can share packed words,
++// scales and fragment pointers across converted elements before vector
++// lowering.
++static iree_status_t load_converted_run(context_t* c, loom_value_id_t v,
++                                        loom_value_id_t carried,
++                                        loom_value_id_t oldf,
++                                        loom_type_t payload,
++                                        loom_value_id_t* result) {
++  loom_op_t* op = defining(c, v);
++  if (v == carried) {
++    *result = loom_scf_for_iter_args(c->producer)
++                  .values[loom_value_def_index(loom_value_table_const_value(
++                              &c->module->values, v)) -
++                          1];
++    return iree_ok_status();
++  }
++  loom_value_id_t base_lane = c->mapped_lane;
++  if (loom_vector_insert_isa(op)) {
++    loom_op_t* made = NULL;
++    IREE_RETURN_IF_ERROR(loom_vector_constant_build(
++        &c->rw.builder, loom_attr_f64(0.0), payload, op->location, &made));
++    loom_value_id_t packed = loom_vector_constant_result(made);
++    c->run_value_count = c->module->values.count;
++    iree_host_size_t count = (iree_host_size_t)c->run_value_count * 8;
++    IREE_RETURN_IF_ERROR(iree_arena_allocate_array(c->pass->arena, count,
++                                                   sizeof(*c->run_classes),
++                                                   (void**)&c->run_classes));
++    IREE_RETURN_IF_ERROR(iree_arena_allocate_array(
++        c->pass->arena, count, sizeof(*c->run_values), (void**)&c->run_values));
++    for (iree_host_size_t i = 0; i < count; ++i) {
++      c->run_classes[i] = UINT8_MAX;
++      c->run_values[i] = LOOM_VALUE_ID_INVALID;
++    }
++    for (unsigned i = 0; i < 8; ++i) {
++      c->run_component = i;
++      loom_value_id_t component, scalar;
++      IREE_RETURN_IF_ERROR(constant(c, i, LOOM_SCALAR_TYPE_INDEX, &component));
++      IREE_RETURN_IF_ERROR(binary(c, loom_index_add_build, base_lane, component,
++                                  &c->mapped_lane));
++      IREE_RETURN_IF_ERROR(fresh_remap(c, oldf));
++      IREE_RETURN_IF_ERROR(
++          clone_value(c, loom_vector_insert_value(op), &scalar));
++      int64_t dynamic = INT64_MIN;
++      IREE_RETURN_IF_ERROR(loom_vector_insert_build(
++          &c->rw.builder, scalar, packed, &component, 1, &dynamic, 1, payload,
++          op->location, &made));
++      packed = loom_vector_insert_result(made);
++    }
++    c->run_values = NULL;
++    c->run_classes = NULL;
++    c->mapped_lane = base_lane;
++    *result = packed;
++    return iree_ok_status();
++  }
++  IREE_RETURN_IF_ERROR(fresh_remap(c, oldf));
++  loom_value_id_t condition;
++  IREE_RETURN_IF_ERROR(clone_value(c, loom_scf_if_condition(op), &condition));
++  loom_op_t* branch = NULL;
++  IREE_RETURN_IF_ERROR(loom_scf_if_build(
++      &c->rw.builder, LOOM_SCF_IF_BUILD_FLAG_HAS_ELSE_REGION, condition,
++      &payload, 1, NULL, 0, op->location, &branch));
++  unsigned ordinal =
++      loom_value_def_index(loom_value_table_const_value(&c->module->values, v));
++  for (unsigned r = 0; r < 2; ++r) {
++    loom_builder_ip_t ip = loom_builder_enter_region(
++        &c->rw.builder, branch, loom_op_regions(branch)[r]);
++    loom_op_t* yield = loom_region_entry_block(loom_op_regions(op)[r])->last_op;
++    loom_value_id_t packed;
++    IREE_RETURN_IF_ERROR(
++        load_converted_run(c, loom_scf_yield_values(yield).values[ordinal],
++                           carried, oldf, payload, &packed));
++    loom_op_t* terminator = NULL;
++    IREE_RETURN_IF_ERROR(loom_scf_yield_build(&c->rw.builder, &packed, 1,
++                                              op->location, &terminator));
++    loom_builder_restore(&c->rw.builder, ip);
++  }
++  *result = loom_scf_if_results(branch).values[0];
++  return iree_ok_status();
++}
++static iree_status_t load_converted(context_t* c, loom_value_id_t v,
++                                    loom_value_id_t carried,
++                                    loom_value_id_t oldf,
++                                    loom_type_t scalar_type,
++                                    loom_value_id_t* result) {
++  loom_op_t* op = defining(c, v);
++  if (v == carried) {
++    loom_op_t* init = defining(
++        c, loom_scf_for_iter_args(c->producer)
++               .values[loom_value_def_index(loom_value_table_const_value(
++                           &c->module->values, v)) -
++                       1]);
++    loom_op_t* value = NULL;
++    IREE_RETURN_IF_ERROR(loom_scalar_constant_build(
++        &c->rw.builder, loom_vector_constant_value(init), scalar_type,
++        c->producer->location, &value));
++    *result = loom_scalar_constant_result(value);
++    return iree_ok_status();
++  }
++  IREE_RETURN_IF_ERROR(fresh_remap(c, oldf));
++  if (loom_vector_insert_isa(op))
++    return clone_value(c, loom_vector_insert_value(op), result);
++  loom_value_id_t condition;
++  IREE_RETURN_IF_ERROR(clone_value(c, loom_scf_if_condition(op), &condition));
++  loom_op_t* branch = NULL;
++  IREE_RETURN_IF_ERROR(loom_scf_if_build(
++      &c->rw.builder, LOOM_SCF_IF_BUILD_FLAG_HAS_ELSE_REGION, condition,
++      &scalar_type, 1, NULL, 0, op->location, &branch));
++  unsigned ordinal =
++      loom_value_def_index(loom_value_table_const_value(&c->module->values, v));
++  for (unsigned r = 0; r < 2; ++r) {
++    loom_builder_ip_t ip = loom_builder_enter_region(
++        &c->rw.builder, branch, loom_op_regions(branch)[r]);
++    loom_op_t* yield = loom_region_entry_block(loom_op_regions(op)[r])->last_op;
++    loom_value_id_t scalar;
++    IREE_RETURN_IF_ERROR(
++        load_converted(c, loom_scf_yield_values(yield).values[ordinal], carried,
++                       oldf, scalar_type, &scalar));
++    loom_op_t* terminator = NULL;
++    IREE_RETURN_IF_ERROR(loom_scf_yield_build(&c->rw.builder, &scalar, 1,
++                                              op->location, &terminator));
++    loom_builder_restore(&c->rw.builder, ip);
++  }
++  *result = loom_scf_if_results(branch).values[0];
++  return iree_ok_status();
++}
 +static iree_status_t rewrite(context_t* c, loom_op_t* fragment,
-+                             uint16_t ordinal) {
++                             uint16_t ordinal, bool vector_load) {
 +  loom_value_id_t first_generated = c->module->values.count;
 +  loom_op_t* old = c->producer;
 +  loom_block_t* old_block = loom_region_entry_block(loom_scf_for_body(old));
@@ -747,7 +1099,13 @@ index 00000000..100f1d9f
 +  IREE_RETURN_IF_ERROR(binary(c, loom_index_add_build, wave, half, &tmp));
 +  IREE_RETURN_IF_ERROR(
 +      binary(c, loom_index_add_build, tmp, low, &c->mapped_lane));
-+  IREE_RETURN_IF_ERROR(load_run(c, yielded, carried, oldf, payload, &packed));
++  bool packed_run = vector_load || uniform_masks(c, yielded, carried);
++  if (vector_load) {
++    IREE_RETURN_IF_ERROR(load_run(c, yielded, carried, oldf, payload, &packed));
++  } else if (packed_run) {
++    IREE_RETURN_IF_ERROR(
++        load_converted_run(c, yielded, carried, oldf, payload, &packed));
++  }
 +  loom_op_t* producer = NULL;
 +  IREE_RETURN_IF_ERROR(loom_scf_for_build(
 +      &c->rw.builder, LOOM_SCF_FOR_BUILD_FLAG_HAS_UNROLL_POLICY, zero, eight,
@@ -762,10 +1120,18 @@ index 00000000..100f1d9f
 +  loom_value_slice_t initial = loom_scf_for_iter_args(old);
 +  loom_value_id_t result;
 +  int64_t dynamic = INT64_MIN;
-+  IREE_RETURN_IF_ERROR(loom_vector_extract_build(
-+      &c->rw.builder, packed, &component, 1, &dynamic, 1,
-+      loom_type_scalar(element), old->location, &op));
-+  loom_value_id_t scalar = loom_vector_extract_result(op), at;
++  loom_value_id_t scalar, at;
++  if (packed_run) {
++    IREE_RETURN_IF_ERROR(loom_vector_extract_build(
++        &c->rw.builder, packed, &component, 1, &dynamic, 1,
++        loom_type_scalar(element), old->location, &op));
++    scalar = loom_vector_extract_result(op);
++  } else {
++    IREE_RETURN_IF_ERROR(binary(c, loom_index_add_build, c->mapped_lane,
++                                component, &c->mapped_lane));
++    IREE_RETURN_IF_ERROR(load_converted(c, yielded, carried, oldf,
++                                        loom_type_scalar(element), &scalar));
++  }
 +  IREE_RETURN_IF_ERROR(binary(c, loom_index_mul_build, row, stride, &tmp));
 +  IREE_RETURN_IF_ERROR(binary(c, loom_index_add_build, tmp, column, &at));
 +  IREE_RETURN_IF_ERROR(loom_view_store_build(&c->rw.builder, 0, scalar, staging,
@@ -999,14 +1365,21 @@ index 00000000..100f1d9f
 +      status = report(&c, fragment, "declined", "workgroup_storage_budget");
 +      continue;
 +    }
-+    if (!vectorizable(&c, loom_scf_yield_values(block->last_op).values[ordinal],
-+                      loom_block_arg_id(block, ordinal + 1))) {
++    loom_value_id_t yielded =
++        loom_scf_yield_values(block->last_op).values[ordinal];
++    loom_value_id_t carried = loom_block_arg_id(block, ordinal + 1);
++    bool vector_load = vectorizable(&c, yielded, carried);
++    bool coalesced = false;
++    if (!vector_load &&
++        (!convertible(&c, yielded, carried, &coalesced) || !coalesced)) {
 +      status = report(&c, fragment, "declined", "no_contiguous_vector_run");
 +      continue;
 +    }
-+    status = rewrite(&c, fragment, ordinal);
++    status = rewrite(&c, fragment, ordinal, vector_load);
 +    if (iree_status_is_ok(status))
-+      status = report(&c, fragment, "selected", "cooperative_vector_load");
++      status = report(&c, fragment, "selected",
++                      vector_load ? "cooperative_vector_load"
++                                  : "cooperative_converted_load");
 +  }
 +  loom_rewriter_deinitialize(&c.rw);
 +  if (pass->value_facts)
@@ -1015,10 +1388,10 @@ index 00000000..100f1d9f
 +}
 diff --git a/loom/src/loom/transforms/kernel/stage_matrix_operands.h b/loom/src/loom/transforms/kernel/stage_matrix_operands.h
 new file mode 100644
-index 00000000..57d1c6b2
+index 00000000..64ea8533
 --- /dev/null
 +++ b/loom/src/loom/transforms/kernel/stage_matrix_operands.h
-@@ -0,0 +1,19 @@
+@@ -0,0 +1,20 @@
 +// Copyright 2026 The IREE Authors
 +// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 +#ifndef LOOM_TRANSFORMS_KERNEL_STAGE_MATRIX_OPERANDS_H_
@@ -1028,7 +1401,8 @@ index 00000000..57d1c6b2
 +extern "C" {
 +#endif
 +// Redistributes independent matrix-operand element producers across a
-+// workgroup. The source masks and address calculations are preserved under a
++// workgroup, including packed and converted operand loads. The source masks
++// and address calculations are preserved under a
 +// bijective lane permutation. LDS restores the original per-lane payload before
 +// matrix math.
 +const loom_pass_info_t* loom_stage_matrix_operands_pass_info(void);
@@ -1040,10 +1414,10 @@ index 00000000..57d1c6b2
 +#endif
 diff --git a/loom/src/loom/transforms/kernel/test/stage_matrix_operands.loom-test b/loom/src/loom/transforms/kernel/test/stage_matrix_operands.loom-test
 new file mode 100644
-index 00000000..ca126fb7
+index 00000000..8eef41c2
 --- /dev/null
 +++ b/loom/src/loom/transforms/kernel/test/stage_matrix_operands.loom-test
-@@ -0,0 +1,953 @@
+@@ -0,0 +1,2035 @@
 +// RUN: pass stage-matrix-operands,canonicalize,cse,dce
 +
 +test.target<low_core> @target {abi = hal_kernel, subgroup_size = 32, max_workgroup_storage_bytes = 65536}
@@ -1159,7 +1533,6 @@ index 00000000..ca126fb7
 +  test.use %rhs : vector<8xbf16>
 +  kernel.return
 +}
-+
 +
 +// ====
 +// RUN: pass stage-matrix-operands,canonicalize,cse,dce
@@ -1278,7 +1651,6 @@ index 00000000..ca126fb7
 +  kernel.return
 +}
 +
-+
 +// ====
 +// RUN: pass stage-matrix-operands,canonicalize,cse,dce
 +
@@ -1345,7 +1717,6 @@ index 00000000..ca126fb7
 +  test.use %rhs : vector<8xbf16>
 +  kernel.return
 +}
-+
 +
 +// ====
 +// RUN: pass stage-matrix-operands,canonicalize,cse,dce
@@ -1423,7 +1794,6 @@ index 00000000..ca126fb7
 +  test.use %rhs : vector<8xbf16>
 +  kernel.return
 +}
-+
 +
 +// ====
 +// RUN: pass stage-matrix-operands,canonicalize,cse,dce
@@ -1503,7 +1873,6 @@ index 00000000..ca126fb7
 +  test.use %rhs : vector<8xbf16>
 +  kernel.return
 +}
-+
 +
 +// ====
 +// RUN: pass stage-matrix-operands,canonicalize,cse,dce
@@ -1587,7 +1956,6 @@ index 00000000..ca126fb7
 +  }
 +  kernel.return
 +}
-+
 +
 +// ====
 +// RUN: pass stage-matrix-operands,canonicalize,cse,dce
@@ -1720,7 +2088,6 @@ index 00000000..ca126fb7
 +  kernel.return
 +}
 +
-+
 +// ====
 +// RUN: pass stage-matrix-operands,canonicalize,cse,dce
 +
@@ -1775,39 +2142,78 @@ index 00000000..ca126fb7
 +  %threads = index.constant 256 : index
 +  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%threads, %one, %one) : index
 +} launch(%weights: buffer) {
-+  %zero = index.constant 0 : index
-+  %one = index.constant 1 : index
++  %32 = index.constant 4352 : offset
++  %33 = index.constant 0 : offset
++  %34 = buffer.alloca %32 {base_alignment = 16, memory_space = workgroup} : buffer
++  %35 = encoding.layout.dense : encoding<layout>
++  %36 = buffer.view %34[%33] : buffer -> view<2176xbf16, %35>
 +  %eight = index.constant 8 : index
 +  %sixteen = index.constant 16 : index
 +  %width = index.constant 128 : index
-+  %offset = index.constant 0 : offset
-+  %view = buffer.view %weights[%offset] : buffer -> view<2048xbf16, #dense>
-+  %lane = kernel.workitem.id<x> : index
-+  %41 = index.constant 5 : index
-+  %wave = index.shrui %lane, %41 : index
-+  %39 = index.constant 15 : index
-+  %low = index.andi %lane, %39 : index
-+  %37 = index.constant 31 : index
-+  %within = index.andi %lane, %37 : index
-+  %35 = index.constant 4 : index
-+  %half = index.shrui %within, %35 : index
-+  %column = index.madd %wave, %sixteen, %low : index
++  %view = buffer.view %weights[%33] : buffer -> view<2048xbf16, #dense>
 +  %init = vector.constant 0.0 : vector<8xbf16>
 +  %last_row = index.constant 13 : index
-+  %payload = scf.for %f = [%zero to %eight step %one](%acc = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
-+    %row = index.madd %half, %eight, %f : index
-+    %at = index.madd %row, %width, %column : index
-+    %valid = index.cmp ult, %column, %last_row : index
-+    %selected = scf.if %valid -> (vector<8xbf16>) {
-+      %value = view.load %view[%at] : view<2048xbf16, #dense> -> bf16
-+      %next = vector.insert %value into %acc[%f] : bf16, vector<8xbf16>
-+      scf.yield %next : vector<8xbf16>
++  %37 = index.constant 0 : index
++  %38 = index.constant 1 : index
++  %41 = index.constant 32 : index
++  %42 = index.constant 136 : index
++  %43 = kernel.workitem.id<x> : index
++  %137 = index.constant 4 : index
++  %138 = index.shrui %43, %137 : index
++  %135 = index.constant 15 : index
++  %136 = index.andi %43, %135 : index
++  %133 = index.constant 3 : index
++  %134 = index.shli %136, %133 : index
++  %131 = index.constant 7 : index
++  %132 = index.andi %138, %131 : index
++  %130 = index.shrui %134, %137 : index
++  %140 = index.shrui %43, %131 : index
++  %126 = index.shli %140, %137 : index
++  %124 = index.andi %134, %135 : index
++  %122 = index.madd %130, %41, %126 : index
++  %54 = index.add %122, %124 : index
++  scf.for %55 = [%37 to %eight step %38] unroll {
++    %110 = index.madd %136, %eight, %55 : index
++    %57 = index.add %54, %55 : index
++    %108 = index.constant 5 : index
++    %109 = index.shrui %57, %108 : index
++    %107 = index.andi %57, %135 : index
++    %105 = index.madd %109, %sixteen, %107 : index
++    %62 = index.cmp ult, %105, %last_row : index
++    %63 = scf.if %62 -> (bf16) {
++      %102 = index.constant 31 : index
++      %103 = index.andi %57, %102 : index
++      %101 = index.shrui %103, %137 : index
++      %99 = index.madd %101, %eight, %132 : index
++      %93 = index.madd %99, %width, %105 : index
++      %74 = view.load %view[%93] : view<2048xbf16, #dense> -> bf16
++      scf.yield %74 : bf16
 +    } else {
-+      scf.yield %acc : vector<8xbf16>
++      %75 = scalar.constant 0.0 : bf16
++      scf.yield %75 : bf16
 +    }
-+    scf.yield %selected : vector<8xbf16>
++    %104 = index.madd %138, %42, %110 : index
++    view.store %63, %36[%104] : bf16, view<2176xbf16, %35>
 +  }
-+  %rhs = vector.fragment<rhs> %payload shape [%sixteen, %sixteen] : vector<8xbf16>
++  kernel.barrier<workgroup> {ordering = acq_rel, scope = workgroup}
++  %120 = index.constant 31 : index
++  %121 = index.andi %43, %120 : index
++  %118 = index.constant 4 : index
++  %119 = index.shrui %121, %118 : index
++  %116 = index.constant 5 : index
++  %117 = index.shrui %43, %116 : index
++  %114 = index.constant 15 : index
++  %115 = index.andi %121, %114 : index
++  %113 = index.madd %117, %sixteen, %115 : index
++  %87 = scf.for %85 = [%37 to %eight step %38](%86 = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %112 = index.madd %119, %eight, %85 : index
++    %111 = index.madd %112, %42, %113 : index
++    %91 = view.load %36[%111] : view<2176xbf16, %35> -> bf16
++    %92 = vector.insert %91 into %86[%85] : bf16, vector<8xbf16>
++    scf.yield %92 : vector<8xbf16>
++  }
++  kernel.barrier<workgroup> {ordering = acq_rel, scope = workgroup}
++  %rhs = vector.fragment<rhs> %87 shape [%sixteen, %sixteen] : vector<8xbf16>
 +  test.use %rhs : vector<8xbf16>
 +  kernel.return
 +}
@@ -1995,5 +2401,1055 @@ index 00000000..ca126fb7
 +  kernel.barrier<workgroup> {ordering = acq_rel, scope = workgroup}
 +  %rhs_second = vector.fragment<rhs> %141 shape [%sixteen, %sixteen] : vector<8xbf16>
 +  test.use %rhs_second : vector<8xbf16>
++  kernel.return
++}
++
++// ====
++// RUN: pass stage-matrix-operands,canonicalize,cse,dce
++
++test.target<low_core> @target {abi = hal_kernel, subgroup_size = 32, max_workgroup_storage_bytes = 65536}
++kernel.def target(@target) @matrix_packed_f8E4M3() {
++  %one = index.constant 1 : index
++  %threads = index.constant 256 : index
++  kernel.launch.config workgroups(%one,%one,%one) workgroup_size(%threads,%one,%one) : index
++} launch(%weights: buffer) {
++  %zero = index.constant 0 : index
++  %one = index.constant 1 : index
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %thirtytwo = index.constant 32 : index
++  %width = index.constant 128 : index
++  %offset = index.constant 0 : offset
++  %view = buffer.view %weights[%offset] : buffer -> view<528xi32,#dense>
++  %lane = kernel.workitem.id<x> : index
++  %wave = index.div %lane, %thirtytwo : index
++  %low = index.rem %lane, %sixteen : index
++  %within = index.rem %lane, %thirtytwo : index
++  %half = index.div %within, %sixteen : index
++  %rowbase = index.mul %half, %eight : index
++  %colbase = index.mul %wave, %sixteen : index
++  %column = index.add %colbase, %low : index
++  %init = vector.constant 0.0 : vector<8xbf16>
++  %payload = scf.for %f = [%zero to %eight step %one](%acc = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %row = index.add %rowbase, %f : index
++    %pitch = index.constant 33 : index
++    %four = index.constant 4 : index
++    %word_width = index.constant 32 : index
++    %linear = index.mul %row, %pitch : index
++    %word_col = index.div %column, %four : index
++    %at = index.add %linear, %word_col : index
++    %word = view.load %view[%at] : view<528xi32,#dense> -> i32
++    %byte = index.rem %column, %four : index
++    %byte_i = index.cast %byte : index to i32
++    %bits = scalar.constant 8 : i32
++    %shift = scalar.muli %byte_i, %bits : i32
++    %shifted = scalar.shrui %word, %shift : i32
++    %packed = vector.splat %shifted : vector<1xi32>
++    %bytes = vector.bitcast %packed : vector<1xi32> to vector<4xf8E4M3>
++    %byte_value = vector.extract %bytes[0] : vector<4xf8E4M3> -> f8E4M3
++    %decoded = scalar.extf %byte_value : f8E4M3 to f32
++    %scale_at = index.add %linear, %word_width : index
++    %scale_bits = view.load %view[%scale_at] : view<528xi32,#dense> -> i32
++    %scale = scalar.bitcast %scale_bits : i32 to f32
++    %scaled = scalar.mulf %decoded, %scale : f32
++    %value = scalar.fptrunc %scaled : f32 to bf16
++    %next = vector.insert %value into %acc[%f] : bf16, vector<8xbf16>
++    scf.yield %next : vector<8xbf16>
++  }
++  %rhs = vector.fragment<rhs> %payload shape [%sixteen,%sixteen] : vector<8xbf16>
++  test.use %rhs : vector<8xbf16>
++  kernel.return
++}
++
++// ----
++test.target<low_core> @target {abi = hal_kernel, max_workgroup_storage_bytes = 65536, subgroup_size = 32}
++
++kernel.def target(@target) @matrix_packed_f8E4M3() {
++  %one = index.constant 1 : index
++  %threads = index.constant 256 : index
++  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%threads, %one, %one) : index
++} launch(%weights: buffer) {
++  %47 = index.constant 4352 : offset
++  %48 = index.constant 0 : offset
++  %49 = buffer.alloca %47 {base_alignment = 16, memory_space = workgroup} : buffer
++  %50 = encoding.layout.dense : encoding<layout>
++  %51 = buffer.view %49[%48] : buffer -> view<2176xbf16, %50>
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %view = buffer.view %weights[%48] : buffer -> view<528xi32, #dense>
++  %init = vector.constant 0.0 : vector<8xbf16>
++  %52 = index.constant 0 : index
++  %53 = index.constant 1 : index
++  %56 = index.constant 32 : index
++  %57 = index.constant 136 : index
++  %58 = kernel.workitem.id<x> : index
++  %294 = index.constant 4 : index
++  %295 = index.shrui %58, %294 : index
++  %292 = index.constant 15 : index
++  %293 = index.andi %58, %292 : index
++  %290 = index.constant 3 : index
++  %291 = index.shli %293, %290 : index
++  %288 = index.constant 7 : index
++  %289 = index.andi %295, %288 : index
++  %287 = index.shrui %291, %294 : index
++  %297 = index.shrui %58, %288 : index
++  %283 = index.shli %297, %294 : index
++  %281 = index.andi %291, %292 : index
++  %279 = index.madd %287, %56, %283 : index
++  %69 = index.add %279, %281 : index
++  %277 = index.constant 31 : index
++  %278 = index.andi %69, %277 : index
++  %276 = index.shrui %278, %294 : index
++  %274 = index.madd %276, %eight, %289 : index
++  %77 = index.constant 33 : index
++  %272 = index.constant 5 : index
++  %273 = index.shrui %69, %272 : index
++  %271 = index.andi %69, %292 : index
++  %269 = index.madd %273, %sixteen, %271 : index
++  %267 = index.constant 2 : index
++  %268 = index.shrui %269, %267 : index
++  %266 = index.madd %274, %77, %268 : index
++  %86 = view.load %view[%266] : view<528xi32, #dense> -> i32
++  %265 = index.andi %269, %290 : index
++  %88 = index.cast %265 : index to i32
++  %262 = scalar.constant 3 : i32
++  %263 = scalar.shli %88, %262 : i32
++  %91 = scalar.shrui %86, %263 : i32
++  %92 = vector.splat %91 : vector<1xi32>
++  %93 = vector.bitcast %92 : vector<1xi32> to vector<4xf8E4M3>
++  %94 = vector.extract %93[0] : vector<4xf8E4M3> -> f8E4M3
++  %95 = scalar.extf %94 : f8E4M3 to f32
++  %261 = index.madd %274, %77, %56 : index
++  %98 = view.load %view[%261] : view<528xi32, #dense> -> i32
++  %99 = scalar.bitcast %98 : i32 to f32
++  %100 = scalar.mulf %95, %99 : f32
++  %101 = scalar.fptrunc %100 : f32 to bf16
++  %260 = vector.insert %101 into %init[0] : bf16, vector<8xbf16>
++  %104 = index.add %69, %53 : index
++  %259 = index.andi %104, %292 : index
++  %257 = index.madd %273, %sixteen, %259 : index
++  %256 = index.andi %257, %290 : index
++  %108 = index.cast %256 : index to i32
++  %254 = scalar.shli %108, %262 : i32
++  %110 = scalar.shrui %86, %254 : i32
++  %111 = vector.splat %110 : vector<1xi32>
++  %112 = vector.bitcast %111 : vector<1xi32> to vector<4xf8E4M3>
++  %113 = vector.extract %112[0] : vector<4xf8E4M3> -> f8E4M3
++  %114 = scalar.extf %113 : f8E4M3 to f32
++  %115 = scalar.mulf %114, %99 : f32
++  %116 = scalar.fptrunc %115 : f32 to bf16
++  %252 = vector.insert %116 into %260[1] : bf16, vector<8xbf16>
++  %119 = index.add %69, %267 : index
++  %251 = index.andi %119, %292 : index
++  %249 = index.madd %273, %sixteen, %251 : index
++  %248 = index.andi %249, %290 : index
++  %123 = index.cast %248 : index to i32
++  %246 = scalar.shli %123, %262 : i32
++  %125 = scalar.shrui %86, %246 : i32
++  %126 = vector.splat %125 : vector<1xi32>
++  %127 = vector.bitcast %126 : vector<1xi32> to vector<4xf8E4M3>
++  %128 = vector.extract %127[0] : vector<4xf8E4M3> -> f8E4M3
++  %129 = scalar.extf %128 : f8E4M3 to f32
++  %130 = scalar.mulf %129, %99 : f32
++  %131 = scalar.fptrunc %130 : f32 to bf16
++  %244 = vector.insert %131 into %252[2] : bf16, vector<8xbf16>
++  %134 = index.add %69, %290 : index
++  %243 = index.andi %134, %292 : index
++  %241 = index.madd %273, %sixteen, %243 : index
++  %240 = index.andi %241, %290 : index
++  %138 = index.cast %240 : index to i32
++  %238 = scalar.shli %138, %262 : i32
++  %140 = scalar.shrui %86, %238 : i32
++  %141 = vector.splat %140 : vector<1xi32>
++  %142 = vector.bitcast %141 : vector<1xi32> to vector<4xf8E4M3>
++  %143 = vector.extract %142[0] : vector<4xf8E4M3> -> f8E4M3
++  %144 = scalar.extf %143 : f8E4M3 to f32
++  %145 = scalar.mulf %144, %99 : f32
++  %146 = scalar.fptrunc %145 : f32 to bf16
++  %236 = vector.insert %146 into %244[3] : bf16, vector<8xbf16>
++  %149 = index.add %69, %294 : index
++  %235 = index.andi %149, %292 : index
++  %233 = index.madd %273, %sixteen, %235 : index
++  %232 = index.shrui %233, %267 : index
++  %230 = index.madd %274, %77, %232 : index
++  %154 = view.load %view[%230] : view<528xi32, #dense> -> i32
++  %155 = scalar.shrui %154, %263 : i32
++  %156 = vector.splat %155 : vector<1xi32>
++  %157 = vector.bitcast %156 : vector<1xi32> to vector<4xf8E4M3>
++  %158 = vector.extract %157[0] : vector<4xf8E4M3> -> f8E4M3
++  %159 = scalar.extf %158 : f8E4M3 to f32
++  %160 = scalar.mulf %159, %99 : f32
++  %161 = scalar.fptrunc %160 : f32 to bf16
++  %229 = vector.insert %161 into %236[4] : bf16, vector<8xbf16>
++  %165 = scalar.shrui %154, %254 : i32
++  %166 = vector.splat %165 : vector<1xi32>
++  %167 = vector.bitcast %166 : vector<1xi32> to vector<4xf8E4M3>
++  %168 = vector.extract %167[0] : vector<4xf8E4M3> -> f8E4M3
++  %169 = scalar.extf %168 : f8E4M3 to f32
++  %170 = scalar.mulf %169, %99 : f32
++  %171 = scalar.fptrunc %170 : f32 to bf16
++  %228 = vector.insert %171 into %229[5] : bf16, vector<8xbf16>
++  %175 = scalar.shrui %154, %246 : i32
++  %176 = vector.splat %175 : vector<1xi32>
++  %177 = vector.bitcast %176 : vector<1xi32> to vector<4xf8E4M3>
++  %178 = vector.extract %177[0] : vector<4xf8E4M3> -> f8E4M3
++  %179 = scalar.extf %178 : f8E4M3 to f32
++  %180 = scalar.mulf %179, %99 : f32
++  %181 = scalar.fptrunc %180 : f32 to bf16
++  %227 = vector.insert %181 into %228[6] : bf16, vector<8xbf16>
++  %185 = scalar.shrui %154, %238 : i32
++  %186 = vector.splat %185 : vector<1xi32>
++  %187 = vector.bitcast %186 : vector<1xi32> to vector<4xf8E4M3>
++  %188 = vector.extract %187[0] : vector<4xf8E4M3> -> f8E4M3
++  %189 = scalar.extf %188 : f8E4M3 to f32
++  %190 = scalar.mulf %189, %99 : f32
++  %191 = scalar.fptrunc %190 : f32 to bf16
++  %226 = vector.insert %191 into %227[7] : bf16, vector<8xbf16>
++  scf.for %193 = [%52 to %eight step %53] unroll {
++    %214 = index.madd %293, %eight, %193 : index
++    %195 = vector.extract %226[%193] : vector<8xbf16> -> bf16
++    %213 = index.madd %295, %57, %214 : index
++    view.store %195, %51[%213] : bf16, view<2176xbf16, %50>
++  }
++  kernel.barrier<workgroup> {ordering = acq_rel, scope = workgroup}
++  %224 = index.constant 31 : index
++  %225 = index.andi %58, %224 : index
++  %222 = index.constant 4 : index
++  %223 = index.shrui %225, %222 : index
++  %220 = index.constant 5 : index
++  %221 = index.shrui %58, %220 : index
++  %218 = index.constant 15 : index
++  %219 = index.andi %225, %218 : index
++  %217 = index.madd %221, %sixteen, %219 : index
++  %207 = scf.for %205 = [%52 to %eight step %53](%206 = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %216 = index.madd %223, %eight, %205 : index
++    %215 = index.madd %216, %57, %217 : index
++    %211 = view.load %51[%215] : view<2176xbf16, %50> -> bf16
++    %212 = vector.insert %211 into %206[%205] : bf16, vector<8xbf16>
++    scf.yield %212 : vector<8xbf16>
++  }
++  kernel.barrier<workgroup> {ordering = acq_rel, scope = workgroup}
++  %rhs = vector.fragment<rhs> %207 shape [%sixteen, %sixteen] : vector<8xbf16>
++  test.use %rhs : vector<8xbf16>
++  kernel.return
++}
++
++// ====
++// RUN: pass stage-matrix-operands,canonicalize,cse,dce
++
++test.target<low_core> @target {abi = hal_kernel, subgroup_size = 32, max_workgroup_storage_bytes = 65536}
++kernel.def target(@target) @matrix_packed_f8E5M2() {
++  %one = index.constant 1 : index
++  %threads = index.constant 256 : index
++  kernel.launch.config workgroups(%one,%one,%one) workgroup_size(%threads,%one,%one) : index
++} launch(%weights: buffer) {
++  %zero = index.constant 0 : index
++  %one = index.constant 1 : index
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %thirtytwo = index.constant 32 : index
++  %width = index.constant 128 : index
++  %offset = index.constant 0 : offset
++  %view = buffer.view %weights[%offset] : buffer -> view<528xi32,#dense>
++  %lane = kernel.workitem.id<x> : index
++  %wave = index.div %lane, %thirtytwo : index
++  %low = index.rem %lane, %sixteen : index
++  %within = index.rem %lane, %thirtytwo : index
++  %half = index.div %within, %sixteen : index
++  %rowbase = index.mul %half, %eight : index
++  %colbase = index.mul %wave, %sixteen : index
++  %column = index.add %colbase, %low : index
++  %init = vector.constant 0.0 : vector<8xbf16>
++  %payload = scf.for %f = [%zero to %eight step %one](%acc = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %row = index.add %rowbase, %f : index
++    %pitch = index.constant 33 : index
++    %four = index.constant 4 : index
++    %word_width = index.constant 32 : index
++    %linear = index.mul %row, %pitch : index
++    %word_col = index.div %column, %four : index
++    %at = index.add %linear, %word_col : index
++    %word = view.load %view[%at] : view<528xi32,#dense> -> i32
++    %byte = index.rem %column, %four : index
++    %byte_i = index.cast %byte : index to i32
++    %bits = scalar.constant 8 : i32
++    %shift = scalar.muli %byte_i, %bits : i32
++    %shifted = scalar.shrui %word, %shift : i32
++    %packed = vector.splat %shifted : vector<1xi32>
++    %bytes = vector.bitcast %packed : vector<1xi32> to vector<4xf8E5M2>
++    %byte_value = vector.extract %bytes[0] : vector<4xf8E5M2> -> f8E5M2
++    %decoded = scalar.extf %byte_value : f8E5M2 to f32
++    %scale_at = index.add %linear, %word_width : index
++    %scale_bits = view.load %view[%scale_at] : view<528xi32,#dense> -> i32
++    %scale = scalar.bitcast %scale_bits : i32 to f32
++    %scaled = scalar.mulf %decoded, %scale : f32
++    %value = scalar.fptrunc %scaled : f32 to bf16
++    %next = vector.insert %value into %acc[%f] : bf16, vector<8xbf16>
++    scf.yield %next : vector<8xbf16>
++  }
++  %rhs = vector.fragment<rhs> %payload shape [%sixteen,%sixteen] : vector<8xbf16>
++  test.use %rhs : vector<8xbf16>
++  kernel.return
++}
++
++// ----
++test.target<low_core> @target {abi = hal_kernel, max_workgroup_storage_bytes = 65536, subgroup_size = 32}
++
++kernel.def target(@target) @matrix_packed_f8E5M2() {
++  %one = index.constant 1 : index
++  %threads = index.constant 256 : index
++  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%threads, %one, %one) : index
++} launch(%weights: buffer) {
++  %47 = index.constant 4352 : offset
++  %48 = index.constant 0 : offset
++  %49 = buffer.alloca %47 {base_alignment = 16, memory_space = workgroup} : buffer
++  %50 = encoding.layout.dense : encoding<layout>
++  %51 = buffer.view %49[%48] : buffer -> view<2176xbf16, %50>
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %view = buffer.view %weights[%48] : buffer -> view<528xi32, #dense>
++  %init = vector.constant 0.0 : vector<8xbf16>
++  %52 = index.constant 0 : index
++  %53 = index.constant 1 : index
++  %56 = index.constant 32 : index
++  %57 = index.constant 136 : index
++  %58 = kernel.workitem.id<x> : index
++  %294 = index.constant 4 : index
++  %295 = index.shrui %58, %294 : index
++  %292 = index.constant 15 : index
++  %293 = index.andi %58, %292 : index
++  %290 = index.constant 3 : index
++  %291 = index.shli %293, %290 : index
++  %288 = index.constant 7 : index
++  %289 = index.andi %295, %288 : index
++  %287 = index.shrui %291, %294 : index
++  %297 = index.shrui %58, %288 : index
++  %283 = index.shli %297, %294 : index
++  %281 = index.andi %291, %292 : index
++  %279 = index.madd %287, %56, %283 : index
++  %69 = index.add %279, %281 : index
++  %277 = index.constant 31 : index
++  %278 = index.andi %69, %277 : index
++  %276 = index.shrui %278, %294 : index
++  %274 = index.madd %276, %eight, %289 : index
++  %77 = index.constant 33 : index
++  %272 = index.constant 5 : index
++  %273 = index.shrui %69, %272 : index
++  %271 = index.andi %69, %292 : index
++  %269 = index.madd %273, %sixteen, %271 : index
++  %267 = index.constant 2 : index
++  %268 = index.shrui %269, %267 : index
++  %266 = index.madd %274, %77, %268 : index
++  %86 = view.load %view[%266] : view<528xi32, #dense> -> i32
++  %265 = index.andi %269, %290 : index
++  %88 = index.cast %265 : index to i32
++  %262 = scalar.constant 3 : i32
++  %263 = scalar.shli %88, %262 : i32
++  %91 = scalar.shrui %86, %263 : i32
++  %92 = vector.splat %91 : vector<1xi32>
++  %93 = vector.bitcast %92 : vector<1xi32> to vector<4xf8E5M2>
++  %94 = vector.extract %93[0] : vector<4xf8E5M2> -> f8E5M2
++  %95 = scalar.extf %94 : f8E5M2 to f32
++  %261 = index.madd %274, %77, %56 : index
++  %98 = view.load %view[%261] : view<528xi32, #dense> -> i32
++  %99 = scalar.bitcast %98 : i32 to f32
++  %100 = scalar.mulf %95, %99 : f32
++  %101 = scalar.fptrunc %100 : f32 to bf16
++  %260 = vector.insert %101 into %init[0] : bf16, vector<8xbf16>
++  %104 = index.add %69, %53 : index
++  %259 = index.andi %104, %292 : index
++  %257 = index.madd %273, %sixteen, %259 : index
++  %256 = index.andi %257, %290 : index
++  %108 = index.cast %256 : index to i32
++  %254 = scalar.shli %108, %262 : i32
++  %110 = scalar.shrui %86, %254 : i32
++  %111 = vector.splat %110 : vector<1xi32>
++  %112 = vector.bitcast %111 : vector<1xi32> to vector<4xf8E5M2>
++  %113 = vector.extract %112[0] : vector<4xf8E5M2> -> f8E5M2
++  %114 = scalar.extf %113 : f8E5M2 to f32
++  %115 = scalar.mulf %114, %99 : f32
++  %116 = scalar.fptrunc %115 : f32 to bf16
++  %252 = vector.insert %116 into %260[1] : bf16, vector<8xbf16>
++  %119 = index.add %69, %267 : index
++  %251 = index.andi %119, %292 : index
++  %249 = index.madd %273, %sixteen, %251 : index
++  %248 = index.andi %249, %290 : index
++  %123 = index.cast %248 : index to i32
++  %246 = scalar.shli %123, %262 : i32
++  %125 = scalar.shrui %86, %246 : i32
++  %126 = vector.splat %125 : vector<1xi32>
++  %127 = vector.bitcast %126 : vector<1xi32> to vector<4xf8E5M2>
++  %128 = vector.extract %127[0] : vector<4xf8E5M2> -> f8E5M2
++  %129 = scalar.extf %128 : f8E5M2 to f32
++  %130 = scalar.mulf %129, %99 : f32
++  %131 = scalar.fptrunc %130 : f32 to bf16
++  %244 = vector.insert %131 into %252[2] : bf16, vector<8xbf16>
++  %134 = index.add %69, %290 : index
++  %243 = index.andi %134, %292 : index
++  %241 = index.madd %273, %sixteen, %243 : index
++  %240 = index.andi %241, %290 : index
++  %138 = index.cast %240 : index to i32
++  %238 = scalar.shli %138, %262 : i32
++  %140 = scalar.shrui %86, %238 : i32
++  %141 = vector.splat %140 : vector<1xi32>
++  %142 = vector.bitcast %141 : vector<1xi32> to vector<4xf8E5M2>
++  %143 = vector.extract %142[0] : vector<4xf8E5M2> -> f8E5M2
++  %144 = scalar.extf %143 : f8E5M2 to f32
++  %145 = scalar.mulf %144, %99 : f32
++  %146 = scalar.fptrunc %145 : f32 to bf16
++  %236 = vector.insert %146 into %244[3] : bf16, vector<8xbf16>
++  %149 = index.add %69, %294 : index
++  %235 = index.andi %149, %292 : index
++  %233 = index.madd %273, %sixteen, %235 : index
++  %232 = index.shrui %233, %267 : index
++  %230 = index.madd %274, %77, %232 : index
++  %154 = view.load %view[%230] : view<528xi32, #dense> -> i32
++  %155 = scalar.shrui %154, %263 : i32
++  %156 = vector.splat %155 : vector<1xi32>
++  %157 = vector.bitcast %156 : vector<1xi32> to vector<4xf8E5M2>
++  %158 = vector.extract %157[0] : vector<4xf8E5M2> -> f8E5M2
++  %159 = scalar.extf %158 : f8E5M2 to f32
++  %160 = scalar.mulf %159, %99 : f32
++  %161 = scalar.fptrunc %160 : f32 to bf16
++  %229 = vector.insert %161 into %236[4] : bf16, vector<8xbf16>
++  %165 = scalar.shrui %154, %254 : i32
++  %166 = vector.splat %165 : vector<1xi32>
++  %167 = vector.bitcast %166 : vector<1xi32> to vector<4xf8E5M2>
++  %168 = vector.extract %167[0] : vector<4xf8E5M2> -> f8E5M2
++  %169 = scalar.extf %168 : f8E5M2 to f32
++  %170 = scalar.mulf %169, %99 : f32
++  %171 = scalar.fptrunc %170 : f32 to bf16
++  %228 = vector.insert %171 into %229[5] : bf16, vector<8xbf16>
++  %175 = scalar.shrui %154, %246 : i32
++  %176 = vector.splat %175 : vector<1xi32>
++  %177 = vector.bitcast %176 : vector<1xi32> to vector<4xf8E5M2>
++  %178 = vector.extract %177[0] : vector<4xf8E5M2> -> f8E5M2
++  %179 = scalar.extf %178 : f8E5M2 to f32
++  %180 = scalar.mulf %179, %99 : f32
++  %181 = scalar.fptrunc %180 : f32 to bf16
++  %227 = vector.insert %181 into %228[6] : bf16, vector<8xbf16>
++  %185 = scalar.shrui %154, %238 : i32
++  %186 = vector.splat %185 : vector<1xi32>
++  %187 = vector.bitcast %186 : vector<1xi32> to vector<4xf8E5M2>
++  %188 = vector.extract %187[0] : vector<4xf8E5M2> -> f8E5M2
++  %189 = scalar.extf %188 : f8E5M2 to f32
++  %190 = scalar.mulf %189, %99 : f32
++  %191 = scalar.fptrunc %190 : f32 to bf16
++  %226 = vector.insert %191 into %227[7] : bf16, vector<8xbf16>
++  scf.for %193 = [%52 to %eight step %53] unroll {
++    %214 = index.madd %293, %eight, %193 : index
++    %195 = vector.extract %226[%193] : vector<8xbf16> -> bf16
++    %213 = index.madd %295, %57, %214 : index
++    view.store %195, %51[%213] : bf16, view<2176xbf16, %50>
++  }
++  kernel.barrier<workgroup> {ordering = acq_rel, scope = workgroup}
++  %224 = index.constant 31 : index
++  %225 = index.andi %58, %224 : index
++  %222 = index.constant 4 : index
++  %223 = index.shrui %225, %222 : index
++  %220 = index.constant 5 : index
++  %221 = index.shrui %58, %220 : index
++  %218 = index.constant 15 : index
++  %219 = index.andi %225, %218 : index
++  %217 = index.madd %221, %sixteen, %219 : index
++  %207 = scf.for %205 = [%52 to %eight step %53](%206 = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %216 = index.madd %223, %eight, %205 : index
++    %215 = index.madd %216, %57, %217 : index
++    %211 = view.load %51[%215] : view<2176xbf16, %50> -> bf16
++    %212 = vector.insert %211 into %206[%205] : bf16, vector<8xbf16>
++    scf.yield %212 : vector<8xbf16>
++  }
++  kernel.barrier<workgroup> {ordering = acq_rel, scope = workgroup}
++  %rhs = vector.fragment<rhs> %207 shape [%sixteen, %sixteen] : vector<8xbf16>
++  test.use %rhs : vector<8xbf16>
++  kernel.return
++}
++
++// ====
++// RUN: pass stage-matrix-operands,canonicalize,cse,dce
++
++test.target<low_core> @target {abi = hal_kernel, subgroup_size = 32, max_workgroup_storage_bytes = 65536}
++kernel.def target(@target) @matrix_converted_f32() {
++  %one = index.constant 1 : index
++  %threads = index.constant 256 : index
++  kernel.launch.config workgroups(%one,%one,%one) workgroup_size(%threads,%one,%one) : index
++} launch(%weights: buffer) {
++  %zero = index.constant 0 : index
++  %one = index.constant 1 : index
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %thirtytwo = index.constant 32 : index
++  %width = index.constant 128 : index
++  %offset = index.constant 0 : offset
++  %view = buffer.view %weights[%offset] : buffer -> view<2048xf32,#dense>
++  %lane = kernel.workitem.id<x> : index
++  %wave = index.div %lane, %thirtytwo : index
++  %low = index.rem %lane, %sixteen : index
++  %within = index.rem %lane, %thirtytwo : index
++  %half = index.div %within, %sixteen : index
++  %rowbase = index.mul %half, %eight : index
++  %colbase = index.mul %wave, %sixteen : index
++  %column = index.add %colbase, %low : index
++  %init = vector.constant 0.0 : vector<8xbf16>
++  %payload = scf.for %f = [%zero to %eight step %one](%acc = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %row = index.add %rowbase, %f : index
++    %linear = index.mul %row, %width : index
++    %at = index.add %linear, %column : index
++    %loaded = view.load %view[%at] : view<2048xf32,#dense> -> f32
++    %value = scalar.fptrunc %loaded : f32 to bf16
++    %next = vector.insert %value into %acc[%f] : bf16, vector<8xbf16>
++    scf.yield %next : vector<8xbf16>
++  }
++  %rhs = vector.fragment<rhs> %payload shape [%sixteen,%sixteen] : vector<8xbf16>
++  test.use %rhs : vector<8xbf16>
++  kernel.return
++}
++
++// ----
++test.target<low_core> @target {abi = hal_kernel, max_workgroup_storage_bytes = 65536, subgroup_size = 32}
++
++kernel.def target(@target) @matrix_converted_f32() {
++  %one = index.constant 1 : index
++  %threads = index.constant 256 : index
++  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%threads, %one, %one) : index
++} launch(%weights: buffer) {
++  %30 = index.constant 4352 : offset
++  %31 = index.constant 0 : offset
++  %32 = buffer.alloca %30 {base_alignment = 16, memory_space = workgroup} : buffer
++  %33 = encoding.layout.dense : encoding<layout>
++  %34 = buffer.view %32[%31] : buffer -> view<2176xbf16, %33>
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %width = index.constant 128 : index
++  %view = buffer.view %weights[%31] : buffer -> view<2048xf32, #dense>
++  %init = vector.constant 0.0 : vector<8xbf16>
++  %35 = index.constant 0 : index
++  %36 = index.constant 1 : index
++  %39 = index.constant 32 : index
++  %40 = index.constant 136 : index
++  %41 = kernel.workitem.id<x> : index
++  %220 = index.constant 4 : index
++  %221 = index.shrui %41, %220 : index
++  %218 = index.constant 15 : index
++  %219 = index.andi %41, %218 : index
++  %216 = index.constant 3 : index
++  %217 = index.shli %219, %216 : index
++  %214 = index.constant 7 : index
++  %215 = index.andi %221, %214 : index
++  %213 = index.shrui %217, %220 : index
++  %223 = index.shrui %41, %214 : index
++  %209 = index.shli %223, %220 : index
++  %207 = index.andi %217, %218 : index
++  %205 = index.madd %213, %39, %209 : index
++  %52 = index.add %205, %207 : index
++  %203 = index.constant 31 : index
++  %204 = index.andi %52, %203 : index
++  %202 = index.shrui %204, %220 : index
++  %200 = index.madd %202, %eight, %215 : index
++  %198 = index.constant 5 : index
++  %199 = index.shrui %52, %198 : index
++  %197 = index.andi %52, %218 : index
++  %195 = index.madd %199, %sixteen, %197 : index
++  %194 = index.madd %200, %width, %195 : index
++  %66 = view.load %view[%194] : view<2048xf32, #dense> -> f32
++  %67 = scalar.fptrunc %66 : f32 to bf16
++  %193 = vector.insert %67 into %init[0] : bf16, vector<8xbf16>
++  %70 = index.add %52, %36 : index
++  %192 = index.andi %70, %218 : index
++  %190 = index.madd %199, %sixteen, %192 : index
++  %189 = index.madd %200, %width, %190 : index
++  %74 = view.load %view[%189] : view<2048xf32, #dense> -> f32
++  %75 = scalar.fptrunc %74 : f32 to bf16
++  %188 = vector.insert %75 into %193[1] : bf16, vector<8xbf16>
++  %77 = index.constant 2 : index
++  %78 = index.add %52, %77 : index
++  %187 = index.andi %78, %218 : index
++  %185 = index.madd %199, %sixteen, %187 : index
++  %184 = index.madd %200, %width, %185 : index
++  %82 = view.load %view[%184] : view<2048xf32, #dense> -> f32
++  %83 = scalar.fptrunc %82 : f32 to bf16
++  %183 = vector.insert %83 into %188[2] : bf16, vector<8xbf16>
++  %86 = index.add %52, %216 : index
++  %182 = index.andi %86, %218 : index
++  %180 = index.madd %199, %sixteen, %182 : index
++  %179 = index.madd %200, %width, %180 : index
++  %90 = view.load %view[%179] : view<2048xf32, #dense> -> f32
++  %91 = scalar.fptrunc %90 : f32 to bf16
++  %178 = vector.insert %91 into %183[3] : bf16, vector<8xbf16>
++  %94 = index.add %52, %220 : index
++  %177 = index.andi %94, %218 : index
++  %175 = index.madd %199, %sixteen, %177 : index
++  %174 = index.madd %200, %width, %175 : index
++  %98 = view.load %view[%174] : view<2048xf32, #dense> -> f32
++  %99 = scalar.fptrunc %98 : f32 to bf16
++  %173 = vector.insert %99 into %178[4] : bf16, vector<8xbf16>
++  %102 = index.add %52, %198 : index
++  %172 = index.andi %102, %218 : index
++  %170 = index.madd %199, %sixteen, %172 : index
++  %169 = index.madd %200, %width, %170 : index
++  %106 = view.load %view[%169] : view<2048xf32, #dense> -> f32
++  %107 = scalar.fptrunc %106 : f32 to bf16
++  %168 = vector.insert %107 into %173[5] : bf16, vector<8xbf16>
++  %109 = index.constant 6 : index
++  %110 = index.add %52, %109 : index
++  %167 = index.andi %110, %218 : index
++  %165 = index.madd %199, %sixteen, %167 : index
++  %164 = index.madd %200, %width, %165 : index
++  %114 = view.load %view[%164] : view<2048xf32, #dense> -> f32
++  %115 = scalar.fptrunc %114 : f32 to bf16
++  %163 = vector.insert %115 into %168[6] : bf16, vector<8xbf16>
++  %118 = index.add %52, %214 : index
++  %162 = index.andi %118, %218 : index
++  %160 = index.madd %199, %sixteen, %162 : index
++  %159 = index.madd %200, %width, %160 : index
++  %122 = view.load %view[%159] : view<2048xf32, #dense> -> f32
++  %123 = scalar.fptrunc %122 : f32 to bf16
++  %158 = vector.insert %123 into %163[7] : bf16, vector<8xbf16>
++  scf.for %125 = [%35 to %eight step %36] unroll {
++    %146 = index.madd %219, %eight, %125 : index
++    %127 = vector.extract %158[%125] : vector<8xbf16> -> bf16
++    %145 = index.madd %221, %40, %146 : index
++    view.store %127, %34[%145] : bf16, view<2176xbf16, %33>
++  }
++  kernel.barrier<workgroup> {ordering = acq_rel, scope = workgroup}
++  %156 = index.constant 31 : index
++  %157 = index.andi %41, %156 : index
++  %154 = index.constant 4 : index
++  %155 = index.shrui %157, %154 : index
++  %152 = index.constant 5 : index
++  %153 = index.shrui %41, %152 : index
++  %150 = index.constant 15 : index
++  %151 = index.andi %157, %150 : index
++  %149 = index.madd %153, %sixteen, %151 : index
++  %139 = scf.for %137 = [%35 to %eight step %36](%138 = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %148 = index.madd %155, %eight, %137 : index
++    %147 = index.madd %148, %40, %149 : index
++    %143 = view.load %34[%147] : view<2176xbf16, %33> -> bf16
++    %144 = vector.insert %143 into %138[%137] : bf16, vector<8xbf16>
++    scf.yield %144 : vector<8xbf16>
++  }
++  kernel.barrier<workgroup> {ordering = acq_rel, scope = workgroup}
++  %rhs = vector.fragment<rhs> %139 shape [%sixteen, %sixteen] : vector<8xbf16>
++  test.use %rhs : vector<8xbf16>
++  kernel.return
++}
++
++// ====
++// RUN: pass stage-matrix-operands,canonicalize,cse,dce
++
++test.target<low_core> @target {abi = hal_kernel, subgroup_size = 32, max_workgroup_storage_bytes = 65536}
++kernel.def target(@target) @matrix_recurrence_rejected() {
++  %one = index.constant 1 : index
++  %threads = index.constant 256 : index
++  kernel.launch.config workgroups(%one,%one,%one) workgroup_size(%threads,%one,%one) : index
++} launch(%weights: buffer) {
++  %zero = index.constant 0 : index
++  %one = index.constant 1 : index
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %thirtytwo = index.constant 32 : index
++  %width = index.constant 128 : index
++  %offset = index.constant 0 : offset
++  %view = buffer.view %weights[%offset] : buffer -> view<2048xbf16,#dense>
++  %lane = kernel.workitem.id<x> : index
++  %wave = index.div %lane, %thirtytwo : index
++  %low = index.rem %lane, %sixteen : index
++  %within = index.rem %lane, %thirtytwo : index
++  %half = index.div %within, %sixteen : index
++  %rowbase = index.mul %half, %eight : index
++  %colbase = index.mul %wave, %sixteen : index
++  %column = index.add %colbase, %low : index
++  %init = vector.constant 0.0 : vector<8xbf16>
++  %payload = scf.for %f = [%zero to %eight step %one](%acc = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %row = index.add %rowbase, %f : index
++    %linear = index.mul %row, %width : index
++    %at = index.add %linear, %column : index
++    %value = view.load %view[%at] : view<2048xbf16,#dense> -> bf16
++    %previous = vector.extract %acc[0] : vector<8xbf16> -> bf16
++    %sum = scalar.addf %previous, %value : bf16
++    %next = vector.insert %sum into %acc[%f] : bf16, vector<8xbf16>
++    scf.yield %next : vector<8xbf16>
++  }
++  %rhs = vector.fragment<rhs> %payload shape [%sixteen,%sixteen] : vector<8xbf16>
++  test.use %rhs : vector<8xbf16>
++  kernel.return
++}
++
++// ----
++test.target<low_core> @target {abi = hal_kernel, max_workgroup_storage_bytes = 65536, subgroup_size = 32}
++
++kernel.def target(@target) @matrix_recurrence_rejected() {
++  %one = index.constant 1 : index
++  %threads = index.constant 256 : index
++  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%threads, %one, %one) : index
++} launch(%weights: buffer) {
++  %zero = index.constant 0 : index
++  %one = index.constant 1 : index
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %width = index.constant 128 : index
++  %offset = index.constant 0 : offset
++  %view = buffer.view %weights[%offset] : buffer -> view<2048xbf16, #dense>
++  %lane = kernel.workitem.id<x> : index
++  %40 = index.constant 5 : index
++  %wave = index.shrui %lane, %40 : index
++  %38 = index.constant 15 : index
++  %low = index.andi %lane, %38 : index
++  %36 = index.constant 31 : index
++  %within = index.andi %lane, %36 : index
++  %34 = index.constant 4 : index
++  %half = index.shrui %within, %34 : index
++  %column = index.madd %wave, %sixteen, %low : index
++  %init = vector.constant 0.0 : vector<8xbf16>
++  %payload = scf.for %f = [%zero to %eight step %one](%acc = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %row = index.madd %half, %eight, %f : index
++    %at = index.madd %row, %width, %column : index
++    %value = view.load %view[%at] : view<2048xbf16, #dense> -> bf16
++    %previous = vector.extract %acc[0] : vector<8xbf16> -> bf16
++    %sum = scalar.addf %previous, %value : bf16
++    %next = vector.insert %sum into %acc[%f] : bf16, vector<8xbf16>
++    scf.yield %next : vector<8xbf16>
++  }
++  %rhs = vector.fragment<rhs> %payload shape [%sixteen, %sixteen] : vector<8xbf16>
++  test.use %rhs : vector<8xbf16>
++  kernel.return
++}
++
++// ====
++// RUN: pass stage-matrix-operands,canonicalize,cse,dce
++
++test.target<low_core> @target {abi = hal_kernel, subgroup_size = 32, max_workgroup_storage_bytes = 65536}
++kernel.def target(@target) @matrix_native_f8E4M3() {
++  %one = index.constant 1 : index
++  %threads = index.constant 256 : index
++  kernel.launch.config workgroups(%one,%one,%one) workgroup_size(%threads,%one,%one) : index
++} launch(%weights: buffer) {
++  %zero = index.constant 0 : index
++  %one = index.constant 1 : index
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %thirtytwo = index.constant 32 : index
++  %width = index.constant 128 : index
++  %offset = index.constant 0 : offset
++  %view = buffer.view %weights[%offset] : buffer -> view<2048xf8E4M3,#dense>
++  %lane = kernel.workitem.id<x> : index
++  %wave = index.div %lane, %thirtytwo : index
++  %low = index.rem %lane, %sixteen : index
++  %within = index.rem %lane, %thirtytwo : index
++  %half = index.div %within, %sixteen : index
++  %rowbase = index.mul %half, %eight : index
++  %colbase = index.mul %wave, %sixteen : index
++  %column = index.add %colbase, %low : index
++  %init = vector.constant 0.0 : vector<8xbf16>
++  %payload = scf.for %f = [%zero to %eight step %one](%acc = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %row = index.add %rowbase, %f : index
++    %linear = index.mul %row, %width : index
++    %at = index.add %linear, %column : index
++    %raw = view.load %view[%at] : view<2048xf8E4M3,#dense> -> f8E4M3
++    %wide = scalar.extf %raw : f8E4M3 to f32
++    %value = scalar.fptrunc %wide : f32 to bf16
++    %next = vector.insert %value into %acc[%f] : bf16, vector<8xbf16>
++    scf.yield %next : vector<8xbf16>
++  }
++  %rhs = vector.fragment<rhs> %payload shape [%sixteen,%sixteen] : vector<8xbf16>
++  test.use %rhs : vector<8xbf16>
++  kernel.return
++}
++
++// ----
++test.target<low_core> @target {abi = hal_kernel, max_workgroup_storage_bytes = 65536, subgroup_size = 32}
++
++kernel.def target(@target) @matrix_native_f8E4M3() {
++  %one = index.constant 1 : index
++  %threads = index.constant 256 : index
++  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%threads, %one, %one) : index
++} launch(%weights: buffer) {
++  %31 = index.constant 4352 : offset
++  %32 = index.constant 0 : offset
++  %33 = buffer.alloca %31 {base_alignment = 16, memory_space = workgroup} : buffer
++  %34 = encoding.layout.dense : encoding<layout>
++  %35 = buffer.view %33[%32] : buffer -> view<2176xbf16, %34>
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %width = index.constant 128 : index
++  %view = buffer.view %weights[%32] : buffer -> view<2048xf8E4M3, #dense>
++  %init = vector.constant 0.0 : vector<8xbf16>
++  %36 = index.constant 0 : index
++  %37 = index.constant 1 : index
++  %40 = index.constant 32 : index
++  %41 = index.constant 136 : index
++  %42 = kernel.workitem.id<x> : index
++  %237 = index.constant 4 : index
++  %238 = index.shrui %42, %237 : index
++  %235 = index.constant 15 : index
++  %236 = index.andi %42, %235 : index
++  %233 = index.constant 3 : index
++  %234 = index.shli %236, %233 : index
++  %231 = index.constant 7 : index
++  %232 = index.andi %238, %231 : index
++  %230 = index.shrui %234, %237 : index
++  %240 = index.shrui %42, %231 : index
++  %226 = index.shli %240, %237 : index
++  %224 = index.andi %234, %235 : index
++  %222 = index.madd %230, %40, %226 : index
++  %53 = index.add %222, %224 : index
++  %220 = index.constant 31 : index
++  %221 = index.andi %53, %220 : index
++  %219 = index.shrui %221, %237 : index
++  %217 = index.madd %219, %eight, %232 : index
++  %215 = index.constant 5 : index
++  %216 = index.shrui %53, %215 : index
++  %214 = index.andi %53, %235 : index
++  %212 = index.madd %216, %sixteen, %214 : index
++  %211 = index.madd %217, %width, %212 : index
++  %67 = view.load %view[%211] : view<2048xf8E4M3, #dense> -> f8E4M3
++  %210 = scalar.extf %67 : f8E4M3 to bf16
++  %209 = vector.insert %210 into %init[0] : bf16, vector<8xbf16>
++  %72 = index.add %53, %37 : index
++  %208 = index.andi %72, %235 : index
++  %206 = index.madd %216, %sixteen, %208 : index
++  %205 = index.madd %217, %width, %206 : index
++  %76 = view.load %view[%205] : view<2048xf8E4M3, #dense> -> f8E4M3
++  %204 = scalar.extf %76 : f8E4M3 to bf16
++  %203 = vector.insert %204 into %209[1] : bf16, vector<8xbf16>
++  %80 = index.constant 2 : index
++  %81 = index.add %53, %80 : index
++  %202 = index.andi %81, %235 : index
++  %200 = index.madd %216, %sixteen, %202 : index
++  %199 = index.madd %217, %width, %200 : index
++  %85 = view.load %view[%199] : view<2048xf8E4M3, #dense> -> f8E4M3
++  %198 = scalar.extf %85 : f8E4M3 to bf16
++  %197 = vector.insert %198 into %203[2] : bf16, vector<8xbf16>
++  %90 = index.add %53, %233 : index
++  %196 = index.andi %90, %235 : index
++  %194 = index.madd %216, %sixteen, %196 : index
++  %193 = index.madd %217, %width, %194 : index
++  %94 = view.load %view[%193] : view<2048xf8E4M3, #dense> -> f8E4M3
++  %192 = scalar.extf %94 : f8E4M3 to bf16
++  %191 = vector.insert %192 into %197[3] : bf16, vector<8xbf16>
++  %99 = index.add %53, %237 : index
++  %190 = index.andi %99, %235 : index
++  %188 = index.madd %216, %sixteen, %190 : index
++  %187 = index.madd %217, %width, %188 : index
++  %103 = view.load %view[%187] : view<2048xf8E4M3, #dense> -> f8E4M3
++  %186 = scalar.extf %103 : f8E4M3 to bf16
++  %185 = vector.insert %186 into %191[4] : bf16, vector<8xbf16>
++  %108 = index.add %53, %215 : index
++  %184 = index.andi %108, %235 : index
++  %182 = index.madd %216, %sixteen, %184 : index
++  %181 = index.madd %217, %width, %182 : index
++  %112 = view.load %view[%181] : view<2048xf8E4M3, #dense> -> f8E4M3
++  %180 = scalar.extf %112 : f8E4M3 to bf16
++  %179 = vector.insert %180 into %185[5] : bf16, vector<8xbf16>
++  %116 = index.constant 6 : index
++  %117 = index.add %53, %116 : index
++  %178 = index.andi %117, %235 : index
++  %176 = index.madd %216, %sixteen, %178 : index
++  %175 = index.madd %217, %width, %176 : index
++  %121 = view.load %view[%175] : view<2048xf8E4M3, #dense> -> f8E4M3
++  %174 = scalar.extf %121 : f8E4M3 to bf16
++  %173 = vector.insert %174 into %179[6] : bf16, vector<8xbf16>
++  %126 = index.add %53, %231 : index
++  %172 = index.andi %126, %235 : index
++  %170 = index.madd %216, %sixteen, %172 : index
++  %169 = index.madd %217, %width, %170 : index
++  %130 = view.load %view[%169] : view<2048xf8E4M3, #dense> -> f8E4M3
++  %168 = scalar.extf %130 : f8E4M3 to bf16
++  %167 = vector.insert %168 into %173[7] : bf16, vector<8xbf16>
++  scf.for %134 = [%36 to %eight step %37] unroll {
++    %155 = index.madd %236, %eight, %134 : index
++    %136 = vector.extract %167[%134] : vector<8xbf16> -> bf16
++    %154 = index.madd %238, %41, %155 : index
++    view.store %136, %35[%154] : bf16, view<2176xbf16, %34>
++  }
++  kernel.barrier<workgroup> {ordering = acq_rel, scope = workgroup}
++  %165 = index.constant 31 : index
++  %166 = index.andi %42, %165 : index
++  %163 = index.constant 4 : index
++  %164 = index.shrui %166, %163 : index
++  %161 = index.constant 5 : index
++  %162 = index.shrui %42, %161 : index
++  %159 = index.constant 15 : index
++  %160 = index.andi %166, %159 : index
++  %158 = index.madd %162, %sixteen, %160 : index
++  %148 = scf.for %146 = [%36 to %eight step %37](%147 = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %157 = index.madd %164, %eight, %146 : index
++    %156 = index.madd %157, %41, %158 : index
++    %152 = view.load %35[%156] : view<2176xbf16, %34> -> bf16
++    %153 = vector.insert %152 into %147[%146] : bf16, vector<8xbf16>
++    scf.yield %153 : vector<8xbf16>
++  }
++  kernel.barrier<workgroup> {ordering = acq_rel, scope = workgroup}
++  %rhs = vector.fragment<rhs> %148 shape [%sixteen, %sixteen] : vector<8xbf16>
++  test.use %rhs : vector<8xbf16>
++  kernel.return
++}
++
++// ====
++// RUN: pass stage-matrix-operands,canonicalize,cse,dce
++
++test.target<low_core> @target {abi = hal_kernel, subgroup_size = 32, max_workgroup_storage_bytes = 65536}
++kernel.def target(@target) @matrix_native_f8E5M2() {
++  %one = index.constant 1 : index
++  %threads = index.constant 256 : index
++  kernel.launch.config workgroups(%one,%one,%one) workgroup_size(%threads,%one,%one) : index
++} launch(%weights: buffer) {
++  %zero = index.constant 0 : index
++  %one = index.constant 1 : index
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %thirtytwo = index.constant 32 : index
++  %width = index.constant 128 : index
++  %offset = index.constant 0 : offset
++  %view = buffer.view %weights[%offset] : buffer -> view<2048xf8E5M2,#dense>
++  %lane = kernel.workitem.id<x> : index
++  %wave = index.div %lane, %thirtytwo : index
++  %low = index.rem %lane, %sixteen : index
++  %within = index.rem %lane, %thirtytwo : index
++  %half = index.div %within, %sixteen : index
++  %rowbase = index.mul %half, %eight : index
++  %colbase = index.mul %wave, %sixteen : index
++  %column = index.add %colbase, %low : index
++  %init = vector.constant 0.0 : vector<8xbf16>
++  %payload = scf.for %f = [%zero to %eight step %one](%acc = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %row = index.add %rowbase, %f : index
++    %linear = index.mul %row, %width : index
++    %at = index.add %linear, %column : index
++    %raw = view.load %view[%at] : view<2048xf8E5M2,#dense> -> f8E5M2
++    %wide = scalar.extf %raw : f8E5M2 to f32
++    %value = scalar.fptrunc %wide : f32 to bf16
++    %next = vector.insert %value into %acc[%f] : bf16, vector<8xbf16>
++    scf.yield %next : vector<8xbf16>
++  }
++  %rhs = vector.fragment<rhs> %payload shape [%sixteen,%sixteen] : vector<8xbf16>
++  test.use %rhs : vector<8xbf16>
++  kernel.return
++}
++
++// ----
++test.target<low_core> @target {abi = hal_kernel, max_workgroup_storage_bytes = 65536, subgroup_size = 32}
++
++kernel.def target(@target) @matrix_native_f8E5M2() {
++  %one = index.constant 1 : index
++  %threads = index.constant 256 : index
++  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%threads, %one, %one) : index
++} launch(%weights: buffer) {
++  %31 = index.constant 4352 : offset
++  %32 = index.constant 0 : offset
++  %33 = buffer.alloca %31 {base_alignment = 16, memory_space = workgroup} : buffer
++  %34 = encoding.layout.dense : encoding<layout>
++  %35 = buffer.view %33[%32] : buffer -> view<2176xbf16, %34>
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %width = index.constant 128 : index
++  %view = buffer.view %weights[%32] : buffer -> view<2048xf8E5M2, #dense>
++  %init = vector.constant 0.0 : vector<8xbf16>
++  %36 = index.constant 0 : index
++  %37 = index.constant 1 : index
++  %40 = index.constant 32 : index
++  %41 = index.constant 136 : index
++  %42 = kernel.workitem.id<x> : index
++  %237 = index.constant 4 : index
++  %238 = index.shrui %42, %237 : index
++  %235 = index.constant 15 : index
++  %236 = index.andi %42, %235 : index
++  %233 = index.constant 3 : index
++  %234 = index.shli %236, %233 : index
++  %231 = index.constant 7 : index
++  %232 = index.andi %238, %231 : index
++  %230 = index.shrui %234, %237 : index
++  %240 = index.shrui %42, %231 : index
++  %226 = index.shli %240, %237 : index
++  %224 = index.andi %234, %235 : index
++  %222 = index.madd %230, %40, %226 : index
++  %53 = index.add %222, %224 : index
++  %220 = index.constant 31 : index
++  %221 = index.andi %53, %220 : index
++  %219 = index.shrui %221, %237 : index
++  %217 = index.madd %219, %eight, %232 : index
++  %215 = index.constant 5 : index
++  %216 = index.shrui %53, %215 : index
++  %214 = index.andi %53, %235 : index
++  %212 = index.madd %216, %sixteen, %214 : index
++  %211 = index.madd %217, %width, %212 : index
++  %67 = view.load %view[%211] : view<2048xf8E5M2, #dense> -> f8E5M2
++  %210 = scalar.extf %67 : f8E5M2 to bf16
++  %209 = vector.insert %210 into %init[0] : bf16, vector<8xbf16>
++  %72 = index.add %53, %37 : index
++  %208 = index.andi %72, %235 : index
++  %206 = index.madd %216, %sixteen, %208 : index
++  %205 = index.madd %217, %width, %206 : index
++  %76 = view.load %view[%205] : view<2048xf8E5M2, #dense> -> f8E5M2
++  %204 = scalar.extf %76 : f8E5M2 to bf16
++  %203 = vector.insert %204 into %209[1] : bf16, vector<8xbf16>
++  %80 = index.constant 2 : index
++  %81 = index.add %53, %80 : index
++  %202 = index.andi %81, %235 : index
++  %200 = index.madd %216, %sixteen, %202 : index
++  %199 = index.madd %217, %width, %200 : index
++  %85 = view.load %view[%199] : view<2048xf8E5M2, #dense> -> f8E5M2
++  %198 = scalar.extf %85 : f8E5M2 to bf16
++  %197 = vector.insert %198 into %203[2] : bf16, vector<8xbf16>
++  %90 = index.add %53, %233 : index
++  %196 = index.andi %90, %235 : index
++  %194 = index.madd %216, %sixteen, %196 : index
++  %193 = index.madd %217, %width, %194 : index
++  %94 = view.load %view[%193] : view<2048xf8E5M2, #dense> -> f8E5M2
++  %192 = scalar.extf %94 : f8E5M2 to bf16
++  %191 = vector.insert %192 into %197[3] : bf16, vector<8xbf16>
++  %99 = index.add %53, %237 : index
++  %190 = index.andi %99, %235 : index
++  %188 = index.madd %216, %sixteen, %190 : index
++  %187 = index.madd %217, %width, %188 : index
++  %103 = view.load %view[%187] : view<2048xf8E5M2, #dense> -> f8E5M2
++  %186 = scalar.extf %103 : f8E5M2 to bf16
++  %185 = vector.insert %186 into %191[4] : bf16, vector<8xbf16>
++  %108 = index.add %53, %215 : index
++  %184 = index.andi %108, %235 : index
++  %182 = index.madd %216, %sixteen, %184 : index
++  %181 = index.madd %217, %width, %182 : index
++  %112 = view.load %view[%181] : view<2048xf8E5M2, #dense> -> f8E5M2
++  %180 = scalar.extf %112 : f8E5M2 to bf16
++  %179 = vector.insert %180 into %185[5] : bf16, vector<8xbf16>
++  %116 = index.constant 6 : index
++  %117 = index.add %53, %116 : index
++  %178 = index.andi %117, %235 : index
++  %176 = index.madd %216, %sixteen, %178 : index
++  %175 = index.madd %217, %width, %176 : index
++  %121 = view.load %view[%175] : view<2048xf8E5M2, #dense> -> f8E5M2
++  %174 = scalar.extf %121 : f8E5M2 to bf16
++  %173 = vector.insert %174 into %179[6] : bf16, vector<8xbf16>
++  %126 = index.add %53, %231 : index
++  %172 = index.andi %126, %235 : index
++  %170 = index.madd %216, %sixteen, %172 : index
++  %169 = index.madd %217, %width, %170 : index
++  %130 = view.load %view[%169] : view<2048xf8E5M2, #dense> -> f8E5M2
++  %168 = scalar.extf %130 : f8E5M2 to bf16
++  %167 = vector.insert %168 into %173[7] : bf16, vector<8xbf16>
++  scf.for %134 = [%36 to %eight step %37] unroll {
++    %155 = index.madd %236, %eight, %134 : index
++    %136 = vector.extract %167[%134] : vector<8xbf16> -> bf16
++    %154 = index.madd %238, %41, %155 : index
++    view.store %136, %35[%154] : bf16, view<2176xbf16, %34>
++  }
++  kernel.barrier<workgroup> {ordering = acq_rel, scope = workgroup}
++  %165 = index.constant 31 : index
++  %166 = index.andi %42, %165 : index
++  %163 = index.constant 4 : index
++  %164 = index.shrui %166, %163 : index
++  %161 = index.constant 5 : index
++  %162 = index.shrui %42, %161 : index
++  %159 = index.constant 15 : index
++  %160 = index.andi %166, %159 : index
++  %158 = index.madd %162, %sixteen, %160 : index
++  %148 = scf.for %146 = [%36 to %eight step %37](%147 = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %157 = index.madd %164, %eight, %146 : index
++    %156 = index.madd %157, %41, %158 : index
++    %152 = view.load %35[%156] : view<2176xbf16, %34> -> bf16
++    %153 = vector.insert %152 into %147[%146] : bf16, vector<8xbf16>
++    scf.yield %153 : vector<8xbf16>
++  }
++  kernel.barrier<workgroup> {ordering = acq_rel, scope = workgroup}
++  %rhs = vector.fragment<rhs> %148 shape [%sixteen, %sixteen] : vector<8xbf16>
++  test.use %rhs : vector<8xbf16>
 +  kernel.return
 +}
