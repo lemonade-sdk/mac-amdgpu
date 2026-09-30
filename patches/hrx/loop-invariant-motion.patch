@@ -1,0 +1,11 @@
+--- a/loom/src/loom/target/pipeline.c
++++ b/loom/src/loom/target/pipeline.c
+@@ -331,6 +331,8 @@
+       builder, IREE_SV("vector-memory-to-scalar")));
+   IREE_RETURN_IF_ERROR(loom_target_pipeline_build_run(
+       builder, IREE_SV("linearize-view-accesses")));
++  IREE_RETURN_IF_ERROR(loom_target_pipeline_build_cleanup(builder));
++  IREE_RETURN_IF_ERROR(loom_target_pipeline_build_run(builder, IREE_SV("licm")));
+   return loom_target_pipeline_build_cleanup(builder);
+ }
+ 
