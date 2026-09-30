@@ -1,0 +1,1999 @@
+diff --git a/loom/src/loom/pass/BUILD.bazel b/loom/src/loom/pass/BUILD.bazel
+index 3e7ff882..06fb178d 100644
+--- a/loom/src/loom/pass/BUILD.bazel
++++ b/loom/src/loom/pass/BUILD.bazel
+@@ -264,6 +264,7 @@ loom_cc_library(
+         "//loom/src/loom/transforms/kernel:kernel_resources",
+         "//loom/src/loom/transforms/kernel:promote_private_fragments",
+         "//loom/src/loom/transforms/kernel:stage_loop_carried_fragments",
++        "//loom/src/loom/transforms/kernel:stage_matrix_operands",
+         "//loom/src/loom/transforms/loop:licm",
+         "//loom/src/loom/transforms/loop:loop_fusion",
+         "//loom/src/loom/transforms/math:legalize",
+diff --git a/loom/src/loom/pass/CMakeLists.txt b/loom/src/loom/pass/CMakeLists.txt
+index 4e77ec24..2a0db870 100644
+--- a/loom/src/loom/pass/CMakeLists.txt
++++ b/loom/src/loom/pass/CMakeLists.txt
+@@ -299,6 +299,7 @@ loom_cc_library(
+     loom::transforms::kernel::kernel_resources
+     loom::transforms::kernel::promote_private_fragments
+     loom::transforms::kernel::stage_loop_carried_fragments
++    loom::transforms::kernel::stage_matrix_operands
+     loom::transforms::loop::licm
+     loom::transforms::loop::loop_fusion
+     loom::transforms::math::legalize
+diff --git a/loom/src/loom/pass/builtin_registry.c b/loom/src/loom/pass/builtin_registry.c
+index 1976aade..6d2ca39e 100644
+--- a/loom/src/loom/pass/builtin_registry.c
++++ b/loom/src/loom/pass/builtin_registry.c
+@@ -29,6 +29,7 @@
+ #include "loom/transforms/kernel/kernel_resources.h"
+ #include "loom/transforms/kernel/promote_private_fragments.h"
+ #include "loom/transforms/kernel/stage_loop_carried_fragments.h"
++#include "loom/transforms/kernel/stage_matrix_operands.h"
+ #include "loom/transforms/loop/licm.h"
+ #include "loom/transforms/loop/loop_fusion.h"
+ #include "loom/transforms/math/legalize.h"
+@@ -480,6 +481,11 @@ static const loom_pass_descriptor_t kBuiltinPassDescriptors[] = {
+         .info = loom_stage_loop_carried_fragments_pass_info,
+         .function_run = loom_stage_loop_carried_fragments_run,
+     },
++    {
++        .key = IREE_SVL("stage-matrix-operands"),
++        .info = loom_stage_matrix_operands_pass_info,
++        .function_run = loom_stage_matrix_operands_run,
++    },
+     {
+         .key = IREE_SVL("strip-hints"),
+         .info = loom_strip_hints_pass_info,
+diff --git a/loom/src/loom/target/pipeline.c b/loom/src/loom/target/pipeline.c
+index 6c06bcda..276a56fd 100644
+--- a/loom/src/loom/target/pipeline.c
++++ b/loom/src/loom/target/pipeline.c
+@@ -311,6 +311,8 @@ loom_target_pipeline_build_source_normalization_before_authoring_expansion(
+       builder, IREE_SV("normalize-kernel-resources")));
+   IREE_RETURN_IF_ERROR(loom_target_pipeline_build_run(
+       builder, IREE_SV("promote-private-fragments")));
++  IREE_RETURN_IF_ERROR(loom_target_pipeline_build_run(
++      builder, IREE_SV("stage-matrix-operands")));
+   return loom_target_pipeline_build_cleanup(builder);
+ }
+ 
+diff --git a/loom/src/loom/transforms/kernel/BUILD.bazel b/loom/src/loom/transforms/kernel/BUILD.bazel
+index 740ce3e0..99d43935 100644
+--- a/loom/src/loom/transforms/kernel/BUILD.bazel
++++ b/loom/src/loom/transforms/kernel/BUILD.bazel
+@@ -92,3 +92,36 @@ loom_cc_library(
+         "//runtime/src/iree/base/internal:arena",
+     ],
+ )
++
++loom_cc_library(
++    name = "stage_matrix_operands",
++    srcs = ["stage_matrix_operands.c"],
++    hdrs = ["stage_matrix_operands.h"],
++    deps = [
++        "//loom/src/loom/analysis:control_uniformity",
++        "//loom/src/loom/codegen/low/pipeline:pass_environment",
++        "//loom/src/loom/ir",
++        "//loom/src/loom/ops:op_defs",
++        "//loom/src/loom/ops/buffer",
++        "//loom/src/loom/ops/encoding",
++        "//loom/src/loom/ops/index",
++        "//loom/src/loom/ops/kernel",
++        "//loom/src/loom/ops/scf",
++        "//loom/src/loom/ops/scalar",
++        "//loom/src/loom/ops/vector",
++        "//loom/src/loom/ops/view",
++        "//loom/src/loom/pass:types",
++        "//loom/src/loom/pass:value_facts",
++        "//loom/src/loom/rewrite:materialize",
++        "//loom/src/loom/rewrite:remap",
++        "//loom/src/loom/rewrite:rewriter",
++        "//loom/src/loom/target:facts",
++        "//loom/src/loom/target:launch",
++        "//loom/src/loom/target:pass_environment",
++        "//loom/src/loom/target/reporting:report",
++        "//loom/src/loom/util:walk",
++        "//runtime/src/iree/base",
++        "//runtime/src/iree/base/internal",
++        "//runtime/src/iree/base/internal:arena",
++    ],
++)
+diff --git a/loom/src/loom/transforms/kernel/CMakeLists.txt b/loom/src/loom/transforms/kernel/CMakeLists.txt
+index d1852cd9..d3b3bfdd 100644
+--- a/loom/src/loom/transforms/kernel/CMakeLists.txt
++++ b/loom/src/loom/transforms/kernel/CMakeLists.txt
+@@ -103,3 +103,41 @@ loom_cc_library(
+ )
+ 
+ ### BAZEL_TO_CMAKE_PRESERVES_ALL_CONTENT_BELOW_THIS_LINE ###
++
++loom_cc_library(
++  NAME
++    stage_matrix_operands
++  HDRS
++    "stage_matrix_operands.h"
++  SRCS
++    "stage_matrix_operands.c"
++  DEPS
++    iree::base
++    iree::base::internal
++    iree::base::internal::arena
++    loom::analysis::control_uniformity
++    loom::codegen::low::pipeline::pass_environment
++    loom::ir
++    loom::ops::buffer
++    loom::ops::encoding
++    loom::ops::index
++    loom::ops::kernel
++    loom::ops::op_defs
++    loom::ops::scf
++    loom::ops::scalar
++    loom::ops::vector
++    loom::ops::view
++    loom::pass::types
++    loom::pass::value_facts
++    loom::rewrite::materialize
++    loom::rewrite::remap
++    loom::rewrite::rewriter
++    loom::target::facts
++    loom::target::launch
++    loom::target::pass_environment
++    loom::target::reporting::report
++    loom::util::walk
++  PUBLIC
++)
++
++### BAZEL_TO_CMAKE_PRESERVES_ALL_CONTENT_BELOW_THIS_LINE ###
+diff --git a/loom/src/loom/transforms/kernel/test/BUILD.bazel b/loom/src/loom/transforms/kernel/test/BUILD.bazel
+index d0c04b24..e0c6b9f6 100644
+--- a/loom/src/loom/transforms/kernel/test/BUILD.bazel
++++ b/loom/src/loom/transforms/kernel/test/BUILD.bazel
+@@ -20,6 +20,7 @@ loom_check_test_suite(
+         "promote_private_fragments.loom-test",
+         "promote_private_fragments_after_unroll.loom-test",
+         "promote_private_fragments_footprint.loom-test",
++        "stage_matrix_operands.loom-test",
+         "stage_loop_carried_fragments.loom-test",
+     ],
+ )
+diff --git a/loom/src/loom/transforms/kernel/test/CMakeLists.txt b/loom/src/loom/transforms/kernel/test/CMakeLists.txt
+index 556ef4d1..aded8424 100644
+--- a/loom/src/loom/transforms/kernel/test/CMakeLists.txt
++++ b/loom/src/loom/transforms/kernel/test/CMakeLists.txt
+@@ -18,6 +18,7 @@ loom_check_test_suite(
+     "promote_private_fragments.loom-test"
+     "promote_private_fragments_after_unroll.loom-test"
+     "promote_private_fragments_footprint.loom-test"
++    "stage_matrix_operands.loom-test"
+     "stage_loop_carried_fragments.loom-test"
+ )
+ 
+diff --git a/loom/src/loom/transforms/kernel/stage_matrix_operands.c b/loom/src/loom/transforms/kernel/stage_matrix_operands.c
+new file mode 100644
+index 00000000..100f1d9f
+--- /dev/null
++++ b/loom/src/loom/transforms/kernel/stage_matrix_operands.c
+@@ -0,0 +1,837 @@
++// Copyright 2026 The IREE Authors
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++#include "loom/transforms/kernel/stage_matrix_operands.h"
++
++#include <string.h>
++
++#include "iree/base/internal/arena.h"
++#include "loom/analysis/control_uniformity.h"
++#include "loom/codegen/low/pipeline/pass_environment.h"
++#include "loom/ir/context.h"
++#include "loom/ir/module.h"
++#include "loom/ops/buffer/ops.h"
++#include "loom/ops/encoding/ops.h"
++#include "loom/ops/index/ops.h"
++#include "loom/ops/kernel/launch_config.h"
++#include "loom/ops/kernel/ops.h"
++#include "loom/ops/scalar/ops.h"
++#include "loom/ops/scf/ops.h"
++#include "loom/ops/vector/ops.h"
++#include "loom/ops/view/ops.h"
++#include "loom/pass/value_facts.h"
++#include "loom/rewrite/materialize.h"
++#include "loom/rewrite/remap.h"
++#include "loom/rewrite/rewriter.h"
++#include "loom/target/facts.h"
++#include "loom/target/launch.h"
++#include "loom/target/pass_environment.h"
++#include "loom/target/reporting/report.h"
++#include "loom/util/walk.h"
++
++static const loom_pass_info_t pass_info = {
++    .name = IREE_SVL("stage-matrix-operands"),
++    .description = IREE_SVL("Cooperatively load independent matrix operand "
++                            "elements through workgroup memory."),
++    .kind = LOOM_PASS_FUNCTION,
++};
++const loom_pass_info_t* loom_stage_matrix_operands_pass_info(void) {
++  return &pass_info;
++}
++
++typedef struct context_t {
++  loom_pass_t* pass;
++  loom_module_t* module;
++  loom_func_like_t function;
++  loom_rewriter_t rw;
++  loom_control_uniformity_info_t uniformity;
++  loom_op_t** candidates;
++  iree_host_size_t count, capacity;
++  // One reusable allocation per element type; every consumer ends with a
++  // barrier.
++  loom_value_id_t staging[2];
++  uint8_t* dependence;
++  loom_op_t* producer;
++  loom_ir_remap_t remap;
++  loom_value_id_t mapped_lane;
++  uint64_t workgroup_bytes, storage_limit;
++  bool unknown_storage;
++  loom_target_compile_report_t* report;
++} context_t;
++
++static loom_op_t* defining(context_t* c, loom_value_id_t id) {
++  const loom_value_t* v = loom_value_table_const_value(&c->module->values, id);
++  return loom_value_is_block_arg(v) ? NULL : loom_value_def_op(v);
++}
++static bool within(loom_op_t* op, loom_op_t* ancestor) {
++  for (; op; op = op->parent_op)
++    if (op == ancestor) return true;
++  return false;
++}
++static bool exact(context_t* c, loom_value_id_t v, int64_t n) {
++  int64_t value = 0;
++  return loom_value_facts_as_exact_i64(loom_rewriter_value_facts(&c->rw, v),
++                                       &value) &&
++         value == n;
++}
++// 1: lane independent, 2: reproducible for another lane, 3: unsupported.
++static uint8_t dependency(context_t* c, loom_value_id_t v) {
++  if (c->dependence[v]) return c->dependence[v];
++  uint8_t result = 1;
++  loom_value_facts_t facts = loom_rewriter_value_facts(&c->rw, v);
++  if (loom_value_facts_is_uniform_at_scope(
++          facts, LOOM_VALUE_FACT_UNIFORM_SCOPE_WORKGROUP))
++    return c->dependence[v] = 1;
++  loom_op_t* op = defining(c, v);
++  if (!op) {
++    const loom_value_t* value =
++        loom_value_table_const_value(&c->module->values, v);
++    return c->dependence[v] =
++               loom_value_def_block(value) ==
++                       loom_region_entry_block(loom_func_like_body(c->function))
++                   ? 1
++                   : 3;
++  }
++  if (loom_kernel_workitem_id_isa(op))
++    return c->dependence[v] =
++               loom_kernel_workitem_id_dimension(op) == LOOM_KERNEL_DIMENSION_X
++                   ? 2
++                   : 3;
++  // Do not reconstruct values produced by loops or participant-dependent ops.
++  if ((op->region_count && !loom_scf_if_isa(op)) ||
++      loom_traits_has_side_effects(op->traits) ||
++      (op->traits & (LOOM_TRAIT_CONVERGENT | LOOM_TRAIT_UNIQUE_IDENTITY)))
++    return c->dependence[v] = 3;
++  c->dependence[v] = 3;
++  for (uint16_t i = 0; i < op->operand_count; ++i) {
++    uint8_t d = dependency(c, loom_op_operands(op)[i]);
++    if (d > result) result = d;
++  }
++  // A previous load may precede an intervening store. Reconstruct only
++  // reads already inside the producer; uniform values can be reused as SSA.
++  if (result == 2 && !within(op, c->producer) &&
++      (op->traits & LOOM_TRAIT_READS_MEMORY))
++    result = 3;
++  if (loom_scf_if_isa(op)) {
++    const loom_value_t* value =
++        loom_value_table_const_value(&c->module->values, v);
++    uint16_t ordinal = loom_value_def_index(value);
++    for (uint16_t r = 0; r < op->region_count; ++r) {
++      loom_op_t* yield =
++          loom_region_entry_block(loom_op_regions(op)[r])->last_op;
++      uint8_t d = dependency(c, loom_scf_yield_values(yield).values[ordinal]);
++      if (d > result) result = d;
++    }
++    // A varying structured producer requires region-aware motion; leave it.
++    if (result == 2) result = 3;
++  }
++  return c->dependence[v] = result;
++}
++static bool check_external(context_t* c, loom_op_t* op) {
++  for (uint16_t i = 0; i < op->operand_count; ++i) {
++    loom_value_id_t v = loom_op_operands(op)[i];
++    const loom_value_t* value =
++        loom_value_table_const_value(&c->module->values, v);
++    if (loom_value_is_block_arg(value) &&
++        loom_value_def_block(value) ==
++            loom_region_entry_block(loom_scf_for_body(c->producer)))
++      continue;
++    loom_op_t* def = defining(c, v);
++    if (def && within(def, c->producer)) continue;
++    if (dependency(c, v) == 3) {
++      return false;
++    }
++  }
++  for (uint16_t r = 0; r < op->region_count; ++r) {
++    loom_region_t* region = loom_op_regions(op)[r];
++    for (uint16_t b = 0; b < region->block_count; ++b)
++      for (loom_op_t* child = region->blocks[b]->first_op; child;
++           child = child->next_op)
++        if (!check_external(c, child)) return false;
++  }
++  return true;
++}
++static bool independent_body(loom_op_t* op) {
++  if (loom_traits_has_side_effects(op->traits) ||
++      (op->traits & LOOM_TRAIT_CONVERGENT))
++    return false;
++  if (loom_op_dialect_id(op->kind) == LOOM_DIALECT_VECTOR &&
++      !loom_vector_insert_isa(op) && !loom_vector_constant_isa(op))
++    return false;
++  if (op->region_count && !loom_scf_if_isa(op)) return false;
++  for (uint16_t r = 0; r < op->region_count; ++r) {
++    loom_region_t* region = loom_op_regions(op)[r];
++    for (uint16_t b = 0; b < region->block_count; ++b)
++      for (loom_op_t* child = region->blocks[b]->first_op; child;
++           child = child->next_op)
++        if (!independent_body(child)) return false;
++  }
++  return true;
++}
++// A result element must be written at the loop IV, or retain its initial value.
++// This excludes recurrences between payload components.
++static bool global_scalar_read(context_t* c, loom_value_id_t v,
++                               unsigned depth) {
++  if (depth > 64) return false;
++  loom_op_t* op = defining(c, v);
++  if (!op) return false;
++  if (loom_view_load_isa(op)) {
++    loom_op_t* view = defining(c, loom_view_load_view(op));
++    if (!view || !loom_buffer_view_isa(view)) return false;
++    loom_value_id_t buffer = loom_buffer_view_buffer(view);
++    loom_op_t* root = defining(c, buffer);
++    if (root && loom_buffer_assume_noalias_isa(root)) {
++      uint16_t index = loom_value_def_index(
++          loom_value_table_const_value(&c->module->values, buffer));
++      buffer = loom_op_operands(root)[index];
++      root = defining(c, buffer);
++    }
++    return !root || loom_buffer_from_address_isa(root);
++  }
++  if (op->region_count || !(op->traits & LOOM_TRAIT_PURE)) return false;
++  for (uint16_t i = 0; i < op->operand_count; ++i)
++    if (global_scalar_read(c, loom_op_operands(op)[i], depth + 1)) return true;
++  return false;
++}
++static bool pointwise(context_t* c, loom_value_id_t v, loom_value_id_t carried,
++                      loom_value_id_t iv, bool* has_load) {
++  if (v == carried) return true;
++  loom_op_t* op = defining(c, v);
++  if (!op) return false;
++  if (loom_vector_insert_isa(op)) {
++    loom_value_slice_t indices = loom_vector_insert_indices(op);
++    if (indices.count != 1 || indices.values[0] != iv) return false;
++    *has_load |= global_scalar_read(c, loom_vector_insert_value(op), 0);
++    return pointwise(c, loom_vector_insert_dest(op), carried, iv, has_load);
++  }
++  if (loom_scf_if_isa(op)) {
++    const loom_value_t* value =
++        loom_value_table_const_value(&c->module->values, v);
++    uint16_t ordinal = loom_value_def_index(value);
++    if (op->region_count != 2) return false;
++    for (uint16_t r = 0; r < 2; ++r) {
++      loom_block_t* block = loom_region_entry_block(loom_op_regions(op)[r]);
++      if (!block || !block->last_op || !loom_scf_yield_isa(block->last_op))
++        return false;
++      if (!pointwise(c, loom_scf_yield_values(block->last_op).values[ordinal],
++                     carried, iv, has_load))
++        return false;
++    }
++    return true;
++  }
++  return false;
++}
++
++static iree_status_t constant(context_t* c, int64_t n, loom_scalar_type_t t,
++                              loom_value_id_t* out) {
++  loom_op_t* op = NULL;
++  IREE_RETURN_IF_ERROR(loom_index_constant_build(
++      &c->rw.builder, loom_attr_i64(n), loom_type_scalar(t),
++      c->producer->location, &op));
++  *out = loom_index_constant_result(op);
++  return iree_ok_status();
++}
++typedef iree_status_t (*binary_fn_t)(loom_builder_t*, loom_value_id_t,
++                                     loom_value_id_t, loom_type_t,
++                                     loom_location_id_t, loom_op_t**);
++static iree_status_t binary(context_t* c, binary_fn_t fn, loom_value_id_t a,
++                            loom_value_id_t b, loom_value_id_t* out) {
++  loom_op_t* op = NULL;
++  IREE_RETURN_IF_ERROR(fn(&c->rw.builder, a, b,
++                          loom_type_scalar(LOOM_SCALAR_TYPE_INDEX),
++                          c->producer->location, &op));
++  *out = loom_op_results(op)[0];
++  return iree_ok_status();
++}
++static iree_status_t barrier(context_t* c) {
++  loom_op_t* op = NULL;
++  return loom_kernel_barrier_build(
++      &c->rw.builder, LOOM_VALUE_FACT_MEMORY_SPACE_WORKGROUP,
++      LOOM_ATOMIC_ORDERING_ACQ_REL, LOOM_ATOMIC_SCOPE_WORKGROUP,
++      c->producer->location, &op);
++}
++
++// Track an eight-element lane run as base + stride * component. Alignment is
++// for component zero. Division/remainder can discard the component only when
++// the complete run stays in one aligned interval.
++typedef struct run_t {
++  int64_t stride;
++  uint64_t alignment;
++  bool valid;
++} run_t;
++static uint64_t alignment(int64_t x) {
++  uint64_t u = (uint64_t)x;
++  return u ? (u & (~u + 1)) : (UINT64_C(1) << 32);
++}
++static run_t run(context_t* c, loom_value_id_t v) {
++  const run_t bad = {0, 1, false};
++  int64_t known = 0;
++  if (loom_value_facts_as_exact_i64(loom_rewriter_value_facts(&c->rw, v),
++                                    &known))
++    return (run_t){0, alignment(known), true};
++  loom_op_t* op = defining(c, v);
++  if (!op) return (run_t){0, 1, true};
++  if (loom_kernel_workitem_id_isa(op)) return (run_t){1, 8, true};
++  if (!within(op, c->producer) && dependency(c, v) == 1)
++    return (run_t){0, 1, true};
++  if (op->region_count || op->operand_count > 3) return bad;
++  run_t args[3] = {{0, 1, true}, {0, 1, true}, {0, 1, true}};
++  bool varies = false;
++  for (uint16_t i = 0; i < op->operand_count; ++i) {
++    args[i] = run(c, loom_op_operands(op)[i]);
++    if (!args[i].valid) return bad;
++    varies |= args[i].stride != 0;
++  }
++  for (uint16_t i = 0; i < op->operand_count; ++i)
++    if (args[i].stride < -INT64_C(4294967296) ||
++        args[i].stride > INT64_C(4294967296))
++      return bad;
++  uint64_t align = iree_min(args[0].alignment, args[1].alignment);
++  switch (op->kind) {
++    case LOOM_OP_INDEX_ADD:
++      return (run_t){args[0].stride + args[1].stride, align, true};
++    case LOOM_OP_INDEX_SUB:
++      return (run_t){args[0].stride - args[1].stride, align, true};
++    case LOOM_OP_INDEX_MUL: {
++      if (!varies)
++        return (run_t){0,
++                       iree_min(args[0].alignment, UINT64_C(1) << 16) *
++                           iree_min(args[1].alignment, UINT64_C(1) << 16),
++                       true};
++      int other = args[0].stride ? 1 : 0, varying = 1 - other;
++      if (args[other].stride ||
++          !loom_value_facts_as_exact_i64(
++              loom_rewriter_value_facts(&c->rw, loom_op_operands(op)[other]),
++              &known) ||
++          known < 0 || known > 65536)
++        return bad;
++      if (args[varying].stride < 0 || args[varying].stride > 65536) return bad;
++      return (run_t){args[varying].stride * known,
++                     iree_min(args[varying].alignment, UINT64_C(1) << 16) *
++                         iree_min(alignment(known), UINT64_C(1) << 16),
++                     true};
++    }
++    case LOOM_OP_INDEX_CAST:
++    case LOOM_OP_INDEX_ASSUME:
++      return args[0];
++    case LOOM_OP_INDEX_DIV:
++    case LOOM_OP_INDEX_REM: {
++      if (!varies) return (run_t){0, 1, true};
++      if (args[1].stride ||
++          !loom_value_facts_as_exact_i64(
++              loom_rewriter_value_facts(&c->rw, loom_op_operands(op)[1]),
++              &known) ||
++          known <= 0 || (known & (known - 1)))
++        return bad;
++      uint64_t step = iree_min(args[0].alignment, (uint64_t)known);
++      if (args[0].stride < 0 || (uint64_t)args[0].stride >= ((step + 6) / 7))
++        return bad;
++      if (op->kind == LOOM_OP_INDEX_DIV)
++        return (run_t){
++            0, iree_max(args[0].alignment / (uint64_t)known, UINT64_C(1)),
++            true};
++      return (run_t){args[0].stride, step, true};
++    }
++    case LOOM_OP_INDEX_CMP: {
++      if (!varies) return (run_t){0, 1, true};
++      // Strict less-than cannot change inside an aligned eight-element run
++      // when both endpoints are multiples of eight.
++      if ((loom_index_cmp_predicate(op) == LOOM_INDEX_CMP_PREDICATE_ULT ||
++           loom_index_cmp_predicate(op) == LOOM_INDEX_CMP_PREDICATE_SLT) &&
++          args[0].stride == 1 && args[1].stride == 0 && align >= 8)
++        return (run_t){0, 1, true};
++      return bad;
++    }
++    default:
++      return varies ? bad : (run_t){0, 1, true};
++  }
++}
++static bool vectorizable(context_t* c, loom_value_id_t v,
++                         loom_value_id_t carried) {
++  if (v == carried) {
++    loom_op_t* init = defining(
++        c, loom_scf_for_iter_args(c->producer)
++               .values[loom_value_def_index(loom_value_table_const_value(
++                           &c->module->values, v)) -
++                       1]);
++    return init && loom_vector_constant_isa(init);
++  }
++  loom_op_t* op = defining(c, v);
++  if (!op) return false;
++  if (loom_vector_insert_isa(op)) {
++    loom_value_id_t scalar = loom_vector_insert_value(op);
++    loom_op_t* leaf = defining(c, scalar);
++    if (leaf && loom_view_load_isa(leaf)) {
++      loom_value_slice_t indices = loom_view_load_indices(leaf);
++      if (indices.count != 1 || loom_type_rank(loom_module_value_type(
++                                    c->module, loom_view_load_view(leaf))) != 1)
++        return false;
++      run_t address = run(c, indices.values[0]),
++            view = run(c, loom_view_load_view(leaf));
++
++      return address.valid && address.stride == 1 && address.alignment >= 8 &&
++             view.valid && view.stride == 0;
++    }
++    // A scalar constant (including a narrowing cast of zero) can be splatted.
++    return leaf && ((leaf->traits & LOOM_TRAIT_CONSTANT_LIKE) ||
++                    (loom_scalar_fptrunc_isa(leaf) &&
++                     defining(c, loom_op_operands(leaf)[0]) &&
++                     (defining(c, loom_op_operands(leaf)[0])->traits &
++                      LOOM_TRAIT_CONSTANT_LIKE)));
++  }
++  if (loom_scf_if_isa(op)) {
++    run_t condition = run(c, loom_scf_if_condition(op));
++    if (!condition.valid || condition.stride) {
++      return false;
++    }
++    uint16_t ordinal = loom_value_def_index(
++        loom_value_table_const_value(&c->module->values, v));
++    for (uint16_t r = 0; r < op->region_count; ++r) {
++      loom_op_t* yield =
++          loom_region_entry_block(loom_op_regions(op)[r])->last_op;
++      if (!vectorizable(c, loom_scf_yield_values(yield).values[ordinal],
++                        carried))
++        return false;
++    }
++    return true;
++  }
++  return false;
++}
++static iree_status_t clone_value(context_t* c, loom_value_id_t v,
++                                 loom_value_id_t* result) {
++  if (loom_ir_remap_try_lookup_value(&c->remap, v, result))
++    return iree_ok_status();
++  loom_op_t* op = defining(c, v);
++  if (!op || (!within(op, c->producer) && dependency(c, v) == 1)) {
++    *result = v;
++    return iree_ok_status();
++  }
++  if (loom_kernel_workitem_id_isa(op)) {
++    *result = c->mapped_lane;
++    return iree_ok_status();
++  }
++  for (uint16_t i = 0; i < op->operand_count; ++i) {
++    loom_value_id_t old = loom_op_operands(op)[i], mapped;
++    IREE_RETURN_IF_ERROR(clone_value(c, old, &mapped));
++    IREE_RETURN_IF_ERROR(loom_ir_remap_map_value(&c->remap, old, mapped));
++  }
++  loom_op_t* cloned = NULL;
++  IREE_RETURN_IF_ERROR(
++      loom_ir_clone_op(&c->rw.builder, op, &c->remap, &cloned));
++  return loom_ir_remap_resolve_value(&c->remap, v, result);
++}
++static iree_status_t fresh_remap(context_t* c, loom_value_id_t oldf) {
++  IREE_RETURN_IF_ERROR(loom_ir_remap_initialize(
++      c->module, c->module, c->pass->arena,
++      &(loom_ir_remap_options_t){.allow_unmapped_values = true}, &c->remap));
++  return loom_ir_remap_map_value(
++      &c->remap,
++      loom_block_arg_id(loom_region_entry_block(loom_scf_for_body(c->producer)),
++                        0),
++      oldf);
++}
++static iree_status_t load_run(context_t* c, loom_value_id_t v,
++                              loom_value_id_t carried, loom_value_id_t oldf,
++                              loom_type_t payload, loom_value_id_t* result) {
++  loom_op_t *op = defining(c, v), *built = NULL;
++  if (v == carried) {
++    *result = loom_scf_for_iter_args(c->producer)
++                  .values[loom_value_def_index(loom_value_table_const_value(
++                              &c->module->values, v)) -
++                          1];
++    return iree_ok_status();
++  }
++  IREE_RETURN_IF_ERROR(fresh_remap(c, oldf));
++  if (loom_vector_insert_isa(op)) {
++    loom_value_id_t scalar = loom_vector_insert_value(op);
++    loom_op_t* leaf = defining(c, scalar);
++    if (loom_view_load_isa(leaf)) {
++      loom_value_id_t view, index;
++      IREE_RETURN_IF_ERROR(clone_value(c, loom_view_load_view(leaf), &view));
++      IREE_RETURN_IF_ERROR(
++          clone_value(c, loom_view_load_indices(leaf).values[0], &index));
++      // The run proof establishes an eight-element-aligned base. Express
++      // that identity so footprint analysis also sees the tightened upper
++      // bound.
++      loom_value_id_t width, quotient, aligned;
++      IREE_RETURN_IF_ERROR(constant(c, 8, LOOM_SCALAR_TYPE_INDEX, &width));
++      IREE_RETURN_IF_ERROR(
++          binary(c, loom_index_div_build, index, width, &quotient));
++      IREE_RETURN_IF_ERROR(
++          binary(c, loom_index_mul_build, quotient, width, &aligned));
++      index = aligned;
++      int64_t dynamic = INT64_MIN;
++      uint32_t flags = 0;
++      if (!loom_attr_is_absent(
++              loom_op_attrs(leaf)[loom_view_load_cache_scope_ATTR_INDEX]))
++        flags |= LOOM_VECTOR_LOAD_BUILD_FLAG_HAS_CACHE_SCOPE;
++      if (!loom_attr_is_absent(
++              loom_op_attrs(leaf)[loom_view_load_cache_temporal_ATTR_INDEX]))
++        flags |= LOOM_VECTOR_LOAD_BUILD_FLAG_HAS_CACHE_TEMPORAL;
++      IREE_RETURN_IF_ERROR(loom_vector_load_build(
++          &c->rw.builder, flags, view, &index, 1, &dynamic, 1,
++          loom_view_load_cache_scope(leaf), loom_view_load_cache_temporal(leaf),
++          payload, op->location, &built));
++      *result = loom_vector_load_result(built);
++    } else {
++      loom_value_id_t mapped;
++      IREE_RETURN_IF_ERROR(clone_value(c, scalar, &mapped));
++      IREE_RETURN_IF_ERROR(loom_vector_splat_build(
++          &c->rw.builder, mapped, payload, op->location, &built));
++      *result = loom_vector_splat_result(built);
++    }
++    return iree_ok_status();
++  }
++  loom_value_id_t condition;
++  IREE_RETURN_IF_ERROR(clone_value(c, loom_scf_if_condition(op), &condition));
++  IREE_RETURN_IF_ERROR(
++      loom_scf_if_build(&c->rw.builder, LOOM_SCF_IF_BUILD_FLAG_HAS_ELSE_REGION,
++                        condition, &payload, 1, NULL, 0, op->location, &built));
++  uint16_t ordinal =
++      loom_value_def_index(loom_value_table_const_value(&c->module->values, v));
++  for (uint16_t r = 0; r < 2; ++r) {
++    loom_builder_ip_t ip = loom_builder_enter_region(&c->rw.builder, built,
++                                                     loom_op_regions(built)[r]);
++    loom_op_t* yield = loom_region_entry_block(loom_op_regions(op)[r])->last_op;
++    loom_value_id_t branch;
++    IREE_RETURN_IF_ERROR(load_run(c,
++                                  loom_scf_yield_values(yield).values[ordinal],
++                                  carried, oldf, payload, &branch));
++    loom_op_t* new_yield = NULL;
++    IREE_RETURN_IF_ERROR(loom_scf_yield_build(&c->rw.builder, &branch, 1,
++                                              op->location, &new_yield));
++    loom_builder_restore(&c->rw.builder, ip);
++  }
++  *result = loom_scf_if_results(built).values[0];
++  return iree_ok_status();
++}
++static iree_status_t rewrite(context_t* c, loom_op_t* fragment,
++                             uint16_t ordinal) {
++  loom_value_id_t first_generated = c->module->values.count;
++  loom_op_t* old = c->producer;
++  loom_block_t* old_block = loom_region_entry_block(loom_scf_for_body(old));
++  loom_type_t payload =
++      loom_module_value_type(c->module, loom_vector_fragment_data(fragment));
++  loom_scalar_type_t element = loom_type_element_type(payload);
++  unsigned slot = element == LOOM_SCALAR_TYPE_BF16;
++  loom_op_t* op = NULL;
++  if (c->staging[slot] == LOOM_VALUE_ID_INVALID) {
++    loom_block_t* entry =
++        loom_region_entry_block(loom_func_like_body(c->function));
++    loom_builder_set_before(&c->rw.builder, entry->first_op);
++    loom_value_id_t bytes, zero;
++    IREE_RETURN_IF_ERROR(constant(c, 4352, LOOM_SCALAR_TYPE_OFFSET, &bytes));
++    IREE_RETURN_IF_ERROR(constant(c, 0, LOOM_SCALAR_TYPE_OFFSET, &zero));
++    IREE_RETURN_IF_ERROR(loom_buffer_alloca_build(
++        &c->rw.builder, bytes, 16, LOOM_VALUE_FACT_MEMORY_SPACE_WORKGROUP,
++        loom_type_buffer(), old->location, &op));
++    loom_value_id_t buffer = loom_buffer_alloca_result(op);
++    IREE_RETURN_IF_ERROR(loom_encoding_layout_dense_build(
++        &c->rw.builder,
++        loom_type_encoding_with_role(LOOM_ENCODING_ROLE_ADDRESS_LAYOUT),
++        old->location, &op));
++    loom_type_t view = loom_type_shaped_1d(LOOM_TYPE_VIEW, element,
++                                           loom_dim_pack_static(2176), 0);
++    view.encoding_id = (uint16_t)loom_encoding_layout_dense_result(op);
++    view.encoding_flags = LOOM_ENCODING_FLAG_SSA;
++    IREE_RETURN_IF_ERROR(loom_buffer_view_build(&c->rw.builder, buffer, zero,
++                                                view, old->location, &op));
++    c->staging[slot] = loom_buffer_view_result(op);
++    c->workgroup_bytes += 4352;
++  }
++  loom_value_id_t staging = c->staging[slot];
++  loom_builder_set_before(&c->rw.builder, old);
++  loom_value_id_t zero, one, eight, sixteen, thirtytwo, stride, lid;
++  IREE_RETURN_IF_ERROR(constant(c, 0, LOOM_SCALAR_TYPE_INDEX, &zero));
++  IREE_RETURN_IF_ERROR(constant(c, 1, LOOM_SCALAR_TYPE_INDEX, &one));
++  IREE_RETURN_IF_ERROR(constant(c, 8, LOOM_SCALAR_TYPE_INDEX, &eight));
++  IREE_RETURN_IF_ERROR(constant(c, 16, LOOM_SCALAR_TYPE_INDEX, &sixteen));
++  IREE_RETURN_IF_ERROR(constant(c, 32, LOOM_SCALAR_TYPE_INDEX, &thirtytwo));
++  IREE_RETURN_IF_ERROR(constant(c, 136, LOOM_SCALAR_TYPE_INDEX, &stride));
++  IREE_RETURN_IF_ERROR(loom_kernel_workitem_id_build(
++      &c->rw.builder, LOOM_KERNEL_DIMENSION_X,
++      loom_type_scalar(LOOM_SCALAR_TYPE_INDEX), old->location, &op));
++  lid = loom_kernel_workitem_id_result(op);
++  loom_value_id_t row, colbase, oldf, tmp;
++  IREE_RETURN_IF_ERROR(binary(c, loom_index_div_build, lid, sixteen, &row));
++  IREE_RETURN_IF_ERROR(binary(c, loom_index_rem_build, lid, sixteen, &tmp));
++  IREE_RETURN_IF_ERROR(binary(c, loom_index_mul_build, tmp, eight, &colbase));
++  IREE_RETURN_IF_ERROR(binary(c, loom_index_rem_build, row, eight, &oldf));
++  loom_value_id_t yielded =
++      loom_scf_yield_values(old_block->last_op).values[ordinal];
++  loom_value_id_t carried = loom_block_arg_id(old_block, ordinal + 1);
++  loom_value_id_t packed = LOOM_VALUE_ID_INVALID;
++  loom_value_id_t wave, half, low;
++  IREE_RETURN_IF_ERROR(binary(c, loom_index_div_build, colbase, sixteen, &tmp));
++  IREE_RETURN_IF_ERROR(binary(c, loom_index_mul_build, tmp, thirtytwo, &wave));
++  IREE_RETURN_IF_ERROR(binary(c, loom_index_div_build, row, eight, &tmp));
++  IREE_RETURN_IF_ERROR(binary(c, loom_index_mul_build, tmp, sixteen, &half));
++  IREE_RETURN_IF_ERROR(binary(c, loom_index_rem_build, colbase, sixteen, &low));
++  IREE_RETURN_IF_ERROR(binary(c, loom_index_add_build, wave, half, &tmp));
++  IREE_RETURN_IF_ERROR(
++      binary(c, loom_index_add_build, tmp, low, &c->mapped_lane));
++  IREE_RETURN_IF_ERROR(load_run(c, yielded, carried, oldf, payload, &packed));
++  loom_op_t* producer = NULL;
++  IREE_RETURN_IF_ERROR(loom_scf_for_build(
++      &c->rw.builder, LOOM_SCF_FOR_BUILD_FLAG_HAS_UNROLL_POLICY, zero, eight,
++      one, NULL, 0, NULL, 0, NULL, 0, LOOM_VALUE_ID_INVALID,
++      LOOM_SCF_FOR_UNROLL_POLICY_UNROLL, 0, old->location, &producer));
++  loom_builder_ip_t ip = loom_builder_enter_region(&c->rw.builder, producer,
++                                                   loom_scf_for_body(producer));
++  loom_block_t* block = loom_region_entry_block(loom_scf_for_body(producer));
++  loom_value_id_t component = loom_block_arg_id(block, 0), column;
++  IREE_RETURN_IF_ERROR(
++      binary(c, loom_index_add_build, colbase, component, &column));
++  loom_value_slice_t initial = loom_scf_for_iter_args(old);
++  loom_value_id_t result;
++  int64_t dynamic = INT64_MIN;
++  IREE_RETURN_IF_ERROR(loom_vector_extract_build(
++      &c->rw.builder, packed, &component, 1, &dynamic, 1,
++      loom_type_scalar(element), old->location, &op));
++  loom_value_id_t scalar = loom_vector_extract_result(op), at;
++  IREE_RETURN_IF_ERROR(binary(c, loom_index_mul_build, row, stride, &tmp));
++  IREE_RETURN_IF_ERROR(binary(c, loom_index_add_build, tmp, column, &at));
++  IREE_RETURN_IF_ERROR(loom_view_store_build(&c->rw.builder, 0, scalar, staging,
++                                             &at, 1, &dynamic, 1, 0, 0,
++                                             old->location, &op));
++  IREE_RETURN_IF_ERROR(
++      loom_scf_yield_build(&c->rw.builder, NULL, 0, old->location, &op));
++  loom_builder_restore(&c->rw.builder, ip);
++  IREE_RETURN_IF_ERROR(barrier(c));
++  loom_value_id_t lane, base;
++  IREE_RETURN_IF_ERROR(binary(c, loom_index_rem_build, lid, thirtytwo, &lane));
++  IREE_RETURN_IF_ERROR(binary(c, loom_index_div_build, lane, sixteen, &tmp));
++  IREE_RETURN_IF_ERROR(binary(c, loom_index_mul_build, tmp, eight, &row));
++  IREE_RETURN_IF_ERROR(binary(c, loom_index_div_build, lid, thirtytwo, &tmp));
++  IREE_RETURN_IF_ERROR(binary(c, loom_index_mul_build, tmp, sixteen, &wave));
++  IREE_RETURN_IF_ERROR(binary(c, loom_index_rem_build, lane, sixteen, &tmp));
++  IREE_RETURN_IF_ERROR(binary(c, loom_index_add_build, wave, tmp, &base));
++  loom_value_id_t init = initial.values[ordinal];
++  loom_op_t* consumer = NULL;
++  IREE_RETURN_IF_ERROR(loom_scf_for_build(
++      &c->rw.builder, LOOM_SCF_FOR_BUILD_FLAG_HAS_UNROLL_POLICY, zero, eight,
++      one, &init, 1, &payload, 1, NULL, 0, LOOM_VALUE_ID_INVALID,
++      LOOM_SCF_FOR_UNROLL_POLICY_UNROLL, 0, old->location, &consumer));
++  ip = loom_builder_enter_region(&c->rw.builder, consumer,
++                                 loom_scf_for_body(consumer));
++  block = loom_region_entry_block(loom_scf_for_body(consumer));
++  component = loom_block_arg_id(block, 0);
++  IREE_RETURN_IF_ERROR(binary(c, loom_index_add_build, row, component, &tmp));
++  IREE_RETURN_IF_ERROR(binary(c, loom_index_mul_build, tmp, stride, &at));
++  IREE_RETURN_IF_ERROR(binary(c, loom_index_add_build, at, base, &tmp));
++  IREE_RETURN_IF_ERROR(
++      loom_view_load_build(&c->rw.builder, 0, staging, &tmp, 1, &dynamic, 1, 0,
++                           0, loom_type_scalar(element), old->location, &op));
++  scalar = loom_view_load_result(op);
++  IREE_RETURN_IF_ERROR(loom_vector_insert_build(
++      &c->rw.builder, scalar, loom_block_arg_id(block, 1), &component, 1,
++      &dynamic, 1, payload, old->location, &op));
++  result = loom_vector_insert_result(op);
++  IREE_RETURN_IF_ERROR(
++      loom_scf_yield_build(&c->rw.builder, &result, 1, old->location, &op));
++  loom_builder_restore(&c->rw.builder, ip);
++  IREE_RETURN_IF_ERROR(barrier(c));
++  IREE_RETURN_IF_ERROR(loom_rewriter_replace_all_uses_with(
++      &c->rw, loom_scf_for_results(old).values[ordinal],
++      loom_scf_for_results(consumer).values[0]));
++  IREE_RETURN_IF_ERROR(
++      loom_rewriter_set_operand(&c->rw, old_block->last_op, ordinal,
++                                loom_block_arg_id(old_block, ordinal + 1)));
++  // Cloned producer definitions may move into an ancestor scope. Reusing
++  // their authored display names there would shadow the original values when
++  // the transformed module is printed and parsed again.
++  for (loom_value_id_t v = first_generated; v < c->module->values.count; ++v) {
++    IREE_RETURN_IF_ERROR(loom_module_clear_value_name(c->module, v));
++  }
++  loom_pass_mark_changed(c->pass);
++  return iree_ok_status();
++}
++static iree_status_t report(context_t* c, loom_op_t* op, const char* outcome,
++                            const char* reason) {
++  if (!c->report) return iree_ok_status();
++  loom_symbol_ref_t symbol = loom_func_like_callee(c->function);
++  const loom_symbol_t* entry = &c->module->symbols.entries[symbol.symbol_id];
++  const loom_target_compile_report_source_low_transform_row_t row = {
++      .function_name = c->module->strings.entries[entry->name_id],
++      .source_op_name = loom_op_name(c->module, op),
++      .source_op_kind = op->kind,
++      .transform_key = IREE_SV("stage-matrix-operands"),
++      .outcome = iree_make_cstring_view(outcome),
++      .reason = iree_make_cstring_view(reason),
++      .candidate_value_count = 1,
++      .selected_value_count = !strcmp(outcome, "selected"),
++      .row_count = 16,
++      .column_count = 128,
++      .workgroup_memory_byte_count = 4352,
++      .inserted_barrier_op_count = !strcmp(outcome, "selected") ? 2 : 0,
++  };
++  return loom_target_compile_report_record_source_low_transform_row(c->report,
++                                                                    &row);
++}
++static iree_status_t count_storage(void* user, loom_op_t* op,
++                                   const loom_walk_context_t* walk,
++                                   loom_walk_result_t* result) {
++  (void)walk;
++  *result = LOOM_WALK_CONTINUE;
++  context_t* c = user;
++  if (!loom_buffer_alloca_isa(op) || loom_buffer_alloca_memory_space(op) !=
++                                         LOOM_VALUE_FACT_MEMORY_SPACE_WORKGROUP)
++    return iree_ok_status();
++  int64_t bytes = 0;
++  if (!loom_value_facts_as_exact_i64(
++          loom_rewriter_value_facts(&c->rw, loom_buffer_alloca_byte_length(op)),
++          &bytes) ||
++      bytes < 0 || bytes > INT32_MAX)
++    c->unknown_storage = true;
++  else
++    c->workgroup_bytes += ((uint64_t)bytes + 15) & ~UINT64_C(15);
++  return iree_ok_status();
++}
++static iree_status_t collect(void* user, loom_op_t* op,
++                             const loom_walk_context_t* walk,
++                             loom_walk_result_t* result) {
++  (void)walk;
++  *result = LOOM_WALK_CONTINUE;
++  context_t* c = user;
++  if (!loom_vector_fragment_isa(op) ||
++      loom_vector_fragment_role(op) != LOOM_VECTOR_ROLE_RHS)
++    return iree_ok_status();
++  IREE_RETURN_IF_ERROR(iree_arena_grow_array(
++      c->pass->arena, c->count, c->count + 1, sizeof(*c->candidates),
++      &c->capacity, (void**)&c->candidates));
++  c->candidates[c->count++] = op;
++  return iree_ok_status();
++}
++iree_status_t loom_stage_matrix_operands_run(loom_pass_t* pass,
++                                             loom_module_t* module,
++                                             loom_func_like_t function) {
++  if (!loom_kernel_def_isa(function.op) || !loom_func_like_body(function))
++    return iree_ok_status();
++  context_t c = {.pass = pass,
++                 .module = module,
++                 .function = function,
++                 .staging = {LOOM_VALUE_ID_INVALID, LOOM_VALUE_ID_INVALID}};
++  c.report = loom_low_pass_capability_compile_report(
++      loom_low_pass_capability_from_pass(pass));
++  loom_walk_result_t walk;
++  IREE_RETURN_IF_ERROR(loom_walk_function(module, function, LOOM_WALK_PRE_ORDER,
++                                          (loom_walk_callback_t){collect, &c},
++                                          pass->arena, &walk));
++
++  if (!c.count) return iree_ok_status();
++  const loom_target_facts_t* target = NULL;
++  bool resolved = false;
++  IREE_RETURN_IF_ERROR(loom_target_pass_resolve_function_facts(
++      pass, module, function, &resolved, &target));
++  const loom_target_bundle_t* bundle =
++      resolved ? loom_target_facts_bundle(target) : NULL;
++
++  if (!bundle || !bundle->snapshot || bundle->snapshot->subgroup_size != 32)
++    return iree_ok_status();
++  loom_value_fact_table_t* facts = NULL;
++  IREE_RETURN_IF_ERROR(loom_pass_value_facts_prepare(
++      pass, module,
++      loom_pass_value_fact_scope_function_for_target(function, target),
++      &facts));
++  loom_target_workgroup_size_t size = {0};
++  if (!loom_kernel_def_static_workgroup_size_from_facts(module, function.op,
++                                                        facts, &size))
++    return iree_ok_status();
++
++  c.storage_limit = bundle->snapshot->max_workgroup_storage_bytes;
++  uint32_t flat = 0;
++  if (!loom_target_workgroup_size_flat_product_u32(&size, &flat) ||
++      flat != 256 || size.x != 256 || size.y != 1 || size.z != 1)
++    return iree_ok_status();
++  IREE_RETURN_IF_ERROR(loom_rewriter_initialize(&c.rw, module, pass->arena));
++  iree_status_t status = loom_rewriter_enable_analysis(&c.rw, function, facts);
++  loom_control_uniformity_info_initialize(module, facts, pass->arena,
++                                          &c.uniformity);
++  if (iree_status_is_ok(status))
++    status = loom_walk_function(module, function, LOOM_WALK_PRE_ORDER,
++                                (loom_walk_callback_t){count_storage, &c},
++                                pass->arena, &walk);
++  for (iree_host_size_t i = 0; iree_status_is_ok(status) && i < c.count; ++i) {
++    loom_op_t* fragment = c.candidates[i];
++    loom_value_id_t data = loom_vector_fragment_data(fragment);
++    loom_type_t type = loom_module_value_type(module, data);
++    uint64_t n = 0;
++    if (!loom_type_static_element_count(type, &n) || n != 8 ||
++        (loom_type_element_type(type) != LOOM_SCALAR_TYPE_BF16 &&
++         loom_type_element_type(type) != LOOM_SCALAR_TYPE_F16) ||
++        !exact(&c, loom_vector_fragment_rows(fragment), 16) ||
++        !exact(&c, loom_vector_fragment_columns(fragment), 16))
++      continue;
++
++    c.producer = defining(&c, data);
++    if (!c.producer || !loom_scf_for_isa(c.producer) ||
++        !exact(&c, loom_scf_for_lower_bound(c.producer), 0) ||
++        !exact(&c, loom_scf_for_upper_bound(c.producer), 8) ||
++        !exact(&c, loom_scf_for_step(c.producer), 1))
++      continue;
++    loom_block_t* block =
++        loom_region_entry_block(loom_scf_for_body(c.producer));
++    uint16_t ordinal = loom_value_def_index(
++        loom_value_table_const_value(&module->values, data));
++
++    bool has_load = false;
++    if (!pointwise(&c, loom_scf_yield_values(block->last_op).values[ordinal],
++                   loom_block_arg_id(block, ordinal + 1),
++                   loom_block_arg_id(block, 0), &has_load) ||
++        !has_load)
++      continue;
++
++    bool valid = true;
++    for (uint16_t j = 0; j < c.producer->result_count; ++j) {
++      bool read = false;
++      if (!pointwise(&c, loom_scf_yield_values(block->last_op).values[j],
++                     loom_block_arg_id(block, j + 1),
++                     loom_block_arg_id(block, 0), &read))
++        valid = false;
++    }
++    if (!valid) continue;
++    status =
++        iree_arena_allocate_array(pass->arena, module->values.count,
++                                  sizeof(*c.dependence), (void**)&c.dependence);
++    if (!iree_status_is_ok(status)) break;
++    memset(c.dependence, 0, module->values.count);
++    for (loom_op_t* child = block->first_op; child; child = child->next_op)
++      if (!independent_body(child) || !check_external(&c, child)) {
++        valid = false;
++        break;
++      }
++    if (!valid) {
++      continue;
++    }
++    bool uniform = false;
++    loom_control_uniformity_failure_t failure = {0};
++    status = loom_control_uniformity_prove_execution(
++        &c.uniformity, c.producer, LOOM_VALUE_FACT_UNIFORM_SCOPE_WORKGROUP,
++        &failure, &uniform);
++    if (!iree_status_is_ok(status)) break;
++    if (!uniform) {
++      status =
++          report(&c, fragment, "declined", "control_not_workgroup_uniform");
++      continue;
++    }
++
++    unsigned slot = loom_type_element_type(type) == LOOM_SCALAR_TYPE_BF16;
++    uint64_t extra = c.staging[slot] == LOOM_VALUE_ID_INVALID ? 4352 : 0;
++    if (c.unknown_storage || !c.storage_limit ||
++        c.workgroup_bytes + extra > c.storage_limit) {
++      status = report(&c, fragment, "declined", "workgroup_storage_budget");
++      continue;
++    }
++    if (!vectorizable(&c, loom_scf_yield_values(block->last_op).values[ordinal],
++                      loom_block_arg_id(block, ordinal + 1))) {
++      status = report(&c, fragment, "declined", "no_contiguous_vector_run");
++      continue;
++    }
++    status = rewrite(&c, fragment, ordinal);
++    if (iree_status_is_ok(status))
++      status = report(&c, fragment, "selected", "cooperative_vector_load");
++  }
++  loom_rewriter_deinitialize(&c.rw);
++  if (pass->value_facts)
++    loom_pass_value_fact_owner_invalidate(pass->value_facts);
++  return status;
++}
+diff --git a/loom/src/loom/transforms/kernel/stage_matrix_operands.h b/loom/src/loom/transforms/kernel/stage_matrix_operands.h
+new file mode 100644
+index 00000000..57d1c6b2
+--- /dev/null
++++ b/loom/src/loom/transforms/kernel/stage_matrix_operands.h
+@@ -0,0 +1,19 @@
++// Copyright 2026 The IREE Authors
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++#ifndef LOOM_TRANSFORMS_KERNEL_STAGE_MATRIX_OPERANDS_H_
++#define LOOM_TRANSFORMS_KERNEL_STAGE_MATRIX_OPERANDS_H_
++#include "loom/pass/types.h"
++#ifdef __cplusplus
++extern "C" {
++#endif
++// Redistributes independent matrix-operand element producers across a
++// workgroup. The source masks and address calculations are preserved under a
++// bijective lane permutation. LDS restores the original per-lane payload before
++// matrix math.
++const loom_pass_info_t* loom_stage_matrix_operands_pass_info(void);
++iree_status_t loom_stage_matrix_operands_run(loom_pass_t*, loom_module_t*,
++                                             loom_func_like_t);
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/loom/src/loom/transforms/kernel/test/stage_matrix_operands.loom-test b/loom/src/loom/transforms/kernel/test/stage_matrix_operands.loom-test
+new file mode 100644
+index 00000000..ca126fb7
+--- /dev/null
++++ b/loom/src/loom/transforms/kernel/test/stage_matrix_operands.loom-test
+@@ -0,0 +1,953 @@
++// RUN: pass stage-matrix-operands,canonicalize,cse,dce
++
++test.target<low_core> @target {abi = hal_kernel, subgroup_size = 32, max_workgroup_storage_bytes = 65536}
++kernel.def target(@target) @matrix_rhs() {
++  %one = index.constant 1 : index
++  %threads = index.constant 256 : index
++  kernel.launch.config workgroups(%one,%one,%one) workgroup_size(%threads,%one,%one) : index
++} launch(%weights: buffer) {
++  %zero = index.constant 0 : index
++  %one = index.constant 1 : index
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %thirtytwo = index.constant 32 : index
++  %width = index.constant 128 : index
++  %offset = index.constant 0 : offset
++  %view = buffer.view %weights[%offset] : buffer -> view<2048xbf16,#dense>
++  %lane = kernel.workitem.id<x> : index
++  %wave = index.div %lane, %thirtytwo : index
++  %low = index.rem %lane, %sixteen : index
++  %within = index.rem %lane, %thirtytwo : index
++  %half = index.div %within, %sixteen : index
++  %rowbase = index.mul %half, %eight : index
++  %colbase = index.mul %wave, %sixteen : index
++  %column = index.add %colbase, %low : index
++  %init = vector.constant 0.0 : vector<8xbf16>
++  %payload = scf.for %f = [%zero to %eight step %one](%acc = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %row = index.add %rowbase, %f : index
++    %linear = index.mul %row, %width : index
++    %at = index.add %linear, %column : index
++    %value = view.load %view[%at] : view<2048xbf16,#dense> -> bf16
++    %next = vector.insert %value into %acc[%f] : bf16, vector<8xbf16>
++    scf.yield %next : vector<8xbf16>
++  }
++  %rhs = vector.fragment<rhs> %payload shape [%sixteen,%sixteen] : vector<8xbf16>
++  test.use %rhs : vector<8xbf16>
++  kernel.return
++}
++
++// ----
++test.target<low_core> @target {abi = hal_kernel, max_workgroup_storage_bytes = 65536, subgroup_size = 32}
++
++kernel.def target(@target) @matrix_rhs() {
++  %one = index.constant 1 : index
++  %threads = index.constant 256 : index
++  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%threads, %one, %one) : index
++} launch(%weights: buffer) {
++  %29 = index.constant 4352 : offset
++  %30 = index.constant 0 : offset
++  %31 = buffer.alloca %29 {base_alignment = 16, memory_space = workgroup} : buffer
++  %32 = encoding.layout.dense : encoding<layout>
++  %33 = buffer.view %31[%30] : buffer -> view<2176xbf16, %32>
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %width = index.constant 128 : index
++  %view = buffer.view %weights[%30] : buffer -> view<2048xbf16, #dense>
++  %init = vector.constant 0.0 : vector<8xbf16>
++  %34 = index.constant 0 : index
++  %35 = index.constant 1 : index
++  %38 = index.constant 32 : index
++  %39 = index.constant 136 : index
++  %40 = kernel.workitem.id<x> : index
++  %129 = index.constant 4 : index
++  %130 = index.shrui %40, %129 : index
++  %127 = index.constant 15 : index
++  %128 = index.andi %40, %127 : index
++  %125 = index.constant 3 : index
++  %126 = index.shli %128, %125 : index
++  %123 = index.constant 7 : index
++  %124 = index.andi %130, %123 : index
++  %122 = index.shrui %126, %129 : index
++  %132 = index.shrui %40, %123 : index
++  %118 = index.shli %132, %129 : index
++  %116 = index.andi %126, %127 : index
++  %114 = index.madd %122, %38, %118 : index
++  %51 = index.add %114, %116 : index
++  %112 = index.constant 31 : index
++  %113 = index.andi %51, %112 : index
++  %111 = index.shrui %113, %129 : index
++  %109 = index.madd %111, %eight, %124 : index
++  %107 = index.constant 5 : index
++  %108 = index.shrui %51, %107 : index
++  %106 = index.andi %51, %127 : index
++  %104 = index.madd %108, %sixteen, %106 : index
++  %103 = index.madd %109, %width, %104 : index
++  %102 = index.shrui %103, %125 : index
++  %100 = index.shli %102, %125 : index
++  %65 = vector.load %view[%100] : view<2048xbf16, #dense> -> vector<8xbf16>
++  scf.for %66 = [%34 to %eight step %35] unroll {
++    %87 = index.madd %128, %eight, %66 : index
++    %68 = vector.extract %65[%66] : vector<8xbf16> -> bf16
++    %86 = index.madd %130, %39, %87 : index
++    view.store %68, %33[%86] : bf16, view<2176xbf16, %32>
++  }
++  kernel.barrier<workgroup> {ordering = acq_rel, scope = workgroup}
++  %97 = index.constant 31 : index
++  %98 = index.andi %40, %97 : index
++  %95 = index.constant 4 : index
++  %96 = index.shrui %98, %95 : index
++  %93 = index.constant 5 : index
++  %94 = index.shrui %40, %93 : index
++  %91 = index.constant 15 : index
++  %92 = index.andi %98, %91 : index
++  %90 = index.madd %94, %sixteen, %92 : index
++  %80 = scf.for %78 = [%34 to %eight step %35](%79 = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %89 = index.madd %96, %eight, %78 : index
++    %88 = index.madd %89, %39, %90 : index
++    %84 = view.load %33[%88] : view<2176xbf16, %32> -> bf16
++    %85 = vector.insert %84 into %79[%78] : bf16, vector<8xbf16>
++    scf.yield %85 : vector<8xbf16>
++  }
++  kernel.barrier<workgroup> {ordering = acq_rel, scope = workgroup}
++  %rhs = vector.fragment<rhs> %80 shape [%sixteen, %sixteen] : vector<8xbf16>
++  test.use %rhs : vector<8xbf16>
++  kernel.return
++}
++
++
++// ====
++// RUN: pass stage-matrix-operands,canonicalize,cse,dce
++
++test.target<low_core> @target {abi = hal_kernel, subgroup_size = 32, max_workgroup_storage_bytes = 65536}
++kernel.def target(@target) @matrix_rhs_f16() {
++  %one = index.constant 1 : index
++  %threads = index.constant 256 : index
++  kernel.launch.config workgroups(%one,%one,%one) workgroup_size(%threads,%one,%one) : index
++} launch(%weights: buffer) {
++  %zero = index.constant 0 : index
++  %one = index.constant 1 : index
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %thirtytwo = index.constant 32 : index
++  %width = index.constant 128 : index
++  %offset = index.constant 0 : offset
++  %view = buffer.view %weights[%offset] : buffer -> view<2048xf16,#dense>
++  %lane = kernel.workitem.id<x> : index
++  %wave = index.div %lane, %thirtytwo : index
++  %low = index.rem %lane, %sixteen : index
++  %within = index.rem %lane, %thirtytwo : index
++  %half = index.div %within, %sixteen : index
++  %rowbase = index.mul %half, %eight : index
++  %colbase = index.mul %wave, %sixteen : index
++  %column = index.add %colbase, %low : index
++  %init = vector.constant 0.0 : vector<8xf16>
++  %payload = scf.for %f = [%zero to %eight step %one](%acc = %init : vector<8xf16>) -> (vector<8xf16>) unroll {
++    %row = index.add %rowbase, %f : index
++    %linear = index.mul %row, %width : index
++    %at = index.add %linear, %column : index
++    %value = view.load %view[%at] : view<2048xf16,#dense> -> f16
++    %next = vector.insert %value into %acc[%f] : f16, vector<8xf16>
++    scf.yield %next : vector<8xf16>
++  }
++  %rhs = vector.fragment<rhs> %payload shape [%sixteen,%sixteen] : vector<8xf16>
++  test.use %rhs : vector<8xf16>
++  kernel.return
++}
++
++// ----
++test.target<low_core> @target {abi = hal_kernel, max_workgroup_storage_bytes = 65536, subgroup_size = 32}
++
++kernel.def target(@target) @matrix_rhs_f16() {
++  %one = index.constant 1 : index
++  %threads = index.constant 256 : index
++  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%threads, %one, %one) : index
++} launch(%weights: buffer) {
++  %29 = index.constant 4352 : offset
++  %30 = index.constant 0 : offset
++  %31 = buffer.alloca %29 {base_alignment = 16, memory_space = workgroup} : buffer
++  %32 = encoding.layout.dense : encoding<layout>
++  %33 = buffer.view %31[%30] : buffer -> view<2176xf16, %32>
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %width = index.constant 128 : index
++  %view = buffer.view %weights[%30] : buffer -> view<2048xf16, #dense>
++  %init = vector.constant 0.0 : vector<8xf16>
++  %34 = index.constant 0 : index
++  %35 = index.constant 1 : index
++  %38 = index.constant 32 : index
++  %39 = index.constant 136 : index
++  %40 = kernel.workitem.id<x> : index
++  %129 = index.constant 4 : index
++  %130 = index.shrui %40, %129 : index
++  %127 = index.constant 15 : index
++  %128 = index.andi %40, %127 : index
++  %125 = index.constant 3 : index
++  %126 = index.shli %128, %125 : index
++  %123 = index.constant 7 : index
++  %124 = index.andi %130, %123 : index
++  %122 = index.shrui %126, %129 : index
++  %132 = index.shrui %40, %123 : index
++  %118 = index.shli %132, %129 : index
++  %116 = index.andi %126, %127 : index
++  %114 = index.madd %122, %38, %118 : index
++  %51 = index.add %114, %116 : index
++  %112 = index.constant 31 : index
++  %113 = index.andi %51, %112 : index
++  %111 = index.shrui %113, %129 : index
++  %109 = index.madd %111, %eight, %124 : index
++  %107 = index.constant 5 : index
++  %108 = index.shrui %51, %107 : index
++  %106 = index.andi %51, %127 : index
++  %104 = index.madd %108, %sixteen, %106 : index
++  %103 = index.madd %109, %width, %104 : index
++  %102 = index.shrui %103, %125 : index
++  %100 = index.shli %102, %125 : index
++  %65 = vector.load %view[%100] : view<2048xf16, #dense> -> vector<8xf16>
++  scf.for %66 = [%34 to %eight step %35] unroll {
++    %87 = index.madd %128, %eight, %66 : index
++    %68 = vector.extract %65[%66] : vector<8xf16> -> f16
++    %86 = index.madd %130, %39, %87 : index
++    view.store %68, %33[%86] : f16, view<2176xf16, %32>
++  }
++  kernel.barrier<workgroup> {ordering = acq_rel, scope = workgroup}
++  %97 = index.constant 31 : index
++  %98 = index.andi %40, %97 : index
++  %95 = index.constant 4 : index
++  %96 = index.shrui %98, %95 : index
++  %93 = index.constant 5 : index
++  %94 = index.shrui %40, %93 : index
++  %91 = index.constant 15 : index
++  %92 = index.andi %98, %91 : index
++  %90 = index.madd %94, %sixteen, %92 : index
++  %80 = scf.for %78 = [%34 to %eight step %35](%79 = %init : vector<8xf16>) -> (vector<8xf16>) unroll {
++    %89 = index.madd %96, %eight, %78 : index
++    %88 = index.madd %89, %39, %90 : index
++    %84 = view.load %33[%88] : view<2176xf16, %32> -> f16
++    %85 = vector.insert %84 into %79[%78] : f16, vector<8xf16>
++    scf.yield %85 : vector<8xf16>
++  }
++  kernel.barrier<workgroup> {ordering = acq_rel, scope = workgroup}
++  %rhs = vector.fragment<rhs> %80 shape [%sixteen, %sixteen] : vector<8xf16>
++  test.use %rhs : vector<8xf16>
++  kernel.return
++}
++
++
++// ====
++// RUN: pass stage-matrix-operands,canonicalize,cse,dce
++
++test.target<low_core> @target {abi = hal_kernel, subgroup_size = 32, max_workgroup_storage_bytes = 65536}
++kernel.def target(@target) @already_contiguous() {
++  %one = index.constant 1 : index
++  %threads = index.constant 256 : index
++  kernel.launch.config workgroups(%one,%one,%one) workgroup_size(%threads,%one,%one) : index
++} launch(%weights: buffer) {
++  %zero = index.constant 0 : index
++  %one = index.constant 1 : index
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %thirtytwo = index.constant 32 : index
++  %width = index.constant 128 : index
++  %offset = index.constant 0 : offset
++  %view = buffer.view %weights[%offset] : buffer -> view<2048xbf16,#dense>
++  %lane = kernel.workitem.id<x> : index
++  %wave = index.div %lane, %thirtytwo : index
++  %low = index.rem %lane, %sixteen : index
++  %within = index.rem %lane, %thirtytwo : index
++  %half = index.div %within, %sixteen : index
++  %rowbase = index.mul %half, %eight : index
++  %colbase = index.mul %wave, %sixteen : index
++  %column = index.add %colbase, %low : index
++  %init = vector.constant 0.0 : vector<8xbf16>
++  %payload = scf.for %f = [%zero to %eight step %one](%acc = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %row = index.add %rowbase, %f : index
++    %linear = index.mul %row, %width : index
++    %lane_base = index.mul %lane, %eight : index
++    %at = index.add %lane_base, %f : index
++    %value = view.load %view[%at] : view<2048xbf16,#dense> -> bf16
++    %next = vector.insert %value into %acc[%f] : bf16, vector<8xbf16>
++    scf.yield %next : vector<8xbf16>
++  }
++  %rhs = vector.fragment<rhs> %payload shape [%sixteen,%sixteen] : vector<8xbf16>
++  test.use %rhs : vector<8xbf16>
++  kernel.return
++}
++
++// ----
++test.target<low_core> @target {abi = hal_kernel, max_workgroup_storage_bytes = 65536, subgroup_size = 32}
++
++kernel.def target(@target) @already_contiguous() {
++  %one = index.constant 1 : index
++  %threads = index.constant 256 : index
++  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%threads, %one, %one) : index
++} launch(%weights: buffer) {
++  %zero = index.constant 0 : index
++  %one = index.constant 1 : index
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %offset = index.constant 0 : offset
++  %view = buffer.view %weights[%offset] : buffer -> view<2048xbf16, #dense>
++  %lane = kernel.workitem.id<x> : index
++  %init = vector.constant 0.0 : vector<8xbf16>
++  %payload = scf.for %f = [%zero to %eight step %one](%acc = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %at = index.madd %lane, %eight, %f : index
++    %value = view.load %view[%at] : view<2048xbf16, #dense> -> bf16
++    %next = vector.insert %value into %acc[%f] : bf16, vector<8xbf16>
++    scf.yield %next : vector<8xbf16>
++  }
++  %rhs = vector.fragment<rhs> %payload shape [%sixteen, %sixteen] : vector<8xbf16>
++  test.use %rhs : vector<8xbf16>
++  kernel.return
++}
++
++
++// ====
++// RUN: pass stage-matrix-operands,canonicalize,cse,dce
++
++test.target<low_core> @target {abi = hal_kernel, subgroup_size = 32, max_workgroup_storage_bytes = 4096}
++kernel.def target(@target) @storage_budget() {
++  %one = index.constant 1 : index
++  %threads = index.constant 256 : index
++  kernel.launch.config workgroups(%one,%one,%one) workgroup_size(%threads,%one,%one) : index
++} launch(%weights: buffer) {
++  %zero = index.constant 0 : index
++  %one = index.constant 1 : index
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %thirtytwo = index.constant 32 : index
++  %width = index.constant 128 : index
++  %offset = index.constant 0 : offset
++  %view = buffer.view %weights[%offset] : buffer -> view<2048xbf16,#dense>
++  %lane = kernel.workitem.id<x> : index
++  %wave = index.div %lane, %thirtytwo : index
++  %low = index.rem %lane, %sixteen : index
++  %within = index.rem %lane, %thirtytwo : index
++  %half = index.div %within, %sixteen : index
++  %rowbase = index.mul %half, %eight : index
++  %colbase = index.mul %wave, %sixteen : index
++  %column = index.add %colbase, %low : index
++  %init = vector.constant 0.0 : vector<8xbf16>
++  %payload = scf.for %f = [%zero to %eight step %one](%acc = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %row = index.add %rowbase, %f : index
++    %linear = index.mul %row, %width : index
++    %at = index.add %linear, %column : index
++    %value = view.load %view[%at] : view<2048xbf16,#dense> -> bf16
++    %next = vector.insert %value into %acc[%f] : bf16, vector<8xbf16>
++    scf.yield %next : vector<8xbf16>
++  }
++  %rhs = vector.fragment<rhs> %payload shape [%sixteen,%sixteen] : vector<8xbf16>
++  test.use %rhs : vector<8xbf16>
++  kernel.return
++}
++
++// ----
++test.target<low_core> @target {abi = hal_kernel, max_workgroup_storage_bytes = 4096, subgroup_size = 32}
++
++kernel.def target(@target) @storage_budget() {
++  %one = index.constant 1 : index
++  %threads = index.constant 256 : index
++  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%threads, %one, %one) : index
++} launch(%weights: buffer) {
++  %zero = index.constant 0 : index
++  %one = index.constant 1 : index
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %width = index.constant 128 : index
++  %offset = index.constant 0 : offset
++  %view = buffer.view %weights[%offset] : buffer -> view<2048xbf16, #dense>
++  %lane = kernel.workitem.id<x> : index
++  %38 = index.constant 5 : index
++  %wave = index.shrui %lane, %38 : index
++  %36 = index.constant 15 : index
++  %low = index.andi %lane, %36 : index
++  %34 = index.constant 31 : index
++  %within = index.andi %lane, %34 : index
++  %32 = index.constant 4 : index
++  %half = index.shrui %within, %32 : index
++  %column = index.madd %wave, %sixteen, %low : index
++  %init = vector.constant 0.0 : vector<8xbf16>
++  %payload = scf.for %f = [%zero to %eight step %one](%acc = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %row = index.madd %half, %eight, %f : index
++    %at = index.madd %row, %width, %column : index
++    %value = view.load %view[%at] : view<2048xbf16, #dense> -> bf16
++    %next = vector.insert %value into %acc[%f] : bf16, vector<8xbf16>
++    scf.yield %next : vector<8xbf16>
++  }
++  %rhs = vector.fragment<rhs> %payload shape [%sixteen, %sixteen] : vector<8xbf16>
++  test.use %rhs : vector<8xbf16>
++  kernel.return
++}
++
++
++// ====
++// RUN: pass stage-matrix-operands,canonicalize,cse,dce
++
++test.target<low_core> @target {abi = hal_kernel, subgroup_size = 32, max_workgroup_storage_bytes = 65536}
++kernel.def target(@target) @multiple_dimensions() {
++  %one = index.constant 1 : index
++  %threads = index.constant 64 : index
++  %four = index.constant 4 : index
++  kernel.launch.config workgroups(%one,%one,%one) workgroup_size(%threads,%four,%one) : index
++} launch(%weights: buffer) {
++  %zero = index.constant 0 : index
++  %one = index.constant 1 : index
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %thirtytwo = index.constant 32 : index
++  %width = index.constant 128 : index
++  %offset = index.constant 0 : offset
++  %view = buffer.view %weights[%offset] : buffer -> view<2048xbf16,#dense>
++  %lane = kernel.workitem.id<x> : index
++  %wave = index.div %lane, %thirtytwo : index
++  %low = index.rem %lane, %sixteen : index
++  %within = index.rem %lane, %thirtytwo : index
++  %half = index.div %within, %sixteen : index
++  %rowbase = index.mul %half, %eight : index
++  %colbase = index.mul %wave, %sixteen : index
++  %column = index.add %colbase, %low : index
++  %init = vector.constant 0.0 : vector<8xbf16>
++  %payload = scf.for %f = [%zero to %eight step %one](%acc = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %row = index.add %rowbase, %f : index
++    %linear = index.mul %row, %width : index
++    %at = index.add %linear, %column : index
++    %value = view.load %view[%at] : view<2048xbf16,#dense> -> bf16
++    %next = vector.insert %value into %acc[%f] : bf16, vector<8xbf16>
++    scf.yield %next : vector<8xbf16>
++  }
++  %rhs = vector.fragment<rhs> %payload shape [%sixteen,%sixteen] : vector<8xbf16>
++  test.use %rhs : vector<8xbf16>
++  kernel.return
++}
++
++// ----
++test.target<low_core> @target {abi = hal_kernel, max_workgroup_storage_bytes = 65536, subgroup_size = 32}
++
++kernel.def target(@target) @multiple_dimensions() {
++  %one = index.constant 1 : index
++  %threads = index.constant 64 : index
++  %four = index.constant 4 : index
++  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%threads, %four, %one) : index
++} launch(%weights: buffer) {
++  %zero = index.constant 0 : index
++  %one = index.constant 1 : index
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %width = index.constant 128 : index
++  %offset = index.constant 0 : offset
++  %view = buffer.view %weights[%offset] : buffer -> view<2048xbf16, #dense>
++  %lane = kernel.workitem.id<x> : index
++  %39 = index.constant 5 : index
++  %wave = index.shrui %lane, %39 : index
++  %37 = index.constant 15 : index
++  %low = index.andi %lane, %37 : index
++  %35 = index.constant 31 : index
++  %within = index.andi %lane, %35 : index
++  %33 = index.constant 4 : index
++  %half = index.shrui %within, %33 : index
++  %column = index.madd %wave, %sixteen, %low : index
++  %init = vector.constant 0.0 : vector<8xbf16>
++  %payload = scf.for %f = [%zero to %eight step %one](%acc = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %row = index.madd %half, %eight, %f : index
++    %at = index.madd %row, %width, %column : index
++    %value = view.load %view[%at] : view<2048xbf16, #dense> -> bf16
++    %next = vector.insert %value into %acc[%f] : bf16, vector<8xbf16>
++    scf.yield %next : vector<8xbf16>
++  }
++  %rhs = vector.fragment<rhs> %payload shape [%sixteen, %sixteen] : vector<8xbf16>
++  test.use %rhs : vector<8xbf16>
++  kernel.return
++}
++
++
++// ====
++// RUN: pass stage-matrix-operands,canonicalize,cse,dce
++
++test.target<low_core> @target {abi = hal_kernel, subgroup_size = 32, max_workgroup_storage_bytes = 65536}
++kernel.def target(@target) @divergent_participants() {
++  %one = index.constant 1 : index
++  %threads = index.constant 256 : index
++  kernel.launch.config workgroups(%one,%one,%one) workgroup_size(%threads,%one,%one) : index
++} launch(%weights: buffer) {
++  %zero = index.constant 0 : index
++  %one = index.constant 1 : index
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %thirtytwo = index.constant 32 : index
++  %width = index.constant 128 : index
++  %offset = index.constant 0 : offset
++  %view = buffer.view %weights[%offset] : buffer -> view<2048xbf16,#dense>
++  %lane = kernel.workitem.id<x> : index
++  %wave = index.div %lane, %thirtytwo : index
++  %low = index.rem %lane, %sixteen : index
++  %within = index.rem %lane, %thirtytwo : index
++  %half = index.div %within, %sixteen : index
++  %rowbase = index.mul %half, %eight : index
++  %colbase = index.mul %wave, %sixteen : index
++  %column = index.add %colbase, %low : index
++  %init = vector.constant 0.0 : vector<8xbf16>
++  %active = index.cmp ult, %lane, %width : index
++  scf.if %active {
++  %payload = scf.for %f = [%zero to %eight step %one](%acc = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %row = index.add %rowbase, %f : index
++    %linear = index.mul %row, %width : index
++    %at = index.add %linear, %column : index
++    %value = view.load %view[%at] : view<2048xbf16,#dense> -> bf16
++    %next = vector.insert %value into %acc[%f] : bf16, vector<8xbf16>
++    scf.yield %next : vector<8xbf16>
++  }
++  %rhs = vector.fragment<rhs> %payload shape [%sixteen,%sixteen] : vector<8xbf16>
++  test.use %rhs : vector<8xbf16>
++  }
++  kernel.return
++}
++
++// ----
++test.target<low_core> @target {abi = hal_kernel, max_workgroup_storage_bytes = 65536, subgroup_size = 32}
++
++kernel.def target(@target) @divergent_participants() {
++  %one = index.constant 1 : index
++  %threads = index.constant 256 : index
++  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%threads, %one, %one) : index
++} launch(%weights: buffer) {
++  %zero = index.constant 0 : index
++  %one = index.constant 1 : index
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %width = index.constant 128 : index
++  %offset = index.constant 0 : offset
++  %view = buffer.view %weights[%offset] : buffer -> view<2048xbf16, #dense>
++  %lane = kernel.workitem.id<x> : index
++  %39 = index.constant 5 : index
++  %wave = index.shrui %lane, %39 : index
++  %37 = index.constant 15 : index
++  %low = index.andi %lane, %37 : index
++  %35 = index.constant 31 : index
++  %within = index.andi %lane, %35 : index
++  %33 = index.constant 4 : index
++  %half = index.shrui %within, %33 : index
++  %column = index.madd %wave, %sixteen, %low : index
++  %init = vector.constant 0.0 : vector<8xbf16>
++  %active = index.cmp ult, %lane, %width : index
++  scf.if %active {
++    %payload = scf.for %f = [%zero to %eight step %one](%acc = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++      %row = index.madd %half, %eight, %f : index
++      %at = index.madd %row, %width, %column : index
++      %value = view.load %view[%at] : view<2048xbf16, #dense> -> bf16
++      %next = vector.insert %value into %acc[%f] : bf16, vector<8xbf16>
++      scf.yield %next : vector<8xbf16>
++    }
++    %rhs = vector.fragment<rhs> %payload shape [%sixteen, %sixteen] : vector<8xbf16>
++    test.use %rhs : vector<8xbf16>
++  }
++  kernel.return
++}
++
++
++// ====
++// RUN: pass stage-matrix-operands,canonicalize,cse,dce
++
++test.target<low_core> @target {abi = hal_kernel, subgroup_size = 32, max_workgroup_storage_bytes = 65536}
++kernel.def target(@target) @masked_row_tail() {
++  %one = index.constant 1 : index
++  %threads = index.constant 256 : index
++  kernel.launch.config workgroups(%one,%one,%one) workgroup_size(%threads,%one,%one) : index
++} launch(%weights: buffer) {
++  %zero = index.constant 0 : index
++  %one = index.constant 1 : index
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %thirtytwo = index.constant 32 : index
++  %width = index.constant 128 : index
++  %offset = index.constant 0 : offset
++  %view = buffer.view %weights[%offset] : buffer -> view<2048xbf16,#dense>
++  %lane = kernel.workitem.id<x> : index
++  %wave = index.div %lane, %thirtytwo : index
++  %low = index.rem %lane, %sixteen : index
++  %within = index.rem %lane, %thirtytwo : index
++  %half = index.div %within, %sixteen : index
++  %rowbase = index.mul %half, %eight : index
++  %colbase = index.mul %wave, %sixteen : index
++  %column = index.add %colbase, %low : index
++  %init = vector.constant 0.0 : vector<8xbf16>
++  %last_row = index.constant 13 : index
++  %payload = scf.for %f = [%zero to %eight step %one](%acc = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %row = index.add %rowbase, %f : index
++    %linear = index.mul %row, %width : index
++    %at = index.add %linear, %column : index
++    %valid = index.cmp ult, %row, %last_row : index
++    %selected = scf.if %valid -> (vector<8xbf16>) {
++    %value = view.load %view[%at] : view<2048xbf16,#dense> -> bf16
++    %next = vector.insert %value into %acc[%f] : bf16, vector<8xbf16>
++    scf.yield %next : vector<8xbf16>
++    } else {
++      scf.yield %acc : vector<8xbf16>
++    }
++    scf.yield %selected : vector<8xbf16>
++  }
++  %rhs = vector.fragment<rhs> %payload shape [%sixteen,%sixteen] : vector<8xbf16>
++  test.use %rhs : vector<8xbf16>
++  kernel.return
++}
++
++// ----
++test.target<low_core> @target {abi = hal_kernel, max_workgroup_storage_bytes = 65536, subgroup_size = 32}
++
++kernel.def target(@target) @masked_row_tail() {
++  %one = index.constant 1 : index
++  %threads = index.constant 256 : index
++  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%threads, %one, %one) : index
++} launch(%weights: buffer) {
++  %32 = index.constant 4352 : offset
++  %33 = index.constant 0 : offset
++  %34 = buffer.alloca %32 {base_alignment = 16, memory_space = workgroup} : buffer
++  %35 = encoding.layout.dense : encoding<layout>
++  %36 = buffer.view %34[%33] : buffer -> view<2176xbf16, %35>
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %width = index.constant 128 : index
++  %view = buffer.view %weights[%33] : buffer -> view<2048xbf16, #dense>
++  %init = vector.constant 0.0 : vector<8xbf16>
++  %last_row = index.constant 13 : index
++  %37 = index.constant 0 : index
++  %38 = index.constant 1 : index
++  %41 = index.constant 32 : index
++  %42 = index.constant 136 : index
++  %43 = kernel.workitem.id<x> : index
++  %143 = index.constant 4 : index
++  %144 = index.shrui %43, %143 : index
++  %141 = index.constant 15 : index
++  %142 = index.andi %43, %141 : index
++  %139 = index.constant 3 : index
++  %140 = index.shli %142, %139 : index
++  %137 = index.constant 7 : index
++  %138 = index.andi %144, %137 : index
++  %136 = index.shrui %140, %143 : index
++  %146 = index.shrui %43, %137 : index
++  %132 = index.shli %146, %143 : index
++  %130 = index.andi %140, %141 : index
++  %128 = index.madd %136, %41, %132 : index
++  %54 = index.add %128, %130 : index
++  %126 = index.constant 31 : index
++  %127 = index.andi %54, %126 : index
++  %125 = index.shrui %127, %143 : index
++  %123 = index.madd %125, %eight, %138 : index
++  %59 = index.cmp ult, %123, %last_row : index
++  %60 = scf.if %59 -> (vector<8xbf16>) {
++    %103 = index.constant 5 : index
++    %104 = index.shrui %54, %103 : index
++    %102 = index.andi %54, %141 : index
++    %100 = index.madd %104, %sixteen, %102 : index
++    %99 = index.madd %123, %width, %100 : index
++    %98 = index.shrui %99, %139 : index
++    %96 = index.shli %98, %139 : index
++    %74 = vector.load %view[%96] : view<2048xbf16, #dense> -> vector<8xbf16>
++    scf.yield %74 : vector<8xbf16>
++  } else {
++    scf.yield %init : vector<8xbf16>
++  }
++  scf.for %75 = [%37 to %eight step %38] unroll {
++    %111 = index.madd %142, %eight, %75 : index
++    %77 = vector.extract %60[%75] : vector<8xbf16> -> bf16
++    %110 = index.madd %144, %42, %111 : index
++    view.store %77, %36[%110] : bf16, view<2176xbf16, %35>
++  }
++  kernel.barrier<workgroup> {ordering = acq_rel, scope = workgroup}
++  %121 = index.constant 31 : index
++  %122 = index.andi %43, %121 : index
++  %119 = index.constant 4 : index
++  %120 = index.shrui %122, %119 : index
++  %117 = index.constant 5 : index
++  %118 = index.shrui %43, %117 : index
++  %115 = index.constant 15 : index
++  %116 = index.andi %122, %115 : index
++  %114 = index.madd %118, %sixteen, %116 : index
++  %89 = scf.for %87 = [%37 to %eight step %38](%88 = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %113 = index.madd %120, %eight, %87 : index
++    %112 = index.madd %113, %42, %114 : index
++    %93 = view.load %36[%112] : view<2176xbf16, %35> -> bf16
++    %94 = vector.insert %93 into %88[%87] : bf16, vector<8xbf16>
++    scf.yield %94 : vector<8xbf16>
++  }
++  kernel.barrier<workgroup> {ordering = acq_rel, scope = workgroup}
++  %rhs = vector.fragment<rhs> %89 shape [%sixteen, %sixteen] : vector<8xbf16>
++  test.use %rhs : vector<8xbf16>
++  kernel.return
++}
++
++
++// ====
++// RUN: pass stage-matrix-operands,canonicalize,cse,dce
++
++test.target<low_core> @target {abi = hal_kernel, subgroup_size = 32, max_workgroup_storage_bytes = 65536}
++kernel.def target(@target) @masked_column_tail() {
++  %one = index.constant 1 : index
++  %threads = index.constant 256 : index
++  kernel.launch.config workgroups(%one,%one,%one) workgroup_size(%threads,%one,%one) : index
++} launch(%weights: buffer) {
++  %zero = index.constant 0 : index
++  %one = index.constant 1 : index
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %thirtytwo = index.constant 32 : index
++  %width = index.constant 128 : index
++  %offset = index.constant 0 : offset
++  %view = buffer.view %weights[%offset] : buffer -> view<2048xbf16,#dense>
++  %lane = kernel.workitem.id<x> : index
++  %wave = index.div %lane, %thirtytwo : index
++  %low = index.rem %lane, %sixteen : index
++  %within = index.rem %lane, %thirtytwo : index
++  %half = index.div %within, %sixteen : index
++  %rowbase = index.mul %half, %eight : index
++  %colbase = index.mul %wave, %sixteen : index
++  %column = index.add %colbase, %low : index
++  %init = vector.constant 0.0 : vector<8xbf16>
++  %last_row = index.constant 13 : index
++  %payload = scf.for %f = [%zero to %eight step %one](%acc = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %row = index.add %rowbase, %f : index
++    %linear = index.mul %row, %width : index
++    %at = index.add %linear, %column : index
++    %valid = index.cmp ult, %column, %last_row : index
++    %selected = scf.if %valid -> (vector<8xbf16>) {
++    %value = view.load %view[%at] : view<2048xbf16,#dense> -> bf16
++    %next = vector.insert %value into %acc[%f] : bf16, vector<8xbf16>
++    scf.yield %next : vector<8xbf16>
++    } else {
++      scf.yield %acc : vector<8xbf16>
++    }
++    scf.yield %selected : vector<8xbf16>
++  }
++  %rhs = vector.fragment<rhs> %payload shape [%sixteen,%sixteen] : vector<8xbf16>
++  test.use %rhs : vector<8xbf16>
++  kernel.return
++}
++
++// ----
++test.target<low_core> @target {abi = hal_kernel, max_workgroup_storage_bytes = 65536, subgroup_size = 32}
++
++kernel.def target(@target) @masked_column_tail() {
++  %one = index.constant 1 : index
++  %threads = index.constant 256 : index
++  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%threads, %one, %one) : index
++} launch(%weights: buffer) {
++  %zero = index.constant 0 : index
++  %one = index.constant 1 : index
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %width = index.constant 128 : index
++  %offset = index.constant 0 : offset
++  %view = buffer.view %weights[%offset] : buffer -> view<2048xbf16, #dense>
++  %lane = kernel.workitem.id<x> : index
++  %41 = index.constant 5 : index
++  %wave = index.shrui %lane, %41 : index
++  %39 = index.constant 15 : index
++  %low = index.andi %lane, %39 : index
++  %37 = index.constant 31 : index
++  %within = index.andi %lane, %37 : index
++  %35 = index.constant 4 : index
++  %half = index.shrui %within, %35 : index
++  %column = index.madd %wave, %sixteen, %low : index
++  %init = vector.constant 0.0 : vector<8xbf16>
++  %last_row = index.constant 13 : index
++  %payload = scf.for %f = [%zero to %eight step %one](%acc = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %row = index.madd %half, %eight, %f : index
++    %at = index.madd %row, %width, %column : index
++    %valid = index.cmp ult, %column, %last_row : index
++    %selected = scf.if %valid -> (vector<8xbf16>) {
++      %value = view.load %view[%at] : view<2048xbf16, #dense> -> bf16
++      %next = vector.insert %value into %acc[%f] : bf16, vector<8xbf16>
++      scf.yield %next : vector<8xbf16>
++    } else {
++      scf.yield %acc : vector<8xbf16>
++    }
++    scf.yield %selected : vector<8xbf16>
++  }
++  %rhs = vector.fragment<rhs> %payload shape [%sixteen, %sixteen] : vector<8xbf16>
++  test.use %rhs : vector<8xbf16>
++  kernel.return
++}
++
++// ====
++// RUN: pass stage-matrix-operands,canonicalize,cse,dce
++
++test.target<low_core> @target {abi = hal_kernel, subgroup_size = 32, max_workgroup_storage_bytes = 65536}
++kernel.def target(@target) @matrix_rhs_shared_stage() {
++  %one = index.constant 1 : index
++  %threads = index.constant 256 : index
++  kernel.launch.config workgroups(%one,%one,%one) workgroup_size(%threads,%one,%one) : index
++} launch(%weights: buffer) {
++  %zero = index.constant 0 : index
++  %one = index.constant 1 : index
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %thirtytwo = index.constant 32 : index
++  %width = index.constant 128 : index
++  %offset = index.constant 0 : offset
++  %view = buffer.view %weights[%offset] : buffer -> view<2048xbf16,#dense>
++  %lane = kernel.workitem.id<x> : index
++  %wave = index.div %lane, %thirtytwo : index
++  %low = index.rem %lane, %sixteen : index
++  %within = index.rem %lane, %thirtytwo : index
++  %half = index.div %within, %sixteen : index
++  %rowbase = index.mul %half, %eight : index
++  %colbase = index.mul %wave, %sixteen : index
++  %column = index.add %colbase, %low : index
++  %init = vector.constant 0.0 : vector<8xbf16>
++  %payload = scf.for %f = [%zero to %eight step %one](%acc = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %row = index.add %rowbase, %f : index
++    %linear = index.mul %row, %width : index
++    %at = index.add %linear, %column : index
++    %value = view.load %view[%at] : view<2048xbf16,#dense> -> bf16
++    %next = vector.insert %value into %acc[%f] : bf16, vector<8xbf16>
++    scf.yield %next : vector<8xbf16>
++  }
++  %rhs = vector.fragment<rhs> %payload shape [%sixteen,%sixteen] : vector<8xbf16>
++  test.use %rhs : vector<8xbf16>
++  %payload_second = scf.for %f_second = [%zero to %eight step %one](%acc_second = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %row_second = index.add %rowbase, %f_second : index
++    %linear_second = index.mul %row_second, %width : index
++    %at_second = index.add %linear_second, %column : index
++    %value_second = view.load %view[%at_second] : view<2048xbf16,#dense> -> bf16
++    %next_second = vector.insert %value_second into %acc_second[%f_second] : bf16, vector<8xbf16>
++    scf.yield %next_second : vector<8xbf16>
++  }
++  %rhs_second = vector.fragment<rhs> %payload_second shape [%sixteen,%sixteen] : vector<8xbf16>
++  test.use %rhs_second : vector<8xbf16>
++  kernel.return
++}
++
++// ----
++test.target<low_core> @target {abi = hal_kernel, max_workgroup_storage_bytes = 65536, subgroup_size = 32}
++
++kernel.def target(@target) @matrix_rhs_shared_stage() {
++  %one = index.constant 1 : index
++  %threads = index.constant 256 : index
++  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%threads, %one, %one) : index
++} launch(%weights: buffer) {
++  %38 = index.constant 4352 : offset
++  %39 = index.constant 0 : offset
++  %40 = buffer.alloca %38 {base_alignment = 16, memory_space = workgroup} : buffer
++  %41 = encoding.layout.dense : encoding<layout>
++  %42 = buffer.view %40[%39] : buffer -> view<2176xbf16, %41>
++  %eight = index.constant 8 : index
++  %sixteen = index.constant 16 : index
++  %width = index.constant 128 : index
++  %view = buffer.view %weights[%39] : buffer -> view<2048xbf16, #dense>
++  %init = vector.constant 0.0 : vector<8xbf16>
++  %43 = index.constant 0 : index
++  %44 = index.constant 1 : index
++  %47 = index.constant 32 : index
++  %48 = index.constant 136 : index
++  %49 = kernel.workitem.id<x> : index
++  %237 = index.constant 4 : index
++  %238 = index.shrui %49, %237 : index
++  %235 = index.constant 15 : index
++  %236 = index.andi %49, %235 : index
++  %233 = index.constant 3 : index
++  %234 = index.shli %236, %233 : index
++  %231 = index.constant 7 : index
++  %232 = index.andi %238, %231 : index
++  %230 = index.shrui %234, %237 : index
++  %240 = index.shrui %49, %231 : index
++  %226 = index.shli %240, %237 : index
++  %224 = index.andi %234, %235 : index
++  %222 = index.madd %230, %47, %226 : index
++  %60 = index.add %222, %224 : index
++  %220 = index.constant 31 : index
++  %221 = index.andi %60, %220 : index
++  %219 = index.shrui %221, %237 : index
++  %217 = index.madd %219, %eight, %232 : index
++  %215 = index.constant 5 : index
++  %216 = index.shrui %60, %215 : index
++  %214 = index.andi %60, %235 : index
++  %212 = index.madd %216, %sixteen, %214 : index
++  %211 = index.madd %217, %width, %212 : index
++  %210 = index.shrui %211, %233 : index
++  %208 = index.shli %210, %233 : index
++  %74 = vector.load %view[%208] : view<2048xbf16, #dense> -> vector<8xbf16>
++  scf.for %75 = [%43 to %eight step %44] unroll {
++    %148 = index.madd %236, %eight, %75 : index
++    %77 = vector.extract %74[%75] : vector<8xbf16> -> bf16
++    %147 = index.madd %238, %48, %148 : index
++    view.store %77, %42[%147] : bf16, view<2176xbf16, %41>
++  }
++  kernel.barrier<workgroup> {ordering = acq_rel, scope = workgroup}
++  %205 = index.constant 31 : index
++  %206 = index.andi %49, %205 : index
++  %203 = index.constant 4 : index
++  %204 = index.shrui %206, %203 : index
++  %201 = index.constant 5 : index
++  %202 = index.shrui %49, %201 : index
++  %199 = index.constant 15 : index
++  %200 = index.andi %206, %199 : index
++  %198 = index.madd %202, %sixteen, %200 : index
++  %89 = scf.for %87 = [%43 to %eight step %44](%88 = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %150 = index.madd %204, %eight, %87 : index
++    %149 = index.madd %150, %48, %198 : index
++    %93 = view.load %42[%149] : view<2176xbf16, %41> -> bf16
++    %94 = vector.insert %93 into %88[%87] : bf16, vector<8xbf16>
++    scf.yield %94 : vector<8xbf16>
++  }
++  kernel.barrier<workgroup> {ordering = acq_rel, scope = workgroup}
++  %rhs = vector.fragment<rhs> %89 shape [%sixteen, %sixteen] : vector<8xbf16>
++  test.use %rhs : vector<8xbf16>
++  %95 = index.constant 0 : index
++  %96 = index.constant 1 : index
++  %97 = index.constant 8 : index
++  %98 = index.constant 16 : index
++  %99 = index.constant 32 : index
++  %100 = index.constant 136 : index
++  %101 = kernel.workitem.id<x> : index
++  %194 = index.constant 4 : index
++  %195 = index.shrui %101, %194 : index
++  %192 = index.constant 15 : index
++  %193 = index.andi %101, %192 : index
++  %190 = index.constant 3 : index
++  %191 = index.shli %193, %190 : index
++  %188 = index.constant 7 : index
++  %189 = index.andi %195, %188 : index
++  %187 = index.shrui %191, %194 : index
++  %197 = index.shrui %101, %188 : index
++  %183 = index.shli %197, %194 : index
++  %181 = index.andi %191, %192 : index
++  %179 = index.madd %187, %99, %183 : index
++  %112 = index.add %179, %181 : index
++  %177 = index.constant 31 : index
++  %178 = index.andi %112, %177 : index
++  %176 = index.shrui %178, %194 : index
++  %174 = index.madd %176, %eight, %189 : index
++  %172 = index.constant 5 : index
++  %173 = index.shrui %112, %172 : index
++  %171 = index.andi %112, %192 : index
++  %169 = index.madd %173, %sixteen, %171 : index
++  %168 = index.madd %174, %width, %169 : index
++  %167 = index.shrui %168, %190 : index
++  %165 = index.shli %167, %190 : index
++  %126 = vector.load %view[%165] : view<2048xbf16, #dense> -> vector<8xbf16>
++  scf.for %127 = [%95 to %97 step %96] unroll {
++    %152 = index.madd %193, %97, %127 : index
++    %129 = vector.extract %126[%127] : vector<8xbf16> -> bf16
++    %151 = index.madd %195, %100, %152 : index
++    view.store %129, %42[%151] : bf16, view<2176xbf16, %41>
++  }
++  kernel.barrier<workgroup> {ordering = acq_rel, scope = workgroup}
++  %162 = index.constant 31 : index
++  %163 = index.andi %101, %162 : index
++  %160 = index.constant 4 : index
++  %161 = index.shrui %163, %160 : index
++  %158 = index.constant 5 : index
++  %159 = index.shrui %101, %158 : index
++  %156 = index.constant 15 : index
++  %157 = index.andi %163, %156 : index
++  %155 = index.madd %159, %98, %157 : index
++  %141 = scf.for %139 = [%95 to %97 step %96](%140 = %init : vector<8xbf16>) -> (vector<8xbf16>) unroll {
++    %154 = index.madd %161, %97, %139 : index
++    %153 = index.madd %154, %100, %155 : index
++    %145 = view.load %42[%153] : view<2176xbf16, %41> -> bf16
++    %146 = vector.insert %145 into %140[%139] : bf16, vector<8xbf16>
++    scf.yield %146 : vector<8xbf16>
++  }
++  kernel.barrier<workgroup> {ordering = acq_rel, scope = workgroup}
++  %rhs_second = vector.fragment<rhs> %141 shape [%sixteen, %sixteen] : vector<8xbf16>
++  test.use %rhs_second : vector<8xbf16>
++  kernel.return
++}

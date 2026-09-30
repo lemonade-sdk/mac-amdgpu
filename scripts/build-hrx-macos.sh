@@ -22,7 +22,8 @@ fi
 }
 for patch in "$hrx_patch" \
   "$repo_root/patches/hrx/symbolic-memo-touched-reset.patch" \
-  "$repo_root/patches/hrx/kv-fragment-addressing.patch"; do
+  "$repo_root/patches/hrx/kv-fragment-addressing.patch" \
+  "$repo_root/patches/hrx/cooperative-matrix-operands.patch"; do
   if git -C "$hrx_copy" apply --reverse --check "$patch" 2>/dev/null; then
     :
   else
