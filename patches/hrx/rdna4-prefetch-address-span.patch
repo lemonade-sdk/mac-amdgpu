@@ -1,0 +1,234 @@
+diff --git a/loom/src/loom/target/arch/amdgpu/lower/plan.h b/loom/src/loom/target/arch/amdgpu/lower/plan.h
+index 688d679d..5d776d4d 100644
+--- a/loom/src/loom/target/arch/amdgpu/lower/plan.h
++++ b/loom/src/loom/target/arch/amdgpu/lower/plan.h
+@@ -1670,13 +1670,11 @@ typedef struct loom_amdgpu_prefetch_plan_t {
+   loom_string_id_t count_attr_name_id;
+   // Target-independent source memory access plan being wrapped.
+   loom_low_source_memory_access_plan_t source;
+-  // Target operand path selected for the source dynamic address term.
+-  loom_amdgpu_memory_dynamic_index_kind_t dynamic_term_kind;
+-  // Static offset value encoded in the descriptor offset immediate.
++  // Nonnegative static byte address offset encoded in the immediate. Dynamic
++  // addresses and offsets outside the immediate range are not selected: the
++  // packet's SOFFSET operand controls span, not address.
+   int64_t immediate_offset;
+-  // Static byte offset materialized through the scalar SOFFSET operand.
+-  uint32_t scalar_byte_offset;
+-  // Prefetch span count encoded in the descriptor count immediate.
++  // Zero-based count of 128-byte units encoded in the descriptor immediate.
+   uint32_t count;
+ } loom_amdgpu_prefetch_plan_t;
+ 
+diff --git a/loom/src/loom/target/arch/amdgpu/lower/prefetch.c b/loom/src/loom/target/arch/amdgpu/lower/prefetch.c
+index 4d73d5d4..932d9905 100644
+--- a/loom/src/loom/target/arch/amdgpu/lower/prefetch.c
++++ b/loom/src/loom/target/arch/amdgpu/lower/prefetch.c
+@@ -40,19 +40,6 @@ static iree_string_view_t loom_amdgpu_prefetch_locality_name(uint8_t locality) {
+   return IREE_SV("invalid");
+ }
+ 
+-static iree_string_view_t loom_amdgpu_prefetch_dynamic_index_kind_name(
+-    loom_amdgpu_memory_dynamic_index_kind_t kind) {
+-  switch (kind) {
+-    case LOOM_AMDGPU_MEMORY_DYNAMIC_INDEX_NONE:
+-      return IREE_SV("none");
+-    case LOOM_AMDGPU_MEMORY_DYNAMIC_INDEX_VADDR:
+-      return IREE_SV("vaddr");
+-    case LOOM_AMDGPU_MEMORY_DYNAMIC_INDEX_SOFFSET:
+-      return IREE_SV("soffset");
+-  }
+-  return IREE_SV("invalid");
+-}
+-
+ static bool loom_amdgpu_prefetch_static_offset_split(
+     const loom_amdgpu_descriptor_offset_immediate_info_t* offset_info,
+     loom_amdgpu_prefetch_plan_t* plan) {
+@@ -61,59 +48,14 @@ static bool loom_amdgpu_prefetch_static_offset_split(
+     return false;
+   }
+   const uint64_t static_byte_offset = (uint64_t)plan->source.static_byte_offset;
+-  const uint64_t immediate_offset =
+-      iree_min(static_byte_offset, offset_info->unsigned_max);
+-  const uint64_t scalar_byte_offset = static_byte_offset - immediate_offset;
+-  if (scalar_byte_offset > UINT32_MAX) {
++  if (static_byte_offset > offset_info->unsigned_max) {
+     return false;
+   }
+-  plan->immediate_offset = (int64_t)immediate_offset;
+-  plan->scalar_byte_offset = (uint32_t)scalar_byte_offset;
++  plan->immediate_offset = (int64_t)static_byte_offset;
+   return loom_amdgpu_source_memory_offset_fits_u32(
+       &plan->source, plan->source.static_byte_offset);
+ }
+ 
+-static bool loom_amdgpu_prefetch_select_dynamic_index(
+-    const loom_module_t* module, const loom_value_fact_table_t* fact_table,
+-    const loom_view_region_table_t* view_regions,
+-    loom_amdgpu_prefetch_plan_t* plan) {
+-  if (!loom_low_source_memory_access_is_dynamic(&plan->source)) {
+-    return true;
+-  }
+-  const loom_low_source_memory_dynamic_term_t* term =
+-      loom_low_source_memory_access_single_dynamic_term(&plan->source);
+-  if (!term) {
+-    return false;
+-  }
+-  if (term->byte_stride < 0 || term->byte_stride > UINT32_MAX) {
+-    return false;
+-  }
+-  if (!loom_low_source_memory_dynamic_term_fits_unsigned_bit_count(term, 32)) {
+-    return false;
+-  }
+-  if (term->byte_stride != 1 &&
+-      term->byte_shift == LOOM_AMDGPU_MEMORY_ACCESS_BYTE_SHIFT_NONE) {
+-    return false;
+-  }
+-
+-  switch (term->source) {
+-    case LOOM_LOW_SOURCE_MEMORY_DYNAMIC_INDEX_SOURCE_WORKGROUP_ID:
+-      plan->dynamic_term_kind = LOOM_AMDGPU_MEMORY_DYNAMIC_INDEX_SOFFSET;
+-      return true;
+-    case LOOM_LOW_SOURCE_MEMORY_DYNAMIC_INDEX_SOURCE_VALUE:
+-      if (loom_amdgpu_source_value_prefers_vgpr(module, fact_table,
+-                                                view_regions, term->index)) {
+-        return false;
+-      }
+-      plan->dynamic_term_kind = LOOM_AMDGPU_MEMORY_DYNAMIC_INDEX_SOFFSET;
+-      return true;
+-    case LOOM_LOW_SOURCE_MEMORY_DYNAMIC_INDEX_SOURCE_WORKITEM_ID:
+-    case LOOM_LOW_SOURCE_MEMORY_DYNAMIC_INDEX_SOURCE_NONE:
+-      return false;
+-  }
+-  return false;
+-}
+-
+ static bool loom_amdgpu_view_prefetch_count(const loom_op_t* source_op,
+                                             uint32_t* out_count) {
+   *out_count = 0;
+@@ -126,7 +68,7 @@ static bool loom_amdgpu_view_prefetch_count(const loom_op_t* source_op,
+       // AMDGPU data-prefetch packets expose a span count, not a portable cache
+       // locality selector. The source locality chooses whether to prefetch; the
+       // packet span stays at the minimal representable value.
+-      *out_count = 1;
++      *out_count = 0;
+       return true;
+     case LOOM_VIEW_PREFETCH_LOCALITY_COUNT_:
+       break;
+@@ -203,8 +145,9 @@ static bool loom_amdgpu_prefetch_select_source(
+     *out_decision_key = IREE_SV("prefetch.memory_space");
+     return false;
+   }
+-  if (!loom_amdgpu_prefetch_select_dynamic_index(module, fact_table,
+-                                                 view_regions, out_plan)) {
++  // S_BUFFER_PREFETCH_DATA uses SOFFSET as a length contribution, not an
++  // address offset. Dynamic addresses need a different instruction plan.
++  if (loom_low_source_memory_access_is_dynamic(&out_plan->source)) {
+     *out_decision_key = IREE_SV("prefetch.dynamic_index");
+     return false;
+   }
+@@ -282,9 +225,7 @@ iree_status_t loom_amdgpu_record_view_prefetch_diagnostic(
+       loom_amdgpu_prefetch_locality_name(
+           loom_view_prefetch_locality(source_op)),
+       decision_key, selected ? IREE_SV("selected") : IREE_SV("dropped"),
+-      packet_key, plan.immediate_offset, plan.scalar_byte_offset,
+-      loom_amdgpu_prefetch_dynamic_index_kind_name(plan.dynamic_term_kind),
+-      plan.count);
++      packet_key, plan.immediate_offset, 0, IREE_SV("none"), plan.count);
+ }
+ 
+ iree_status_t loom_amdgpu_select_view_prefetch_plan(
+@@ -302,22 +243,10 @@ iree_status_t loom_amdgpu_lower_view_prefetch(
+       context, loom_low_source_memory_access_base_view_value_id(&plan->source),
+       &low_resource));
+ 
+-  const loom_value_id_t dynamic_index =
+-      plan->dynamic_term_kind == LOOM_AMDGPU_MEMORY_DYNAMIC_INDEX_SOFFSET
+-          ? plan->source.dynamic_terms[0].index
+-          : LOOM_VALUE_ID_INVALID;
+-  const int64_t dynamic_index_byte_stride =
+-      dynamic_index == LOOM_VALUE_ID_INVALID
+-          ? 1
+-          : plan->source.dynamic_terms[0].byte_stride;
+-  const uint32_t dynamic_index_byte_shift =
+-      dynamic_index == LOOM_VALUE_ID_INVALID
+-          ? LOOM_LOW_SOURCE_MEMORY_ACCESS_BYTE_SHIFT_NONE
+-          : plan->source.dynamic_terms[0].byte_shift;
+   loom_value_id_t low_soffset = LOOM_VALUE_ID_INVALID;
+   IREE_RETURN_IF_ERROR(loom_amdgpu_emit_sgpr_byte_offset(
+-      context, source_op, dynamic_index, dynamic_index_byte_stride,
+-      dynamic_index_byte_shift, plan->scalar_byte_offset, &low_soffset));
++      context, source_op, LOOM_VALUE_ID_INVALID, 1,
++      LOOM_LOW_SOURCE_MEMORY_ACCESS_BYTE_SHIFT_NONE, 0, &low_soffset));
+ 
+   loom_named_attr_t attrs[] = {
+       {
+diff --git a/loom/src/loom/target/arch/amdgpu/test/source_low/source_low_prefetch_gfx12.loom-test b/loom/src/loom/target/arch/amdgpu/test/source_low/source_low_prefetch_gfx12.loom-test
+index 4e509af3..7c4ed703 100644
+--- a/loom/src/loom/target/arch/amdgpu/test/source_low/source_low_prefetch_gfx12.loom-test
++++ b/loom/src/loom/target/arch/amdgpu/test/source_low/source_low_prefetch_gfx12.loom-test
+@@ -22,7 +22,7 @@ low.func.def target<amdgpu.rdna4.core>(@target) abi(hal_kernel) @prefetch_static
+   %11 = s_mov_b32 272
+   %12 = s_mov_b32 822173696
+   %13 = concat(%10, %11, %12) : (reg<amdgpu.sgpr x2>, reg<amdgpu.sgpr>, reg<amdgpu.sgpr>) -> reg<amdgpu.sgpr x4>
+-  s_buffer_prefetch_data %13, %4 {offset = 32, count = 1}
++  s_buffer_prefetch_data %13, %4 {offset = 32, count = 0}
+   return
+ }
+ 
+@@ -37,25 +37,13 @@ kernel.def target(@target) @prefetch_workgroup_id() {
+   %workgroup = kernel.workgroup.id<x> : index
+   %zero = index.constant 0 : offset
+   %input_view = buffer.view %input[%zero] : buffer -> view<1025xi32, #dense>
+-  // REMARK@+1: BACKEND/041 "selected prefetch 'read/l2'" "immediate offset 0" "dynamic index 'soffset'" "count 1"
++  // REMARK@+1: BACKEND/041 "dropped prefetch 'read/l2'" "decision 'prefetch.dynamic_index'" "dynamic index 'none'" "count 0"
+   view.prefetch %input_view[%workgroup] {intent = read, locality = l2} : view<1025xi32, #dense>
+   kernel.return
+ }
+ 
+ // ----
+ low.kernel.def target<amdgpu.rdna4.core>(@target) workgroup_size(1, 1, 1) workgroup_count(1025, 1, 1) @prefetch_workgroup_id() asm {
+-  %workgroup = live_in<amdgpu.cluster_id_x> : reg<amdgpu.sgpr>
+-  %input_view = resource<hal_binding> {index = 0, source_type = hal.buffer, extent = 4100} : reg<amdgpu.sgpr x2>
+-  %8 = s_lshl_b32_rhs_inline %workgroup, 2
+-  %10 = slice %input_view[0] : reg<amdgpu.sgpr x2> -> reg<amdgpu.sgpr>
+-  %11 = slice %input_view[1] : reg<amdgpu.sgpr x2> -> reg<amdgpu.sgpr>
+-  %12 = s_mov_b32 65535
+-  %13 = s_and_b32 %11, %12
+-  %14 = concat(%10, %13) : (reg<amdgpu.sgpr>, reg<amdgpu.sgpr>) -> reg<amdgpu.sgpr x2>
+-  %15 = s_mov_b32 4100
+-  %16 = s_mov_b32 822173696
+-  %17 = concat(%14, %15, %16) : (reg<amdgpu.sgpr x2>, reg<amdgpu.sgpr>, reg<amdgpu.sgpr>) -> reg<amdgpu.sgpr x4>
+-  s_buffer_prefetch_data %17, %8 {count = 1}
+   return
+ }
+ 
+@@ -94,7 +82,7 @@ low.kernel.def target<amdgpu.rdna4.core>(@target) workgroup_size(8, 4, 1) workgr
+   %21 = s_mov_b32 256
+   %22 = s_mov_b32 822173696
+   %23 = concat(%20, %21, %22) : (reg<amdgpu.sgpr x2>, reg<amdgpu.sgpr>, reg<amdgpu.sgpr>) -> reg<amdgpu.sgpr x4>
+-  s_buffer_prefetch_data %23, %14 {offset = 180, count = 1}
++  s_buffer_prefetch_data %23, %14 {offset = 180, count = 0}
+   return
+ }
+ 
+@@ -118,3 +106,19 @@ kernel.def target(@target) @prefetch_workitem_dropped() {
+ low.kernel.def target<amdgpu.rdna4.core>(@target) workgroup_size(64, 1, 1) workgroup_count(1, 1, 1) @prefetch_workitem_dropped() asm {
+   return
+ }
++
++// ====
++
++amdgpu.target<gfx1200> @target
++func.def target(@target) @prefetch_oversize(%input: buffer) {
++  %base = index.constant 1073741824 : offset
++  %input_view = buffer.view %input[%base] : buffer -> view<64xi32, #dense>
++  // REMARK@+1: BACKEND/041 "dropped prefetch 'read/l1'" "decision 'prefetch.offset_range'" "dynamic index 'none'" "count 0"
++  view.prefetch %input_view[4] {intent = read, locality = l1} : view<64xi32, #dense>
++  func.return
++}
++
++// ----
++low.func.def target<amdgpu.rdna4.core>(@target) abi(hal_kernel) @prefetch_oversize() asm {
++  return
++}
