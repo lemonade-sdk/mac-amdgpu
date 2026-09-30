@@ -21,7 +21,8 @@ fi
   echo 'Existing build source is at an unexpected revision.' >&2; exit 1;
 }
 for patch in "$hrx_patch" \
-  "$repo_root/patches/hrx/symbolic-memo-touched-reset.patch"; do
+  "$repo_root/patches/hrx/symbolic-memo-touched-reset.patch" \
+  "$repo_root/patches/hrx/kv-fragment-addressing.patch"; do
   if git -C "$hrx_copy" apply --reverse --check "$patch" 2>/dev/null; then
     :
   else

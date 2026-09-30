@@ -1,0 +1,27 @@
+amdgpu.target<gfx1201> @target
+kernel.def target(@target) export("kv_fragment_addressing") @kv_fragment_addressing() {
+  %one = index.constant 1 : index
+  %threads = index.constant 64 : index
+  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%addresses: buffer, %indices: buffer, %output: buffer) {
+  %base = index.constant 0 : offset
+  %lane0 = kernel.workitem.id<x> : index
+  %lane = index.assume %lane0 [range(%lane0, 0, 63)] : index
+  %table = buffer.view %addresses[%base] : buffer -> view<64xi64, #dense>
+  %positions = buffer.view %indices[%base] : buffer -> view<64xi64, #dense>
+  %out = buffer.view %output[%base] : buffer -> view<64xf32, #dense>
+  %address = view.load %table[%lane] : view<64xi64, #dense> -> i64
+  %root = buffer.from_address %address {byte_length = 262144, base_alignment = 16} : i64 -> buffer
+  %values = buffer.view %root[%base] : buffer -> view<65536xf32, #dense>
+  %wide = view.load %positions[%lane] : view<64xi64, #dense> -> i64
+  %input = scalar.assume %wide [range(%wide, 0, 65535)] : i64
+  %small = index.cast %input : i64 to index
+  %scale = index.constant 131072 : index
+  %index = index.mul %small, %scale : index
+  %bounded = index.assume %index [range(%index, 0, 65535)] : index
+  %divisor = index.constant 4 : index
+  %at = index.div %bounded, %divisor : index
+  %value = view.load %values[%at] : view<65536xf32, #dense> -> f32
+  view.store %value, %out[%lane] : f32, view<64xf32, #dense>
+  kernel.return
+}

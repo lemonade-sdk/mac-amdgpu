@@ -1,0 +1,377 @@
+diff --git a/libhrx/include/hrx_runtime.h b/libhrx/include/hrx_runtime.h
+index 2fada922..b9321ea5 100644
+--- a/libhrx/include/hrx_runtime.h
++++ b/libhrx/include/hrx_runtime.h
+@@ -648,6 +648,11 @@ HRX_API hrx_status_t hrx_buffer_map(hrx_buffer_t buffer, hrx_map_flags_t flags,
+ 
+ HRX_API hrx_status_t hrx_buffer_unmap(hrx_buffer_t buffer);
+ 
++// Borrow a native device address without mapping storage for host access.
++// The buffer must remain alive until all device uses of this address finish.
++HRX_API hrx_status_t hrx_buffer_get_device_address(hrx_buffer_t buffer,
++                                                 uint64_t* address);
++
+ HRX_API hrx_status_t hrx_buffer_get_device_ptr(hrx_buffer_t buffer,
+                                                void** device_ptr);
+ 
+diff --git a/loom/py/loom/dialect/buffer/__init__.py b/loom/py/loom/dialect/buffer/__init__.py
+index d20b5d08..1dc2939b 100644
+--- a/loom/py/loom/dialect/buffer/__init__.py
++++ b/loom/py/loom/dialect/buffer/__init__.py
+@@ -9,6 +9,7 @@
+ from loom.dialect.buffer.defs import (
+     ALL_BUFFER_OPS,
+     buffer_alloca,
++    buffer_from_address,
+     buffer_assume_memory_space,
+     buffer_ops,
+     buffer_view,
+@@ -20,6 +21,7 @@ __all__ = [
+     "ALL_BUFFER_OPS",
+     "MemorySpace",
+     "buffer_alloca",
++    "buffer_from_address",
+     "buffer_assume_memory_space",
+     "buffer_view",
+ ]
+diff --git a/loom/py/loom/dialect/buffer/defs.py b/loom/py/loom/dialect/buffer/defs.py
+index 0dc04e63..320df29e 100644
+--- a/loom/py/loom/dialect/buffer/defs.py
++++ b/loom/py/loom/dialect/buffer/defs.py
+@@ -31,6 +31,7 @@ from loom.dsl import (
+     ATTR_TYPE_ENUM,
+     ATTR_TYPE_I64,
+     BUFFER,
++    INTEGER,
+     FACT_IDENTITY,
+     OFFSET,
+     PURE,
+@@ -300,6 +301,25 @@ buffer_view = Op(
+ # Registry
+ # ============================================================================
+ 
++buffer_from_address = Op(
++    name="buffer.from_address",
++    group=buffer_ops,
++    doc=("Form a non-owning global buffer from a native 64-bit device address. "
++         "The caller guarantees a live allocation of byte_length bytes at that "
++         "address with base_alignment alignment for every access through the result. "
++         "This operation does not allocate, retain, or grant noalias storage."),
++    operands=[Operand("address", INTEGER, doc="Native i64 device address.")],
++    results=[Result("result", BUFFER, doc="Borrowed global storage root.")],
++    attrs=[AttrDef("byte_length", ATTR_TYPE_I64),
++           AttrDef("base_alignment", ATTR_TYPE_I64)],
++    traits=[PURE],
++    verify="loom_buffer_from_address_verify",
++    facts="loom_buffer_from_address_facts",
++    format=[Ref("address"), AttrDict(), COLON, TypeOf("address"),
++            ARROW, ResultType("result")],
++    examples=["%root = buffer.from_address %address {byte_length = 262144, base_alignment = 16} : i64 -> buffer"],
++)
++
+ ALL_BUFFER_OPS: tuple[Op, ...] = (
+     buffer_alloca,
+     buffer_assume_alignment,
+@@ -307,4 +327,5 @@ ALL_BUFFER_OPS: tuple[Op, ...] = (
+     buffer_assume_noalias,
+     buffer_assume_same_root,
+     buffer_view,
++    buffer_from_address,
+ )
+diff --git a/loom/py/loom/target/arch/amdgpu/contracts/buffer.py b/loom/py/loom/target/arch/amdgpu/contracts/buffer.py
+index 9891ec03..c50b278e 100644
+--- a/loom/py/loom/target/arch/amdgpu/contracts/buffer.py
++++ b/loom/py/loom/target/arch/amdgpu/contracts/buffer.py
+@@ -48,6 +48,11 @@ AMDGPU_BUFFER_CONTRACT_FRAGMENT = ContractFragment(
+     descriptor_set=_DESCRIPTOR_SET,
+     public_header="loom/target/arch/amdgpu/contracts/buffer.h",
+     cases=(
++        ValueAliasRule(
++            source_op=buffer.buffer_from_address,
++            source=ValueRef.operand("address"),
++            result=ValueRef.result("result"),
++        ),
+         ValueAliasRule(
+             source_op=buffer.buffer_view,
+             source=ValueRef.operand("buffer"),
+diff --git a/loom/src/loom/codegen/low/lower/lower.c b/loom/src/loom/codegen/low/lower/lower.c
+index ed5d203f..15b4a80a 100644
+--- a/loom/src/loom/codegen/low/lower/lower.c
++++ b/loom/src/loom/codegen/low/lower/lower.c
+@@ -24,6 +24,7 @@
+ #include "loom/ops/cfg/ops.h"
+ #include "loom/ops/encoding/ops.h"
+ #include "loom/ops/func/ops.h"
++#include "loom/ops/index/ops.h"
+ #include "loom/ops/kernel/launch_config.h"
+ #include "loom/ops/kernel/ops.h"
+ #include "loom/ops/low/ops.h"
+@@ -2522,6 +2523,31 @@ static iree_status_t loom_low_lower_bind_identity_results(
+   const loom_value_id_t* source_operands = loom_op_const_operands(source_op);
+   const loom_value_id_t* source_results = loom_op_const_results(source_op);
+   for (uint16_t i = 0; i < source_op->result_count; ++i) {
++    if (source_op->kind == LOOM_OP_INDEX_ASSUME &&
++        loom_low_lower_source_value_has_low_mapping(context, source_operands[i])) {
++      loom_value_id_t low_source = LOOM_VALUE_ID_INVALID;
++      IREE_RETURN_IF_ERROR(loom_low_lower_lookup_value(
++          context, source_operands[i], &low_source));
++      const loom_type_t source_type =
++          loom_module_value_type(context->module, low_source);
++      loom_type_t result_type = loom_type_none();
++      IREE_RETURN_IF_ERROR(loom_low_lower_map_value(
++          context, source_op, source_results[i], &result_type));
++      if (loom_low_type_is_register(source_type) &&
++          loom_low_type_is_register(result_type) &&
++          loom_low_register_type_unit_count(result_type) <
++              loom_low_register_type_unit_count(source_type)) {
++        // A range assertion can prove that an address fits fewer register
++        // units. Keep the low units instead of aliasing the wider producer.
++        loom_op_t* slice = NULL;
++        IREE_RETURN_IF_ERROR(loom_low_slice_build(
++            &context->builder, low_source, 0, result_type,
++            source_op->location, &slice));
++        IREE_RETURN_IF_ERROR(loom_low_lower_bind_value(
++            context, source_results[i], loom_low_slice_result(slice)));
++        continue;
++      }
++    }
+     IREE_RETURN_IF_ERROR(loom_low_lower_bind_or_elide_alias(
+         context, source_operands[i], source_results[i]));
+   }
+diff --git a/loom/src/loom/ops/buffer/facts.c b/loom/src/loom/ops/buffer/facts.c
+index eef4064e..5bc1423d 100644
+--- a/loom/src/loom/ops/buffer/facts.c
++++ b/loom/src/loom/ops/buffer/facts.c
+@@ -224,6 +224,22 @@ iree_status_t loom_buffer_assume_same_root_facts(
+                                                 &result_facts[0]);
+ }
+ 
++iree_status_t loom_buffer_from_address_facts(
++    loom_fact_context_t* context, const loom_module_t* module,
++    const loom_op_t* op, const loom_value_facts_t* operand_facts,
++    loom_value_facts_t* result_facts) {
++  (void)module;
++  (void)operand_facts;
++  loom_value_fact_buffer_reference_t reference =
++      loom_buffer_default_reference(loom_buffer_from_address_result(op));
++  const int64_t bytes = loom_buffer_from_address_byte_length(op);
++  reference.maximum_byte_extent = loom_value_facts_make(bytes, bytes, 1);
++  reference.minimum_alignment = loom_buffer_from_address_base_alignment(op);
++  reference.memory_space = LOOM_VALUE_FACT_MEMORY_SPACE_GLOBAL;
++  return loom_value_facts_make_buffer_reference(context, reference,
++                                                &result_facts[0]);
++}
++
+ iree_status_t loom_buffer_view_facts(loom_fact_context_t* context,
+                                      const loom_module_t* module,
+                                      const loom_op_t* op,
+diff --git a/loom/src/loom/ops/buffer/ops.h b/loom/src/loom/ops/buffer/ops.h
+index 1e9ba40d..c8d7888b 100644
+--- a/loom/src/loom/ops/buffer/ops.h
++++ b/loom/src/loom/ops/buffer/ops.h
+@@ -26,7 +26,8 @@ enum {
+   LOOM_OP_BUFFER_ASSUME_NOALIAS = LOOM_OP_KIND(LOOM_DIALECT_BUFFER, 3),
+   LOOM_OP_BUFFER_ASSUME_SAME_ROOT = LOOM_OP_KIND(LOOM_DIALECT_BUFFER, 4),
+   LOOM_OP_BUFFER_VIEW = LOOM_OP_KIND(LOOM_DIALECT_BUFFER, 5),
+-  LOOM_OP_BUFFER_COUNT_ = 6,
++  LOOM_OP_BUFFER_FROM_ADDRESS = LOOM_OP_KIND(LOOM_DIALECT_BUFFER, 6),
++  LOOM_OP_BUFFER_COUNT_ = 7,
+ };
+ 
+ // LOOM_OP_BUFFER_ALLOCA: Create a fixed-frame scratch buffer root in workgroup or private memory. Each execution produces a distinct storage identity; identical allocas must not be commoned. The byte length is the requested physical byte count for the execution. Targets requiring a static frame reserve its proven finite non-negative maximum. base_alignment is the minimum byte alignment of the root storage base.
+@@ -159,6 +160,30 @@ iree_status_t loom_buffer_view_verify(
+     const loom_module_t* module, const loom_op_t* op,
+     iree_diagnostic_emitter_t emitter);
+ 
++// LOOM_OP_BUFFER_FROM_ADDRESS: Form a non-owning global buffer from a native 64-bit device address. The caller guarantees a live allocation of byte_length bytes at that address with base_alignment alignment for every access through the result. This operation does not allocate, retain, or grant noalias storage.
++// %root = buffer.from_address %address {byte_length = 262144, base_alignment = 16} : i64 -> buffer
++LOOM_DEFINE_ISA(loom_buffer_from_address_isa, LOOM_OP_BUFFER_FROM_ADDRESS)
++LOOM_DEFINE_OPERAND(loom_buffer_from_address_address, 0)
++LOOM_DEFINE_RESULT(loom_buffer_from_address_result, 0)
++LOOM_DEFINE_ATTR_I64(loom_buffer_from_address_byte_length, 0)
++LOOM_DEFINE_ATTR_I64(loom_buffer_from_address_base_alignment, 1)
++iree_status_t loom_buffer_from_address_build(
++    loom_builder_t* builder,
++    loom_may_consume loom_value_id_t address,
++    int64_t byte_length,
++    int64_t base_alignment,
++    loom_type_t result_type,
++    loom_location_id_t location,
++    loom_op_t** out_op);
++iree_status_t loom_buffer_from_address_facts(
++    loom_fact_context_t* context,
++    const loom_module_t* module, const loom_op_t* op,
++    const loom_value_facts_t* operand_facts,
++    loom_value_facts_t* result_facts);
++iree_status_t loom_buffer_from_address_verify(
++    const loom_module_t* module, const loom_op_t* op,
++    iree_diagnostic_emitter_t emitter);
++
+ // Returns the vtable array for the buffer dialect.
+ const loom_op_vtable_t* const* loom_buffer_dialect_vtables(
+     iree_host_size_t* out_count);
+diff --git a/loom/src/loom/ops/buffer/verify.c b/loom/src/loom/ops/buffer/verify.c
+index 61217093..4263e250 100644
+--- a/loom/src/loom/ops/buffer/verify.c
++++ b/loom/src/loom/ops/buffer/verify.c
+@@ -131,6 +131,31 @@ static iree_status_t loom_buffer_verify_memory_space_refinement(
+       iree_make_cstring_view(expected));
+ }
+ 
++iree_status_t loom_buffer_from_address_verify(
++    const loom_module_t* module, const loom_op_t* op,
++    iree_diagnostic_emitter_t emitter) {
++  const loom_type_t type = loom_module_value_type(
++      module, loom_buffer_from_address_address(op));
++  if (!loom_type_is_scalar(type) ||
++      loom_type_element_type(type) != LOOM_SCALAR_TYPE_I64) {
++    const loom_diagnostic_param_t params[] = {
++        loom_param_string(IREE_SV("address")), loom_param_type(type),
++        loom_param_string(IREE_SV("i64"))};
++    return loom_buffer_emit(emitter, op, LOOM_ERR_TYPE_003, params,
++                            IREE_ARRAYSIZE(params));
++  }
++  const int64_t bytes = loom_buffer_from_address_byte_length(op);
++  if (bytes <= 0)
++    return loom_buffer_emit_attribute_value_constraint(emitter, op,
++        IREE_SV("byte_length"), bytes, IREE_SV("positive byte length"));
++  const int64_t alignment = loom_buffer_from_address_base_alignment(op);
++  if (!iree_math_is_power_of_two_i64(alignment))
++    return loom_buffer_emit_attribute_value_constraint(emitter, op,
++        IREE_SV("base_alignment"), alignment,
++        IREE_SV("positive power-of-two byte alignment"));
++  return iree_ok_status();
++}
++
+ iree_status_t loom_buffer_alloca_verify(const loom_module_t* module,
+                                         const loom_op_t* op,
+                                         iree_diagnostic_emitter_t emitter) {
+diff --git a/loom/src/loom/target/arch/amdgpu/lower/memory.c b/loom/src/loom/target/arch/amdgpu/lower/memory.c
+index 361df2c9..19f05356 100644
+--- a/loom/src/loom/target/arch/amdgpu/lower/memory.c
++++ b/loom/src/loom/target/arch/amdgpu/lower/memory.c
+@@ -2422,6 +2422,10 @@ static bool loom_amdgpu_memory_access_select_address_form(
+     loom_low_source_memory_operation_kind_t kind, bool allow_global_smem,
+     loom_amdgpu_memory_access_t* access,
+     loom_amdgpu_memory_access_diagnostic_t* diagnostic) {
++  const loom_value_t* root = loom_module_value(
++      selection_context->module, access->source.root_value_id);
++  const bool borrowed_address = !loom_value_is_block_arg(root) &&
++      loom_buffer_from_address_isa(loom_value_def_op(root));
+   const loom_amdgpu_memory_address_attempt_t* attempts =
+       kAmdgpuGlobalAddressAttempts;
+   iree_host_size_t attempt_count = IREE_ARRAYSIZE(kAmdgpuGlobalAddressAttempts);
+@@ -2438,6 +2442,12 @@ static bool loom_amdgpu_memory_access_select_address_form(
+     attempt_count = IREE_ARRAYSIZE(kAmdgpuDescriptorAddressAttempts);
+   }
+   for (iree_host_size_t i = 0; i < attempt_count; ++i) {
++    // A borrowed address can differ between lanes. It is not an ABI scalar
++    // buffer binding, so preserve the full address in vector registers.
++    if (borrowed_address &&
++        attempts[i].kind != LOOM_AMDGPU_MEMORY_ADDRESS_ATTEMPT_GLOBAL_FLAT) {
++      continue;
++    }
+     const loom_amdgpu_memory_address_attempt_result_t result =
+         loom_amdgpu_memory_address_attempt_apply(
+             &attempts[i], selection_context, kind, allow_global_smem, access,
+diff --git a/loom/src/loom/target/arch/amdgpu/lower/memory_emit.c b/loom/src/loom/target/arch/amdgpu/lower/memory_emit.c
+index b5e40f35..170f6c89 100644
+--- a/loom/src/loom/target/arch/amdgpu/lower/memory_emit.c
++++ b/loom/src/loom/target/arch/amdgpu/lower/memory_emit.c
+@@ -1587,6 +1587,57 @@ iree_status_t loom_amdgpu_emit_memory_flat_vaddr(
+   loom_type_t sgpr_type = loom_type_none();
+   IREE_RETURN_IF_ERROR(loom_amdgpu_make_sgpr_type(context, &sgpr_type));
+ 
++  const loom_type_t resource_type = loom_module_value_type(
++      loom_low_lower_context_module(context), low_resource);
++  if (loom_amdgpu_low_type_is_register_class(
++          context, resource_type, LOOM_AMDGPU_REG_CLASS_ID_VGPR)) {
++    loom_type_t vgpr_type = loom_type_none();
++    loom_type_t vgpr_x2_type = loom_type_none();
++    loom_type_t sgpr_x2_type = loom_type_none();
++    IREE_RETURN_IF_ERROR(loom_amdgpu_make_vgpr_type(context, &vgpr_type));
++    IREE_RETURN_IF_ERROR(
++        loom_amdgpu_make_vgpr_range_type(context, 2, &vgpr_x2_type));
++    IREE_RETURN_IF_ERROR(
++        loom_amdgpu_make_sgpr_range_type(context, 2, &sgpr_x2_type));
++    loom_value_id_t lo = LOOM_VALUE_ID_INVALID;
++    loom_value_id_t hi = LOOM_VALUE_ID_INVALID;
++    IREE_RETURN_IF_ERROR(loom_amdgpu_emit_low_slice(
++        context, source_op, low_resource, 0, vgpr_type, &lo));
++    IREE_RETURN_IF_ERROR(loom_amdgpu_emit_low_slice(
++        context, source_op, low_resource, 1, vgpr_type, &hi));
++    if (access->vaddr_static_byte_offset != 0) {
++      loom_value_id_t offset = LOOM_VALUE_ID_INVALID;
++      loom_value_id_t offset_lo = LOOM_VALUE_ID_INVALID;
++      loom_value_id_t offset_hi = LOOM_VALUE_ID_INVALID;
++      IREE_RETURN_IF_ERROR(loom_amdgpu_emit_sgpr64_constant_u64(
++          context, source_op, access->vaddr_static_byte_offset, &offset));
++      IREE_RETURN_IF_ERROR(loom_amdgpu_emit_low_slice(
++          context, source_op, offset, 0, sgpr_type, &offset_lo));
++      IREE_RETURN_IF_ERROR(loom_amdgpu_emit_low_slice(
++          context, source_op, offset, 1, sgpr_type, &offset_hi));
++      IREE_RETURN_IF_ERROR(loom_amdgpu_emit_memory_flat_add_term(
++          context, source_op, offset_lo, offset_hi, vgpr_type, sgpr_x2_type,
++          &lo, &hi));
++    }
++    for (uint8_t i = 0; i < access->source.dynamic_term_count; ++i) {
++      loom_value_id_t term_lo = LOOM_VALUE_ID_INVALID;
++      loom_value_id_t term_hi = LOOM_VALUE_ID_INVALID;
++      IREE_RETURN_IF_ERROR(loom_amdgpu_emit_memory_flat_dynamic_term(
++          context, source_op, &access->source.dynamic_terms[i], vgpr_type,
++          &term_lo, &term_hi));
++      IREE_RETURN_IF_ERROR(loom_amdgpu_emit_memory_flat_add_term(
++          context, source_op, term_lo, term_hi, vgpr_type, sgpr_x2_type,
++          &lo, &hi));
++    }
++    const loom_value_id_t sources[] = {lo, hi};
++    loom_op_t* concat_op = NULL;
++    IREE_RETURN_IF_ERROR(loom_low_concat_build(
++        loom_low_lower_context_builder(context), sources, 2, vgpr_x2_type,
++        source_op->location, &concat_op));
++    *out_low_vaddr = loom_low_concat_result(concat_op);
++    return iree_ok_status();
++  }
++
+   loom_value_id_t low_scalar_base = low_resource;
+   if (access->vaddr_static_byte_offset != 0) {
+     loom_value_id_t low_static_offset = LOOM_VALUE_ID_INVALID;
+diff --git a/libhrx/src/libhrx/buffer.c b/libhrx/src/libhrx/buffer.c
+index a8848b0d..650531d7 100644
+--- a/libhrx/src/libhrx/buffer.c
++++ b/libhrx/src/libhrx/buffer.c
+@@ -188,6 +196,22 @@ hrx_status_t hrx_buffer_unmap(hrx_buffer_t buffer) {
+   HRX_RETURN_AND_END_ZONE(z0, hrx_status_from_iree(status));
+ }
+ 
++hrx_status_t hrx_buffer_get_device_address(hrx_buffer_t buffer, uint64_t* address) {
++  if (!buffer || !address) {
++    return hrx_make_status(HRX_STATUS_INVALID_ARGUMENT,
++                          "buffer or address is NULL");
++  }
++  *address = 0;
++  iree_hal_external_buffer_t external_buffer = {0};
++  iree_status_t status = iree_hal_allocator_export_buffer(
++      buffer->device->allocator.hal_allocator, buffer->hal_buffer,
++      IREE_HAL_EXTERNAL_BUFFER_TYPE_DEVICE_ALLOCATION,
++      IREE_HAL_EXTERNAL_BUFFER_FLAG_NONE, &external_buffer);
++  if (!iree_status_is_ok(status)) return hrx_status_from_iree(status);
++  *address = external_buffer.handle.device_allocation.ptr;
++  return hrx_ok_status();
++}
++
+ hrx_status_t hrx_buffer_get_device_ptr(hrx_buffer_t buffer, void** device_ptr) {
+   HRX_TRACE_ZONE_BEGIN(z0, "hrx_buffer_get_device_ptr");
+   if (buffer) {
+diff --git a/libhrx/cmake/hrx_exports_macos.txt b/libhrx/cmake/hrx_exports_macos.txt
+index 95e8bbf2..64bf882a 100644
+--- a/libhrx/cmake/hrx_exports_macos.txt
++++ b/libhrx/cmake/hrx_exports_macos.txt
+@@ -56,6 +58,7 @@ _hrx_buffer_release
+ _hrx_buffer_map
+ _hrx_buffer_unmap
+ _hrx_buffer_get_device_ptr
++_hrx_buffer_get_device_address
+ _hrx_buffer_get_size
+ _hrx_synchronous_h2d
+ _hrx_synchronous_d2h
